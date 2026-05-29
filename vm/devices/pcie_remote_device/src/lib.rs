@@ -13,13 +13,17 @@
 
 pub mod absent;
 pub mod deadman;
+pub mod device;
+pub mod dma;
 pub mod error;
 pub mod handshake;
 pub mod prepared;
 pub mod state;
+pub mod transport;
 pub mod worker;
 
 pub use absent::AbsentPcieDevice;
+pub use device::PcieRemoteDevice;
 pub use error::Error;
 pub use prepared::PreparedPcieRemoteDevice;
 pub use state::DeviceState;
