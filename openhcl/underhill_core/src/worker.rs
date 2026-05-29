@@ -325,6 +325,9 @@ pub struct UnderhillEnvCfg {
     pub config_timeout_in_seconds: u64,
     /// The timeout in milliseconds for dump collection during a panic in servicing.
     pub servicing_timeout_dump_collection_in_ms: u64,
+    /// pcie_remote 实验设备实例（spec v3.1 §3.3）。仅在 IGVM APPEND_CHOSEN
+    /// 策略下可注入；CVM 下被静默过滤。
+    pub pcie_remote_instance: Vec<crate::options::PcieRemoteCliConfig>,
 }
 
 /// Bundle of config + runtime objects for hooking into the underhill remote
@@ -2291,6 +2294,55 @@ async fn new_underhill_vm(
             always_bounce,
         ),
     );
+
+    // pcie_remote vsock resolver（spec v3.1 §3.3）。
+    // 第一层 CVM guard：is_hardware_isolated → 不起 listener，不注册任何 instance。
+    // 第二层兜底（spec §3.10）：resolver 找不到 prepared 时返回 AbsentPcieDevice。
+    let pcie_remote_prepared: pcie_remote_device::PreparedMap =
+        Arc::new(Mutex::new(HashMap::new()));
+    let pcie_remote_listener_tasks = if isolation.is_hardware_isolated() {
+        tracing::warn!(
+            CVM_ALLOWED,
+            "pcie_remote: skipping all instances on hardware-isolated VM"
+        );
+        Vec::new()
+    } else {
+        // v1：只支持 OpenHCL cmdline (`--pcie-remote-instance`) 注入路径。
+        // takeover (path C) 在 vtl2_settings_worker.rs 内 NVMe 循环里完成改派。
+        let instances: Vec<(Guid, u32, Duration)> = env_cfg
+            .pcie_remote_instance
+            .iter()
+            .map(|cfg| {
+                (
+                    cfg.instance_id,
+                    cfg.vsock_port,
+                    Duration::from_millis(cfg.handshake_timeout_ms as u64),
+                )
+            })
+            .collect();
+        if instances.is_empty() {
+            Vec::new()
+        } else {
+            pcie_remote_device::handshake_spawn::spawn_vsock_handshakes(
+                driver_source.simple(),
+                tp.clone(),
+                instances,
+                pcie_remote_prepared.clone(),
+            )
+        }
+    };
+    // 把 listener tasks 转入 detach；OpenHCL 进程退出时它们随 Spawn 一同终止。
+    for t in pcie_remote_listener_tasks {
+        t.detach();
+    }
+    resolver.add_async_resolver::<
+        vm_resource::kind::PciDeviceHandleKind,
+        _,
+        pcie_remote_resources::PcieRemoteVmbusHandle,
+        _,
+    >(pcie_remote_device::PcieRemoteVmbusResolver::new(
+        pcie_remote_prepared,
+    ));
 
     let periodic_telemetry_task = tp.spawn(
         "periodic_telemetry_collection",

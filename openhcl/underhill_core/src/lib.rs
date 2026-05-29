@@ -346,6 +346,7 @@ async fn launch_workers(
         disable_lower_vtl_timer_virt: opt.disable_lower_vtl_timer_virt,
         config_timeout_in_seconds: opt.config_timeout_in_seconds,
         servicing_timeout_dump_collection_in_ms: opt.servicing_timeout_dump_collection_in_ms,
+        pcie_remote_instance: opt.pcie_remote_instance.clone(),
     };
 
     let (mut remote_console_cfg, framebuffer_access) =

@@ -161,6 +161,8 @@ tee_call.workspace = true
 uevent.workspace = true
 user_driver.workspace = true
 vmsocket.workspace = true
+pcie_remote_device.workspace = true
+pcie_remote_resources.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true

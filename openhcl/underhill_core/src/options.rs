@@ -314,6 +314,61 @@ pub struct Options {
     /// The default time to wait in milliseconds for dump collection during a
     /// panic in servicing.
     pub servicing_timeout_dump_collection_in_ms: u64,
+
+    /// (OPENHCL_PCIE_REMOTE_INSTANCE=<guid>:<vsock_port>[,handshake_timeout_ms=N];...)
+    /// 可重复（用 ';' 分隔多个）。每项注入一个 pcie_remote 实验设备实例。
+    /// 仅在 IGVM cmdline policy = APPEND_CHOSEN 下生效；CVM 下被静默过滤。
+    /// 端口黑名单（1/2/3/4/0x1337 等）会被拒绝。
+    /// spec §3.2 / §3.3。
+    pub pcie_remote_instance: Vec<PcieRemoteCliConfig>,
+}
+
+/// 单条 `--pcie-remote-instance` / `OPENHCL_PCIE_REMOTE_INSTANCE` 配置。
+#[derive(Clone, Debug, MeshPayload, Inspect)]
+pub struct PcieRemoteCliConfig {
+    /// 实例 GUID（也作为 vpci bus_instance_id 使用；必须 vmwp 已知）。
+    #[inspect(display)]
+    pub instance_id: guid::Guid,
+    /// vsock 端口（不允许撞 well-known: 1/2/3/4/0x1337/vnc/gdbstub）。
+    pub vsock_port: u32,
+    /// 握手超时（毫秒，默认 2000）。
+    pub handshake_timeout_ms: u32,
+}
+
+impl FromStr for PcieRemoteCliConfig {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, anyhow::Error> {
+        let mut parts = s.split(',');
+        let head = parts.next().ok_or_else(|| anyhow::anyhow!("empty config"))?;
+        let (guid_s, port_s) = head
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("expected <guid>:<port>"))?;
+        let instance_id: guid::Guid = guid_s
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid guid {guid_s}: {e}"))?;
+        let vsock_port: u32 = port_s
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid port {port_s}: {e}"))?;
+        let mut handshake_timeout_ms = 2000u32;
+        for kv in parts {
+            let (k, v) = kv
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("expected key=value: {kv}"))?;
+            match k {
+                "handshake_timeout_ms" => {
+                    handshake_timeout_ms = v
+                        .parse()
+                        .map_err(|e| anyhow::anyhow!("invalid timeout {v}: {e}"))?;
+                }
+                _ => anyhow::bail!("unknown key: {k}"),
+            }
+        }
+        Ok(Self {
+            instance_id,
+            vsock_port,
+            handshake_timeout_ms,
+        })
+    }
 }
 
 impl Options {
@@ -501,6 +556,33 @@ impl Options {
         let servicing_timeout_dump_collection_in_ms =
             parse_env_number("OPENHCL_SERVICING_TIMEOUT_DUMP_COLLECTION_IN_MS")?.unwrap_or(500);
 
+        let pcie_remote_instance: Vec<PcieRemoteCliConfig> = {
+            let raw = read_legacy_openhcl_env("OPENHCL_PCIE_REMOTE_INSTANCE")
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let mut out = Vec::new();
+            for entry in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                let cfg: PcieRemoteCliConfig = entry.parse().with_context(|| {
+                    format!("invalid OPENHCL_PCIE_REMOTE_INSTANCE entry: {entry}")
+                })?;
+                if let Err(e) = pcie_remote_device::transport::check_vsock_port(
+                    cfg.vsock_port,
+                    Some(vnc_port.unwrap_or(3)),
+                    Some(gdbstub_port.unwrap_or(4)),
+                ) {
+                    eprintln!(
+                        "pcie_remote: instance {} rejected ({e}); skipping.",
+                        cfg.instance_id
+                    );
+                    tracing::warn!(error = %e, "pcie_remote: skip blacklisted port");
+                    continue;
+                }
+                out.push(cfg);
+            }
+            out
+        };
+
         let mut args = std::env::args().chain(extra_args);
         // Skip our own filename.
         args.next();
@@ -567,6 +649,7 @@ impl Options {
             disable_lower_vtl_timer_virt,
             config_timeout_in_seconds,
             servicing_timeout_dump_collection_in_ms,
+            pcie_remote_instance,
         })
     }
 
