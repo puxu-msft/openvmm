@@ -29,6 +29,10 @@ pub struct Config {
     pub pcie_root_complexes: Vec<PcieRootComplexConfig>,
     pub pcie_devices: Vec<PcieDeviceConfig>,
     pub pcie_switches: Vec<PcieSwitchConfig>,
+    /// pcie_remote_tcp instances（spec §3.1bis OpenVMM 路径）：
+    /// `(instance_id, "127.0.0.1:port", handshake_timeout_ms)`。
+    /// Worker 启动期会为每个 instance 起 listener + handshake spawn。
+    pub pcie_remote_tcp_instances: Vec<(Guid, String, u32)>,
     pub vpci_devices: Vec<VpciDeviceConfig>,
     pub memory: MemoryConfig,
     pub processor_topology: ProcessorTopologyConfig,

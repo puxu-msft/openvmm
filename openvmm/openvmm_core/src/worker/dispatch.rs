@@ -186,6 +186,7 @@ impl Manifest {
             pcie_root_complexes: config.pcie_root_complexes,
             pcie_devices: config.pcie_devices,
             pcie_switches: config.pcie_switches,
+            pcie_remote_tcp_instances: config.pcie_remote_tcp_instances,
             vpci_devices: config.vpci_devices,
             hypervisor: config.hypervisor,
             memory: config.memory,
@@ -235,6 +236,7 @@ pub struct Manifest {
     pcie_root_complexes: Vec<PcieRootComplexConfig>,
     pcie_devices: Vec<PcieDeviceConfig>,
     pcie_switches: Vec<PcieSwitchConfig>,
+    pcie_remote_tcp_instances: Vec<(guid::Guid, String, u32)>,
     vpci_devices: Vec<VpciDeviceConfig>,
     memory: MemoryConfig,
     processor_topology: ProcessorTopologyConfig,
@@ -2080,6 +2082,36 @@ impl InitializedVm {
             &gm,
         )?;
 
+        // pcie_remote TCP resolver（OpenVMM 路径，spec §3.1bis）。
+        // 不在 #[cfg(target_os = "linux")] 内 —— Windows OpenVMM 也要走。
+        let pcie_remote_prepared: pcie_remote_device::PreparedMap =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let _pcie_remote_listener_tasks = if cfg.pcie_remote_tcp_instances.is_empty() {
+            Vec::new()
+        } else {
+            let instances: Vec<_> = cfg
+                .pcie_remote_tcp_instances
+                .iter()
+                .map(|(id, addr, timeout_ms)| {
+                    (*id, addr.clone(), std::time::Duration::from_millis(*timeout_ms as u64))
+                })
+                .collect();
+            pcie_remote_device::handshake_spawn::spawn_tcp_handshakes(
+                driver_source.simple(),
+                driver_source.simple(),
+                instances,
+                pcie_remote_prepared.clone(),
+            )
+        };
+        resolver.add_async_resolver::<
+            vm_resource::kind::PciDeviceHandleKind,
+            _,
+            pcie_remote_resources::PcieRemoteTcpHandle,
+            _,
+        >(pcie_remote_device::PcieRemoteTcpResolver::new(
+            pcie_remote_prepared,
+        ));
+
         // Resolve PCIe devices concurrently.
         //
         // When ITS is active, the root complex's ITS-wrapped SignalMsi
@@ -3463,6 +3495,7 @@ impl LoadedVm {
             pcie_root_complexes: vec![], // TODO
             pcie_devices: vec![],        // TODO
             pcie_switches: vec![],       // TODO
+            pcie_remote_tcp_instances: vec![], // TODO
             vpci_devices: vec![],        // TODO
             memory: self.inner.memory_cfg,
             processor_topology: self.inner.processor_topology.to_config(),

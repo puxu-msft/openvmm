@@ -607,13 +607,8 @@ async fn vm_config_from_command_line(
     // Build initial PCIe devices list from CLI options. Storage devices
     // (e.g., NVMe controllers on PCIe ports) are added later by storage_builder.
     let mut pcie_devices = Vec::new();
+    let mut pcie_remote_tcp_instances: Vec<(Guid, String, u32)> = Vec::new();
     for (index, cli_cfg) in opt.pcie_remote.iter().enumerate() {
-        tracing::info!(
-            port_name = %cli_cfg.port_name,
-            socket_addr = ?cli_cfg.socket_addr,
-            "instantiating PCIe remote device"
-        );
-
         // Generate a deterministic instance ID based on index
         const PCIE_REMOTE_BASE_INSTANCE_ID: Guid =
             guid::guid!("28ed784d-c059-429f-9d9a-46bea02562c0");
@@ -621,17 +616,42 @@ async fn vm_config_from_command_line(
             data1: index as u32,
             ..PCIE_REMOTE_BASE_INSTANCE_ID
         };
+        let socket_addr = cli_cfg
+            .socket_addr
+            .clone()
+            .unwrap_or_else(|| pcie_remote_resources::DEFAULT_SOCKET_ADDR.to_string());
+
+        // v3.1: enforce loopback. Be user-visible (eprintln!) instead of silent skip.
+        if let Err(e) = pcie_remote_device::transport::check_tcp_loopback(&socket_addr) {
+            eprintln!(
+                "pcie_remote {}: refusing non-loopback TCP addr '{}' ({e}); skipping device.",
+                cli_cfg.port_name, socket_addr
+            );
+            tracing::warn!(
+                port = %cli_cfg.port_name,
+                addr = %socket_addr,
+                "pcie_remote: skip non-loopback"
+            );
+            continue;
+        }
+
+        tracing::info!(
+            port_name = %cli_cfg.port_name,
+            %socket_addr,
+            %instance_id,
+            "instantiating PCIe remote device (TCP loopback)"
+        );
 
         pcie_devices.push(PcieDeviceConfig {
             port_name: cli_cfg.port_name.clone(),
-            resource: pcie_remote_resources::PcieRemoteHandle {
+            resource: pcie_remote_resources::PcieRemoteTcpHandle {
                 instance_id,
-                socket_addr: cli_cfg.socket_addr.clone(),
-                hu: cli_cfg.hu,
-                controller: cli_cfg.controller,
+                socket_addr: socket_addr.clone(),
+                handshake_timeout_ms: 2000,
             }
             .into_resource(),
         });
+        pcie_remote_tcp_instances.push((instance_id, socket_addr, 2000));
     }
 
     #[cfg(windows)]
@@ -1702,6 +1722,7 @@ async fn vm_config_from_command_line(
         #[cfg(not(target_os = "linux"))]
         pcie_devices,
         pcie_switches,
+        pcie_remote_tcp_instances,
         vpci_devices,
         ide_disks: Vec::new(),
         memory: MemoryConfig {

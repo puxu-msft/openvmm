@@ -571,6 +571,7 @@ impl VmService {
             pcie_root_complexes: vec![],
             pcie_devices: vec![],
             pcie_switches: vec![],
+            pcie_remote_tcp_instances: vec![],
             vpci_devices: vec![],
             memory: MemoryConfig {
                 mem_size: config_mem_size,
