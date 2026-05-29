@@ -14,10 +14,13 @@
 pub mod absent;
 pub mod deadman;
 pub mod error;
+pub mod handshake;
+pub mod prepared;
 pub mod state;
 pub mod worker;
 
 pub use absent::AbsentPcieDevice;
 pub use error::Error;
+pub use prepared::PreparedPcieRemoteDevice;
 pub use state::DeviceState;
 pub use state::SharedState;
