@@ -1,0 +1,13 @@
+# 钉定 Rust 工具链版本
+#
+# 仓库上游主线没有声明工具链，会跟随系统默认（当前用户机器是 1.96）。
+# 1.96 把 `std::path::Path::absolute()` 提升为 stable，与 flowey 自己的
+# `FloweyPathExt::absolute` 撞名，触发 `future-incompatible` lint，导致
+# `flowey_lib_hvlite` 无法编译。
+#
+# 1.95 没有这个冲突，能干净跑通 `cargo xflowey build-igvm`。
+# 等上游 flowey 修掉这个命名冲突，或 OpenHCL 自身需要更新版本时，再调整。
+#
+# 注：这是用户私有 fork 里的本地决定，不打算回推上游。
+[toolchain]
+channel = "1.95"

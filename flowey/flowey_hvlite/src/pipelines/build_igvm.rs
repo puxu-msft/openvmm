@@ -404,7 +404,12 @@ impl IntoPipeline for BuildIgvmCli {
         )
         .dep_on(|_| flowey_lib_hvlite::_jobs::cfg_common::Params {
             local_only: Some(flowey_lib_hvlite::_jobs::cfg_common::LocalOnlyParams {
-                interactive: true,
+                // 用户既然传了 `--install-missing-deps`（=auto_install），
+                // 说明同意脚本自动装包；此时不应再让 apt-get 走交互式确认。
+                // 默认 `interactive: true` 会让 install_dist_pkg 跳过 `-y`，
+                // 在没有 TTY 的环境（CI/远程 shell）下 apt-get 会直接 Abort，
+                // 整个 build-igvm 流程失败。
+                interactive: !install_missing_deps,
                 auto_install: install_missing_deps,
                 ignore_rust_version: true,
             }),
