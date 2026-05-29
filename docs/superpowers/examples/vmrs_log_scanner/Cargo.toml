@@ -1,0 +1,24 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vmrs_log_scanner"
+version = "0.1.0"
+edition = "2021"
+
+# 简单的诊断工具：扫描 .vmrs (Hyper-V saved state) 中的 RAM blocks，找出 OpenHCL
+# boot_logger / underhill tracing 输出（可读 UTF-8 字符串），用以诊断
+# Path C 中 VTL2 早期 panic。
+#
+# 不需要解析 partition_state 或 register chunks，只读 /savedstate/RamBlockN 数据块。
+
+[dependencies]
+hvs_file = { path = "../../../../support/hvs_file" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[[bin]]
+name = "vmrs_log_scanner"
+path = "src/main.rs"
+
+[workspace]
