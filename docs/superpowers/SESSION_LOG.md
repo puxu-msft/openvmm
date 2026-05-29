@@ -126,3 +126,54 @@ OpenHCL 在 OpenVMM 上启动需要 **WHP 或 mshv** hypervisor（提供 VTL2）
 - **dispatch.rs 必须等 prepared_map 满或超时再 add_async_resolver**（spec §3.3 boot grace period），否则 resolve 总是命中 absent fallback
 - xwin 跨编 windows-msvc 还需要 lib.exe（cc-rs）和 clang-cl，仅有 SDK 不够 —— 用户 Windows 原生编更省事
 - WSL2 用户在 sudo 组但 `id -G` 缓存了登录时旧 group list；用 `sg kvm <cmd>` 可临时拿 kvm 组权限访问 /dev/kvm（不需要 sudo / 重启 WSL）
+
+---
+
+## 2026-05-29 ~ 05-30 后续：K-IDs 清零 + Path C 实战
+
+### K-8/K-11/K-15/K-17/K-18/K-19 全部清零
+
+| K-ID | 主旨 | 落地 |
+|------|------|------|
+| K-8 | cvm_tracing `CVM_ALLOWED` gate | 所有 pcie_remote tracing 调用加上 CVM_ALLOWED marker；`cvm_tracing` 加进 pcie_remote_device 依赖；underhill_core/src/options.rs 一处 tracing 同样加上 |
+| K-11 | 单 instance accept 重试封顶 | `MAX_ACCEPT_ATTEMPTS = 32`（handshake_spawn.rs） |
+| K-15 | prost generated 类型 + mesh derive 双兼容 | `mesh_payload_compat` 测试模块：编译期断言 15 个消息类型都 impl MeshPayload；BarInfo.kind 是 i32 不是 Kind 枚举，故不需要为 Kind derive |
+| K-17 | duplicate resolver panic 契约 | 添加文档化测试 `add_async_resolver_duplicate_panics_contract_documented`（pcie_remote_tcp / pcie_remote_vmbus ID 不同） |
+| K-18 | MMIO 访问尺寸合法性 | `pcie_remote_protocol::is_valid_mmio_size(size) ∈ {1,2,4,8}` + worker.rs 拒绝非法尺寸；size_tests 模块 |
+| K-19 | handshake_timeout 上限 | `parse_pcie_remote_entries` 拒绝 `handshake_timeout_ms > config_timeout/2`；2 个新测试 |
+
+测试统计更新：
+
+| 层 | 数 |
+|----|----|
+| pcie_remote_protocol（codec + size_tests + mesh_payload_compat） | 7 |
+| pcie_remote_device 单元 | 28 |
+| pcie_remote_device 集成（e2e_tcp 同进程） | 3 |
+| underhill_core::options pcie_remote 解析 | 10 |
+| **TOTAL** | **48 单测 / 集成** |
+
+### Path C（真 Hyper-V）实战进展
+
+**新增工件**：
+- `docs/superpowers/examples/pcie_remote_noop_host/src/vsock_main.rs` —— Windows AF_HYPERV 客户端变体，跨编 `pcie_remote_noop_host_vsock.exe` 成功
+- `/mnt/c/temp/pcie_remote_exp/enable_vmbus_redirect.ps1` —— 通过 WMI ModifySystemSettings 设置 `vssd.VMBusMessageRedirection = 1`（VTL2 vsock listener 必需）
+- `/mnt/c/temp/pcie_remote_exp/switch_igvm.ps1` —— 不重建 VM 切换 IGVM 文件 + VTL2 内存
+- `/mnt/c/temp/pcie_remote_exp/boot_and_read_com1.ps1` —— 异步读 COM1 命名管道
+- `/tmp/openhcl-x64-com1.json` —— 自定义 IGVM 清单（`OPENHCL_BOOT_LOG=com1` + `OPENHCL_IGVM_VTL2_GPA_POOL_CONFIG=debug`）；产物 74MB dev IGVM
+
+**已确认事实**：
+- WSL2 当前 kernel `6.6.114.1-1-microsoft-standard-WSL2` 不含 `CONFIG_MSHV_ROOT`，`/dev/mshv` 无法启用（详见 `MSHV_DIAGNOSIS.md`）→ 决定走 Path C
+- `VMBusMessageRedirection=1` 通过 WMI 设置成功（vssd 字段）
+- `vssd.GuestFeatureSet = 0x201` 已开启 OpenHCL VTL2 加载
+- 自定义 dev IGVM 已构建（`openhcl-x64-com1.bin`，含 debug GPA pool）
+- 当前 HCS state 卡在 "Created"，VP0 HLT 0.1% / VP1 0%（OpenHCL 早期等待状态）
+
+**待解决**：
+- ohcldiag-dev 仍 `WSA 10060 ETIMEDOUT`（VMBusMessageRedirection 已设但 diag_server 仍不可达）
+- COM1 0 字节读出 —— OpenHCL boot_logger 仅在 `com3_serial_available=true` 时使用 COM3；Win11 26200 stock 不支持 Hyper-V Gen2 COM3（仅 Insider Canary ≥27813）
+- hcsdiag exec/console 不支持 Hyper-V VM（仅 UVM 容器）
+
+**T7 下一步候选**（不需要用户介入）：
+1. 写一个 .vmrs 抽取器（~80 行 Rust）从 saved-state HVS 格式中读出 VTL2 RAM 的 boot_log buffer
+2. 在 OpenHCL boot 早期插更明显的 hypercall log trap（如果有的话）
+3. 修改 IGVM 清单加上 `OPENHCL_BOOT_LOG=vmbus`（如可用）

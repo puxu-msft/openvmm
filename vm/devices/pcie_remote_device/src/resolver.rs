@@ -14,6 +14,7 @@ use crate::PreparedPcieRemoteDevice;
 use crate::state::DeviceState;
 use crate::state::SharedState;
 use async_trait::async_trait;
+use cvm_tracing::CVM_ALLOWED;
 use parking_lot::Mutex;
 use pcie_remote_protocol::DeviceDescribe;
 use pcie_remote_resources::PcieRemoteTcpHandle;
@@ -88,6 +89,7 @@ impl AsyncResolveResource<PciDeviceHandleKind, PcieRemoteVmbusHandle> for PcieRe
 fn resolve_one(prepared: &PreparedMap, instance_id: guid::Guid) -> ResolvedPciDevice {
     let Some(prep) = prepared.lock().remove(&instance_id) else {
         tracing::error!(
+            CVM_ALLOWED,
             %instance_id,
             "pcie_remote handshake missing; serving AbsentPcieDevice"
         );

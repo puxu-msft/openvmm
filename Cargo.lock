@@ -6111,6 +6111,7 @@ dependencies = [
  "async-trait",
  "chipset_device",
  "chipset_device_resources",
+ "cvm_tracing",
  "futures",
  "guestmem",
  "guid",

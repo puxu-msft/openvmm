@@ -7,6 +7,7 @@
 
 use anyhow::Context;
 use anyhow::bail;
+use cvm_tracing::CVM_ALLOWED;
 use inspect::Inspect;
 use inspect::InspectMut;
 use mesh::MeshPayload;
@@ -417,7 +418,7 @@ fn parse_pcie_remote_entries(
                 "pcie_remote: {env_name} entry {} rejected ({e}); skipping.",
                 cfg.instance_id
             );
-            tracing::warn!(error = %e, env = env_name, "pcie_remote: skip blacklisted port");
+            tracing::warn!(CVM_ALLOWED, error = %e, env = env_name, "pcie_remote: skip blacklisted port");
             continue;
         }
         out.push(cfg);

@@ -14,6 +14,7 @@ use crate::state::SharedState;
 use chipset_device::io::IoError;
 use chipset_device::io::deferred::DeferredRead;
 use chipset_device::io::deferred::DeferredWrite;
+use cvm_tracing::CVM_ALLOWED;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::io::AsyncRead;
@@ -85,7 +86,7 @@ where
         loop {
             select_biased! {
                 _ = shutdown.next().fuse() => {
-                    tracing::info!("pcie_remote worker shutdown signal");
+                    tracing::info!(CVM_ALLOWED, "pcie_remote worker shutdown signal");
                     break;
                 }
                 req = self.from_device.next().fuse() => {
@@ -97,7 +98,7 @@ where
                         self.in_flight.insert(req.seq, pending);
                     }
                     if let Err(e) = codec::write_frame(&mut self.transport, &req.frame).await {
-                        tracing::warn!(error = %e, "write_frame failed; going Lost");
+                        tracing::warn!(CVM_ALLOWED, error = %e, "write_frame failed; going Lost");
                         break;
                     }
                 }
@@ -105,7 +106,7 @@ where
                     match inbound {
                         Ok(m) => self.dispatch_inbound(m),
                         Err(e) => {
-                            tracing::warn!(error = %e, "read_frame failed; going Lost");
+                            tracing::warn!(CVM_ALLOWED, error = %e, "read_frame failed; going Lost");
                             break;
                         }
                     }
@@ -127,6 +128,7 @@ where
                     // K-18: MMIO 访问尺寸严格 ∈ {1,2,4,8}。其他值是协议错。
                     if !matches!(access_size, 1 | 2 | 4 | 8) {
                         tracing::warn!(
+                            CVM_ALLOWED,
                             seq,
                             access_size,
                             "pcie_remote: invalid access_size for MMIO read; failing request"
@@ -139,13 +141,13 @@ where
                 }
             }
             Some(Body::ReadGpa(_) | Body::WriteGpa(_)) => {
-                tracing::warn!("DMA messages not yet implemented (Phase 5+)");
+                tracing::warn!(CVM_ALLOWED, "DMA messages not yet implemented (Phase 5+)");
             }
             Some(Body::InterruptFire(_)) => {
-                tracing::warn!("InterruptFire delivery lands when device.rs holds Vec<Interrupt>");
+                tracing::warn!(CVM_ALLOWED, "InterruptFire delivery lands when device.rs holds Vec<Interrupt>");
             }
             None => {
-                tracing::warn!("ToOpenhcl missing body");
+                tracing::warn!(CVM_ALLOWED, "ToOpenhcl missing body");
             }
         }
     }

@@ -55,3 +55,49 @@ mod size_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod mesh_payload_compat {
+    //! K-15: 验证 prost-generated message 都 derive 了 mesh::MeshPayload
+    //! 且 nested enum (BarInfo.Kind) 通过 i32 字段透明传递 — mesh 不需
+    //! 直接 derive 该 enum。
+    use super::*;
+    use mesh::MeshPayload;
+    use mesh::payload::Protobuf;
+
+    fn _assert_meshpayload<T: MeshPayload>() {}
+    fn _assert_protobuf<T: Protobuf>() {}
+
+    #[test]
+    fn all_messages_are_meshpayload() {
+        _assert_meshpayload::<Hello>();
+        _assert_meshpayload::<HelloAck>();
+        _assert_meshpayload::<DeviceDescribe>();
+        _assert_meshpayload::<BarInfo>();
+        _assert_meshpayload::<CapabilityBlob>();
+        _assert_meshpayload::<MmioAccess>();
+        _assert_meshpayload::<MmioReadResult>();
+        _assert_meshpayload::<CfgAccess>();
+        _assert_meshpayload::<InterruptFire>();
+        _assert_meshpayload::<ReadGpaRequest>();
+        _assert_meshpayload::<WriteGpaRequest>();
+        _assert_meshpayload::<DmaCompletion>();
+        _assert_meshpayload::<Reset>();
+        _assert_meshpayload::<ToHost>();
+        _assert_meshpayload::<ToOpenhcl>();
+    }
+
+    #[test]
+    fn bar_info_kind_is_i32_in_struct() {
+        // BarInfo.kind 字段类型是 i32 (prost enum -> i32)，不是 Kind 类型。
+        // 这样 mesh 不必为 Kind enum 单独 derive MeshPayload。
+        let b = BarInfo {
+            index: 0,
+            size: 4096,
+            kind: bar_info::Kind::Mmio32 as i32,
+            prefetchable: false,
+        };
+        // 字段类型断言（compile-time）
+        let _check: i32 = b.kind;
+    }
+}

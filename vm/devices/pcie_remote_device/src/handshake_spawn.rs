@@ -16,6 +16,7 @@ use crate::resolver::PreparedMap;
 use crate::state::DeviceState;
 use crate::state::SharedState;
 use crate::worker::Worker;
+use cvm_tracing::CVM_ALLOWED;
 use mesh::CancelContext;
 use pal_async::driver::Driver;
 use pal_async::socket::PolledSocket;
@@ -44,6 +45,7 @@ where
         Ok(l) => l,
         Err(e) => {
             tracing::error!(
+                CVM_ALLOWED,
                 %instance_id,
                 error = %e,
                 "pcie_remote: PolledSocket::new(listener) failed"
@@ -60,6 +62,7 @@ where
             loop {
                 if attempts >= MAX_ACCEPT_ATTEMPTS {
                     tracing::error!(
+                        CVM_ALLOWED,
                         %instance_id,
                         attempts,
                         "pcie_remote: per-instance accept attempt cap reached"
@@ -71,6 +74,7 @@ where
                     Ok(s) => s,
                     Err(e) => {
                         tracing::warn!(
+                            CVM_ALLOWED,
                             %instance_id,
                             error = %e,
                             "pcie_remote: accept failed; backing off"
@@ -85,6 +89,7 @@ where
                     Ok(p) => p,
                     Err(e) => {
                         tracing::warn!(
+                            CVM_ALLOWED,
                             %instance_id,
                             error = %e,
                             "pcie_remote: PolledSocket::new(stream) failed"
@@ -96,6 +101,7 @@ where
                     Ok((prep, polled)) => return Some((prep, polled)),
                     Err(e) => {
                         tracing::warn!(
+                            CVM_ALLOWED,
                             %instance_id,
                             error = %e,
                             "pcie_remote: handshake failed; listener kept open"
@@ -131,6 +137,7 @@ pub fn spawn_tcp_handshakes(
                 Ok(l) => l,
                 Err(e) => {
                     tracing::error!(
+                        CVM_ALLOWED,
                         %id, addr,
                         error = %e,
                         "pcie_remote: TCP bind failed"
@@ -139,13 +146,13 @@ pub fn spawn_tcp_handshakes(
                 }
             };
             if let Err(e) = listener.set_nonblocking(true) {
-                tracing::error!(%id, error = %e, "pcie_remote: set_nonblocking failed");
+                tracing::error!(CVM_ALLOWED, %id, error = %e, "pcie_remote: set_nonblocking failed");
                 return;
             }
             let Some((mut prep, polled_stream)) =
                 accept_and_handshake(driver.clone(), listener, id, timeout).await
             else {
-                tracing::warn!(%id, "pcie_remote: TCP handshake timeout; device absent");
+                tracing::warn!(CVM_ALLOWED, %id, "pcie_remote: TCP handshake timeout; device absent");
                 return;
             };
             let inbox = prep.take_worker_inbox();
@@ -163,7 +170,7 @@ pub fn spawn_tcp_handshakes(
                     worker.run(shutdown_rx),
                 )
                 .detach();
-            tracing::info!(%id, "pcie_remote: TCP handshake ok, worker spawned");
+            tracing::info!(CVM_ALLOWED, %id, "pcie_remote: TCP handshake ok, worker spawned");
         });
         tasks.push(task);
     }
@@ -187,6 +194,7 @@ pub fn spawn_vsock_handshakes(
                 Ok(l) => l,
                 Err(e) => {
                     tracing::error!(
+                        CVM_ALLOWED,
                         %id, port,
                         error = %e,
                         "pcie_remote: vsock bind failed"
@@ -197,7 +205,7 @@ pub fn spawn_vsock_handshakes(
             let Some((mut prep, polled_stream)) =
                 accept_and_handshake(driver.clone(), listener, id, timeout).await
             else {
-                tracing::warn!(%id, "pcie_remote: vsock handshake timeout; device absent");
+                tracing::warn!(CVM_ALLOWED, %id, "pcie_remote: vsock handshake timeout; device absent");
                 return;
             };
             let inbox = prep.take_worker_inbox();
@@ -212,7 +220,7 @@ pub fn spawn_vsock_handshakes(
                     worker.run(shutdown_rx),
                 )
                 .detach();
-            tracing::info!(%id, "pcie_remote: vsock handshake ok, worker spawned");
+            tracing::info!(CVM_ALLOWED, %id, "pcie_remote: vsock handshake ok, worker spawned");
         });
         tasks.push(task);
     }
