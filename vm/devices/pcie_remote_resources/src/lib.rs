@@ -6,7 +6,7 @@
 //! Resource definitions for the PCIe remote experimental device (spec v3.1).
 //!
 //! 三种 handle:
-//! - `PcieRemoteHandle`（已废弃，OpenVMM 旧 CLI 兼容占位）
+//! - `PcieRemoteHandle`：旧定义，OpenVMM 当前 CLI 仍构造它；Phase 6 切换完成后删除。
 //! - `PcieRemoteTcpHandle`（OpenVMM 路径，TCP loopback）
 //! - `PcieRemoteVmbusHandle`（OpenHCL 路径，vsock）
 
@@ -17,11 +17,9 @@ use vm_resource::kind::PciDeviceHandleKind;
 /// 默认 TCP 地址（仅 OpenVMM 旧 CLI 兼容；v3.1 起仅允许 loopback）。
 pub const DEFAULT_SOCKET_ADDR: &str = "127.0.0.1:48914";
 
-/// 旧 handle，保留作为 OpenVMM CLI 兼容；新代码请用 `PcieRemoteTcpHandle`
-/// 或 `PcieRemoteVmbusHandle`。
-#[allow(deprecated)]
+/// 旧 handle，OpenVMM CLI 当前仍构造。Phase 6 切换为 `PcieRemoteTcpHandle`
+/// 后删除。新代码不要使用。
 #[derive(MeshPayload)]
-#[deprecated(note = "use PcieRemoteTcpHandle (OpenVMM) or PcieRemoteVmbusHandle (OpenHCL)")]
 pub struct PcieRemoteHandle {
     /// 实例唯一标识。
     pub instance_id: guid::Guid,
@@ -33,7 +31,6 @@ pub struct PcieRemoteHandle {
     pub controller: u16,
 }
 
-#[allow(deprecated)]
 impl PcieRemoteHandle {
     /// 返回 socket 地址；缺省时用 [`DEFAULT_SOCKET_ADDR`]。
     pub fn socket_addr(&self) -> &str {
@@ -41,7 +38,6 @@ impl PcieRemoteHandle {
     }
 }
 
-#[allow(deprecated)]
 impl ResourceId<PciDeviceHandleKind> for PcieRemoteHandle {
     const ID: &'static str = "pcie_remote";
 }
