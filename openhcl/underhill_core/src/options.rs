@@ -385,12 +385,29 @@ fn parse_pcie_remote_entries(
     env_name: &str,
     vnc_port: Option<u32>,
     gdbstub_port: Option<u32>,
+    config_timeout_secs: u64,
 ) -> anyhow::Result<Vec<PcieRemoteCliConfig>> {
+    // K-19: handshake_timeout_ms 必须 ≤ config_timeout/2，否则 OpenHCL boot
+    // 整体被这一个 instance 卡死风险过大。
+    let max_handshake_timeout_ms = (config_timeout_secs * 500) as u32; // /2 (ms 单位)
     let mut out = Vec::new();
     for entry in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
         let cfg: PcieRemoteCliConfig = entry
             .parse()
             .with_context(|| format!("invalid {env_name} entry: {entry}"))?;
+        if cfg.handshake_timeout_ms > max_handshake_timeout_ms {
+            eprintln!(
+                "pcie_remote: {env_name} entry {} rejected (handshake_timeout_ms={} > max {}=config_timeout/2); skipping.",
+                cfg.instance_id, cfg.handshake_timeout_ms, max_handshake_timeout_ms
+            );
+            tracing::warn!(
+                env = env_name,
+                handshake_timeout_ms = cfg.handshake_timeout_ms,
+                max = max_handshake_timeout_ms,
+                "pcie_remote: skip excessive handshake_timeout"
+            );
+            continue;
+        }
         if let Err(e) = pcie_remote_device::transport::check_vsock_port(
             cfg.vsock_port,
             Some(vnc_port.unwrap_or(3)),
@@ -600,6 +617,7 @@ impl Options {
             "OPENHCL_PCIE_REMOTE_INSTANCE",
             vnc_port,
             gdbstub_port,
+            config_timeout_in_seconds,
         )?;
         let pcie_remote_takeover: Vec<PcieRemoteCliConfig> = parse_pcie_remote_entries(
             read_legacy_openhcl_env("OPENHCL_PCIE_REMOTE_TAKEOVER")
@@ -608,6 +626,7 @@ impl Options {
             "OPENHCL_PCIE_REMOTE_TAKEOVER",
             vnc_port,
             gdbstub_port,
+            config_timeout_in_seconds,
         )?;
 
         let mut args = std::env::args().chain(extra_args);
@@ -740,7 +759,7 @@ mod pcie_remote_tests {
         // 黑名单端口（1=VSOCK_CONTROL）被静默跳过，不让 boot fail。
         let raw =
             "deadbeef-0000-0000-0000-000000000000:1;feedface-0000-0000-0000-000000000000:50000";
-        let out = parse_pcie_remote_entries(raw, "TEST", Some(3), Some(4)).unwrap();
+        let out = parse_pcie_remote_entries(raw, "TEST", Some(3), Some(4), 5).unwrap();
         assert_eq!(out.len(), 1, "blacklisted port should be silently skipped");
         assert_eq!(out[0].vsock_port, 50000);
     }
@@ -748,13 +767,13 @@ mod pcie_remote_tests {
     #[test]
     fn parse_entries_skips_vnc_collision() {
         let raw = "deadbeef-0000-0000-0000-000000000000:5900";
-        let out = parse_pcie_remote_entries(raw, "TEST", Some(5900), Some(4)).unwrap();
+        let out = parse_pcie_remote_entries(raw, "TEST", Some(5900), Some(4), 5).unwrap();
         assert_eq!(out.len(), 0);
     }
 
     #[test]
     fn parse_entries_handles_empty_string() {
-        let out = parse_pcie_remote_entries("", "TEST", None, None).unwrap();
+        let out = parse_pcie_remote_entries("", "TEST", None, None, 5).unwrap();
         assert!(out.is_empty());
     }
 
@@ -762,7 +781,26 @@ mod pcie_remote_tests {
     fn parse_entries_invalid_syntax_propagates() {
         // 非法 GUID 整段 raw 解析失败（and_then 不吞下 parse error）
         let raw = "totally:bogus";
-        let r = parse_pcie_remote_entries(raw, "TEST", None, None);
+        let r = parse_pcie_remote_entries(raw, "TEST", None, None, 5);
         assert!(r.is_err());
+    }
+
+    /// K-19: handshake_timeout_ms 超过 config_timeout/2 应被跳过。
+    #[test]
+    fn parse_entries_rejects_oversized_handshake_timeout() {
+        // config_timeout = 5s → max = 2500ms。10000ms 超出。
+        let raw = "deadbeef-0000-0000-0000-000000000000:50000,handshake_timeout_ms=10000";
+        let out = parse_pcie_remote_entries(raw, "TEST", None, None, 5).unwrap();
+        assert!(out.is_empty(), "oversized handshake_timeout should be skipped");
+    }
+
+    /// K-19: handshake_timeout_ms 在限内应被保留。
+    #[test]
+    fn parse_entries_accepts_in_range_handshake_timeout() {
+        // config_timeout = 10s → max = 5000ms。3000ms 在限内。
+        let raw = "deadbeef-0000-0000-0000-000000000000:50000,handshake_timeout_ms=3000";
+        let out = parse_pcie_remote_entries(raw, "TEST", None, None, 10).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].handshake_timeout_ms, 3000);
     }
 }

@@ -124,9 +124,18 @@ where
                 if let Some(InFlight::Read { token, access_size }) =
                     self.in_flight.remove(&seq)
                 {
+                    // K-18: MMIO 访问尺寸严格 ∈ {1,2,4,8}。其他值是协议错。
+                    if !matches!(access_size, 1 | 2 | 4 | 8) {
+                        tracing::warn!(
+                            seq,
+                            access_size,
+                            "pcie_remote: invalid access_size for MMIO read; failing request"
+                        );
+                        token.complete_error(IoError::InvalidRegister);
+                        return;
+                    }
                     let bytes = r.value.to_le_bytes();
-                    let n = access_size.min(8);
-                    token.complete(&bytes[..n]);
+                    token.complete(&bytes[..access_size]);
                 }
             }
             Some(Body::ReadGpa(_) | Body::WriteGpa(_)) => {

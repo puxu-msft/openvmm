@@ -24,6 +24,10 @@ use pal_async::task::Task;
 use pal_async::timer::PolledTimer;
 use std::time::Duration;
 
+/// K-11: Per-instance accept attempts cap. 拒绝恶意 host 用大 timeout 把 vm
+/// boot 期间拉到无限重试。32 是仓库 ttrpc / pipette 等设施的常见值。
+const MAX_ACCEPT_ATTEMPTS: u32 = 32;
+
 /// Listener 类型擦除：抽离 listener 接收 + accept + 返回 polled stream 的能力。
 async fn accept_and_handshake<L>(
     driver: impl Driver + Clone,
@@ -52,7 +56,17 @@ where
     let driver_for_backoff = driver.clone();
     let outcome = ctx
         .until_cancelled(async move {
+            let mut attempts: u32 = 0;
             loop {
+                if attempts >= MAX_ACCEPT_ATTEMPTS {
+                    tracing::error!(
+                        %instance_id,
+                        attempts,
+                        "pcie_remote: per-instance accept attempt cap reached"
+                    );
+                    return None;
+                }
+                attempts += 1;
                 let (stream, _addr) = match polled_listener.accept().await {
                     Ok(s) => s,
                     Err(e) => {
