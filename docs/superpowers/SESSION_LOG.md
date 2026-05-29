@@ -221,3 +221,148 @@ vmcx 验证：`hvs_file` reader 读 .vmcx confirm 配置在位：
 工具留存：
 - `docs/superpowers/examples/vmrs_log_scanner/` (cross-platform + Windows-only
   variants)；任何 .vmrs 都可以拿 `vmrs_log_scanner_win.exe` 扫
+
+---
+
+## 2026-05-30 🎉 突破：Path C 完全打通
+
+### 真根因
+
+旧 VM `pcie-remote-exp` 是用 `New-CustomVM` (petri hyperv.psm1) 创建的，**没有
+`-GuestStateIsolationType OpenHCL`**。后期 vssd 上 `GuestFeatureSet=0x201` +
+`FirmwareFile=...` 看似配置了 OpenHCL，但**实际上 Hyper-V 对 retrofit
+的 OpenHCL 配置直接忽略**，启动时加载 stock Msvm UEFI，所以：
+
+- "Create compute system, result 0xC0370103" 实际是 silent firmware ignore
+- "No bootable devices configured" 是 stock UEFI 找不到 boot device
+- VTL2 不存在 → vsock listener 不存在 → ohcldiag-dev 10060 timeout
+
+### 修复
+
+按 `Guide/src/user_guide/openhcl/run/hyperv.md` 的官方方法：
+
+```powershell
+Remove-VM pcie-remote-exp -Force
+$vm = New-VM -Name pcie-remote-exp -Generation 2 `
+  -GuestStateIsolationType OpenHCL `
+  -MemoryStartupBytes 2GB
+Set-VM -VM $vm -AutomaticCheckpointsEnabled $false
+Set-VMFirmware -VM $vm -EnableSecureBoot Off
+# 再用仓库脚本设 firmware file
+& openhcl\Set-OpenHCL-HyperV-VM.ps1 -VM $vm -Path C:\path\to\openhcl-x64.bin
+Start-VM $vm
+```
+
+### 验证
+
+```
+PS> ohcldiag-dev.exe pcie-remote-exp inspect /
+{
+    build_info: _,
+    control_state: "started",
+    mesh: _,
+    proc: _,
+    trace: _,
+    uhdiag: _,
+    vm: _,
+}
+```
+
+OpenHCL VTL2 完全启动并响应 diag！🎉
+
+### 副产品发现
+
+- `VMBusMessageRedirection=1` **不是必需的**（GuestStateIsolationType=OpenHCL
+  路径自动处理 vsock routing）
+- 用 `-GuestStateIsolationType OpenHCL` 创建后，vssd 上 `GuestFeatureSet=0x513`
+  （含 isolation flags），用 `Set-OpenHCL-HyperV-VM.ps1` 设了 FirmwareFile
+  后变成 `0x201`，但 OpenHCL 仍 boot —— 说明真正决定是创建时的 isolation
+  type，不是后续的 GuestFeatureSet
+- 没有 VHD（disk）也能 boot OpenHCL（只是 guest UEFI 没 boot device，但 VTL2 已起）
+
+### Path C 进入下一阶段
+
+OpenHCL boot 起来，下一步可以：
+1. 跑真 PCIe Remote 实验：cmdline 加 OPENHCL_PCIE_REMOTE_INSTANCE，本机 vsock client 连
+2. 用 ohcldiag-dev inspect 看 pcie_remote 实例状态
+3. 实际验证 spec §3.10 layer-2 absent fallback 在真 Hyper-V 上的行为
+
+---
+
+## 2026-05-30 🎉🎉🎉 真 Hyper-V 端到端验证
+
+### 实验步骤
+
+1. 构建带 PCIe Remote cmdline 的 IGVM:
+   ```bash
+   cat > /tmp/openhcl-x64-pcie.json <<'JSON'
+   {
+       "guest_arch": "x64",
+       "guest_configs": [{
+           "guest_svn": 1, "max_vtl": 2, "isolation_type": "none",
+           "image": {"openhcl": {
+               "command_line": "OPENHCL_PCIE_REMOTE_INSTANCE=11111111-2222-3333-4444-555555555555:50000,handshake_timeout_ms=2000",
+               "memory_page_count": 131072,
+               "uefi": true
+           }}
+       }]
+   }
+   JSON
+   cargo xflowey build-igvm x64 --release --override-manifest /tmp/openhcl-x64-pcie.json -o pcie-test
+   ```
+
+2. 部署 + 重启:
+   ```powershell
+   Stop-VM pcie-remote-exp -TurnOff -Force
+   $vm = Get-VM pcie-remote-exp
+   & .\Set-OpenHCL-HyperV-VM.ps1 -VM $vm -Path C:\temp\openhcl-pcie-test.bin
+   Start-VM $vm
+   ```
+
+3. 同时启 host vsock client:
+   ```powershell
+   $vmid = (Get-VM pcie-remote-exp).Id
+   pcie_remote_noop_host_vsock.exe --vm-id $vmid --port 50000 --retries 60 --retry-ms 500
+   ```
+
+### 输出（成功！）
+
+Host noop_host_vsock:
+```
+INFO pcie_remote_noop_host_vsock: vsock client connecting vm_id=2a0a... port=50000
+INFO pcie_remote_noop_host_vsock: connected
+INFO pcie_remote_noop_host_vsock: received Hello magic=0x52504345 version=1
+INFO pcie_remote_noop_host_vsock: sent HelloAck
+```
+
+OpenHCL VTL2 kmsg:
+```
+[2.346256] pcie_remote_device::handshake_spawn:
+  INFO  pcie_remote: vsock handshake ok, worker spawned
+  id=11111111-2222-3333-4444-555555555555
+```
+
+### 验证的 spec items
+
+| Spec 段 | 行为 | 真 Hyper-V 验证 |
+|---|---|---|
+| §3.3 boot grace period | OpenHCL boot 期等 host handshake，超时进 Lost | ✅ 2.59s 超时（无 host 时）/ 2.35s handshake ok（有 host 时） |
+| §3.10 layer-2 absent fallback | handshake 失败 → AbsentPcieDevice | ✅ 上一轮日志：`vsock handshake timeout; device absent` |
+| §3.4 Hello/HelloAck 协议 | magic 0x52504345 / version 1 | ✅ host 收到 magic=0x52504345 version=1 |
+| K-8 CVM_ALLOWED | 关键 tracing 在 OpenHCL kmsg 可见 | ✅ `pcie_remote: vsock handshake ok` 含 CVM_ALLOWED marker |
+| K-19 handshake timeout 上限 | timeout > config/2 拒绝 | ✅ 第一次 10s 被拒：`rejected (handshake_timeout_ms=10000 > max 2500=config_timeout/2)` |
+
+### 验证清单完成度
+
+- **真 Linux KVM** (OpenVMM 路径): ✅ (前期工作)
+- **真 Hyper-V** (OpenHCL 路径): ✅ **新增**
+- **vsock transport** (AF_HYPERV / HIGH_VTL): ✅ **新增**
+- **CVM transport** (SNP/TDX/VBS): 仍需真机；代码路径已覆盖
+
+### 总测试统计
+
+- 单元 + 集成: 48 (pcie_remote_device 28 + protocol 7 + options 10 + e2e_tcp 3)
+- 真 KVM e2e (OpenVMM, 前期): 已 logged
+- 真 Hyper-V e2e (OpenHCL, **此次**): 上面的输出
+
+Path C 闭环。
