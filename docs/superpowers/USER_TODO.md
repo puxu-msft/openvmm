@@ -1,116 +1,118 @@
 # 需要用户配合的事项
 
-> Claude 无人值守跑到的边界。所有不需用户配合的部分都已推进；本表列出剩下的人工操作。
+> 已经验证：你的 Windows host 上 Hyper-V 已装并 running（vmms+vmcompute 服务在跑），
+> Windows sudo / gsudo 也都装了，PowerShell 5.1 在 WSL 内可直接调用 (`/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`)。
+>
+> **当前阻塞点：从 WSL 调出的 PowerShell 是 medium IL token，UAC 把管理员权限剥离了，因此 `Get-VM` 静默无输出。** 一次提权操作即可彻底解决（见 §1）。
 
-## 强烈推荐：让 WSL 直连 Windows Hyper-V (`/dev/mshv`)
+---
 
-**为什么**：这是 OpenVMM/OpenHCL 在 WSL 内最原生的开发方案 —— 用 Microsoft Hypervisor (不是 KVM)，与 Windows host 上跑 OpenVMM 行为一致；KVM 是 Linux-only，行为差异较大。
+## §1【一次性，强烈推荐】把当前 Windows 用户加入 `Hyper-V Administrators`
 
-**用户操作**：
-1. Windows 11 22H2+ 主机
-2. PowerShell（管理员）启用 Hyper-V：
+这是消除"每次操作 Hyper-V 都需要弹 UAC"的根本解。做完这一步后，**Claude 可以从 WSL 完全无人值守地控制 Hyper-V**，包括创建 VM、添加 NVMe controller、查状态、删除等。
+
+### 操作（一次性）
+
+1. **Windows host 开管理员 PowerShell**（Win+X → "Terminal (Admin)"，或开始菜单搜 "Powershell" → 右键管理员运行）
+2. 跑：
+
    ```powershell
-   Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All
+   net localgroup "Hyper-V Administrators" puxu /add
    ```
-3. 在 `%USERPROFILE%\.wslconfig` 加：
+
+3. **完全注销当前 Windows 用户再登录**（仅重启 PowerShell 不够，组成员资格在登录时被锁进 token）。
+4. 验证（重登后，从 WSL 调即可，不需要 elevation）：
+
+   ```bash
+   /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -Command "Get-VMHost | Select-Object Name"
+   ```
+
+   能输出主机名 = 成功。
+
+### 等价的图形界面操作（如果不想敲命令）
+
+控制面板 → 用户账户 → 管理其他账户 → 改账户类型 ❌ 不行，要走：
+
+`compmgmt.msc` (Computer Management) → System Tools → Local Users and Groups → Groups → `Hyper-V Administrators` → 右键 Properties → Add → 输入 `puxu` → OK。然后注销重登。
+
+---
+
+## §2 创建一个测试用 Hyper-V VM（让 Claude 试 OpenHCL Path C）
+
+完成 §1 之后，**Claude 可以从 WSL 完全自动**做这一步。但也提供给你看清楚到底要建什么。
+
+详细 runbook：[`HYPERV_RUNBOOK.md`](HYPERV_RUNBOOK.md)。
+
+---
+
+## §3【可选】启用 WSL2 `/dev/mshv`
+
+让 WSL 内直接用 Microsoft Hypervisor（与 Hyper-V 共享 root partition），不需要切到 Windows 跑 VM。OpenHCL 的 VTL2 在 WSL 内就能跑（比 KVM 强：KVM 不支持 VTL2）。
+
+### 操作
+
+1. **Windows host 管理员 PowerShell**：
+
+   ```powershell
+   # 1. 确认 Hyper-V 平台 + nested virt 都已启用（你机器看起来已经够了）
+   Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -All
+   Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All
+   # 上一步可能要求重启。
+
+   # 2. 编辑 %USERPROFILE%\.wslconfig（如不存在则创建）
+   notepad $env:USERPROFILE\.wslconfig
+   ```
+
+2. `.wslconfig` 加（或合并）：
+
    ```ini
    [wsl2]
    nestedVirtualization=true
    kernelCommandLine=hyperv_default_partition=1
    ```
-4. `wsl --shutdown` 后重开 WSL
-5. 验证：`ls /dev/mshv` 应能看到
 
-**效果**：之后 `target/debug/openvmm --hypervisor mshv ...` 就能用真硬件加速跑 guest，不依赖 KVM。
+3. PowerShell 跑 `wsl --shutdown`，然后重开 WSL。
 
----
+4. 验证：在 WSL 里 `ls -la /dev/mshv`，能看到 char device 即成功。
 
-## 次选：用本机 KVM（更快但与产品场景差异大）
-
-### 用户操作
-```bash
-sudo usermod -aG kvm $USER
-newgrp kvm   # 或重新登录 WSL
-```
-验证：`ls -la /dev/kvm` 应该读写权限里有自己。
+完成后告诉 Claude，会自动切到 mshv backend 启 OpenHCL（替代当前 KVM 路径）。
 
 ---
 
-## 跨编 Windows openvmm.exe（如果想在 Windows 上原生跑）
+## §4【生产 Hyper-V Path C】仅在做完 §1 后由 Claude 自动执行
 
-### 推荐：直接在 Windows 上原生编译（不需要 xwin）
+完成 §1 之后，Claude 会自动跑以下序列（不再需要人工操作）：
 
-既然你已经有 VS Enterprise 2022 + Windows SDK，**最简单**：
-- 用 PowerShell 直接到仓库目录 `cd \\wsl$\Ubuntu\home\xp\refs\openvmm`（或把代码 copy 到 Windows 盘）
-- `cargo build -p openvmm`（会自动用 `x86_64-pc-windows-msvc` target）
-- 产出 `target\debug\openvmm.exe`
+1. `New-VM` 创建一个 Gen2 VM（256MB / 1 vCPU 即够）
+2. `Add-VMNvmeController` 加占位 NVMe controller（不绑磁盘）
+3. 跑 `setup-pcie-remote.ps1 -VsockPort 50000` 注册 service GUID + ACL
+4. `Set-VMFirmware` 指向自建 IGVM `\\wsl$\Ubuntu\home\xp\refs\openvmm\flowey-out\artifacts\build-igvm\ship\x64\openhcl-x64.bin`
+5. 在 WSL 里编一个 host SDK 实验程序（vsock client）
+6. `Start-VM`，guest dmesg 看到 pcie_remote 设备
 
-VS Build Tools 已经把 `link.exe` / `INCLUDE` / `LIB` 环境配好了。
-
-### 备选：WSL 跨编（需要 xwin 模拟 SDK 环境）
-
-用户的 Windows SDK 装在 Windows 文件系统里，**WSL 跨编不能直接复用**，原因：
-
-1. **路径混乱**：Windows SDK 用 `C:\Program Files\...` 路径，WSL 看到的是 `/mnt/c/...`；SDK 内部 .props/.targets 文件互相用 Windows 路径引用，cargo/rustc 无法解析。
-2. **大小写敏感**：Linux fs 大小写敏感，`#include <Windows.h>` vs 实际 `windows.h` 不匹配；WSL 9P 协议虽然不区分但会引发其他冲突。
-3. **环境变量集合**：rustc 需要 `INCLUDE`、`LIB`、`LIBPATH`、`WINDOWSSDKDIR`、`UCRTVersion` 等十几个 Windows 风格变量正确指向 SDK；用户不该手工拼。
-
-**xwin 的作用**：从 Microsoft 公开下载 SDK + MSVC libs（不需要 VS license），解压到 Linux 友好的目录（规范大小写、生成 symlink），输出 `.cargo/config.toml` 片段把 `linker = "lld-link"` 和路径都配好。**等价于"在 Linux 上准备一份纯净的 Windows toolchain"**。
-
-如果你想走这条：
-```bash
-cargo install xwin    # 已装
-xwin --accept-license splat --output ~/.xwin
-# 配 .cargo/config.toml 指向 ~/.xwin
-cargo build --target x86_64-pc-windows-msvc -p openvmm
-```
-
-但**直接在 Windows 编**更省事。
-
-> 不装 mingw 的替代：在 Windows 上原生 `cargo build`（用 Visual Studio Build Tools），不需要跨编。这是仓库默认推荐路径。
+但**第 4 步设 IGVM 路径需要本机 Hyper-V 支持自定义 IGVM 加载**，这是 OpenHCL preview 功能；如果 Microsoft VM 模板不让传 custom IGVM，要走 `mshv` 或 OpenVMM-hosted OpenHCL 路径。
 
 ---
 
-## 在 Windows host 上跑生产 Hyper-V Path C（真 vsock + IGVM）
+## §5【可选】跨编 openvmm.exe 在 Windows 跑
 
-### 用户操作
-1. 在 Windows host 启用 Hyper-V Platform（同上 mshv 步骤 2）
-2. 创建一个 VM 配 OpenHCL：
-   ```powershell
-   New-VM -Name MyExpVM -Generation 2 -MemoryStartupBytes 2GB
-   # ... 按 OpenHCL 文档配 IGVM ...
-   ```
-3. 添加占位 NVMe controller（不绑磁盘）：
-   ```powershell
-   Add-VMNvmeController -VMName MyExpVM
-   $Ctrl = (Get-VMNvmeController -VMName MyExpVM)[0]
-   $NvmeGuid = $Ctrl.Id
-   Write-Host "Use this GUID in OpenHCL cmdline: $NvmeGuid"
-   ```
-4. 一次性注册 vsock service GUID + ACL：
-   ```powershell
-   .\docs\superpowers\scripts\setup-pcie-remote.ps1 -VsockPort 50000
-   ```
-5. OpenHCL cmdline 注入（需要 IGVM build 时 cmdline policy=APPEND_CHOSEN）：
-   ```
-   OPENHCL_PCIE_REMOTE_INSTANCE=<NvmeGuid>:50000
-   ```
-6. 在 Windows 编译并启动 host 实验程序：
-   ```powershell
-   cd docs\superpowers\examples\pcie_remote_noop_host
-   cargo run
-   ```
-   （它默认 bind 127.0.0.1:48914 是 TCP loopback，需要适配 vsock —— Phase 10 的扩展，spec K-20）
-7. 启动 VM，guest dmesg 应看到 PCIe 设备。
+xwin 已在 WSL 安装好（`~/.xwin/sdk` + `~/.xwin/crt`），但还差 `lib.exe` / `clang-cl`。
+**更简单**：直接在 Windows 上 `cd \\wsl$\Ubuntu\home\xp\refs\openvmm` + `cargo build -p openvmm`，会自动用 VS Build Tools 已装好的 link.exe。
 
 ---
 
-## 何时不需要用户配合
+## 不需用户配合 / 已完成
 
-- 所有 30 个单测/集成测试可以一直跑通（`cargo test -p pcie_remote_device -p pcie_remote_protocol`）
-- 所有 cargo check / clippy / build 都能本地完成
-- spec / plan / 文档 / setup.ps1 / host SDK 示例都已落盘
+- ✅ 30+ 单测 / 集成测试 全部通过
+- ✅ `cargo build -p openvmm` (Linux KVM 可跑)
+- ✅ `cargo xflowey build-igvm x64 --release` 完整 IGVM (19MB ship)
+- ✅ 真 KVM 端到端验证（OpenVMM + UEFI + PCIe RC + pcie_remote 设备完整加载）
+- ✅ AbsentPcieDevice 兜底验证（host 不在 → VM 仍正常启动，spec §3.10 layer-2）
+- ✅ Path C (NVMe takeover) 代码完整
+- ✅ host SDK example (client mode) 已可用
+
+详见 [SESSION_LOG.md](SESSION_LOG.md)。
 
 ## 联系点
 
-如果以上任一项遇到问题，把错误粘给 Claude 继续处理。
+完成 §1 即可解锁后续所有自动化。完成后告诉 Claude 一声，剩下的事情我会接着做。
