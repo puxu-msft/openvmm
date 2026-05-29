@@ -1,0 +1,72 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+syntax = "proto3";
+package openhcl.pcie_remote.v1;
+
+message Hello {
+    uint32 magic = 1;
+    uint32 version = 2;
+    bytes instance_id = 3;
+}
+
+message HelloAck {
+    bool ok = 1;
+    string reason = 2;
+    DeviceDescribe device = 3;
+}
+
+message BarInfo {
+    enum Kind { MMIO_32 = 0; MMIO_64 = 1; }
+    uint32 index = 1;
+    uint64 size = 2;
+    Kind kind = 3;
+    bool prefetchable = 4;
+}
+
+message CapabilityBlob {
+    uint32 cap_id = 1;
+    bytes raw = 2;
+}
+
+message DeviceDescribe {
+    uint32 vendor_id = 1;
+    uint32 device_id = 2;
+    uint32 class_code = 3;
+    uint32 revision = 4;
+    uint32 subsystem_vendor = 5;
+    uint32 subsystem_device = 6;
+    repeated BarInfo bars = 7;
+    uint32 msix_count = 8;
+    repeated CapabilityBlob capabilities = 9;
+    repeated uint32 cfg_write_side_effect_offsets = 10;
+}
+
+message MmioAccess { uint32 bar = 1; uint64 offset = 2; uint32 size = 3; uint64 value = 4; }
+message MmioReadResult { uint64 value = 1; }
+message CfgAccess { uint32 offset = 1; uint32 size = 2; uint32 value = 3; }
+message InterruptFire { uint32 msix_index = 1; }
+message ReadGpaRequest { uint64 token = 1; uint64 gpa = 2; uint32 len = 3; }
+message WriteGpaRequest { uint64 token = 1; uint64 gpa = 2; bytes data = 3; }
+message DmaCompletion { uint64 token = 1; bool ok = 2; bytes data = 3; }
+message Reset { uint32 kind = 1; }
+
+message ToHost {
+    uint64 seq = 1;
+    oneof body {
+        MmioAccess mmio_write = 11;
+        MmioAccess mmio_read = 12;
+        CfgAccess cfg_write_side_effect = 13;
+        Reset reset = 16;
+    }
+}
+
+message ToOpenhcl {
+    uint64 seq = 1;
+    oneof body {
+        MmioReadResult mmio_read_result = 11;
+        ReadGpaRequest read_gpa = 12;
+        WriteGpaRequest write_gpa = 13;
+        InterruptFire interrupt_fire = 14;
+    }
+}

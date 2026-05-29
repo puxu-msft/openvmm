@@ -58,10 +58,14 @@ members = [
   "opentmk",
   # support crates consumed by closed-source only
   "support/debug_output_tracing",
+  # pcie_remote experimental device
+  "vm/devices/pcie_remote_protocol",
+  "vm/devices/pcie_remote_device",
 ]
 exclude = [
   "xsync",
-  "Guide/mdbook-openvmm-shim"
+  "Guide/mdbook-openvmm-shim",
+  "docs/superpowers/examples/pcie_remote_noop_host",
 ]
 
 [workspace.package]
@@ -350,6 +354,8 @@ tpm_lib = { path = "vm/devices/tpm/tpm_lib" }
 tpm_protocol = { path = "vm/devices/tpm/tpm_protocol" }
 tpm_resources = { path = "vm/devices/tpm_resources" }
 pcie_remote_resources = { path = "vm/devices/pcie_remote_resources" }
+pcie_remote_protocol = { path = "vm/devices/pcie_remote_protocol" }
+pcie_remote_device = { path = "vm/devices/pcie_remote_device" }
 uidevices = { path = "vm/devices/uidevices" }
 uidevices_resources = { path = "vm/devices/uidevices_resources" }
 user_driver = { path = "vm/devices/user_driver" }

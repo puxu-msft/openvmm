@@ -1,0 +1,24 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "pcie_remote_protocol"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+inspect.workspace = true
+mesh = { workspace = true, features = ["prost"] }
+prost.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+mesh_build.workspace = true
+prost-build.workspace = true
+
+[dev-dependencies]
+pal_async.workspace = true
+
+[lints]
+workspace = true
