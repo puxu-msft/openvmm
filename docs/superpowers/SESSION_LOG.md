@@ -177,3 +177,47 @@ OpenHCL 在 OpenVMM 上启动需要 **WHP 或 mshv** hypervisor（提供 VTL2）
 1. 写一个 .vmrs 抽取器（~80 行 Rust）从 saved-state HVS 格式中读出 VTL2 RAM 的 boot_log buffer
 2. 在 OpenHCL boot 早期插更明显的 hypercall log trap（如果有的话）
 3. 修改 IGVM 清单加上 `OPENHCL_BOOT_LOG=vmbus`（如可用）
+
+---
+
+## 2026-05-30 关键发现：IGVM 没被加载
+
+`vmrs_log_scanner_win.exe`（新工具，调 VmSavedStateDumpProvider.dll 自动解
+XPRESS-HUFF）扫描 `pcie-remote-exp` VM 的 Save-VM 后 .vmrs：
+
+- 总 RAM 512 MiB，1 个 GPA chunk 0x0..0x20000000
+- min_run=64 无过滤扫出 ~80+ 字符串
+- **所有字符串都来自 Hyper-V stock Msvm UEFI 固件**：
+  - `c:\__w\1\s\Build\MsvmX64\RELEASE_VS2022\X64\...\.pdb`
+  - `EltCheckBootCatalog: El Torito boot catalog header...`
+  - `ScsiDisk: Failed to install the Erase Block Protocol!`
+  - `TranslateGopBltToBmp: GopBlt is too large...`
+- **没有任何 `openhcl`、`underhill`、`boot_logger`、`vmlinuz`、`initrd`、`linux`、`kernel` 字符串**
+
+vmcx 验证：`hvs_file` reader 读 .vmcx confirm 配置在位：
+- `/configuration/settings/Compatibility/GuestFeatureSet = 0x201` ✅
+- `/configuration/settings/firmware/file_path = "C:\\temp\\pcie_remote_exp\\openhcl-x64-com1.bin"` ✅
+
+**结论**：vmcx 配置已应用，但 **Hyper-V 在 boot 时忽略了 firmware override，加载了 stock Msvm UEFI**。
+
+可能原因（待用户在 Windows 上验证）：
+1. `AllowFirmwareLoadFromFile` registry key 是 `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization` 还是别处？需要重新确认实际生效
+2. Win11 26200 stock 不支持 IGVM `firmware/file_path` 字段（只 Insider Canary 才支持自建 IGVM 加载）
+3. `GuestFeatureSet=0x201` 仅启用 VTL2，但**还需要另一个 flag**指示用 file path 而不是 stock IGVM
+4. IGVM 文件格式版本 不匹配（dev IGVM 74MB vs 通常 19MB ship）
+
+这是 path C 的真实阻塞点 —— 不是 vsock listener、不是 VMBusMessageRedirection、
+也不是 diag_server，而是 **OpenHCL 整个没起来，VM 在跑 stock UEFI**。
+
+之前所有 "10060 timeout" 表象都是因为 VTL2 不存在 → 没有 listener 自然 timeout。
+
+### 下一步建议
+
+- **请用户**：在 Windows 上运行仓库自带的 `Set-OpenHCL-HyperV-VM.ps1`（Microsoft
+  推荐的最小配置），把它和我们的脚本做对比，找出 vmcx 字段差异
+- 或者：抓 Hyper-V Worker 进程的 ETW provider `Microsoft-Windows-Hyper-V-Worker`
+  channel Analytic（admin only），看 firmware load 阶段的事件
+
+工具留存：
+- `docs/superpowers/examples/vmrs_log_scanner/` (cross-platform + Windows-only
+  variants)；任何 .vmrs 都可以拿 `vmrs_log_scanner_win.exe` 扫

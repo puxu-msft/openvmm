@@ -56,6 +56,14 @@ cargo run --release -- --path /mnt/c/temp/dump.vmrs --max-blocks 64 --verbose
 - ASCII only（UTF-8 内的 ASCII run）；中文/emoji log 不抽出
 - VTL2 RAM 与 VTL0 RAM 在 .vmrs 中混合（OpenHCL paravisor 模式），需要
   按 marker 文本（"openhcl"、"underhill"、"pcie_remote" 等）过滤
+- **重要：Hyper-V 在 Save-VM 时对 RamBlock 应用 XPRESS-HUFF 压缩**，本工具
+  目前不解压，只能扫到原始未压缩的 block（典型是 page-aligned plain block
+  或某些 metadata block）。生产 .vmrs 实际命中率极低。要扩展，需要：
+  1. 调 Windows `RtlDecompressBuffer` (NTDLL) with `COMPRESSION_FORMAT_XPRESS_HUFF`
+     —— 但本工具是 cross-platform Rust，跑在 WSL
+  2. 或 port 一个 LZ77+Huffman decoder（仓库内**没有**现成的）
+  3. 实测：`Save-VM` 后 512 个 RamBlock 中只有 9 个未压缩（其它 20-byte
+     metadata header），扫出 1 个 `[ERROR]` 残片但无完整行
 
 ## 关联实现
 

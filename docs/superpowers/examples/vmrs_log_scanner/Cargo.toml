@@ -10,7 +10,10 @@ edition = "2021"
 # boot_logger / underhill tracing 输出（可读 UTF-8 字符串），用以诊断
 # Path C 中 VTL2 早期 panic。
 #
-# 不需要解析 partition_state 或 register chunks，只读 /savedstate/RamBlockN 数据块。
+# 提供两个 bin：
+#   - vmrs_log_scanner     —— 跨平台；只读未压缩 block（命中率低）
+#   - vmrs_log_scanner_win —— Windows-only；调 VmSavedStateDumpProvider.dll
+#                             自动解 XPRESS-HUFF 压缩，命中所有 RAM
 
 [dependencies]
 hvs_file = { path = "../../../../support/hvs_file" }
@@ -20,5 +23,10 @@ anyhow = "1"
 [[bin]]
 name = "vmrs_log_scanner"
 path = "src/main.rs"
+
+[[bin]]
+name = "vmrs_log_scanner_win"
+path = "src/win_main.rs"
+required-features = []
 
 [workspace]
