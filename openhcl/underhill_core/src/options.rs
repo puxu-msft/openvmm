@@ -702,3 +702,67 @@ impl Options {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod pcie_remote_tests {
+    use super::*;
+
+    #[test]
+    fn parse_basic_entry() {
+        let s = "deadbeef-0000-0000-0000-000000000000:50000";
+        let cfg: PcieRemoteCliConfig = s.parse().unwrap();
+        assert_eq!(cfg.instance_id.data1, 0xdead_beef);
+        assert_eq!(cfg.vsock_port, 50000);
+        assert_eq!(cfg.handshake_timeout_ms, 2000); // default
+    }
+
+    #[test]
+    fn parse_with_timeout() {
+        let s = "deadbeef-0000-0000-0000-000000000000:50000,handshake_timeout_ms=5000";
+        let cfg: PcieRemoteCliConfig = s.parse().unwrap();
+        assert_eq!(cfg.handshake_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn parse_rejects_bad_guid() {
+        let s = "not-a-guid:50000";
+        assert!(s.parse::<PcieRemoteCliConfig>().is_err());
+    }
+
+    #[test]
+    fn parse_rejects_unknown_key() {
+        let s = "deadbeef-0000-0000-0000-000000000000:50000,bogus=x";
+        assert!(s.parse::<PcieRemoteCliConfig>().is_err());
+    }
+
+    #[test]
+    fn parse_entries_skips_blacklisted_ports() {
+        // 黑名单端口（1=VSOCK_CONTROL）被静默跳过，不让 boot fail。
+        let raw =
+            "deadbeef-0000-0000-0000-000000000000:1;feedface-0000-0000-0000-000000000000:50000";
+        let out = parse_pcie_remote_entries(raw, "TEST", Some(3), Some(4)).unwrap();
+        assert_eq!(out.len(), 1, "blacklisted port should be silently skipped");
+        assert_eq!(out[0].vsock_port, 50000);
+    }
+
+    #[test]
+    fn parse_entries_skips_vnc_collision() {
+        let raw = "deadbeef-0000-0000-0000-000000000000:5900";
+        let out = parse_pcie_remote_entries(raw, "TEST", Some(5900), Some(4)).unwrap();
+        assert_eq!(out.len(), 0);
+    }
+
+    #[test]
+    fn parse_entries_handles_empty_string() {
+        let out = parse_pcie_remote_entries("", "TEST", None, None).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parse_entries_invalid_syntax_propagates() {
+        // 非法 GUID 整段 raw 解析失败（and_then 不吞下 parse error）
+        let raw = "totally:bogus";
+        let r = parse_pcie_remote_entries(raw, "TEST", None, None);
+        assert!(r.is_err());
+    }
+}

@@ -113,3 +113,74 @@ fn build_initial_cfg(d: &DeviceDescribe) -> [u32; 64] {
     cfg[2] = ((d.class_code & 0x00ff_ffff) << 8) | (d.revision & 0xff);
     cfg
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mesh::channel;
+    use pcie_remote_protocol::BarInfo;
+    use pcie_remote_protocol::bar_info::Kind;
+
+    fn dummy_describe() -> DeviceDescribe {
+        DeviceDescribe {
+            vendor_id: 0x1414,
+            device_id: 0xc0de,
+            class_code: 0x010802,
+            revision: 1,
+            subsystem_vendor: 0,
+            subsystem_device: 0,
+            bars: vec![BarInfo {
+                index: 0,
+                size: 4096,
+                kind: Kind::Mmio32 as i32,
+                prefetchable: false,
+            }],
+            msix_count: 1,
+            capabilities: vec![],
+            cfg_write_side_effect_offsets: vec![],
+        }
+    }
+
+    /// 验证 spec §3.10 layer-2：prepared_map 中缺项时返回 AbsentPcieDevice，
+    /// 而**不**是 bail!。这是 CVM bug 防护 / boot DoS 防御的关键。
+    #[test]
+    fn missing_prep_returns_absent_device() {
+        let prepared: PreparedMap = Arc::new(Mutex::new(HashMap::new()));
+        let id = guid::Guid {
+            data1: 0xdead_beef,
+            ..Default::default()
+        };
+        // resolve_one 是同步函数，可以直接测。它必须**不 panic** 并返回某个 device。
+        let _dev = resolve_one(&prepared, id);
+    }
+
+    /// prepared_map 中有项时正常组装并消耗。
+    #[test]
+    fn present_prep_returns_real_device() {
+        let prepared: PreparedMap = Arc::new(Mutex::new(HashMap::new()));
+        let id = guid::Guid {
+            data1: 0xabcd_1234,
+            ..Default::default()
+        };
+        let (tx, _rx) = channel();
+        let prep = PreparedPcieRemoteDevice {
+            describe: dummy_describe(),
+            to_worker: tx,
+            worker_inbox: Some(channel().1),
+        };
+        prepared.lock().insert(id, prep);
+        let _dev = resolve_one(&prepared, id);
+        assert!(
+            prepared.lock().is_empty(),
+            "resolve_one should consume prepared entry"
+        );
+    }
+
+    #[test]
+    fn build_initial_cfg_packs_vendor_device() {
+        let d = dummy_describe();
+        let cfg = build_initial_cfg(&d);
+        assert_eq!(cfg[0], 0x1414 | (0xc0de << 16));
+        assert_eq!(cfg[2], (0x010802 << 8) | 1);
+    }
+}
