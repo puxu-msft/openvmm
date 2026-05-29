@@ -894,22 +894,26 @@ Examples:
     # Attach to root port rc0rp0 with default socket
     --pcie-remote rc0rp0
 
-    # Attach with custom socket address
-    --pcie-remote rc0rp0,socket=0.0.0.0:48914
+    # Attach with custom socket address (loopback only as of v3.1)
+    --pcie-remote rc0rp0,socket=127.0.0.1:48914
 
     # Specify HU and controller identifiers
     --pcie-remote rc0rp0,hu=1,controller=0
 
     # Multiple devices on different ports
-    --pcie-remote rc0rp0,socket=0.0.0.0:48914
-    --pcie-remote rc0rp1,socket=0.0.0.0:48915
+    --pcie-remote rc0rp0,socket=127.0.0.1:48914
+    --pcie-remote rc0rp1,socket=127.0.0.1:48915
 
 Syntax: <port_name>[,opt=arg,...]
 
 Options:
-    `socket=<address>`              TCP socket (default: localhost:48914)
+    `socket=<address>`              TCP socket (default: 127.0.0.1:48914,
+                                    loopback only enforced since v3.1)
     `hu=<value>`                    Hardware unit identifier (default: 0)
     `controller=<value>`            Controller identifier (default: 0)
+
+WARNING: WSL2 用户须知 —— WSL2 默认 localhostForwarding 把 loopback 暴露给
+Windows host 任意用户进程。生产 / 多用户 host 请改用 OpenHCL + vsock (form C).
 "#)]
     #[clap(long, conflicts_with("pcat"))]
     pub pcie_remote: Vec<PcieRemoteCli>,
