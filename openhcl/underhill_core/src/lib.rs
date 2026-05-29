@@ -347,6 +347,7 @@ async fn launch_workers(
         config_timeout_in_seconds: opt.config_timeout_in_seconds,
         servicing_timeout_dump_collection_in_ms: opt.servicing_timeout_dump_collection_in_ms,
         pcie_remote_instance: opt.pcie_remote_instance.clone(),
+        pcie_remote_takeover: opt.pcie_remote_takeover.clone(),
     };
 
     let (mut remote_console_cfg, framebuffer_access) =

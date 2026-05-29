@@ -328,6 +328,9 @@ pub struct UnderhillEnvCfg {
     /// pcie_remote 实验设备实例（spec v3.1 §3.3）。仅在 IGVM APPEND_CHOSEN
     /// 策略下可注入；CVM 下被静默过滤。
     pub pcie_remote_instance: Vec<crate::options::PcieRemoteCliConfig>,
+    /// pcie_remote takeover GUIDs（spec v3.1 §3.1 path C）。匹配 vmwp 下发的
+    /// NVMe controller GUID，OpenHCL 端改派为 pcie_remote。
+    pub pcie_remote_takeover: Vec<crate::options::PcieRemoteCliConfig>,
 }
 
 /// Bundle of config + runtime objects for hooking into the underhill remote
@@ -2246,6 +2249,13 @@ async fn new_underhill_vm(
         is_restoring,
         default_io_queue_depth,
         env_cfg.config_timeout_in_seconds,
+        &env_cfg
+            .pcie_remote_takeover
+            .iter()
+            .map(|c| c.instance_id)
+            .collect(),
+        &env_cfg.pcie_remote_instance,
+        isolation.is_hardware_isolated(),
     )
     .instrument(tracing::info_span!("new_initial_controllers", CVM_ALLOWED))
     .await

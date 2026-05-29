@@ -1471,6 +1471,9 @@ pub async fn create_storage_controllers_from_vtl2_settings(
     sub_channels: u16,
     is_restoring: bool,
     default_io_queue_depth: u32,
+    // spec v3.1 §3.1 path C: takeover GUIDs。匹配的 NVMe controller GUID 改派
+    // 为 PcieRemoteVmbusHandle 而非真 NvmeControllerHandle。
+    pcie_remote_takeover: &std::collections::HashSet<Guid>,
 ) -> Result<
     (
         Option<UhIdeControllerConfig>,
@@ -1503,6 +1506,26 @@ pub async fn create_storage_controllers_from_vtl2_settings(
 
     let mut nvme_controllers = Vec::new();
     for controller in &settings.nvme_controllers {
+        // spec §3.1 path C: 匹配 takeover 白名单的 GUID → 改派 pcie_remote.
+        // 用 vsock_port = 50000 (硬编码默认)；如需多 instance 不同 port，
+        // 走 OPENHCL_PCIE_REMOTE_INSTANCE 路径而不是 takeover。
+        if pcie_remote_takeover.contains(&controller.instance_id) {
+            tracing::info!(
+                CVM_ALLOWED,
+                instance_id = %controller.instance_id,
+                "pcie_remote: takeover NVMe GUID → PcieRemoteVmbusHandle"
+            );
+            nvme_controllers.push(UhVpciDeviceConfig {
+                instance_id: controller.instance_id,
+                resource: pcie_remote_resources::PcieRemoteVmbusHandle {
+                    instance_id: controller.instance_id,
+                    vsock_port: 50000,
+                    handshake_timeout_ms: 2000,
+                }
+                .into_resource(),
+            });
+            continue;
+        }
         nvme_controllers.push(
             make_nvme_controller_config(ctx, &storage_context, controller, is_restoring).await?,
         );
@@ -1832,6 +1855,15 @@ impl InitialControllers {
         is_restoring: bool,
         default_io_queue_depth: u32,
         config_timeout_in_seconds: u64,
+        // spec v3.1 §3.1 path C: takeover GUIDs。从 vtl2_settings 的
+        // NVMe controller 列表中分流出这些 GUID，改派为 PcieRemoteVmbusHandle
+        // 而非真 NvmeControllerHandle。空集合 = 不启用 takeover。
+        pcie_remote_takeover: &std::collections::HashSet<Guid>,
+        // pcie_remote 已通过 cmdline 注入的 instance（Path B/D）。
+        // 这里同样以 PcieRemoteVmbusHandle 加入 vpci_devices。
+        pcie_remote_cli_instances: &[crate::options::PcieRemoteCliConfig],
+        // CVM guard：is_hardware_isolated → 完全过滤所有 pcie_remote 路径。
+        cvm_skip_pcie_remote: bool,
     ) -> anyhow::Result<Self> {
         let mut context =
             CancelContext::new().with_timeout(Duration::from_secs(config_timeout_in_seconds));
@@ -1848,7 +1880,8 @@ impl InitialControllers {
         let fixed = vtl2_settings.map_or_else(Default::default, |s| s.fixed.clone());
         let dynamic = vtl2_settings.map(|s| &s.dynamic);
 
-        let (ide_controller, scsi_controllers, vpci_devices) = if let Some(dynamic) = &dynamic {
+        let empty_takeover = std::collections::HashSet::new();
+        let (ide_controller, scsi_controllers, mut vpci_devices) = if let Some(dynamic) = &dynamic {
             create_storage_controllers_from_vtl2_settings(
                 &mut context,
                 uevent_listener,
@@ -1857,6 +1890,12 @@ impl InitialControllers {
                 fixed.scsi_sub_channels,
                 is_restoring,
                 default_io_queue_depth,
+                if cvm_skip_pcie_remote || is_restoring {
+                    // CVM / servicing restore → 空集合即可完全跳过 takeover
+                    &empty_takeover
+                } else {
+                    pcie_remote_takeover
+                },
             )
             .instrument(tracing::info_span!(
                 "setting up storage controllers",
@@ -1866,6 +1905,22 @@ impl InitialControllers {
         } else {
             (None, Vec::new(), Vec::new())
         };
+
+        // 把 OPENHCL_PCIE_REMOTE_INSTANCE 注入的实例也作为 vpci 设备登记。
+        // CVM / servicing 跳过。
+        if !cvm_skip_pcie_remote && !is_restoring {
+            for cfg in pcie_remote_cli_instances {
+                vpci_devices.push(UhVpciDeviceConfig {
+                    instance_id: cfg.instance_id,
+                    resource: pcie_remote_resources::PcieRemoteVmbusHandle {
+                        instance_id: cfg.instance_id,
+                        vsock_port: cfg.vsock_port,
+                        handshake_timeout_ms: cfg.handshake_timeout_ms,
+                    }
+                    .into_resource(),
+                });
+            }
+        }
 
         let mana = if let Some(dynamic) = &dynamic {
             get_mana_config_from_vtl2_settings(&mut context, uevent_listener, dynamic).await?

@@ -321,6 +321,12 @@ pub struct Options {
     /// 端口黑名单（1/2/3/4/0x1337 等）会被拒绝。
     /// spec §3.2 / §3.3。
     pub pcie_remote_instance: Vec<PcieRemoteCliConfig>,
+
+    /// (OPENHCL_PCIE_REMOTE_TAKEOVER=<nvme_guid>:<vsock_port>[,handshake_timeout_ms=N];...)
+    /// Path C：把 vmwp 下发的某个 NVMe controller GUID 改派为 pcie_remote。
+    /// 该 GUID 必须是用户先通过 `Add-VMNvmeController` 注册的占位 controller，
+    /// 这样 vmwp 才会 vpci OFFER。CVM 下被静默过滤。spec §3.1 path C。
+    pub pcie_remote_takeover: Vec<PcieRemoteCliConfig>,
 }
 
 /// 单条 `--pcie-remote-instance` / `OPENHCL_PCIE_REMOTE_INSTANCE` 配置。
@@ -369,6 +375,37 @@ impl FromStr for PcieRemoteCliConfig {
             handshake_timeout_ms,
         })
     }
+}
+
+/// 解析 `OPENHCL_PCIE_REMOTE_{INSTANCE,TAKEOVER}` 这种 ';' 分隔多项 + 内部
+/// `<guid>:<port>[,handshake_timeout_ms=N]` 的环境变量，端口黑名单校验后产出
+/// 合法配置列表。非法项 `eprintln!` 后跳过，**不** boot fail（spec §3.3）。
+fn parse_pcie_remote_entries(
+    raw: &str,
+    env_name: &str,
+    vnc_port: Option<u32>,
+    gdbstub_port: Option<u32>,
+) -> anyhow::Result<Vec<PcieRemoteCliConfig>> {
+    let mut out = Vec::new();
+    for entry in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let cfg: PcieRemoteCliConfig = entry
+            .parse()
+            .with_context(|| format!("invalid {env_name} entry: {entry}"))?;
+        if let Err(e) = pcie_remote_device::transport::check_vsock_port(
+            cfg.vsock_port,
+            Some(vnc_port.unwrap_or(3)),
+            Some(gdbstub_port.unwrap_or(4)),
+        ) {
+            eprintln!(
+                "pcie_remote: {env_name} entry {} rejected ({e}); skipping.",
+                cfg.instance_id
+            );
+            tracing::warn!(error = %e, env = env_name, "pcie_remote: skip blacklisted port");
+            continue;
+        }
+        out.push(cfg);
+    }
+    Ok(out)
 }
 
 impl Options {
@@ -556,32 +593,22 @@ impl Options {
         let servicing_timeout_dump_collection_in_ms =
             parse_env_number("OPENHCL_SERVICING_TIMEOUT_DUMP_COLLECTION_IN_MS")?.unwrap_or(500);
 
-        let pcie_remote_instance: Vec<PcieRemoteCliConfig> = {
-            let raw = read_legacy_openhcl_env("OPENHCL_PCIE_REMOTE_INSTANCE")
+        let pcie_remote_instance: Vec<PcieRemoteCliConfig> = parse_pcie_remote_entries(
+            read_legacy_openhcl_env("OPENHCL_PCIE_REMOTE_INSTANCE")
                 .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            let mut out = Vec::new();
-            for entry in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                let cfg: PcieRemoteCliConfig = entry.parse().with_context(|| {
-                    format!("invalid OPENHCL_PCIE_REMOTE_INSTANCE entry: {entry}")
-                })?;
-                if let Err(e) = pcie_remote_device::transport::check_vsock_port(
-                    cfg.vsock_port,
-                    Some(vnc_port.unwrap_or(3)),
-                    Some(gdbstub_port.unwrap_or(4)),
-                ) {
-                    eprintln!(
-                        "pcie_remote: instance {} rejected ({e}); skipping.",
-                        cfg.instance_id
-                    );
-                    tracing::warn!(error = %e, "pcie_remote: skip blacklisted port");
-                    continue;
-                }
-                out.push(cfg);
-            }
-            out
-        };
+                .unwrap_or(""),
+            "OPENHCL_PCIE_REMOTE_INSTANCE",
+            vnc_port,
+            gdbstub_port,
+        )?;
+        let pcie_remote_takeover: Vec<PcieRemoteCliConfig> = parse_pcie_remote_entries(
+            read_legacy_openhcl_env("OPENHCL_PCIE_REMOTE_TAKEOVER")
+                .and_then(|s| s.to_str())
+                .unwrap_or(""),
+            "OPENHCL_PCIE_REMOTE_TAKEOVER",
+            vnc_port,
+            gdbstub_port,
+        )?;
 
         let mut args = std::env::args().chain(extra_args);
         // Skip our own filename.
@@ -650,6 +677,7 @@ impl Options {
             config_timeout_in_seconds,
             servicing_timeout_dump_collection_in_ms,
             pcie_remote_instance,
+            pcie_remote_takeover,
         })
     }
 
