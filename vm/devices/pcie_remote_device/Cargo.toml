@@ -6,5 +6,35 @@ name = "pcie_remote_device"
 edition.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+pcie_remote_protocol.workspace = true
+pcie_remote_resources.workspace = true
+
+# vm-* deps
+chipset_device.workspace = true
+vmcore.workspace = true
+vm_resource.workspace = true
+guestmem.workspace = true
+
+# support-* deps
+pal_async.workspace = true
+mesh = { workspace = true, features = ["prost"] }
+guid = { workspace = true, features = ["mesh"] }
+vmsocket.workspace = true
+inspect.workspace = true
+
+# crates.io
+async-trait.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracelimit.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+pal_async.workspace = true
+
 [lints]
 workspace = true
