@@ -1,6 +1,8 @@
 //! Minimal host stub for pcie_remote 实验。
 //!
-//! 仅 bind 127.0.0.1:48914（spec §3.2 路径 A/D loopback enforce）。
+//! 角色：**client**。OpenVMM 端是 server（spawn_tcp_handshakes bind 127.0.0.1:48914），
+//! 本 host stub 主动 connect 该端口。
+//!
 //! 收到 Hello 后回 HelloAck 描述一个 noop 设备；
 //! 任何 MMIO read 返回 0；cfg side-effect / write 静默丢弃。
 
@@ -20,7 +22,8 @@ use std::env;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
-use tokio::net::TcpListener;
+use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
@@ -28,36 +31,40 @@ use tokio_util::compat::TokioAsyncWriteCompatExt;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    // 安全 hard-code：只允许 127.0.0.1。CLI 不支持任何 `--bind`。
     let port: u16 = env::var("PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(48914);
     let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
     if !addr.ip().is_loopback() {
-        return Err(anyhow!("refusing non-loopback bind: {addr}"));
+        return Err(anyhow!("refusing non-loopback connect: {addr}"));
     }
 
-    let listener = TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "pcie_remote_noop_host: listening (loopback only)");
+    tracing::info!(%addr, "pcie_remote_noop_host: client mode — connecting to OpenVMM/OpenHCL");
 
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        tracing::info!(%peer, "client connected");
-        tokio::spawn(async move {
-            if let Err(e) = serve(stream).await {
-                tracing::warn!(error = %e, "session ended");
+    // 简单重试：OpenVMM 启动期 spawn_tcp_handshakes 可能还没 bind。
+    let stream = loop {
+        match TcpStream::connect(addr).await {
+            Ok(s) => break s,
+            Err(e) => {
+                tracing::warn!(error = %e, "connect failed; retry in 200ms");
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
-        });
+        }
+    };
+    tracing::info!("connected");
+    if let Err(e) = serve(stream).await {
+        tracing::warn!(error = %e, "session ended");
     }
+    Ok(())
 }
 
-async fn serve(stream: tokio::net::TcpStream) -> Result<()> {
+async fn serve(stream: TcpStream) -> Result<()> {
     let (rd, wr) = stream.into_split();
     let mut rd = rd.compat();
     let mut wr = wr.compat_write();
 
-    // Hello
+    // server 端会先发 Hello（按 spec §3.3，OpenVMM/OpenHCL 是协议主动方）
     let hello: pcie_remote_protocol::Hello = codec::read_frame(&mut rd).await?;
     tracing::info!(
         magic = format_args!("{:#x}", hello.magic),
@@ -66,7 +73,7 @@ async fn serve(stream: tokio::net::TcpStream) -> Result<()> {
         "received Hello"
     );
 
-    // HelloAck
+    // 回 HelloAck
     let ack = HelloAck {
         ok: true,
         reason: String::new(),

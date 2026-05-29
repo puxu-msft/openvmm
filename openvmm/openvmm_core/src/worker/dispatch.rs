@@ -2096,12 +2096,31 @@ impl InitializedVm {
                     (*id, addr.clone(), std::time::Duration::from_millis(*timeout_ms as u64))
                 })
                 .collect();
-            pcie_remote_device::handshake_spawn::spawn_tcp_handshakes(
+            // 算出最大超时，作为 boot grace period
+            let max_timeout = instances
+                .iter()
+                .map(|(_, _, t)| *t)
+                .max()
+                .unwrap_or(std::time::Duration::ZERO);
+            let tasks = pcie_remote_device::handshake_spawn::spawn_tcp_handshakes(
                 driver_source.simple(),
                 driver_source.simple(),
-                instances,
+                instances.clone(),
                 pcie_remote_prepared.clone(),
-            )
+            );
+            // spec §3.3：boot 期最多阻塞 max(handshake_timeout)，等 prepared_map 填好。
+            // 用轮询，每 10ms 检查一次；命中所有 instance 或超时退出。
+            let expected = instances.len();
+            let deadline = std::time::Instant::now() + max_timeout;
+            while std::time::Instant::now() < deadline {
+                if pcie_remote_prepared.lock().len() >= expected {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let got = pcie_remote_prepared.lock().len();
+            tracing::info!(expected, got, "pcie_remote: handshake wait done");
+            tasks
         };
         resolver.add_async_resolver::<
             vm_resource::kind::PciDeviceHandleKind,

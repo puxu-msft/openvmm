@@ -47,6 +47,9 @@ __pycache__
 flowey-out
 flowey-persist
 
+# xwin cache (Windows SDK + MSVC libs for cross-compilation; per-user, not source)
+.xwin-cache
+
 # Node.js dependencies and artifacts
 node_modules/
 

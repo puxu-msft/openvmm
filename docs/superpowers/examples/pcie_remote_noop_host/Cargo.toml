@@ -7,7 +7,7 @@ edition = "2024"
 pcie_remote_protocol = { path = "../../../../vm/devices/pcie_remote_protocol" }
 prost = "0.13"
 anyhow = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
 tracing = "0.1"

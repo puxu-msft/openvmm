@@ -137,8 +137,11 @@ pub fn spawn_tcp_handshakes(
             let inbox = prep.take_worker_inbox();
             let state = SharedState::new(DeviceState::Live);
             prepared.lock().insert(id, prep);
+            // shutdown 通道：v1 不主动关，靠 transport EOF / dead-man 进 Lost。
+            // 但我们需要 sender 不被立即 drop（drop 会让 worker.next() Ok(None) 立刻退出）。
+            // 用 mesh::OneshotSender + Receiver<()>，让 sender 永远不发也不 drop（leak 到进程结束）。
             let (shutdown_tx, shutdown_rx) = mesh::channel::<()>();
-            drop(shutdown_tx); // v1 无 graceful shutdown，靠 transport EOF 进 Lost
+            std::mem::forget(shutdown_tx);
             let worker = Worker::new(polled_stream, state, inbox);
             spawner_inner
                 .spawn(
@@ -187,7 +190,7 @@ pub fn spawn_vsock_handshakes(
             let state = SharedState::new(DeviceState::Live);
             prepared.lock().insert(id, prep);
             let (shutdown_tx, shutdown_rx) = mesh::channel::<()>();
-            drop(shutdown_tx);
+            std::mem::forget(shutdown_tx);
             let worker = Worker::new(polled_stream, state, inbox);
             spawner_inner
                 .spawn(

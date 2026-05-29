@@ -38,29 +38,34 @@ newgrp kvm   # 或重新登录 WSL
 
 ## 跨编 Windows openvmm.exe（如果想在 Windows 上原生跑）
 
-### 用户操作
+### 推荐：直接在 Windows 上原生编译（不需要 xwin）
+
+既然你已经有 VS Enterprise 2022 + Windows SDK，**最简单**：
+- 用 PowerShell 直接到仓库目录 `cd \\wsl$\Ubuntu\home\xp\refs\openvmm`（或把代码 copy 到 Windows 盘）
+- `cargo build -p openvmm`（会自动用 `x86_64-pc-windows-msvc` target）
+- 产出 `target\debug\openvmm.exe`
+
+VS Build Tools 已经把 `link.exe` / `INCLUDE` / `LIB` 环境配好了。
+
+### 备选：WSL 跨编（需要 xwin 模拟 SDK 环境）
+
+用户的 Windows SDK 装在 Windows 文件系统里，**WSL 跨编不能直接复用**，原因：
+
+1. **路径混乱**：Windows SDK 用 `C:\Program Files\...` 路径，WSL 看到的是 `/mnt/c/...`；SDK 内部 .props/.targets 文件互相用 Windows 路径引用，cargo/rustc 无法解析。
+2. **大小写敏感**：Linux fs 大小写敏感，`#include <Windows.h>` vs 实际 `windows.h` 不匹配；WSL 9P 协议虽然不区分但会引发其他冲突。
+3. **环境变量集合**：rustc 需要 `INCLUDE`、`LIB`、`LIBPATH`、`WINDOWSSDKDIR`、`UCRTVersion` 等十几个 Windows 风格变量正确指向 SDK；用户不该手工拼。
+
+**xwin 的作用**：从 Microsoft 公开下载 SDK + MSVC libs（不需要 VS license），解压到 Linux 友好的目录（规范大小写、生成 symlink），输出 `.cargo/config.toml` 片段把 `linker = "lld-link"` 和路径都配好。**等价于"在 Linux 上准备一份纯净的 Windows toolchain"**。
+
+如果你想走这条：
 ```bash
-sudo apt install mingw-w64
+cargo install xwin    # 已装
+xwin --accept-license splat --output ~/.xwin
+# 配 .cargo/config.toml 指向 ~/.xwin
+cargo build --target x86_64-pc-windows-msvc -p openvmm
 ```
 
-然后我可以：
-```bash
-cargo build --target x86_64-pc-windows-gnu -p openvmm
-```
-产出 `target/x86_64-pc-windows-gnu/debug/openvmm.exe`，复制到 Windows 跑。
-
-### 为什么需要 mingw（用户疑问回答）
-
-OpenVMM 的 **Rust 源码**确实是纯 Rust，**rustc 自己只产生 .o 对象文件**。把 .o 链成可执行 .exe 需要：
-
-| 目标 | 链接器需求 |
-|------|-----------|
-| `x86_64-unknown-linux-gnu` | 系统 `ld` / `gcc`（Linux 自带） |
-| `x86_64-unknown-linux-musl` | `ld` + musl libc（rustup target 自带 musl lib） |
-| `x86_64-pc-windows-msvc` | MSVC `link.exe` + Windows SDK（仅 Windows） |
-| `x86_64-pc-windows-gnu` | **mingw-w64 的 `x86_64-w64-mingw32-gcc`**（在 Linux 上跨编 .exe 的标准选择） |
-
-另外 OpenVMM 还透过 `windows-sys` / `socket2` / 部分 native 依赖引用 Windows 的 system import lib（如 `kernel32.lib`、`ws2_32.lib`），这些 .lib 文件 mingw-w64 也提供了 GNU 风格的等价品。
+但**直接在 Windows 编**更省事。
 
 > 不装 mingw 的替代：在 Windows 上原生 `cargo build`（用 Visual Studio Build Tools），不需要跨编。这是仓库默认推荐路径。
 

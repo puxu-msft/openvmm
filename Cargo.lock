@@ -5461,11 +5461,14 @@ dependencies = [
  "openvmm_pcat_locator",
  "pal",
  "pal_async",
+ "parking_lot",
  "pci_bus",
  "pci_core",
  "pci_resource_assignment",
  "pci_resources",
  "pcie",
+ "pcie_remote_device",
+ "pcie_remote_resources",
  "range_map_vec",
  "scsi_core",
  "scsidisk",
@@ -5580,6 +5583,7 @@ dependencies = [
  "openvmm_ttrpc_vmservice",
  "pal",
  "pal_async",
+ "pcie_remote_device",
  "pcie_remote_resources",
  "prost",
  "rustyline",
@@ -6097,6 +6101,47 @@ dependencies = [
  "tracing",
  "vmcore",
  "zerocopy",
+]
+
+[[package]]
+name = "pcie_remote_device"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chipset_device",
+ "chipset_device_resources",
+ "futures",
+ "guestmem",
+ "guid",
+ "inspect",
+ "mesh",
+ "pal_async",
+ "parking_lot",
+ "pci_resources",
+ "pcie_remote_protocol",
+ "pcie_remote_resources",
+ "thiserror 2.0.16",
+ "tracelimit",
+ "tracing",
+ "vm_resource",
+ "vmcore",
+ "vmsocket",
+ "zerocopy",
+]
+
+[[package]]
+name = "pcie_remote_protocol"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "inspect",
+ "mesh",
+ "mesh_build",
+ "pal_async",
+ "prost",
+ "prost-build",
+ "thiserror 2.0.16",
 ]
 
 [[package]]
@@ -8639,6 +8684,8 @@ dependencies = [
  "pal_async",
  "pal_uring",
  "parking_lot",
+ "pcie_remote_device",
+ "pcie_remote_resources",
  "profiler_worker",
  "safe_intrinsics",
  "scsi_buffers",
