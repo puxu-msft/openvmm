@@ -128,6 +128,7 @@ async fn serve(
 ) -> Result<()> {
     use futures::FutureExt;
     use pcie_remote_protocol::InterruptFire;
+    use pcie_remote_protocol::ReadGpaRequest;
     use pcie_remote_protocol::ToOpenhcl as OpenhclMsg;
     use pcie_remote_protocol::to_openhcl::Body as OpenhclBody2;
     use std::time::Duration;
@@ -228,7 +229,8 @@ async fn serve(
             }
             Some(Err(e)) => return Err(e.into()),
             None => {
-                // timer 到：主动发 InterruptFire (msix_index=0)。
+                // timer 到：主动发 InterruptFire (msix_index=0)，每隔几次 fire
+                // 加一次 ReadGpa(gpa=0, len=4) 验证 DMA 路径。
                 fire_count += 1;
                 let int_seq = next_int_seq;
                 next_int_seq = next_int_seq.wrapping_add(1);
@@ -241,6 +243,28 @@ async fn serve(
                     "periodic InterruptFire msix_index=0 → guest MSI-X"
                 );
                 codec::write_frame(&mut polled, &fire).await?;
+
+                // 每 3 次 timer tick 发一次 ReadGpa（gpa=0, len=4）。OpenHCL
+                // worker 会从 guest memory @0 读 4 字节回 DmaCompletion；
+                // 我们 noop 不真用读出的字节，只验证 worker stats.read_gpa_requests 递增。
+                if fire_count.is_multiple_of(3) {
+                    let token = fire_count;
+                    let dma_seq = next_int_seq;
+                    next_int_seq = next_int_seq.wrapping_add(1);
+                    let read_gpa = OpenhclMsg {
+                        seq: dma_seq,
+                        body: Some(OpenhclBody2::ReadGpa(ReadGpaRequest {
+                            token,
+                            gpa: 0,
+                            len: 4,
+                        })),
+                    };
+                    tracing::info!(
+                        token, dma_seq,
+                        "periodic ReadGpa gpa=0 len=4 → guest memory DMA"
+                    );
+                    codec::write_frame(&mut polled, &read_gpa).await?;
+                }
             }
         }
     }
