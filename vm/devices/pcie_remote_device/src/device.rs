@@ -53,7 +53,8 @@ pub use crate::handshake::MSIX_BAR_INDEX;
 /// Thin device shim — `ChipsetDevice + PciConfigSpace + MmioIntercept`。
 #[derive(InspectMut)]
 pub struct PcieRemoteDevice {
-    #[inspect(skip)]
+    /// 当前 K-20 hotplug state（Connecting / Live / Lost）。
+    /// 用 ohcldiag-dev inspect 暴露便于运行时 troubleshoot。
     state: SharedState,
     #[inspect(skip)]
     to_worker: Sender<DeviceRequest>,
