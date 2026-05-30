@@ -20,6 +20,7 @@ use crate::state::DeviceState;
 use crate::state::SharedState;
 use crate::worker::DeviceRequest;
 use crate::worker::InFlight;
+use crate::worker::SharedWorkerStats;
 use chipset_device::ChipsetDevice;
 use chipset_device::io::IoError;
 use chipset_device::io::IoResult;
@@ -67,6 +68,8 @@ pub struct PcieRemoteDevice {
     side_effect_offsets: HashSet<u32>,
     /// 序号生成器（device→worker→host 的 MmioAccess / CfgAccess 帧 seq）。
     next_seq: u64,
+    /// 共享 worker stats（worker 写，本字段 inspect 暴露）。
+    worker_stats: SharedWorkerStats,
 }
 
 impl PcieRemoteDevice {
@@ -77,6 +80,7 @@ impl PcieRemoteDevice {
         cfg_space: ConfigSpaceType0Emulator,
         msix: MsixEmulator,
         side_effect_offsets: HashSet<u32>,
+        worker_stats: SharedWorkerStats,
     ) -> Self {
         Self {
             state,
@@ -85,6 +89,7 @@ impl PcieRemoteDevice {
             msix,
             side_effect_offsets,
             next_seq: 1,
+            worker_stats,
         }
     }
 
@@ -317,7 +322,8 @@ mod tests {
         );
         let (tx, _rx) = channel::<DeviceRequest>();
         let s = SharedState::new(state);
-        PcieRemoteDevice::new(s, tx, cfg_space, msix, HashSet::new())
+        let stats = std::sync::Arc::new(crate::worker::WorkerStats::default());
+        PcieRemoteDevice::new(s, tx, cfg_space, msix, HashSet::new(), stats)
     }
 
     #[test]

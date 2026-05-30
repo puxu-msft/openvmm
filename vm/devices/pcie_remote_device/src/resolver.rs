@@ -219,6 +219,9 @@ fn assemble_device(
     // 5. channel for device → worker. mesh::channel 已隐式有缓冲。
     let (to_worker, worker_inbox) = mesh::channel::<DeviceRequest>();
 
+    // 5b. 共享 worker stats（worker 写，device.rs inspect 读）。
+    let stats: crate::worker::SharedWorkerStats = Arc::new(Default::default());
+
     // 6. SharedState — Live 因为 prepared 在 map 时已 handshake 完。
     let state = SharedState::new(DeviceState::Live);
 
@@ -234,6 +237,7 @@ fn assemble_device(
         worker_inbox,
         interrupts,
         params.guest_memory.clone(),
+        stats.clone(),
     );
     let task = params.driver_source.simple().spawn(
         format!("pcie_remote_worker_{instance_id}"),
@@ -248,7 +252,7 @@ fn assemble_device(
         "pcie_remote: device assembled, worker spawned"
     );
 
-    PcieRemoteDevice::new(state, to_worker, cfg_space, msix, side_effect_offsets)
+    PcieRemoteDevice::new(state, to_worker, cfg_space, msix, side_effect_offsets, stats)
 }
 
 /// 用 DeviceDescribe 构造 HardwareIds。

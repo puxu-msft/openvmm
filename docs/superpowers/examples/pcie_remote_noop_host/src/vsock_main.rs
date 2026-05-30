@@ -79,7 +79,7 @@ fn main() -> Result<()> {
             };
             tracing::info!("connected");
             // serve 直到 EOF 或 error → 立刻重连
-            match serve(polled).await {
+            match serve(&driver, polled).await {
                 Ok(()) => {
                     tracing::info!("serve returned normally; reconnecting after 1s");
                 }
@@ -123,8 +123,16 @@ async fn try_connect(
 
 #[cfg(windows)]
 async fn serve(
+    driver: &pal_async::DefaultDriver,
     mut polled: pal_async::socket::PolledSocket<vmsocket::VmStream>,
 ) -> Result<()> {
+    use futures::FutureExt;
+    use futures::select_biased;
+    use pcie_remote_protocol::InterruptFire;
+    use pcie_remote_protocol::ToOpenhcl as OpenhclMsg;
+    use pcie_remote_protocol::to_openhcl::Body as OpenhclBody2;
+    use std::time::Duration;
+
     let hello: pcie_remote_protocol::Hello = codec::read_frame(&mut polled).await?;
     tracing::info!(
         magic = format_args!("{:#x}", hello.magic),
@@ -138,7 +146,13 @@ async fn serve(
         device: Some(DeviceDescribe {
             vendor_id: 0x1414,
             device_id: 0xc0de,
-            class_code: 0x010802,
+            // class_code = 0x010802 (NVMe) 让 Windows stornvme 尝试 init：
+            // 它会 read cfg + BAR0 NVMe registers → 这些 MMIO 访问就会
+            // 真的转给 host noop → 我们用 magic pattern 回应 → stornvme
+            // 看到 invalid NVMe 数据后 bail (CM_PROB_FAILED_START)。
+            // 但**沿路 cfg_read/MMIO_read 都会被 OpenHCL 转发**，这是
+            // 我们验证 v2 完整数据通路的关键。
+            class_code: 0x0001_0802,
             revision: 1,
             subsystem_vendor: 0,
             subsystem_device: 0,
@@ -156,33 +170,78 @@ async fn serve(
     codec::write_frame(&mut polled, &ack).await?;
     tracing::info!("sent HelloAck");
 
+    // 主循环：在读 inbound 时设短超时；超时则发 InterruptFire（不占 polled
+    // 借用），有 inbound 则正常处理。避免 select_biased 内同时双借
+    // &mut polled。
+    let mut next_int_seq: u64 = 1u64 << 32;
+    let mut fire_count: u64 = 0;
+    let mut timer = pal_async::timer::PolledTimer::new(driver);
     loop {
-        let req: ToHost = codec::read_frame(&mut polled).await?;
-        let seq = req.seq;
-        match req.body {
-            Some(HostBody::MmioRead(m)) => {
-                tracing::debug!(seq, bar = m.bar, offset = m.offset, size = m.size, "MMIO read");
-                let resp = ToOpenhcl {
-                    seq,
-                    body: Some(OpenhclBody::MmioReadResult(MmioReadResult { value: 0 })),
-                };
-                codec::write_frame(&mut polled, &resp).await?;
+        let read_timeout = Duration::from_secs(5);
+        // race read vs timer：要让 read_fut/timer_fut 在 select 出后立即
+        // drop（归还 &mut polled），用 inner block 限定 lifetime。
+        let req_opt = {
+            let read_fut = codec::read_frame::<_, ToHost>(&mut polled).fuse();
+            let timer_fut = timer.sleep(read_timeout).fuse();
+            futures::pin_mut!(read_fut, timer_fut);
+            futures::select_biased! {
+                req_or_err = read_fut => Some(req_or_err),
+                _ = timer_fut => None,
             }
-            Some(HostBody::MmioWrite(m)) => {
-                tracing::debug!(seq, bar = m.bar, offset = m.offset, "MMIO write (ignored)");
+        };
+        match req_opt {
+            Some(Ok(req)) => {
+                let seq = req.seq;
+                match req.body {
+                    Some(HostBody::MmioRead(m)) => {
+                        let value = ((m.offset & 0xffff) << 16) | 0xDEAD;
+                        tracing::info!(
+                            seq, bar = m.bar, offset = m.offset, size = m.size,
+                            value = format_args!("{:#x}", value),
+                            "MMIO read → pattern reply"
+                        );
+                        let resp = ToOpenhcl {
+                            seq,
+                            body: Some(OpenhclBody::MmioReadResult(MmioReadResult { value })),
+                        };
+                        codec::write_frame(&mut polled, &resp).await?;
+                    }
+                    Some(HostBody::MmioWrite(m)) => {
+                        tracing::info!(
+                            seq, bar = m.bar, offset = m.offset, size = m.size,
+                            value = format_args!("{:#x}", m.value),
+                            "MMIO write (observed)"
+                        );
+                    }
+                    Some(HostBody::CfgWriteSideEffect(c)) => {
+                        tracing::info!(seq, offset = c.offset, value = format_args!("{:#x}", c.value), "cfg side-effect (observed)");
+                    }
+                    Some(HostBody::Reset(r)) => {
+                        tracing::info!(seq, kind = r.kind, "reset (ignored)");
+                    }
+                    Some(HostBody::DmaCompletion(d)) => {
+                        tracing::debug!(seq, token = d.token, ok = d.ok, data_len = d.data.len(), "DmaCompletion (unexpected on noop client)");
+                    }
+                    None => {
+                        tracing::warn!(seq, "ToHost missing body");
+                    }
+                }
             }
-            Some(HostBody::CfgWriteSideEffect(c)) => {
-                tracing::debug!(seq, offset = c.offset, "cfg side-effect (ignored)");
-            }
-            Some(HostBody::Reset(r)) => {
-                tracing::info!(seq, kind = r.kind, "reset (ignored)");
-            }
-            Some(HostBody::DmaCompletion(d)) => {
-                // OpenHCL → host 的 DMA 完成回执（host 自身没发 DMA 时不该收到）。
-                tracing::debug!(seq, token = d.token, ok = d.ok, data_len = d.data.len(), "DmaCompletion (unexpected on noop client)");
-            }
+            Some(Err(e)) => return Err(e.into()),
             None => {
-                tracing::warn!(seq, "ToHost missing body");
+                // timer 到：主动发 InterruptFire (msix_index=0)。
+                fire_count += 1;
+                let int_seq = next_int_seq;
+                next_int_seq = next_int_seq.wrapping_add(1);
+                let fire = OpenhclMsg {
+                    seq: int_seq,
+                    body: Some(OpenhclBody2::InterruptFire(InterruptFire { msix_index: 0 })),
+                };
+                tracing::info!(
+                    fire_count, int_seq,
+                    "periodic InterruptFire msix_index=0 → guest MSI-X"
+                );
+                codec::write_frame(&mut polled, &fire).await?;
             }
         }
     }

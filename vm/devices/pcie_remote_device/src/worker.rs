@@ -24,6 +24,7 @@ use futures::io::AsyncRead;
 use futures::io::AsyncWrite;
 use futures::select_biased;
 use guestmem::GuestMemory;
+use inspect::Inspect;
 use mesh::Receiver;
 use pcie_remote_protocol::DmaCompletion;
 use pcie_remote_protocol::MAX_DMA_BYTES;
@@ -31,9 +32,41 @@ use pcie_remote_protocol::ToHost;
 use pcie_remote_protocol::ToOpenhcl;
 use pcie_remote_protocol::codec;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use vmcore::interrupt::Interrupt;
+
+/// 可观察的 worker 计数器（device.rs 也持 clone 用于 inspect 暴露）。
+///
+/// 全是 AtomicU64，worker 单写、device.rs / ohcldiag-dev 只读 —— 不需要锁。
+/// Relaxed ordering 即可：这是诊断数据，不影响 program correctness。
+#[derive(Inspect, Default)]
+pub struct WorkerStats {
+    /// 处理过的 MmioReadResult 帧数（host → OpenHCL）。
+    pub mmio_read_results: AtomicU64,
+    /// 处理过的 InterruptFire 数（成功 deliver）。
+    pub interrupts_fired: AtomicU64,
+    /// 越界 InterruptFire 数（msix_index 超 msix_count）。
+    pub interrupts_oob: AtomicU64,
+    /// 处理过的 ReadGpa 请求数（含成功 + 失败）。
+    pub read_gpa_requests: AtomicU64,
+    /// 处理过的 WriteGpa 请求数。
+    pub write_gpa_requests: AtomicU64,
+    /// DMA 速率限制拒绝次数。
+    pub dma_rate_limit_rejects: AtomicU64,
+    /// 当前 inflight 请求数（MMIO read/write 等待 host 回包）。
+    pub inflight_current: AtomicU64,
+    /// 历史 inflight 峰值（仅写不重置）。
+    pub inflight_peak: AtomicU64,
+    /// 连续 bad-frame 计数（达 MAX_BAD_FRAMES 即 Lost；这里实时反映）。
+    pub consecutive_bad_frames: AtomicU64,
+}
+
+/// 共享 stats 句柄。
+pub type SharedWorkerStats = Arc<WorkerStats>;
 
 /// A4：连续非法/越界 inbound 数 ≥ 此阈值 → 立即进 Lost。
 const MAX_BAD_FRAMES: u32 = 4;
@@ -124,6 +157,8 @@ pub struct Worker<T> {
     /// - 本 worker DMA reply 用高半（`1u64 << 63` 起）
     /// 两半互不重叠便于日志排查；host 关联请求实际用 token 不用 seq。
     next_dma_seq: u64,
+    /// 可观察 stats（与 device.rs 共享 Arc，inspect 暴露）。
+    stats: SharedWorkerStats,
 }
 
 impl<T> Worker<T>
@@ -137,6 +172,7 @@ where
         from_device: Receiver<DeviceRequest>,
         interrupts: Vec<Interrupt>,
         guest_memory: GuestMemory,
+        stats: SharedWorkerStats,
     ) -> Self {
         Self {
             transport,
@@ -149,6 +185,7 @@ where
             consecutive_bad_frames: 0,
             dma_rate: DmaRate::new(),
             next_dma_seq: 1 << 63,
+            stats,
         }
     }
 
@@ -167,6 +204,13 @@ where
                     };
                     if let Some(pending) = req.pending {
                         self.in_flight.insert(req.seq, pending);
+                        // 更新 inflight 计数器 + 峰值
+                        let cur = self.in_flight.len() as u64;
+                        self.stats.inflight_current.store(cur, Ordering::Relaxed);
+                        let prev_peak = self.stats.inflight_peak.load(Ordering::Relaxed);
+                        if cur > prev_peak {
+                            self.stats.inflight_peak.store(cur, Ordering::Relaxed);
+                        }
                     }
                     if let Err(e) = codec::write_frame(&mut self.transport, &req.frame).await {
                         tracing::warn!(CVM_ALLOWED, error = %e, "write_frame failed; going Lost");
@@ -206,6 +250,9 @@ where
         match msg.body {
             Some(Body::MmioReadResult(r)) => {
                 if let Some(InFlight::Read { token, access_size }) = self.in_flight.remove(&seq) {
+                    self.stats
+                        .inflight_current
+                        .store(self.in_flight.len() as u64, Ordering::Relaxed);
                     // K-18: MMIO 访问尺寸严格 ∈ {1,2,4,8}。其他值是协议错。
                     if !matches!(access_size, 1 | 2 | 4 | 8) {
                         tracing::warn!(
@@ -219,7 +266,9 @@ where
                     }
                     let bytes = r.value.to_le_bytes();
                     token.complete(&bytes[..access_size]);
+                    self.stats.mmio_read_results.fetch_add(1, Ordering::Relaxed);
                     self.consecutive_bad_frames = 0;
+                    self.stats.consecutive_bad_frames.store(0, Ordering::Relaxed);
                     true
                 } else {
                     // 未知 seq；非致命但记一次"非法"。
@@ -235,9 +284,12 @@ where
                 let idx = f.msix_index as usize;
                 if let Some(intr) = self.interrupts.get(idx) {
                     intr.deliver();
+                    self.stats.interrupts_fired.fetch_add(1, Ordering::Relaxed);
                     self.consecutive_bad_frames = 0;
+                    self.stats.consecutive_bad_frames.store(0, Ordering::Relaxed);
                     true
                 } else {
+                    self.stats.interrupts_oob.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         CVM_ALLOWED,
                         msix_index = f.msix_index,
@@ -445,7 +497,8 @@ mod tests {
             let (_dev_tx, dev_rx) = mesh::channel::<DeviceRequest>();
             let state = crate::state::SharedState::new(crate::state::DeviceState::Live);
             let gm = guestmem::GuestMemory::empty();
-            let mut w = Worker::new(cursor, state, dev_rx, interrupts, gm);
+            let stats: SharedWorkerStats = Arc::new(WorkerStats::default());
+            let mut w = Worker::new(cursor, state, dev_rx, interrupts, gm, stats);
 
             // msix_index = 0 valid。
             let ok_msg = ToOpenhcl {
