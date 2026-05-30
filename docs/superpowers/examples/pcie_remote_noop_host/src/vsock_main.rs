@@ -166,20 +166,33 @@ async fn serve(
         device: Some(DeviceDescribe {
             vendor_id: 0x1414,
             device_id: 0xc0de,
-            // class_code = 0x07_00_02 (Serial Controller, 16550 16-byte FIFO):
-            //   - Windows inbox **serial.sys** 自动 attach
-            //   - serial driver 会 read BAR0 MMIO 去看 16550 UART registers
-            //   - 这些 read 走 IoResult::Defer → worker → host
-            //   → 触发 worker_stats.mmio_read_results 递增
-            //   serial driver 看 register 内容不像合法 UART → 静默 unload；
-            //   设备 device manager 状态可能 Error（与之前 stornvme 同理），但
-            //   **MMIO 路径已经走过**。
+            // class_code = 0x07_00_02 (Serial Controller, 16550 16-byte FIFO).
+            //
+            // **实测**：Windows Server 2025 26100 guest 对此 class **不绑任何
+            // inbox driver**（serial.sys 通过 ACPI/legacy 资源绑定，而非
+            // generic PCI class）。guest 显示为：
+            //   FriendlyName: "PCI Device"
+            //   Class:        (empty)
+            //   Service:      (empty)
+            //   Status:       Error (CM_PROB_FAILED_INSTALL)
+            //
+            // 即"找不到匹配 driver"。比 NVMe class (FAILED_START) 更准确地
+            // 表达 noop 的 "实验/未实现" 性质。
+            //
+            // 关键事实：**没有 driver attach → guest 不会发起 BAR MMIO read** →
+            // worker_stats.mmio_read_results 永远是 0。这是 PCI 协议的正确
+            // 行为，不是 bug。要在 e2e 中触发 mmio_read_results 必须：
+            //   1) 写自签 KMDF dummy driver + INF（需 WDK + testsigning）
+            //   2) Linux guest 用 vfio-pci uio_pci_generic
+            //   3) 用 raw NT API 直接读 PCI BAR mapped pages
             //
             // 历史尝试：
-            // - 0x010802 (NVMe) → stornvme 在 cfg-read VENDOR/DEV 后就 bail,
-            //   未读 BAR → mmio_read_results=0
-            // - 0xff0000 (Unclassified) → 没 inbox driver attach → 未读 BAR
-            // 选 serial 是因为 inbox driver 简单且会 read BAR0。
+            // - 0x010802 (NVMe) → stornvme cache 在 cfg-read VENDOR/DEV 后 bail
+            //   状态 PROB_FAILED_START（看着更像"真的坏了"，不符合 noop 语义）
+            // - 0xff0000 (Unclassified) → 完全没 driver attach，但 device manager
+            //   显示更"普通"，不引人深究
+            // - 0x070002 (Serial) → 同样无 driver 但状态描述更精确，且 PCIe 规范
+            //   允许任何 vendor 注册 PCI serial controller，class 字段合规
             class_code: 0x0007_0002,
             revision: 1,
             subsystem_vendor: 0,
