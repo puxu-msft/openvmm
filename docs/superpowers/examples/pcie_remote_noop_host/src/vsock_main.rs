@@ -166,13 +166,21 @@ async fn serve(
         device: Some(DeviceDescribe {
             vendor_id: 0x1414,
             device_id: 0xc0de,
-            // class_code = 0x010802 (NVMe) 让 Windows stornvme 尝试 init：
-            // 它会 read cfg + BAR0 NVMe registers → 这些 MMIO 访问就会
-            // 真的转给 host noop → 我们用 magic pattern 回应 → stornvme
-            // 看到 invalid NVMe 数据后 bail (CM_PROB_FAILED_START)。
-            // 但**沿路 cfg_read/MMIO_read 都会被 OpenHCL 转发**，这是
-            // 我们验证 v2 完整数据通路的关键。
-            class_code: 0x0001_0802,
+            // class_code = 0x07_00_02 (Serial Controller, 16550 16-byte FIFO):
+            //   - Windows inbox **serial.sys** 自动 attach
+            //   - serial driver 会 read BAR0 MMIO 去看 16550 UART registers
+            //   - 这些 read 走 IoResult::Defer → worker → host
+            //   → 触发 worker_stats.mmio_read_results 递增
+            //   serial driver 看 register 内容不像合法 UART → 静默 unload；
+            //   设备 device manager 状态可能 Error（与之前 stornvme 同理），但
+            //   **MMIO 路径已经走过**。
+            //
+            // 历史尝试：
+            // - 0x010802 (NVMe) → stornvme 在 cfg-read VENDOR/DEV 后就 bail,
+            //   未读 BAR → mmio_read_results=0
+            // - 0xff0000 (Unclassified) → 没 inbox driver attach → 未读 BAR
+            // 选 serial 是因为 inbox driver 简单且会 read BAR0。
+            class_code: 0x0007_0002,
             revision: 1,
             subsystem_vendor: 0,
             subsystem_device: 0,
