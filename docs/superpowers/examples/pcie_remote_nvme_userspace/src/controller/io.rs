@@ -101,8 +101,22 @@ impl NvmeController {
                 } else if bytes <= 2 * NVME_PAGE_SIZE {
                     let half = NVME_PAGE_SIZE as usize;
                     let (b1, b2) = buf.split_at(half);
-                    let _tok1 = ctx.dma_write(prp1, b1.to_vec());
+                    let tok1 = ctx.dma_write(prp1, b1.to_vec());
                     let tok2 = ctx.dma_write(prp2, b2.to_vec());
+                    // **H4 修复**：tok1 也入 pending_ios，否则失败时通用
+                    // DMA-fail 路径找不到上下文 → driver 永远收不到 error
+                    // CQE，直至 timeout。tok1 走 sibling 变体（成功时无
+                    // op，由 tok2 的 NvmReadDmaWrite 负责 success CQE）。
+                    self.pending_ios.insert(
+                        tok1,
+                        PendingIo {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            op: PendingOp::NvmReadDualPrpSiblingHalf,
+                        },
+                    );
                     self.pending_ios.insert(
                         tok2,
                         PendingIo {
@@ -118,7 +132,20 @@ impl NvmeController {
                     // 1) DMA-read PRP list page (PRP2 指向)，4 KiB 含
                     //    (total_pages-1) 个 u64 entry。
                     // 2) list 到达后：写 PRP1 + 各 list page。
+                    //
+                    // **C3 修复**：之前 `data_pages: vec![Some(buf)]` 把整段
+                    // transfer（>= 12 KiB）塞进 data_pages[0]，随后 dma_write
+                    // 把整段写到 PRP1 GPA → 覆盖 PRP1 边界外的 guest 内存。
+                    // 现在按页切分预读 buffer，data_pages[i] 严格对应第 i 页
+                    // 的数据。
                     let total_pages = bytes.div_ceil(NVME_PAGE_SIZE) as u32;
+                    let mut data_pages: Vec<Option<Vec<u8>>> =
+                        Vec::with_capacity(total_pages as usize);
+                    for i in 0..total_pages {
+                        let off = i as usize * NVME_PAGE_SIZE as usize;
+                        let end = ((i + 1) as usize * NVME_PAGE_SIZE as usize).min(buf.len());
+                        data_pages.push(Some(buf[off..end].to_vec()));
+                    }
                     let op_id = self.alloc_op_id();
                     self.prp_list_ops.insert(
                         op_id,
@@ -134,7 +161,7 @@ impl NvmeController {
                             list_entries: None,
                             total_pages,
                             pages_done: 0,
-                            data_pages: vec![Some(buf)], // PRP1 数据已就绪
+                            data_pages,
                         },
                     );
                     let tok = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);

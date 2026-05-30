@@ -63,6 +63,11 @@ pub(super) enum PendingOp {
     /// `num_blocks` = NVM Read 时 LBA 数；admin（Identify/Log）= 0，
     /// 用于 SMART 统计区分（Phase F：只算真 IO，不算 admin 元数据）。
     NvmReadDmaWrite { num_blocks: u32 },
+    /// **H4 修复** — 双 PRP Read 的"非记账段" sibling（成功时静默；失败时
+    /// 经过通用 DMA-fail 路径 post error CQE）。设计：tok2 走
+    /// `NvmReadDmaWrite { num_blocks: nlb }` 负责真正 success CQE +
+    /// counter；tok1 走此变体只为捕获失败。
+    NvmReadDualPrpSiblingHalf,
     /// **Phase E** — NVM Write with PRP list (> 2 page)。
     /// Step 1: DMA-read PRP list page itself（4 KiB u64 数组）。
     NvmWritePrpListFetch { op_id: u64 },
@@ -484,16 +489,27 @@ impl NvmeController {
     ///
     /// NVMe spec § 5.2：当 controller 发生 async 事件（health critical /
     /// namespace change / log page available / firmware activate），从
-    /// 之前 driver 投入的 AsyncEventRequest pending 队列弹一条 (cid, sq,
-    /// head, cq)，构造 CQE 携 cdw0 = `[type:8 | info:8 | log_id:8 | rsvd:8]`，
-    /// post 到对应 CQ + raise interrupt。Driver 看到 CQE 后会读对应 log
-    /// page，然后再投新的 AER。
+    /// 之前 driver 投入的 AsyncEventRequest pending 队列弹一条，构造 CQE
+    /// 携 cdw0 = `[type:3 | rsvd:5 | info:8 | log_id:8 | rsvd:8]`，post
+    /// 到对应 CQ + raise interrupt。Driver 看到 CQE 后会读对应 log page，
+    /// 然后再投新的 AER。
+    ///
+    /// **spec § 5.2 Figure 174 Async Event Type 值**（H1 修正错误注释）：
+    /// - 0x00 = Error
+    /// - 0x01 = **SMART/Health Status**（非 0x02）
+    /// - 0x02 = Notice
+    /// - 0x06 = I/O Command Set Specific
+    /// - 0x07 = Vendor Specific
+    ///
+    /// **H2 修复**：CQE.sqhd 必须反映 controller **当前**实时 SQ head
+    /// （spec § 4.6.1.4 sqhd 单调要求）。不能用 driver 投 AER 时的 stale
+    /// head，否则 driver 会观测到 sqhd 倒退而进入 fatal 状态。
     ///
     /// 当前没有自然事件源（无温度传感器/无 namespace 添加），此函数提
-    /// 供基础设施 + tests 用；外部代码可调 `fire_aen(0x02, 0x00, 0x02)`
+    /// 供基础设施 + tests 用；外部代码可调 `fire_aen(0x01, 0x00, 0x02)`
     /// 模拟 SMART critical。返 true = AER 已 fire；false = 无 pending AER
     /// 可弹（事件丢弃 — driver 下次投 AER 不会重发，与真硬件一致）。
-    #[allow(dead_code)]
+    #[allow(dead_code)] // 当前无自然事件源；保留 API 供未来 SMART/NS hook。
     pub(super) fn fire_aen(
         &mut self,
         ctx: &mut DeviceCtx<'_>,
@@ -501,7 +517,9 @@ impl NvmeController {
         aen_info: u8,
         log_id: u8,
     ) -> bool {
-        let Some((cid, sq_id, sq_head, cq_id)) = self.aen_pending.pop_front() else {
+        // M5：type 只占 3 bit，> 7 是 caller bug → 早 fail。
+        debug_assert!(aen_type < 8, "AEN type must be < 8 (spec § 5.2 Figure 174)");
+        let Some((cid, sq_id, _stale_sq_head, cq_id)) = self.aen_pending.pop_front() else {
             tracing::debug!(
                 aen_type,
                 aen_info,
@@ -510,8 +528,11 @@ impl NvmeController {
             );
             return false;
         };
+        // H2：用 controller 当前实时 sq_head（admin SQ id=0），避免 stale
+        // sqhd 触发 spec § 4.6.1.4 单调违规。
+        let sq_head_now = self.sqs.get(&sq_id).map(|s| s.head as u16).unwrap_or(0);
         let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
-        let mut cqe = Cqe::success(cid, sq_id, sq_head, phase);
+        let mut cqe = Cqe::success(cid, sq_id, sq_head_now, phase);
         // spec § 5.2 CDW0 layout: bits 2:0 = Async Event Type, bits 15:8 =
         // Async Event Info, bits 23:16 = Log Page Identifier。
         cqe.cdw0 = (aen_type as u32 & 0x7) | ((aen_info as u32) << 8) | ((log_id as u32) << 16);
@@ -531,10 +552,8 @@ impl NvmeController {
     fn build_error_info_log(&self, bytes: usize) -> Vec<u8> {
         // Spec：每 entry 64 字节，list 长度 = ELPE+1 (Identify Controller
         // .elpe，我们当前 = 0 → 1 entry)。NUMDL 给的 bytes 通常 ≥ 64。
-        let mut buf = vec![0u8; bytes];
         // Entry 0 全 0 表示 "no error logged yet"，spec allowed。
-        let _ = &mut buf; // 显式 mark used
-        buf
+        vec![0u8; bytes]
     }
 
     /// **Phase C/F** — Log Page 0x02 SMART / Health Information。
@@ -560,8 +579,11 @@ impl NvmeController {
         buf[5] = 0;
         // Offset 6: endurance_group_critical_warning_summary
         // Offset 7-31: reserved
-        let units_read = (self.stat_lba_read / 1000) as u128;
-        let units_written = (self.stat_lba_written / 1000) as u128;
+        // H3 修复：spec § 5.16.1.2 Figure 196 — data_units_*
+        // 以 1000 × 512B sector 为单位，**round up**（"a value of 1
+        // corresponds to 1000 units of 512 bytes read, rounded up"）。
+        let units_read = self.stat_lba_read.div_ceil(1000) as u128;
+        let units_written = self.stat_lba_written.div_ceil(1000) as u128;
         let host_reads = self.stat_host_reads as u128;
         let host_writes = self.stat_host_writes as u128;
         // Offset 32-47: data_units_read (128-bit LE)
@@ -838,6 +860,47 @@ impl PcieDevice for NvmeController {
             // 清相关 pending（IO 或 fetch）
             self.pending_fetches.remove(&token);
             if let Some(p) = self.pending_ios.remove(&token) {
+                // **C1 修复** — 多段 op (dual PRP / PRP list) 必须清掉
+                // sibling 的 pending_ios + 累积器，并保证只 post 一次
+                // error CQE。否则 sibling 完成时会进 unknown-op_id 分支
+                // warn + leak，driver 还可能收两次 error CQE 违反 NVMe
+                // spec § 4.6.1 "one CQE per command"。
+                match p.op {
+                    PendingOp::NvmWriteDualPrp { op_id, .. } => {
+                        self.pending_ios.retain(|_, q| {
+                            !matches!(q.op,
+                                PendingOp::NvmWriteDualPrp { op_id: o, .. } if o == op_id)
+                        });
+                        self.dual_prp_writes.remove(&op_id);
+                    }
+                    PendingOp::NvmWritePrpListFetch { op_id }
+                    | PendingOp::NvmWritePrpListData { op_id, .. }
+                    | PendingOp::NvmReadPrpListFetch { op_id }
+                    | PendingOp::NvmReadPrpListData { op_id, .. } => {
+                        self.pending_ios.retain(|_, q| match q.op {
+                            PendingOp::NvmWritePrpListFetch { op_id: o }
+                            | PendingOp::NvmWritePrpListData { op_id: o, .. }
+                            | PendingOp::NvmReadPrpListFetch { op_id: o }
+                            | PendingOp::NvmReadPrpListData { op_id: o, .. } => o != op_id,
+                            _ => true,
+                        });
+                        self.prp_list_ops.remove(&op_id);
+                    }
+                    PendingOp::NvmReadDualPrpSiblingHalf => {
+                        // sibling tok2 (NvmReadDmaWrite) 还在 pending_ios 中；
+                        // 移除避免它后续到达时给 driver post success CQE
+                        // 覆盖本 error。
+                        self.pending_ios.retain(|_, q| {
+                            !matches!(
+                                q.op,
+                                PendingOp::NvmReadDmaWrite { .. }
+                                    if q.cid == p.cid && q.sq_id == p.sq_id
+                            )
+                        });
+                    }
+                    _ => {}
+                }
+                self.stat_num_err_log_entries += 1;
                 let cq = self.cqs.get(&p.cq_id);
                 let phase = cq.map(|c| c.phase).unwrap_or(1);
                 let cqe = Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR, 0);
@@ -915,6 +978,13 @@ impl PcieDevice for NvmeController {
                     }
                     let cqe = Cqe::success(p.cid, p.sq_id, p.sq_head, phase);
                     self.post_cqe(ctx, p.cq_id, cqe);
+                }
+                PendingOp::NvmReadDualPrpSiblingHalf => {
+                    // **H4**：成功路径无 op — counter + success CQE 全由
+                    // tok2 (NvmReadDmaWrite) 处理；这里只是消化 token
+                    // 让生命周期闭合。失败路径在 on_dma_complete 顶部 ok==
+                    // false 分支统一 post error CQE（参 mod.rs DMA fail）。
+                    tracing::trace!(token, "dual-PRP Read sibling half ok (no-op)");
                 }
                 PendingOp::NvmWriteDualPrp { op_id, is_prp1 } => {
                     // 任一段到达：填入 accum 对应槽；两段都到时 dispatch 写盘。
@@ -1092,30 +1162,29 @@ impl PcieDevice for NvmeController {
                     }
                 }
                 PendingOp::NvmReadPrpListFetch { op_id } => {
-                    // PRP list 页到达 (Read 路径)。Parse + 把 backing file
-                    // 数据 dma_write 到 PRP1 + list 中每个 GPA 页。
+                    // PRP list 页到达 (Read 路径)。Parse + dma_write 已 cached
+                    // 的 per-page data 到 PRP1 + list 中每个 GPA。
+                    //
+                    // **C3 修复后**：dispatch_io 已按页切分 data_pages，这里
+                    // 不再 re-read file，直接 take 每页 buffer dma_write。
                     let entries = parse_prp_list(&data);
-                    // PRP list 解析结果 + 当前 op 关键字段 — 提取出来一次性
-                    // 取走（避免后续多次借 self）。
-                    type ReadPrpListInfo = (u32, u64, u32, u64, Vec<u64>, Vec<u8>);
-                    let info: Option<ReadPrpListInfo> =
+                    // 提取 op 关键字段 + take 全部页 buffer
+                    type ReadPrpListFetchInfo = (u32, u64, Vec<u64>, Vec<Vec<u8>>);
+                    let info: Option<ReadPrpListFetchInfo> =
                         self.prp_list_ops.get_mut(&op_id).map(|op| {
+                            // M2 修复：parse_prp_list 现在不再 0 终止；用
+                            // total_pages-1 精确截 list 长度。
                             let take = (op.total_pages - 1) as usize;
                             let list: Vec<u64> = entries.into_iter().take(take).collect();
-                            // PRP1 数据已在 dispatch_io 时读入 data_pages[0]
-                            let prp1_buf = op.data_pages[0]
-                                .take()
-                                .unwrap_or_else(|| vec![0u8; NVME_PAGE_SIZE as usize]);
-                            (
-                                op.total_pages,
-                                op.lba,
-                                op.num_blocks,
-                                op.prp1_gpa,
-                                list,
-                                prp1_buf,
-                            )
+                            // Take 全部页（含 PRP1 = idx 0）；data_pages 移空
+                            let pages: Vec<Vec<u8>> = op
+                                .data_pages
+                                .iter_mut()
+                                .map(|p| p.take().unwrap_or_default())
+                                .collect();
+                            (op.total_pages, op.prp1_gpa, list, pages)
                         });
-                    let Some((total_pages, lba, nlb, prp1_gpa, list, prp1_buf)) = info else {
+                    let Some((total_pages, prp1_gpa, list, pages)) = info else {
                         tracing::warn!(op_id, "ReadPrpListFetch unknown op_id");
                         return;
                     };
@@ -1126,11 +1195,15 @@ impl PcieDevice for NvmeController {
                         let op = &self.prp_list_ops[&op_id];
                         (op.sq_id, op.cid, op.sq_head, op.cq_id)
                     };
-                    // **Step 2a**: dma_write PRP1 数据（page idx 0）。
-                    // 注：dispatch_io Read 分支已把 file→buf 读入 prp1_buf
-                    // 缓存在 data_pages[0]，这里发起 dma_write。完成回调
-                    // (PendingOp::NvmReadPrpListData{op_id, page_idx:0}) +
-                    // 其它 list 页完成回调汇总后 post CQE。
+                    // 不变量校验：list.len() + 1 (PRP1) == total_pages
+                    debug_assert_eq!(
+                        list.len() as u32 + 1,
+                        total_pages,
+                        "PRP list size != total_pages-1"
+                    );
+                    // **Step 2a**: dma_write PRP1 数据（page idx 0）
+                    let mut pages_iter = pages.into_iter();
+                    let prp1_buf = pages_iter.next().unwrap_or_default();
                     let tok_prp1 = ctx.dma_write(prp1_gpa, prp1_buf);
                     self.pending_ios.insert(
                         tok_prp1,
@@ -1142,27 +1215,11 @@ impl PcieDevice for NvmeController {
                             op: PendingOp::NvmReadPrpListData { op_id, page_idx: 0 },
                         },
                     );
-                    // **Step 2b**: 读 backing file 剩余页，dma_write 到 list GPA。
-                    let total_bytes = nlb as u64 * SECTOR_SIZE;
+                    // **Step 2b**: dma_write 剩余页到 list 中的 GPA
                     for (i, gpa) in list.iter().enumerate() {
                         let page_idx = (i + 1) as u32;
-                        let page_off = page_idx as u64 * NVME_PAGE_SIZE;
-                        let page_bytes = (total_bytes - page_off).min(NVME_PAGE_SIZE) as usize;
-                        let mut buf = vec![0u8; page_bytes];
-                        if let Err(e) = self
-                            .file
-                            .seek(SeekFrom::Start(lba * SECTOR_SIZE + page_off))
-                            .and_then(|_| std::io::Read::read_exact(&mut self.file, &mut buf))
-                        {
-                            tracing::warn!(error = %e, op_id, page_idx, "ReadPrpList file read failed");
-                            let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
-                            let cqe =
-                                Cqe::error(cid, sq_id, sq_head, phase, sc::DATA_TRANSFER_ERROR, 0);
-                            self.prp_list_ops.remove(&op_id);
-                            self.post_cqe(ctx, cq_id, cqe);
-                            return;
-                        }
-                        let tok = ctx.dma_write(*gpa, buf);
+                        let page_buf = pages_iter.next().unwrap_or_default();
+                        let tok = ctx.dma_write(*gpa, page_buf);
                         self.pending_ios.insert(
                             tok,
                             PendingIo {
@@ -1174,7 +1231,6 @@ impl PcieDevice for NvmeController {
                             },
                         );
                     }
-                    let _ = total_pages; // 文档可读性
                 }
                 PendingOp::NvmReadPrpListData { op_id, page_idx } => {
                     // 一个数据页 dma_write 完成（PRP1 或 list 中某页）。
@@ -1212,19 +1268,18 @@ impl PcieDevice for NvmeController {
 }
 
 /// Parse a PRP list page (4 KiB = 512 u64 entries) into Vec<u64>。
-/// 尾部全零 entry 视为终止。Phase E v1 不处理 list chaining（最后一个
-/// entry == 下一个 PRP list 页指针）；MDTS=5 = 32 page 远小于 1 page list
-/// 容量（512 entry），暂不会触发。
+///
+/// **M2 修复**：之前 "尾部全零终止" 与 spec § 4.4 不符 — spec 要求 caller
+/// 按 transfer size 自行算精确 entry 数；GPA = 0 是合法地址（嵌入式 BIOS
+/// 可能把 RAM mapped 从 0 起），不能视为终止。caller 用
+/// `total_pages - 1` 精确截，本函数返回所有 entry 不截断。
+///
+/// Phase E v1 不处理 list chaining（最后一个 entry == 下一个 PRP list 页
+/// 指针）；MDTS=5 = 32 page 远小于 1 page list 容量（512 entry），暂不会触发。
 fn parse_prp_list(data: &[u8]) -> Vec<u64> {
-    let mut out = Vec::new();
-    for chunk in data.chunks_exact(8) {
-        let v = u64::from_le_bytes(chunk.try_into().unwrap());
-        if v == 0 {
-            break;
-        }
-        out.push(v);
-    }
-    out
+    data.chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().expect("chunks_exact(8) guarantees 8 bytes")))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1265,12 +1320,12 @@ mod tests {
         assert_eq!(u16::from_le_bytes([buf[1], buf[2]]), 313);
         // available_spare @ 3 = 100
         assert_eq!(buf[3], 100);
-        // data_units_read @ 32..48: 12345/1000 = 12
+        // data_units_read @ 32..48: ceil(12345/1000) = 13
         let units_read = u128::from_le_bytes(buf[32..48].try_into().unwrap());
-        assert_eq!(units_read, 12);
-        // data_units_written @ 48..64: 67890/1000 = 67
+        assert_eq!(units_read, 13);
+        // data_units_written @ 48..64: ceil(67890/1000) = 68
         let units_written = u128::from_le_bytes(buf[48..64].try_into().unwrap());
-        assert_eq!(units_written, 67);
+        assert_eq!(units_written, 68);
         // host_read_commands @ 64..80 = 5
         let hr = u128::from_le_bytes(buf[64..80].try_into().unwrap());
         assert_eq!(hr, 5);
@@ -1285,17 +1340,24 @@ mod tests {
         assert_eq!(nerr, 3);
     }
 
-    /// Phase E：parse_prp_list 在尾部 0 处终止 + 正确解析 LE u64。
+    /// Phase E (M2 修复后)：parse_prp_list 不再 0 终止 — 返回所有 entry，
+    /// caller 用 total_pages 自行截断。GPA = 0 是合法地址，不能视作终止。
     #[test]
-    fn prp_list_parses_until_zero() {
+    fn prp_list_returns_all_entries_no_zero_termination() {
         let mut bytes = vec![0u8; 64];
         bytes[..8].copy_from_slice(&0x1000_u64.to_le_bytes());
         bytes[8..16].copy_from_slice(&0x2000_u64.to_le_bytes());
         bytes[16..24].copy_from_slice(&0x3000_u64.to_le_bytes());
-        // bytes[24..32] = 0 → 终止
-        bytes[32..40].copy_from_slice(&0xdead_u64.to_le_bytes()); // 应被忽略
+        // bytes[24..32] = 0 — 不再终止
+        bytes[32..40].copy_from_slice(&0xdead_u64.to_le_bytes());
         let entries = parse_prp_list(&bytes);
-        assert_eq!(entries, vec![0x1000, 0x2000, 0x3000]);
+        // 64 / 8 = 8 entry
+        assert_eq!(entries.len(), 8);
+        assert_eq!(entries[0], 0x1000);
+        assert_eq!(entries[1], 0x2000);
+        assert_eq!(entries[2], 0x3000);
+        assert_eq!(entries[3], 0); // 0 不再终止
+        assert_eq!(entries[4], 0xdead);
     }
 
     /// Phase F：AEN queue 行为 — push 多次，弹出顺序 FIFO。
