@@ -133,18 +133,23 @@ where
 /// 为一组 TCP-based instance 启动 listener 任务，结果填入 `prepared`。
 ///
 /// 返回 listener tasks（调用方持有 Vec 不被 drop）。
+///
+/// **K-20 hotplug**：listener task 不在首次 handshake 后退出；继续 accept
+/// 后续 host 连接，把新 transport 通过 `swap_map` 投递给已运行的 worker。
+/// 首次 handshake 走 prepared_map 路径（resolver 后续 consume）；之后走
+/// transport_swap 路径（worker 替换 transport, state Lost → Live 复活）。
 pub fn spawn_tcp_handshakes(
     driver: impl Driver + Clone + 'static,
     spawner: impl Spawn + Clone + 'static,
     instances: Vec<(guid::Guid, String, Duration)>,
     prepared: PreparedMap,
+    swap_map: crate::resolver::TransportSwapMap,
 ) -> Vec<Task<()>> {
     let mut tasks = Vec::new();
     for (id, addr, timeout) in instances {
         let driver = driver.clone();
         let prepared = prepared.clone();
-        let _spawner_keep = spawner.clone();
-        let _ = _spawner_keep; // v2: 不再 spawn worker，spawner 不必再持
+        let swap_map = swap_map.clone();
         let task = spawner.spawn(format!("pcie_remote_listen_{id}"), async move {
             let listener = match std::net::TcpListener::bind(&addr) {
                 Ok(l) => l,
@@ -162,14 +167,68 @@ pub fn spawn_tcp_handshakes(
                 tracing::error!(CVM_ALLOWED, %id, error = %e, "pcie_remote: set_nonblocking failed");
                 return;
             }
-            let Some(prep) =
-                accept_and_handshake(driver.clone(), listener, id, timeout).await
-            else {
-                tracing::warn!(CVM_ALLOWED, %id, "pcie_remote: TCP handshake timeout; device absent");
-                return;
-            };
-            prepared.lock().insert(id, prep);
-            tracing::info!(CVM_ALLOWED, %id, "pcie_remote: TCP handshake ok, prepared inserted");
+            // K-20 hotplug: listen forever
+            let mut first = true;
+            loop {
+                // 用 std::net::TcpListener 不能直接 reuse — accept_and_handshake
+                // 接管 polled_listener。这里我们重新 bind 也不行（port 占用）。
+                // 解决：把 listener 留在外面，accept_and_handshake 调成只
+                // accept 一个 connection。
+                // 但当前 accept_and_handshake 签名拿走 listener。
+                // **简化**：每轮重新 bind（前轮 listener drop 让 port 释放）。
+                // 实际更好做法是改 accept_and_handshake 接受 polled_listener
+                // 引用而非 owned listener，但那需要 listener 的 polled wrapper
+                // 跨 await 持久存活。
+                //
+                // 折中：第一轮用 owned listener；后续 reconnect 时 bind 同
+                // 地址（SO_REUSEADDR 让重 bind 成功，TIME_WAIT 也能复用）。
+                let l = if first {
+                    // listener 已经 bind 好了，复用一次
+                    first = false;
+                    match listener.try_clone() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!(CVM_ALLOWED, %id, error = %e, "TCP try_clone failed");
+                            return;
+                        }
+                    }
+                } else {
+                    // 后续轮：旧 listener drop 后重新 bind
+                    match std::net::TcpListener::bind(&addr) {
+                        Ok(l) => {
+                            let _ = l.set_nonblocking(true);
+                            l
+                        }
+                        Err(e) => {
+                            tracing::warn!(CVM_ALLOWED, %id, addr, error = %e, "TCP rebind failed; sleep + retry");
+                            PolledTimer::new(&driver)
+                                .sleep(Duration::from_secs(1))
+                                .await;
+                            continue;
+                        }
+                    }
+                };
+                let Some(prep) = accept_and_handshake(driver.clone(), l, id, timeout).await
+                else {
+                    tracing::warn!(CVM_ALLOWED, %id, "pcie_remote: TCP handshake timeout/exhausted; will keep listening");
+                    continue;
+                };
+                // 路由：swap_map 有 sender → worker 已 spawn，hot-reconnect
+                //       swap_map 无    → prepared_map 路径，等 resolver consume
+                if let Some(swap_tx) = swap_map.lock().get(&id).cloned() {
+                    tracing::info!(CVM_ALLOWED, %id, "pcie_remote: TCP hot-reconnect → swapping transport to running worker");
+                    let mut prep = prep;
+                    let t = prep.take_transport();
+                    if swap_tx.is_closed() {
+                        tracing::warn!(CVM_ALLOWED, %id, "swap channel closed (worker exited); stopping listener");
+                        return;
+                    }
+                    swap_tx.send(t);
+                } else {
+                    prepared.lock().insert(id, prep);
+                    tracing::info!(CVM_ALLOWED, %id, "pcie_remote: TCP handshake ok, prepared inserted (boot grace)");
+                }
+            }
         });
         tasks.push(task);
     }
@@ -177,37 +236,59 @@ pub fn spawn_tcp_handshakes(
 }
 
 /// 为一组 vsock-based instance 启动 listener 任务（OpenHCL 路径）。
+///
+/// K-20 hotplug：与 TCP 路径同样 listen forever + swap_map 路由。
 pub fn spawn_vsock_handshakes(
     driver: impl Driver + Clone + 'static,
     spawner: impl Spawn + Clone + 'static,
     instances: Vec<(guid::Guid, u32, Duration)>,
     prepared: PreparedMap,
+    swap_map: crate::resolver::TransportSwapMap,
 ) -> Vec<Task<()>> {
     let mut tasks = Vec::new();
     for (id, port, timeout) in instances {
         let driver = driver.clone();
         let prepared = prepared.clone();
+        let swap_map = swap_map.clone();
         let task = spawner.spawn(format!("pcie_remote_vsock_{id}"), async move {
-            let listener = match vmsocket::VmListener::bind(vmsocket::VmAddress::vsock_any(port)) {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::error!(
-                        CVM_ALLOWED,
-                        %id, port,
-                        error = %e,
-                        "pcie_remote: vsock bind failed"
-                    );
-                    return;
+            // K-20: 每轮重 bind vsock（旧 listener drop 后端口释放）。
+            loop {
+                let listener =
+                    match vmsocket::VmListener::bind(vmsocket::VmAddress::vsock_any(port)) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            tracing::warn!(
+                                CVM_ALLOWED,
+                                %id, port,
+                                error = %e,
+                                "pcie_remote: vsock bind failed; sleep + retry"
+                            );
+                            PolledTimer::new(&driver)
+                                .sleep(Duration::from_secs(1))
+                                .await;
+                            continue;
+                        }
+                    };
+                let Some(prep) =
+                    accept_and_handshake(driver.clone(), listener, id, timeout).await
+                else {
+                    tracing::warn!(CVM_ALLOWED, %id, "pcie_remote: vsock handshake timeout; will keep listening");
+                    continue;
+                };
+                if let Some(swap_tx) = swap_map.lock().get(&id).cloned() {
+                    tracing::info!(CVM_ALLOWED, %id, "pcie_remote: vsock hot-reconnect → swapping transport to running worker");
+                    let mut prep = prep;
+                    let t = prep.take_transport();
+                    if swap_tx.is_closed() {
+                        tracing::warn!(CVM_ALLOWED, %id, "swap channel closed (worker exited); stopping listener");
+                        return;
+                    }
+                    swap_tx.send(t);
+                } else {
+                    prepared.lock().insert(id, prep);
+                    tracing::info!(CVM_ALLOWED, %id, "pcie_remote: vsock handshake ok, prepared inserted (boot grace)");
                 }
-            };
-            let Some(prep) =
-                accept_and_handshake(driver.clone(), listener, id, timeout).await
-            else {
-                tracing::warn!(CVM_ALLOWED, %id, "pcie_remote: vsock handshake timeout; device absent");
-                return;
-            };
-            prepared.lock().insert(id, prep);
-            tracing::info!(CVM_ALLOWED, %id, "pcie_remote: vsock handshake ok, prepared inserted");
+            }
         });
         tasks.push(task);
     }

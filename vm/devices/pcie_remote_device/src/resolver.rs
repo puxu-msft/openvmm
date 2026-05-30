@@ -53,6 +53,12 @@ use pci_resources::ResolvedPciDevice;
 /// 共享 prepared map：调用方在 boot 期 populate，resolver 在 resolve 期 take。
 pub type PreparedMap = Arc<Mutex<HashMap<guid::Guid, PreparedPcieRemoteDevice>>>;
 
+/// K-20 hotplug：共享 transport-swap senders map。resolver assemble_device 时
+/// 创建 channel，把 sender 放进 map 让 listener task 后续 host 重连时投递
+/// 新 transport 给 worker。drop 此 sender = listener 关闭 = worker 退出。
+pub type TransportSwapMap =
+    Arc<Mutex<HashMap<guid::Guid, mesh::Sender<crate::prepared::BoxedTransport>>>>;
+
 /// 共享 worker tasks 持有器：assemble_device 时 push，dispatch.rs 持到进程结束。
 ///
 /// **生命周期不变量**：drop `WorkerTasks` Arc 等于取消所有正在运行的 worker
@@ -64,14 +70,20 @@ pub type WorkerTasks = Arc<Mutex<Vec<Task<()>>>>;
 pub struct PcieRemoteTcpResolver {
     prepared: PreparedMap,
     worker_tasks: WorkerTasks,
+    transport_swap_map: TransportSwapMap,
 }
 
 impl PcieRemoteTcpResolver {
     /// 构造。
-    pub fn new(prepared: PreparedMap, worker_tasks: WorkerTasks) -> Self {
+    pub fn new(
+        prepared: PreparedMap,
+        worker_tasks: WorkerTasks,
+        transport_swap_map: TransportSwapMap,
+    ) -> Self {
         Self {
             prepared,
             worker_tasks,
+            transport_swap_map,
         }
     }
 }
@@ -90,6 +102,7 @@ impl AsyncResolveResource<PciDeviceHandleKind, PcieRemoteTcpHandle> for PcieRemo
         Ok(resolve_one(
             &self.prepared,
             &self.worker_tasks,
+            &self.transport_swap_map,
             handle.instance_id,
             params,
         ))
@@ -100,14 +113,20 @@ impl AsyncResolveResource<PciDeviceHandleKind, PcieRemoteTcpHandle> for PcieRemo
 pub struct PcieRemoteVmbusResolver {
     prepared: PreparedMap,
     worker_tasks: WorkerTasks,
+    transport_swap_map: TransportSwapMap,
 }
 
 impl PcieRemoteVmbusResolver {
     /// 构造。
-    pub fn new(prepared: PreparedMap, worker_tasks: WorkerTasks) -> Self {
+    pub fn new(
+        prepared: PreparedMap,
+        worker_tasks: WorkerTasks,
+        transport_swap_map: TransportSwapMap,
+    ) -> Self {
         Self {
             prepared,
             worker_tasks,
+            transport_swap_map,
         }
     }
 }
@@ -126,6 +145,7 @@ impl AsyncResolveResource<PciDeviceHandleKind, PcieRemoteVmbusHandle> for PcieRe
         Ok(resolve_one(
             &self.prepared,
             &self.worker_tasks,
+            &self.transport_swap_map,
             handle.instance_id,
             params,
         ))
@@ -135,6 +155,7 @@ impl AsyncResolveResource<PciDeviceHandleKind, PcieRemoteVmbusHandle> for PcieRe
 fn resolve_one(
     prepared: &PreparedMap,
     worker_tasks: &WorkerTasks,
+    transport_swap_map: &TransportSwapMap,
     instance_id: guid::Guid,
     params: ResolvePciDeviceHandleParams<'_>,
 ) -> ResolvedPciDevice {
@@ -146,7 +167,7 @@ fn resolve_one(
         );
         return AbsentPcieDevice::new().into();
     };
-    let dev = assemble_device(prep, worker_tasks, instance_id, params);
+    let dev = assemble_device(prep, worker_tasks, transport_swap_map, instance_id, params);
     dev.into()
 }
 
@@ -155,6 +176,7 @@ fn resolve_one(
 fn assemble_device(
     mut prep: PreparedPcieRemoteDevice,
     worker_tasks: &WorkerTasks,
+    transport_swap_map: &TransportSwapMap,
     instance_id: guid::Guid,
     params: ResolvePciDeviceHandleParams<'_>,
 ) -> PcieRemoteDevice {
@@ -222,6 +244,11 @@ fn assemble_device(
     // 5b. 共享 worker stats（worker 写，device.rs inspect 读）。
     let stats: crate::worker::SharedWorkerStats = Arc::new(Default::default());
 
+    // 5c. K-20 hotplug: transport-swap channel；sender 注册到 swap map,
+    //     listener task 在 host 重连时通过它投递新 transport 给 worker。
+    let (swap_tx, swap_rx) = mesh::channel::<crate::prepared::BoxedTransport>();
+    transport_swap_map.lock().insert(instance_id, swap_tx);
+
     // 6. SharedState — Live 因为 prepared 在 map 时已 handshake 完。
     let state = SharedState::new(DeviceState::Live);
 
@@ -238,6 +265,7 @@ fn assemble_device(
         interrupts,
         params.guest_memory.clone(),
         stats.clone(),
+        swap_rx,
     );
     let task = params.driver_source.simple().spawn(
         format!("pcie_remote_worker_{instance_id}"),

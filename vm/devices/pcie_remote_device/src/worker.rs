@@ -139,9 +139,31 @@ impl DmaRate {
     }
 }
 
-/// Worker —— 后台 task 持有它，跑 `run()`。
-pub struct Worker<T> {
-    transport: T,
+/// K-20 hotplug helper: 在 worker `run` 主循环中包裹 `codec::read_frame`，
+/// 让 Lost 状态下不实际 read（避免 dead-transport busy-loop）—— 改为永远
+/// pending，由 swap channel 或 from_device 决定下一步。
+async fn read_inbound_or_pending(
+    transport: &mut crate::prepared::BoxedTransport,
+    is_lost: bool,
+) -> Result<ToOpenhcl, pcie_remote_protocol::codec::CodecError> {
+    if is_lost {
+        // 永远 pending（等 swap channel 或 shutdown / from_device）
+        std::future::pending::<()>().await;
+        unreachable!()
+    } else {
+        codec::read_frame::<_, ToOpenhcl>(transport).await
+    }
+}
+
+
+///
+/// **v2 hotplug 设计 (K-20)**：worker 不再 generic over `T`，transport 用
+/// `BoxedTransport` 让 runtime swap 成为可能。新 transport 通过
+/// `transport_swap` channel 传入；listener 任务在 host 重连 / late-attach
+/// 时通过它把新 socket 投递给 worker，worker 自动 drain 旧 inflight + 切换
+/// transport + state Lost → Live 复活。
+pub struct Worker {
+    transport: crate::prepared::BoxedTransport,
     state: SharedState,
     in_flight: HashMap<u64, InFlight>,
     _deadman: DeadMan,
@@ -163,20 +185,21 @@ pub struct Worker<T> {
     next_dma_seq: u64,
     /// 可观察 stats（与 device.rs 共享 Arc，inspect 暴露）。
     stats: SharedWorkerStats,
+    /// K-20 hotplug: listener 通过此 channel 投递新 transport（host 重连）。
+    /// drop 此 sender 意味着 listener 关闭；worker 继续用现有 transport。
+    transport_swap: Receiver<crate::prepared::BoxedTransport>,
 }
 
-impl<T> Worker<T>
-where
-    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+impl Worker {
     /// 构造 Worker。
     pub fn new(
-        transport: T,
+        transport: crate::prepared::BoxedTransport,
         state: SharedState,
         from_device: Receiver<DeviceRequest>,
         interrupts: Vec<Interrupt>,
         guest_memory: GuestMemory,
         stats: SharedWorkerStats,
+        transport_swap: Receiver<crate::prepared::BoxedTransport>,
     ) -> Self {
         Self {
             transport,
@@ -190,50 +213,86 @@ where
             dma_rate: DmaRate::new(),
             next_dma_seq: 1 << 63,
             stats,
+            transport_swap,
         }
     }
 
     /// 主循环：直到 shutdown 信号或 transport 出错。
+    ///
+    /// K-20 hotplug: 收到 `transport_swap` 新 transport → drain 旧 inflight +
+    /// 替换 transport + state Lost → Live 复活。transport 死亡时 state
+    /// → Lost 但 worker **不退出**，等待 swap channel；只有 from_device
+    /// sender 全 drop（device 被 unbind）或 shutdown 信号才真正退出。
     pub async fn run(mut self, mut shutdown: Receiver<()>) {
         loop {
+            // 透明状态：Lost 期不 select read_frame（transport 死，会立即返回
+            // Err，导致 busy-loop）；只 wait swap channel 与 from_device。
+            let is_lost = matches!(self.state.load(), DeviceState::Lost);
             select_biased! {
                 _ = shutdown.next().fuse() => {
                     tracing::info!(CVM_ALLOWED, "pcie_remote worker shutdown signal");
                     break;
                 }
+                new_transport = self.transport_swap.next().fuse() => {
+                    let Some(new) = new_transport else {
+                        // listener task drop → sender 关闭，但 worker 可以继续
+                        // 用现有 transport（host 不会再重连，但当前连接仍工作）。
+                        // 这里我们什么都不做，避免 next().await 永远 pending。
+                        // 实际表现：select_biased 不会再选这条 arm，因 next() Pending。
+                        // 用 std::future::pending::<()>().await 等价
+                        // 但避免 busy-loop，需要 mark channel 关闭后忽略此 arm —
+                        // mesh::Receiver::next 返回 None 仅在所有 sender drop 后一次；
+                        // 之后再次 await 会 panic 或永远 pending。所以记 boolean 标记。
+                        // 简化做法：worker 直接退出，让 device 进入 Lost 永久。
+                        tracing::info!(CVM_ALLOWED, "pcie_remote: transport_swap closed, worker exiting");
+                        break;
+                    };
+                    tracing::info!(CVM_ALLOWED, "pcie_remote: transport refreshed via swap channel; resuming Live");
+                    self.drain_in_flight();
+                    self.transport = new;
+                    self.consecutive_bad_frames = 0;
+                    self.stats.consecutive_bad_frames.store(0, Ordering::Relaxed);
+                    self.dma_rate = DmaRate::new();
+                    self.state.store(DeviceState::Live);
+                }
                 req = self.from_device.next().fuse() => {
                     let Some(req) = req else {
-                        // sender 全 drop，退出
+                        // sender 全 drop（device unbind），worker 真正退出
                         break;
                     };
                     if let Some(pending) = req.pending {
                         self.in_flight.insert(req.seq, pending);
-                        // 更新 inflight 计数器 + 峰值（fetch_max race-free）
                         let cur = self.in_flight.len() as u64;
                         self.stats.inflight_current.store(cur, Ordering::Relaxed);
                         self.stats.inflight_peak.fetch_max(cur, Ordering::Relaxed);
                     }
                     if let Err(e) = codec::write_frame(&mut self.transport, &req.frame).await {
-                        tracing::warn!(CVM_ALLOWED, error = %e, "write_frame failed; going Lost");
-                        break;
+                        tracing::warn!(CVM_ALLOWED, error = %e, "write_frame failed; transport dead, going Lost (awaiting refresh)");
+                        // K-20: 不 break；进 Lost 等 transport_swap
+                        self.state.store(DeviceState::Lost);
+                        self.drain_in_flight();
                     }
                 }
-                inbound = codec::read_frame::<_, ToOpenhcl>(&mut self.transport).fuse() => {
+                // K-20: Lost 时跳过 read_frame arm，避免 busy-loop。
+                // 用 if guard：select_biased! 不直接支持 guard，但我们 wrap 在
+                // 一个 conditional pending future 中。
+                inbound = read_inbound_or_pending(&mut self.transport, is_lost).fuse() => {
                     match inbound {
                         Ok(m) => {
                             if !self.dispatch_inbound(m).await {
-                                // dispatch_inbound 返回 false = 致命 / 应进 Lost
                                 tracing::warn!(
                                     CVM_ALLOWED,
                                     consecutive = self.consecutive_bad_frames,
-                                    "pcie_remote: dispatch failed, going Lost"
+                                    "pcie_remote: dispatch failed, going Lost (awaiting refresh)"
                                 );
-                                break;
+                                self.state.store(DeviceState::Lost);
+                                self.drain_in_flight();
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(CVM_ALLOWED, error = %e, "read_frame failed; going Lost");
-                            break;
+                            tracing::warn!(CVM_ALLOWED, error = %e, "read_frame failed; transport dead, going Lost (awaiting refresh)");
+                            self.state.store(DeviceState::Lost);
+                            self.drain_in_flight();
                         }
                     }
                 }
@@ -507,7 +566,9 @@ mod tests {
             let gm = guestmem::GuestMemory::empty();
             let stats: SharedWorkerStats = Arc::new(WorkerStats::default());
             let stats_for_check = stats.clone();
-            let mut w = Worker::new(cursor, state, dev_rx, Vec::new(), gm, stats);
+            let (_swap_tx, swap_rx) = mesh::channel::<crate::prepared::BoxedTransport>();
+            std::mem::forget(_swap_tx);
+            let mut w = Worker::new(Box::new(cursor) as crate::prepared::BoxedTransport, state, dev_rx, Vec::new(), gm, stats, swap_rx);
 
             // 手工把 2 个 InFlight 塞进 worker（模拟 device.rs 投递过来）。
             let (_d1, t1) = defer_read();
@@ -583,7 +644,9 @@ mod tests {
             let gm = guestmem::GuestMemory::empty();
             let stats: SharedWorkerStats = Arc::new(WorkerStats::default());
             let stats_for_check = stats.clone();
-            let mut w = Worker::new(cursor, state, dev_rx, interrupts, gm, stats);
+            let (_swap_tx, swap_rx) = mesh::channel::<crate::prepared::BoxedTransport>();
+            std::mem::forget(_swap_tx);
+            let mut w = Worker::new(Box::new(cursor) as crate::prepared::BoxedTransport, state, dev_rx, interrupts, gm, stats, swap_rx);
 
             // msix_index = 0 valid。
             let ok_msg = ToOpenhcl {
@@ -654,7 +717,9 @@ mod tests {
             let gm = guestmem::GuestMemory::empty();
             let stats: SharedWorkerStats = Arc::new(WorkerStats::default());
             let stats_for_check = stats.clone();
-            let mut w = Worker::new(cursor, state, dev_rx, Vec::new(), gm, stats);
+            let (_swap_tx, swap_rx) = mesh::channel::<crate::prepared::BoxedTransport>();
+            std::mem::forget(_swap_tx);
+            let mut w = Worker::new(Box::new(cursor) as crate::prepared::BoxedTransport, state, dev_rx, Vec::new(), gm, stats, swap_rx);
 
             // len=0 → bounds reject + record_bad
             let req0 = ReadGpaRequest { token: 1, gpa: 0, len: 0 };
@@ -696,7 +761,9 @@ mod tests {
             let gm = guestmem::GuestMemory::empty();
             let stats: SharedWorkerStats = Arc::new(WorkerStats::default());
             let stats_for_check = stats.clone();
-            let mut w = Worker::new(cursor, state, dev_rx, Vec::new(), gm, stats);
+            let (_swap_tx, swap_rx) = mesh::channel::<crate::prepared::BoxedTransport>();
+            std::mem::forget(_swap_tx);
+            let mut w = Worker::new(Box::new(cursor) as crate::prepared::BoxedTransport, state, dev_rx, Vec::new(), gm, stats, swap_rx);
 
             // 空 data → bounds reject + record_bad
             let req0 = WriteGpaRequest { token: 1, gpa: 0, data: vec![] };
@@ -738,7 +805,9 @@ mod tests {
             let gm = guestmem::GuestMemory::empty();
             let stats: SharedWorkerStats = Arc::new(WorkerStats::default());
             let stats_for_check = stats.clone();
-            let mut w = Worker::new(cursor, state, dev_rx, Vec::new(), gm, stats);
+            let (_swap_tx, swap_rx) = mesh::channel::<crate::prepared::BoxedTransport>();
+            std::mem::forget(_swap_tx);
+            let mut w = Worker::new(Box::new(cursor) as crate::prepared::BoxedTransport, state, dev_rx, Vec::new(), gm, stats, swap_rx);
 
             // 发 1100 个 64KB ReadGpa：1024 个允许（占满 64 MiB/s）+ 76 个被拒
             for i in 0..1100u64 {

@@ -2314,6 +2314,9 @@ async fn new_underhill_vm(
     // Arc 持有，进程结束随 OpenHCL 退出 drop。
     let pcie_remote_worker_tasks: pcie_remote_device::WorkerTasks =
         Arc::new(Mutex::new(Vec::new()));
+    // K-20 hotplug: transport-swap senders map（resolver 注册；listener 查询）。
+    let pcie_remote_transport_swap_map: pcie_remote_device::TransportSwapMap =
+        Arc::new(Mutex::new(HashMap::new()));
     let pcie_remote_listener_tasks = if isolation.is_hardware_isolated() {
         tracing::warn!(
             CVM_ALLOWED,
@@ -2351,6 +2354,7 @@ async fn new_underhill_vm(
                 tp.clone(),
                 instances,
                 pcie_remote_prepared.clone(),
+                pcie_remote_transport_swap_map.clone(),
             );
             // 同步等 prepared_map 满或超时（每 10ms 轮询）。max_timeout 是
             // 所有 instance 的最大 handshake_timeout，覆盖最慢的那个 host。
@@ -2383,6 +2387,7 @@ async fn new_underhill_vm(
     >(pcie_remote_device::PcieRemoteVmbusResolver::new(
         pcie_remote_prepared,
         pcie_remote_worker_tasks,
+        pcie_remote_transport_swap_map,
     ));
 
     let periodic_telemetry_task = tp.spawn(

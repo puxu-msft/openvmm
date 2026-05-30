@@ -38,7 +38,7 @@ async fn handshake_e2e_via_tcp_loopback(driver: DefaultDriver) {
     let addr = format!("127.0.0.1:{port}");
     let instances = vec![(id, addr.clone(), Duration::from_secs(5))];
     let _listener_tasks =
-        spawn_tcp_handshakes(driver.clone(), driver.clone(), instances, prepared.clone());
+        spawn_tcp_handshakes(driver.clone(), driver.clone(), instances, prepared.clone(), Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())));
 
     // 等 server bind 后，作为 client connect 上去
     pal_async::timer::PolledTimer::new(&driver)
@@ -120,6 +120,7 @@ async fn handshake_timeout_leaves_prepared_empty(driver: DefaultDriver) {
         driver.clone(),
         vec![(id, format!("127.0.0.1:{port}"), Duration::from_millis(500))],
         prepared.clone(),
+        Arc::new(parking_lot::Mutex::new(HashMap::new())),
     );
     // 等超时
     pal_async::timer::PolledTimer::new(&driver)
@@ -146,6 +147,7 @@ async fn bind_failure_does_not_panic(driver: DefaultDriver) {
         driver.clone(),
         vec![(id, format!("127.0.0.1:{port}"), Duration::from_millis(500))],
         prepared.clone(),
+        Arc::new(parking_lot::Mutex::new(HashMap::new())),
     );
     pal_async::timer::PolledTimer::new(&driver)
         .sleep(Duration::from_millis(200))

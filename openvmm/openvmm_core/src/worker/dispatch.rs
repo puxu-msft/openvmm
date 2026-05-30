@@ -2090,6 +2090,11 @@ impl InitializedVm {
         // 此 Arc 持有；进程结束时 drop。
         let pcie_remote_worker_tasks: pcie_remote_device::WorkerTasks =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
+        // K-20 hotplug: transport-swap senders map。resolver 在 assemble_device
+        // 时把 sender 注册进来；listener task 后续 host 重连时通过它给 worker
+        // 投递新 transport。
+        let pcie_remote_transport_swap_map: pcie_remote_device::TransportSwapMap =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let _pcie_remote_listener_tasks = if cfg.pcie_remote_tcp_instances.is_empty() {
             Vec::new()
         } else {
@@ -2111,6 +2116,7 @@ impl InitializedVm {
                 driver_source.simple(),
                 instances.clone(),
                 pcie_remote_prepared.clone(),
+                pcie_remote_transport_swap_map.clone(),
             );
             // spec §3.3：boot 期最多阻塞 max(handshake_timeout)，等 prepared_map 填好。
             // 用轮询，每 10ms 检查一次；命中所有 instance 或超时退出。
@@ -2136,6 +2142,7 @@ impl InitializedVm {
         >(pcie_remote_device::PcieRemoteTcpResolver::new(
             pcie_remote_prepared,
             pcie_remote_worker_tasks,
+            pcie_remote_transport_swap_map,
         ));
 
         // Resolve PCIe devices concurrently.
