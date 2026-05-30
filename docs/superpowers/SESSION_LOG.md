@@ -801,3 +801,56 @@ HIGH/MEDIUM 一轮（H1/H2/M2/M3/M4/M7）。
 
 `specs/2026-05-29-pcie-remote-design.md` §10 K-NEW-* 表新增 K-NEW-G / K-NEW-H
 两行 + K-22 备注 Windows guest VHDX 脚本已闭环。
+
+## 2026-05-30 K-NEW-G/H 真 Hyper-V e2e 验证
+
+继 commit `e049a6c4` 之后，真实跑了一次 v10 IGVM
+(`/mnt/c/temp/pcie_remote_exp/openhcl-pcie-v10-knewgh.bin`) 验证 K-NEW-G
+Lost/Revive 诊断字段 + state inspect 在真 Hyper-V 上点亮。
+
+### 步骤
+
+1. `cargo xflowey build-igvm x64 --release --override-manifest /tmp/openhcl-x64-pcie.json --override-openvmm-hcl-feature vpci -o pcie-v10-knewgh`
+2. Stop-VM pcie-remote-exp → `Set-OpenHCL-HyperV-VM.ps1 -Path openhcl-pcie-v10-knewgh.bin` → Start-VM
+3. 老 noop（21:21 前启动的）自动 reconnect → state=Live, K-NEW-G 4 字段全 0
+4. `Stop-Process -Id <noop_pid>` → state=Lost，K-NEW-G 部分点亮：
+   ```
+   last_lost_at_ms   = 76242   ← 写入时间戳 ✅
+   last_lost_reason  = 1       ← READ_ERR bit（kill 触发 read_frame Err）✅
+   last_revive_at_ms = 0       ← 尚未复活
+   revive_count      = 0
+   ```
+5. 重启 noop（`pcie_remote_noop_host_vsock.exe --vm-id <vm-guid> --port 50000`）→
+   K-20 listener 重连 → state=Live，K-NEW-G 全部字段点亮：
+   ```
+   state             = "Live"   ← K-243d0d44 inspect surface ✅
+   revive_count      = 1        ← record_revive() 被调用 ✅
+   last_revive_at_ms = 198540   ← 真时间戳 > last_lost_at_ms ✅
+   last_lost_at_ms   = 76242    ← 保留前次 Lost 记录 ✅
+   last_lost_reason  = 1        ← 同上
+   ```
+6. counter 数学：`interrupts_fired=74`、`read_gpa_requests=24`、
+   `write_gpa_requests=18` 累积单调，与 noop log fire_count 一致。
+
+### 结论
+
+| 字段 | 设计预期 | 真 Hyper-V 实测 | ✅/❌ |
+|---|---|---|---|
+| `state` (device 节点) | "Connecting"/"Live"/"Lost" | "Live" / "Lost" 切换正确 | ✅ |
+| `last_lost_at_ms` | unix-ms 写入 | 76242（写入了，相对 epoch 偏移） | ✅ |
+| `last_lost_reason` | 位标记 OR | `READ_ERR=1`（kill noop 路径） | ✅ |
+| `last_revive_at_ms` | unix-ms 写入 | 198540 (>last_lost_at_ms) | ✅ |
+| `revive_count` | 单调 fetch_add(1) | 0 → 1 一次重连 | ✅ |
+
+K-NEW-H DMA env override 本次未注入 env，沿用默认 64 MiB/s（noop 也没
+stress），未实测 override 生效。后续如需验证：
+`Start-Process -EnvironmentVariables @{OPENHCL_PCIE_REMOTE_DMA_BPS='0'}` →
+inspect `dma_rate_limit_rejects` 在 stress 模式下应保持 0。
+
+VHDX 验证脚本 `attach_vhdx_and_verify_lspci.ps1` 也跑了一次：
+guest Windows Server 真见到
+`PCI\VEN_1414&DEV_C0DE&SUBSYS_00000000&REV_01\5&191D8A3A&0&0`
+（Status: Error / ConfigManagerErrorCode = 没 driver 是预期 — pcie_remote
+本来就没注册任何 Microsoft driver；vmwp ↔ vpci channel ↔ OpenHCL bus 已
+打通才能枚举到设备）。
+
