@@ -160,7 +160,13 @@ pub struct IdentifyController {
     pub maxcmd: u16,     // 514
     pub nn: u32,         // 516
     pub oncs: u16,       // 520
-    pub _resv3: [u8; 4096 - 522],
+    pub fuses: u16,      // 522
+    pub fna: u8,         // 524
+    /// Volatile Write Cache (offset 525) — bit 0 = "present"。
+    /// 设 1 让 driver 主动发 NVM FLUSH (opcode 0x00) 拿持久化承诺，
+    /// 我们的 backing file 默认 write-back，靠 FLUSH 触发 sync_all。
+    pub vwc: u8,         // 525
+    pub _resv3: [u8; 4096 - 526],
 }
 
 impl IdentifyController {
@@ -189,6 +195,9 @@ impl IdentifyController {
         this.maxcmd = 64;
         this.nn = 1; // 1 namespace
         this.oncs = 0; // optional commands: none
+        // VWC bit 0 = 1 → 通告 volatile write cache，driver 主动发 FLUSH。
+        // 配合 NVM FLUSH handler 在 controller.rs 调 sync_all() 拿持久化。
+        this.vwc = 0x01;
         // ACL / AERL / NPSS 用合理默认
         this.acl = 3;
         this.aerl = 3;

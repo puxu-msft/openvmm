@@ -1,6 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+// 示例代码：放宽一些 clippy lint，便于按 NVMe spec 字段名照搬写代码。
+#![allow(clippy::unnecessary_cast)] // u32 spec 字段保留 `as u32` 增强可读性
+#![allow(clippy::too_many_arguments)] // NVMe SQE/CQE 字段多，wrap struct 反而绕
+#![allow(clippy::enum_variant_names)] // PendingOp 全 Nvm 前缀强调 NVMe 语义
+
 //! Userspace NVMe controller — connects to OpenHCL via pcie_remote vsock
 //! and exposes a real NVMe block device backed by a host file.
 //!

@@ -324,7 +324,10 @@ mod tests {
             Vec::new(),
             bars,
         );
-        let (tx, _rx) = channel::<DeviceRequest>();
+        let (tx, rx) = channel::<DeviceRequest>();
+        // 防止 rx 被 drop 导致 is_closed() 立即返 true：forget 让 channel
+        // 在测试函数生命周期内保持开。
+        std::mem::forget(rx);
         let s = SharedState::new(state);
         let stats = std::sync::Arc::new(crate::worker::WorkerStats::default());
         PcieRemoteDevice::new(s, tx, cfg_space, msix, HashSet::new(), stats)
@@ -354,5 +357,69 @@ mod tests {
         let mut dev = build_test_device(DeviceState::Lost);
         let r = <PcieRemoteDevice as PciConfigSpace>::pci_cfg_write(&mut dev, 4, 0xffff_ffff);
         assert!(matches!(r, IoResult::Ok));
+    }
+
+    /// 关键回归测试（commit 291d8645）：MMIO write 必须立即返
+    /// `IoResult::Ok`，**不能** Defer。否则 guest driver 永远等不到
+    /// 写完成 → IRP 卡死 → nvme.sys 写 CC.EN=0 后整个 OS 停响应。
+    ///
+    /// 测试用 cfg space write 给 BAR0 分配一个非零地址，再做 mmio_write，
+    /// 应立即 Ok 不 Defer；不依赖 worker 真消费 frame。
+    #[test]
+    fn mmio_write_returns_ok_immediately_fire_and_forget() {
+        let mut dev = build_test_device(DeviceState::Live);
+        // 分配 BAR0 地址：写 cfg offset 0x10 (BAR0) 一个合法地址 + 写 cmd 启 MEM。
+        let bar_addr: u32 = 0x4000_0000;
+        let _ = <PcieRemoteDevice as PciConfigSpace>::pci_cfg_write(&mut dev, 0x10, bar_addr);
+        // PCI cfg cmd (offset 4): bit 1 = MEM space enable
+        let _ = <PcieRemoteDevice as PciConfigSpace>::pci_cfg_write(&mut dev, 4, 0x0002);
+
+        // mmio_write 到 BAR0+0：必须立即 Ok（无 Defer 等 ack）。
+        let r = <PcieRemoteDevice as MmioIntercept>::mmio_write(
+            &mut dev,
+            bar_addr as u64,
+            &[0xde, 0xad, 0xbe, 0xef],
+        );
+        assert!(
+            matches!(r, IoResult::Ok),
+            "MMIO write must be fire-and-forget (Ok), got {r:?}; \
+             defer would hang guest driver — see commit 291d8645"
+        );
+    }
+
+    /// MMIO write 在 Lost 状态返 Err，不是 Ok / Defer。
+    #[test]
+    fn mmio_write_lost_returns_err() {
+        let mut dev = build_test_device(DeviceState::Lost);
+        // 即使 BAR 没分配（Lost 状态优先检查），mmio_write 都直接 Err。
+        let r = <PcieRemoteDevice as MmioIntercept>::mmio_write(
+            &mut dev,
+            0x4000_0000,
+            &[0; 4],
+        );
+        assert!(
+            matches!(r, IoResult::Err(IoError::InvalidRegister)),
+            "Lost state must return Err, got {r:?}"
+        );
+    }
+
+    /// MMIO write 非法 size（如 3 字节）返 InvalidAccessSize，不 Ok 也不
+    /// Defer。
+    #[test]
+    fn mmio_write_invalid_size_returns_err() {
+        let mut dev = build_test_device(DeviceState::Live);
+        let bar_addr: u32 = 0x4000_0000;
+        let _ = <PcieRemoteDevice as PciConfigSpace>::pci_cfg_write(&mut dev, 0x10, bar_addr);
+        let _ = <PcieRemoteDevice as PciConfigSpace>::pci_cfg_write(&mut dev, 4, 0x0002);
+
+        let r = <PcieRemoteDevice as MmioIntercept>::mmio_write(
+            &mut dev,
+            bar_addr as u64,
+            &[0; 3], // 3 字节非法
+        );
+        assert!(
+            matches!(r, IoResult::Err(IoError::InvalidAccessSize)),
+            "Invalid size must return Err(InvalidAccessSize), got {r:?}"
+        );
     }
 }

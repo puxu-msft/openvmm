@@ -52,14 +52,28 @@ enum PendingOp {
     /// 等 PRP1 内的 data DMA-read 完成 → 写文件 → success CQE。
     /// (单 PRP Write 路径)
     NvmWriteDmaRead { lba: u64, num_blocks: u32 },
-    /// 双 PRP Write：等 PRP1 段的 DMA-read 完成，仅缓存数据到
-    /// `pending_write_accum[paired_token]`。
-    NvmWriteDualPrp1 { paired_token: u64 },
-    /// 双 PRP Write：等 PRP2 段。完成时从 `pending_write_accum` 取出 PRP1
-    /// 段数据 + 拼接 PRP2 段 → 写文件 → success CQE。
-    NvmWriteDualPrp2 { paired_token: u64, lba: u64, num_blocks: u32 },
+    /// 双 PRP Write：PRP1 段 DMA-read 完成 → 填到 `dual_prp_writes[op_id].prp1_data`，
+    /// 两段都到了就触发 dispatch_dual_prp。**op_id 与 PRP2 共用**：靠
+    /// `dual_prp_writes[op_id]` 中的状态决定何时写盘 + 发 CQE。
+    NvmWriteDualPrp { op_id: u64, is_prp1: bool },
     /// 等 DMA-write 数据到 PRP1 完成 → success CQE。(在 NVM Read 路径)
     NvmReadDmaWrite,
+}
+
+/// 双 PRP Write 累积：两段 DMA-read 任一先到都填到 prp1_data/prp2_data；
+/// 两段都到时合并写盘 + 发 CQE。op_id 独立于 SDK DMA token，由
+/// `NvmeController::next_op_id` 单调分配，**两个 PendingOp::NvmWriteDualPrp
+/// 共用同一 op_id**，乱序到达也正确处理；只要双 PRP DMA 都失败才不发 CQE
+/// （由 `on_dma_complete` 失败路径专门处理）。
+struct WriteAccum {
+    sq_id: u16,
+    cid: u16,
+    sq_head: u16,
+    cq_id: u16,
+    lba: u64,
+    num_blocks: u32,
+    prp1_data: Option<Vec<u8>>,
+    prp2_data: Option<Vec<u8>>,
 }
 
 /// NVMe Controller 主结构 — 实现 `PcieDevice`。
@@ -92,9 +106,11 @@ pub struct NvmeController {
     pending_fetches: HashMap<u64, FetchCtx>,
     /// pending IO commands waiting on PRP DMA。token → PendingIo。
     pending_ios: HashMap<u64, PendingIo>,
-    /// 双 PRP Write 数据累积：key = `NvmWriteDualPrp2.paired_token` (PRP2 token)，
-    /// value = 已收到的 PRP1 数据（4 KiB）。
-    pending_write_accum: HashMap<u64, Vec<u8>>,
+    /// 双 PRP Write 累积：op_id（单调分配，独立于 DMA token）→ 两段 PRP buffer
+    /// + cmd 上下文。两段都到达时合并写盘 + 发 CQE。
+    dual_prp_writes: HashMap<u64, WriteAccum>,
+    /// 双 PRP Write 的 op_id 计数器。
+    next_op_id: u64,
     /// 待 dispatch 的 SQE 队列（按 FIFO 顺序），dispatch 是 sync 逻辑但
     /// 触发 DMA 后异步完成。
     sqe_inbox: Vec<(u16, u16, Sqe)>, // (sq_id, sq_head_after_fetch, sqe)
@@ -150,7 +166,8 @@ impl NvmeController {
             cqs: HashMap::new(),
             pending_fetches: HashMap::new(),
             pending_ios: HashMap::new(),
-            pending_write_accum: HashMap::new(),
+            dual_prp_writes: HashMap::new(),
+            next_op_id: 1,
             sqe_inbox: Vec::new(),
             vid,
             ssvid,
@@ -216,7 +233,7 @@ impl NvmeController {
         self.cqs.clear();
         self.pending_fetches.clear();
         self.pending_ios.clear();
-        self.pending_write_accum.clear();
+        self.dual_prp_writes.clear();
         self.sqe_inbox.clear();
         self.state = CtrlState::Disabled;
         self.csts &= !csts::RDY;
@@ -240,15 +257,28 @@ impl NvmeController {
     /// SQyTDBL 写入：driver 通告新 SQE。host 立即 DMA-read 新 entries。
     /// 支持 wrap：[old_tail..size) + [0..new_tail) 拆两段独立 DMA fetch。
     fn on_sq_tail_doorbell(&mut self, ctx: &mut DeviceCtx<'_>, sq_id: u16, new_tail: u32) {
+        // 先校验：spec 要求 0 ≤ new_tail < size；越界视为 driver bug，
+        // 设 CSTS.CFS 让 driver 见到 fatal 状态。在写 sq.tail 前校验，
+        // 否则脏 state 已经在 SQ 中持久化。
         let (base_gpa, size, old_tail) = {
-            let Some(sq) = self.sqs.get_mut(&sq_id) else {
+            let Some(sq) = self.sqs.get(&sq_id) else {
                 tracing::warn!(sq_id, "SQ tail doorbell to unknown SQ");
                 return;
             };
-            let old = sq.tail;
-            sq.tail = new_tail;
-            (sq.base_gpa, sq.size, old)
+            if new_tail >= sq.size {
+                tracing::error!(
+                    sq_id,
+                    new_tail,
+                    size = sq.size,
+                    "SQ doorbell out of range; setting CSTS.CFS"
+                );
+                self.csts |= csts::CFS;
+                return;
+            }
+            (sq.base_gpa, sq.size, sq.tail)
         };
+        // 校验通过后才写 sq.tail。
+        self.sqs.get_mut(&sq_id).unwrap().tail = new_tail;
         if old_tail == new_tail {
             return;
         }
@@ -380,16 +410,13 @@ impl NvmeController {
                         buf
                     }
                     0x03 => {
-                        // Namespace Identification Descriptor list (NVMe 1.3+)
-                        // 4 KiB；driver 期望至少一个 descriptor。我们返回 NIDT=3
-                        // (NGUID, 16 bytes) 全零 — 表示"namespace identifier
-                        // 不可用，但 list 有效"，避免 Windows 报 invalid field。
-                        let mut buf = vec![0u8; 4096];
-                        buf[0] = 0x03; // NIDT = NGUID
-                        buf[1] = 16; // NIDL = 16 bytes
-                        // buf[2..4] reserved；buf[4..20] NGUID = 全 0（"no NGUID"）
-                        // 后续 NIDT=0 终止 list
-                        buf
+                        // Namespace Identification Descriptor list (NVMe 1.3+)。
+                        // 4 KiB；header NIDT=0 表示 list 空 — spec-compliant
+                        // 路径，driver 走 EUI64/默认。
+                        // 之前返 NGUID 全 0 违反 spec § 5.15.2（"NGUID 0h
+                        // indicates the controller does not support NGUID"
+                        // → 不应作为 descriptor 返回）。
+                        vec![0u8; 4096]
                     }
                     0x06 => {
                         // CNS 0x06 = Identify Controller for the controller list /
@@ -632,8 +659,18 @@ impl NvmeController {
                     );
                 } else {
                     // 双 PRP：PRP1 = 第一页 (4 KiB)，PRP2 = 第二页（最多 4 KiB）。
-                    // 两次 dma_read，token1 = PRP1, token2 = PRP2；
-                    // PRP1 完成时缓存数据；PRP2 完成时合并写文件。
+                    // 分配独立 op_id，PRP1/PRP2 完成回调通过 op_id 关联 ——
+                    // 解决 PRP2 先到 PRP1 的乱序数据损坏 + leak 问题（C1）。
+                    let op_id = self.next_op_id;
+                    self.next_op_id = self.next_op_id.wrapping_add(1);
+                    self.dual_prp_writes.insert(
+                        op_id,
+                        WriteAccum {
+                            sq_id, cid, sq_head, cq_id,
+                            lba: slba, num_blocks: nlb,
+                            prp1_data: None, prp2_data: None,
+                        },
+                    );
                     let prp2_bytes = (bytes - NVME_PAGE_SIZE) as u32;
                     let tok1 = ctx.dma_read(prp1, NVME_PAGE_SIZE as u32);
                     let tok2 = ctx.dma_read(prp2, prp2_bytes);
@@ -641,14 +678,14 @@ impl NvmeController {
                         tok1,
                         PendingIo {
                             sq_id, cid, sq_head, cq_id,
-                            op: PendingOp::NvmWriteDualPrp1 { paired_token: tok2 },
+                            op: PendingOp::NvmWriteDualPrp { op_id, is_prp1: true },
                         },
                     );
                     self.pending_ios.insert(
                         tok2,
                         PendingIo {
                             sq_id, cid, sq_head, cq_id,
-                            op: PendingOp::NvmWriteDualPrp2 { paired_token: tok2, lba: slba, num_blocks: nlb },
+                            op: PendingOp::NvmWriteDualPrp { op_id, is_prp1: false },
                         },
                     );
                 }
@@ -939,8 +976,10 @@ impl PcieDevice for NvmeController {
                     let res = self
                         .file
                         .seek(SeekFrom::Start(lba * SECTOR_SIZE))
-                        .and_then(|_| self.file.write_all(&data))
-                        .and_then(|_| self.file.sync_data()); // 立即 flush 避免 host kill 丢数据
+                        .and_then(|_| self.file.write_all(&data));
+                    // 注：不 per-IO fsync（H5）；driver 用 NVM FLUSH (opc 0x00)
+                    // 显式拿持久化承诺；Identify Controller VWC=1 已声明
+                    // volatile write cache，driver 会主动发 FLUSH。
                     let cq = self.cqs.get(&p.cq_id);
                     let phase = cq.map(|c| c.phase).unwrap_or(1);
                     let cqe = match res {
@@ -958,51 +997,60 @@ impl PcieDevice for NvmeController {
                     let cqe = Cqe::success(p.cid, p.sq_id, p.sq_head, phase);
                     self.post_cqe(ctx, p.cq_id, cqe);
                 }
-                PendingOp::NvmWriteDualPrp1 { paired_token } => {
-                    // PRP1 段先到：缓存数据，等 PRP2 段。
-                    tracing::debug!(
-                        paired_token,
-                        data_len = data.len(),
-                        "NVM Write dual-PRP: PRP1 segment cached"
-                    );
-                    self.pending_write_accum.insert(paired_token, data);
-                }
-                PendingOp::NvmWriteDualPrp2 { paired_token, lba, num_blocks } => {
-                    // PRP2 段到达：取出 PRP1 段 → 拼接 → 写文件。
-                    let prp1_data = self.pending_write_accum.remove(&paired_token);
-                    let mut full = match prp1_data {
-                        Some(d) => d,
-                        None => {
-                            tracing::warn!(
-                                paired_token, lba,
-                                "NVM Write dual-PRP: PRP1 segment never arrived; using zeros"
-                            );
-                            vec![0u8; NVME_PAGE_SIZE as usize]
+                PendingOp::NvmWriteDualPrp { op_id, is_prp1 } => {
+                    // 任一段到达：填入 accum 对应槽；两段都到时 dispatch 写盘。
+                    // 乱序到达自动处理（C1 reviewer 指出 PRP2 先到的 data
+                    // corruption + leak 在此被一并解决）。
+                    let ready = if let Some(accum) = self.dual_prp_writes.get_mut(&op_id) {
+                        if is_prp1 {
+                            accum.prp1_data = Some(data);
+                        } else {
+                            accum.prp2_data = Some(data);
                         }
+                        accum.prp1_data.is_some() && accum.prp2_data.is_some()
+                    } else {
+                        tracing::warn!(op_id, is_prp1, "DualPrp completion for unknown op_id");
+                        false
                     };
-                    full.extend_from_slice(&data);
-                    let bytes = num_blocks as u64 * SECTOR_SIZE;
-                    tracing::debug!(
-                        lba, num_blocks,
-                        full_len = full.len(),
-                        expected = bytes,
-                        "NVM Write dual-PRP: PRP2 segment + merged write"
-                    );
-                    let res = self
-                        .file
-                        .seek(SeekFrom::Start(lba * SECTOR_SIZE))
-                        .and_then(|_| self.file.write_all(&full))
-                        .and_then(|_| self.file.sync_data()); // 立即 flush
-                    let cq = self.cqs.get(&p.cq_id);
-                    let phase = cq.map(|c| c.phase).unwrap_or(1);
-                    let cqe = match res {
-                        Ok(()) => Cqe::success(p.cid, p.sq_id, p.sq_head, phase),
-                        Err(e) => {
-                            tracing::warn!(error = %e, lba, num_blocks, "NVM Write dual-PRP file write failed");
-                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR, 0)
-                        }
-                    };
-                    self.post_cqe(ctx, p.cq_id, cqe);
+                    if ready {
+                        // 两段都已到达；移出 accum + 合并写文件 + 发 CQE。
+                        let accum = self.dual_prp_writes.remove(&op_id).unwrap();
+                        let mut full = accum.prp1_data.unwrap();
+                        full.extend_from_slice(&accum.prp2_data.unwrap());
+                        let bytes = accum.num_blocks as u64 * SECTOR_SIZE;
+                        tracing::debug!(
+                            lba = accum.lba,
+                            num_blocks = accum.num_blocks,
+                            full_len = full.len(),
+                            expected = bytes,
+                            op_id,
+                            "NVM Write dual-PRP: both segments ready, writing"
+                        );
+                        let res = self
+                            .file
+                            .seek(SeekFrom::Start(accum.lba * SECTOR_SIZE))
+                            .and_then(|_| self.file.write_all(&full));
+                        // 注：不再 per-IO sync_data（H5）；driver 用 NVM FLUSH
+                        // (opcode 0x00) 拿持久化承诺，spec-compliant 行为。
+                        let cq = self.cqs.get(&accum.cq_id);
+                        let phase = cq.map(|c| c.phase).unwrap_or(1);
+                        let cqe = match res {
+                            Ok(()) => Cqe::success(accum.cid, accum.sq_id, accum.sq_head, phase),
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    lba = accum.lba,
+                                    num_blocks = accum.num_blocks,
+                                    "NVM Write dual-PRP file write failed"
+                                );
+                                Cqe::error(
+                                    accum.cid, accum.sq_id, accum.sq_head, phase,
+                                    sc::DATA_TRANSFER_ERROR, 0,
+                                )
+                            }
+                        };
+                        self.post_cqe(ctx, accum.cq_id, cqe);
+                    }
                 }
             }
             return;

@@ -166,7 +166,12 @@ pub enum InFlight {
         /// 实际访问字节数（1/2/4/8），用于 complete 截断。
         access_size: usize,
     },
-    /// MMIO write 等 host ack（v1 暂未严格 ack；保留接口）。
+    /// **当前不构造** — MMIO write 走 fire-and-forget（device.rs commit
+    /// 291d8645 修复 nvme.sys OS hang bug）。保留 variant 是因为：
+    /// (a) drain_in_flight 仍需要 match 兜底；
+    /// (b) 未来若加入"strict-ack write"模式（如需要 host 实际 OK 才
+    ///     返 IoResult::Ok），可重新构造此 variant。
+    #[allow(dead_code)]
     Write {
         /// DeferredWrite，由 device shim 创建。
         token: DeferredWrite,
