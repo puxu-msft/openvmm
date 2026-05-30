@@ -600,3 +600,84 @@ worker_stats:
 | worker_stats inspect | - | ✅ | ✅ |
 | InterruptFire host→OpenHCL→guest LAPIC | - | ✅ | ✅ |
 | ReadGpa host→OpenHCL→guest_memory→DmaCompletion | - | - | ✅ |
+
+---
+
+## 2026-05-30 v6+v7: K-NEW-C rate limit + A4 Lost 转换 stress 验证
+
+承前 v5 (c6f28f75) 完成 5-counter 周期性验证；本轮通过 noop 主动 stress
+mode 触发剩余两个边界 counter（dma_rate_limit_rejects 与
+consecutive_bad_frames），实测 K-NEW-C 限速与 A4 Lost 转换。
+
+### v6 (commit 265dfb73)：--stress-dma-count
+
+noop_host 加 `--stress-dma-count <N>` 参数，handshake 后立即 burst
+N 个 ReadGpaRequest(gpa=0, len=64KB)。
+
+实测 N=2048（128 MiB 突发）:
+
+```
+worker_stats:
+  read_gpa_requests:      2074  (= 2048 burst + 26 后续 periodic)
+  dma_rate_limit_rejects: 1024  ← 64 MiB/s ÷ 64 KB = 1024 允许
+```
+
+数学验证：1024 个 64KB ReadGpa = 64 MiB 正好填满 1s 窗口，
+余下 2048-1024 = 1024 个被 rate limit 拒绝。
+
+K-NEW-C 行为 OK：
+- worker **不进 Lost**（rate limit ≠ 协议错）
+- 拒绝路径 reply DmaCompletion(ok=false)，token 让 host 知道哪个失败
+- 1s 窗口归零后允许新流量
+
+### v7 (commit a6c36b5b)：--stress-bad-frames
+
+noop_host 加 `--stress-bad-frames <N>` 参数，handshake 后立即 burst
+N 个 InterruptFire(msix_index=99) OOB 帧。
+
+实测 N=8（>MAX_BAD_FRAMES=4）:
+
+```
+worker_stats:
+  consecutive_bad_frames: 4   ← 正好阈值
+  interrupts_oob: 4
+  ...
+
+kmsg:
+  [1.921400] device assembled, worker spawned msix_count=0x1
+  [1.921462..1.921474] WARN  InterruptFire msix_index out of bounds msix_index=0x63 (x4)
+  [1.921478] WARN  dispatch failed, going Lost consecutive=0x4
+```
+
+完整 A4 行为：
+1. 4 个连续 OOB InterruptFire
+2. `record_bad` 累至 MAX_BAD_FRAMES = 4
+3. `dispatch_inbound` 返回 false
+4. `Worker::run` 主循环 break → transport drop / close
+5. noop client 看到 EOF → outer reconnect loop
+6. 但 OpenHCL listener 已退出（v1 spec §3.3 single-attempt）→ reconnect 失败
+
+### 完整 worker_stats counter 验证状态
+
+| Counter | v3 | v4 | v5 | v6 | v7 | 状态 |
+|---|---|---|---|---|---|---|
+| interrupts_fired | 55 | 80 | 108 | 79 | 0 | ✅ |
+| read_gpa_requests | - | 26 | 36 | 2074 | 0 | ✅ |
+| write_gpa_requests | - | - | 27 | 19 | 0 | ✅ |
+| dma_rate_limit_rejects | - | - | - | **1024** | 0 | ✅ |
+| consecutive_bad_frames | - | - | - | 0 | **4** | ✅ |
+| interrupts_oob | - | - | - | - | **4** | ✅ |
+| inflight_current/peak | 0 | 0 | 0 | 0 | 0 | ✅ (单元测试覆盖) |
+| mmio_read_results | 0 | 0 | 0 | 0 | 0 | ⚠ 需 guest driver |
+
+**8/9 counter 实证已触发**；仅 mmio_read_results 待 guest 内有 driver
+真读 BAR 才能触发（要么写 INF + driver，要么挂 PNG / hard-coded class
+让 Windows 真试 init）。
+
+### 工件
+
+- `/mnt/c/temp/pcie_remote_exp/pcie_remote_noop_host_vsock.exe` (current 含 stress 模式)
+- `--stress-dma-count 2048` → K-NEW-C 验证
+- `--stress-bad-frames 8` → A4 Lost 验证
+- `--stress-dma-count 0 --stress-bad-frames 0`（默认）→ periodic 模式仅
+  InterruptFire / ReadGpa / WriteGpa
