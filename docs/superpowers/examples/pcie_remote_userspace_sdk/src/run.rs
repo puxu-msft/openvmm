@@ -86,7 +86,9 @@ pub async fn run<D: PcieDevice>(
     // ─── 2. 主循环 ───
     //
     // 协议状态：seq 由 SDK 单调分配（高位区间避免与 OpenHCL 侧 seq 撞）。
+    // dma_token 同理，独立空间便于 device state machine 关联请求-响应。
     let mut next_seq: u64 = 1u64 << 32;
+    let mut next_dma_token: u64 = 1u64 << 40;
     // 出站帧缓冲：device 回调可能 push 多个；本循环串行 flush。
     let mut outbound: Vec<ToOpenhcl> = Vec::with_capacity(16);
     let mut timer = PolledTimer::new(driver);
@@ -105,13 +107,20 @@ pub async fn run<D: PcieDevice>(
 
         match inbound {
             Some(Ok(req)) => {
-                dispatch_inbound(&mut device, req, &mut outbound, &mut next_seq)?;
+                dispatch_inbound(
+                    &mut device,
+                    req,
+                    &mut outbound,
+                    &mut next_seq,
+                    &mut next_dma_token,
+                )?;
             }
             Some(Err(e)) => return Err(anyhow!("transport read failed: {e}")),
             None => {
                 let mut ctx = DeviceCtx {
                     outbound: &mut outbound,
                     next_seq: &mut next_seq,
+                    next_dma_token: &mut next_dma_token,
                 };
                 device.tick(&mut ctx);
             }
@@ -132,6 +141,7 @@ fn dispatch_inbound<D: PcieDevice>(
     req: ToHost,
     outbound: &mut Vec<ToOpenhcl>,
     next_seq: &mut u64,
+    next_dma_token: &mut u64,
 ) -> Result<()> {
     let seq = req.seq;
     match req.body {
@@ -162,7 +172,12 @@ fn dispatch_inbound<D: PcieDevice>(
                     m.size
                 ));
             }
-            device.mmio_write(m.bar, m.offset, m.size, m.value);
+            let mut ctx = DeviceCtx {
+                outbound,
+                next_seq,
+                next_dma_token,
+            };
+            device.mmio_write(&mut ctx, m.bar, m.offset, m.size, m.value);
         }
         Some(HostBody::CfgWriteSideEffect(c)) => {
             device.cfg_write_side_effect(c.offset, c.value);
@@ -171,20 +186,17 @@ fn dispatch_inbound<D: PcieDevice>(
             device.reset(r.kind);
         }
         Some(HostBody::DmaCompletion(d)) => {
-            // v1 SDK：fire-and-forget DMA，不回调用户。仅 trace 一行供调试。
-            tracing::trace!(
-                seq,
-                token = d.token,
-                ok = d.ok,
-                data_len = d.data.len(),
-                "DmaCompletion (fire-and-forget mode, dropping)"
-            );
+            let mut ctx = DeviceCtx {
+                outbound,
+                next_seq,
+                next_dma_token,
+            };
+            device.on_dma_complete(&mut ctx, d.token, d.ok, d.data);
         }
         None => {
             tracing::warn!(seq, "ToHost missing body; ignored");
         }
     }
-    let _ = next_seq; // 当前 dispatch path 不分配 seq；预留给未来 DMA 完成回调路径
     Ok(())
 }
 

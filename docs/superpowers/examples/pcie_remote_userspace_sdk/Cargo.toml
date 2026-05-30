@@ -10,12 +10,12 @@ pal_async = { path = "../../../../support/pal/pal_async" }
 mesh = { path = "../../../../support/mesh" }
 guid = { path = "../../../../support/guid", features = ["mesh"] }
 vmsocket = { path = "../../../../support/vmsocket" }
-anyhow = "1"
-async-trait = "0.1"
-futures = "0.3"
-tracing = "0.1"
-parking_lot = "0.12"
-socket2 = "0.5"
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+futures = "0.3.32"
+tracing = "0.1.44"
+parking_lot = "0.12.5"
+socket2 = "0.6"
 
 [dev-dependencies]
-tracing-subscriber = "0.3"
+tracing-subscriber = "0.3.23"
