@@ -533,3 +533,70 @@ Get-PnpDevice -PresentOnly | ? { $_.InstanceId -like '*VEN_1414*' }
 - `/mnt/c/temp/pcie_remote_exp/build_winserver_vhdx.ps1` (ISO → VHDX)
 - `/mnt/c/temp/pcie_remote_exp/inject_unattend.ps1` (add unattend + post_logon)
 - `/mnt/c/temp/pcie_remote_exp/deploy_v2_e2e.ps1` (full deploy + start)
+
+---
+
+## 2026-05-30 v3+v4: worker_stats inspect + InterruptFire/DMA 端到端验证
+
+承前 v2 真 Hyper-V guest e2e（29f7293c），本轮在已通的 OpenHCL→guest
+路径上加可观察 stats + 主动 InterruptFire/ReadGpa，验证完整数据通路。
+
+### v3 (commit 22d731d4)：worker_stats inspect 暴露
+
+- `WorkerStats { 9 个 AtomicU64 }`：mmio_read_results / interrupts_fired /
+  interrupts_oob / read_gpa_requests / write_gpa_requests /
+  dma_rate_limit_rejects / inflight_current / inflight_peak /
+  consecutive_bad_frames
+- `Inspect` derive 自动暴露到 ohcldiag-dev
+- `SharedWorkerStats = Arc<WorkerStats>`，worker 单写 + device.rs 持 clone
+  让 inspect tree 看见
+- noop_host vsock_main 加 `select_biased(read, 5s_timer)`，timer tick
+  时主动发 `InterruptFire { msix_index: 0 }`
+
+实测：worker_stats.interrupts_fired = 55 与 host noop fire_count = 55 完全对应
+
+### v3+ (commit 8fee5340)：rust-reviewer #2 修复
+
+3 个 counter (read_gpa_requests / write_gpa_requests / dma_rate_limit_rejects)
+之前声明但未 fetch_add，永远 0 — 修复。inflight_peak load-then-store
+race 改 fetch_max。drain_in_flight 末尾归零 inflight_current。
+interrupt_fire_bounds 测试加 5 个 stats 断言（防回归）。
+
+### v4 (commit 2f8ffe75)：DMA 路径 e2e
+
+noop_host 每 3 个 timer tick (15s) 主动发 ReadGpaRequest(gpa=0, len=4)。
+真 Hyper-V VM 6 分钟实测：
+
+```
+worker_stats:
+  interrupts_fired:   80   ← noop fire_count=80
+  read_gpa_requests:  26   ← noop ReadGpa 发了 26 次
+  dma_rate_limit_rejects: 0
+  inflight_current:   0
+  inflight_peak:      0
+```
+
+**完整 DMA 路径** host noop_vsock ↔ OpenHCL worker ↔ guest_memory 验证：
+1. noop 发 ReadGpaRequest 帧
+2. OpenHCL worker dispatch_inbound → handle_read_gpa
+3. stats.read_gpa_requests.fetch_add(1)
+4. guest_memory.read_at(0, 4) (guest 内存 @0 = bootstrap 永远 mapped)
+5. reply_dma 回 DmaCompletion 给 noop
+
+### 工件 update
+
+`openhcl-pcie-v4.bin` 取代 v3-stats / v2-grace；当前 IGVM 含全部 fix
++ worker_stats + grace period + vpci feature。
+
+### 验证清单 v2 → v4 增量
+
+| 项 | v2 | v3 | v4 |
+|---|---|---|---|
+| OpenHCL VTL2 boot + vsock listener | ✅ | ✅ | ✅ |
+| host noop handshake | ✅ | ✅ | ✅ |
+| device assemble + worker spawn | ✅ | ✅ | ✅ |
+| vmbus vpci channel publish | ✅ | ✅ | ✅ |
+| guest 检测到 VEN_1414&DEV_C0DE | ✅ | ✅ | ✅ |
+| worker_stats inspect | - | ✅ | ✅ |
+| InterruptFire host→OpenHCL→guest LAPIC | - | ✅ | ✅ |
+| ReadGpa host→OpenHCL→guest_memory→DmaCompletion | - | - | ✅ |
