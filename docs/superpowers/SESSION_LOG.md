@@ -912,3 +912,64 @@ guest Windows Server 真见到
 距离用户最初想要的"暴露 PCIe/NVMe 给 userspace"目标 ~80% 完成；
 最后 20% 是 NVMe controller 模拟正确性 debug 迭代。
 
+
+## 2026-05-30 v5 NVMe — rust-reviewer 修复批 + 实时 debug log
+
+### 修复批（commit 待 commit）
+
+应用 rust-reviewer subagent 提的 5 个修复：
+- **试 1**：tracing-subscriber 改 env_filter，default `pcie_remote_*=debug` —
+  立即能看到 driver 真实 MMIO 读写顺序
+- **B2**：`on_fetched_sqes` push 时附 monotonic `head_after_this`，dispatch_sqe
+  收到每条 SQE 的真实 head 位置（不是 batch 末尾）
+- **B3**：双 PRP NVM Read：用 PRP2 token（后完成）作 pending key，避免
+  PRP1 完成时 CQE 提前 post 导致 buffer 未写完 race
+- **C3**：doorbell write size 必须 = 4，其它尺寸忽略 + warn
+- **B1**：fetched SQE byte count mismatch → set CSTS.CFS = fatal status
+  (driver 可见而非 silent drop)
+- **D5**：connect_tcp 改 socket2 + nonblocking + async connect，不阻塞 worker
+- **试 4**：Set Features Number-of-Queues (fid=0x07) 返 cdw0 = (NSQA-1) |
+  ((NCQA-1) << 16) 告诉 driver 实际授予 queue 数
+
+### 真 Hyper-V v5 debug log（第一次看到驱动真实交互）
+
+NVMe userspace `nvme_v5.log` 启动 RUST_LOG=debug 后，捕到完整序列：
+
+```
+DEBUG MMIO read offset=0x0  size=8 value=0xa01003f      ← v4: CAP 只返低 32 位 BUG！
+DEBUG MMIO read offset=0x8  size=4 value=0x10400        ← VS = NVMe 1.4
+DEBUG MMIO read offset=0x14 size=4 value=0x0            ← CC=0
+DEBUG MMIO read offset=0x1c size=4 value=0x0            ← CSTS=0
+DEBUG MMIO write offset=0x14 size=4 value=0x0           ← CC.EN=0 confirm disable
+```
+
+**关键 BUG 发现**：driver 用 `size=8` 一次读 CAP 全部 8 字节，但 v4 的
+`mmio_read` 只 match `offset=0x00` 返回低 32 位 → driver 看到 CAP 高 32 位
+是 0 → bit 37 (CSS_NVM) = 0 → driver 判定"controller 不支持任何 command
+set" → bail。
+
+**v5 修复**：mmio_read 改 `match (offset, size)`，offset=0x00 + size=8 时
+返回完整 `self.cap`。ASQ/ACQ 同理（也是 64-bit register）。重新部署后：
+
+```
+DEBUG MMIO read offset=0x0 size=8 value=0x200a01003f    ← CAP bit 37 现在=1 ✓
+```
+
+driver 解析 CAP 正确后继续 ... 但又卡在第 5 次 MMIO event 后。下一步
+debug 起手式：
+
+1. driver 卡在 "write CC=0 后" 阶段；可能在等 MSI-X capability table /
+   PCI cfg space 某个 register 响应（不属于 MMIO 路径）
+2. 或者 driver 已 set state="device cannot start" 不再发 MMIO（CME=10）
+3. 需要 guest dmesg / Get-WinEvent 看 nvme.sys 具体错误
+
+### 当前完成度
+
+✅ SDK build clean + cross-compile (Windows + Linux)
+✅ NVMe userspace build clean + cross-compile
+✅ vsock handshake + nvme.sys 绑定 "Standard NVM Express Controller"
+✅ Debug log 暴露驱动真实交互（开发反馈循环建立）
+✅ CAP 64-bit read fix（关键 bug 已修）
+⚠️ driver 仍 stuck 在第 5 次 MMIO event 后；下次 debug 需查 cfg space /
+   MSI-X 路径
+

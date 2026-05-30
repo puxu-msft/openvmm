@@ -29,11 +29,26 @@ impl<T> TransportTrait for T where
 /// 连入 OpenVMM TCP listener（开发/CI 用，guest 在同机 KVM）。
 ///
 /// 调用方负责 retries / backoff —— 本函数失败即返 Err。
+/// 用 socket2 + nonblocking 实现 async connect，不阻塞 worker。
 pub async fn connect_tcp(driver: &impl Driver, addr: &str) -> Result<Transport> {
-    let std_stream =
-        std::net::TcpStream::connect(addr).map_err(|e| anyhow!("connect {addr}: {e}"))?;
-    std_stream.set_nonblocking(true)?;
-    let polled: PolledSocket<std::net::TcpStream> = PolledSocket::new(driver, std_stream)?;
+    use std::net::SocketAddr;
+    let socket_addr: SocketAddr = addr
+        .parse()
+        .map_err(|e| anyhow!("parse addr {addr}: {e}"))?;
+    let domain = match socket_addr {
+        SocketAddr::V4(_) => socket2::Domain::IPV4,
+        SocketAddr::V6(_) => socket2::Domain::IPV6,
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::STREAM, None)
+        .map_err(|e| anyhow!("socket2::Socket::new: {e}"))?;
+    sock.set_nonblocking(true)
+        .map_err(|e| anyhow!("set_nonblocking: {e}"))?;
+    let mut polled: PolledSocket<socket2::Socket> =
+        PolledSocket::new(driver, sock).map_err(|e| anyhow!("PolledSocket::new: {e}"))?;
+    polled
+        .connect(&socket_addr.into())
+        .await
+        .map_err(|e| anyhow!("async connect {addr}: {e}"))?;
     Ok(Box::new(polled))
 }
 

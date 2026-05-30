@@ -287,24 +287,24 @@ impl NvmeController {
     fn on_cq_head_doorbell(&mut self, cq_id: u16, new_head: u32) {
         if let Some(cq) = self.cqs.get_mut(&cq_id) {
             cq.head = new_head;
-            tracing::trace!(cq_id, new_head, "CQ head doorbell");
+            tracing::debug!(cq_id, new_head, "CQ head doorbell");
         }
     }
 
     /// Dispatch SQE 单条命令。可能立即完成（构造 CQE 发出去）或入 pending（等
-    /// PRP DMA）。
-    fn dispatch_sqe(&mut self, ctx: &mut DeviceCtx<'_>, sq_id: u16, sqe: Sqe) {
+    /// PRP DMA）。`head_after_this` = controller 已 fetch 到的下一条 SQE 位置
+    /// （CQE.sqhd 字段），由 `on_fetched_sqes` 按批内 index 单调推算给出。
+    fn dispatch_sqe(&mut self, ctx: &mut DeviceCtx<'_>, sq_id: u16, head_after_this: u16, sqe: Sqe) {
         let cid = sqe.cid();
         let opc = sqe.opcode();
         tracing::debug!(
             sq_id,
             cid,
             opc = format_args!("{:#x}", opc),
+            head_after_this,
             "dispatch SQE"
         );
-        // 当 host 完成 fetch_sqe DMA 后，head 已推进 = start_slot + count。
-        // 这里我们仅记 sq_head 给 CQE 用（driver 看 SQ head ptr）。
-        let sq_head = self.sqs.get(&sq_id).map(|s| s.head as u16).unwrap_or(0);
+        let sq_head = head_after_this;
         let cq_id = self.sqs.get(&sq_id).map(|s| s.cq_id).unwrap_or(0);
 
         let is_admin = sq_id == 0;
@@ -421,10 +421,29 @@ impl NvmeController {
                 Some(Cqe::success(cid, 0, sq_head, phase))
             }
             admin_opc::SET_FEATURES => {
-                // 简化：所有 set_features 都 success
                 let fid = (sqe.cdw10 & 0xff) as u8;
-                tracing::debug!(fid, "Set Features (no-op success)");
-                Some(Cqe::success(cid, 0, sq_head, phase))
+                // NVMe spec § 5.21.1.7 (Feature 0x07 = Number of Queues)：driver
+                // 写 cdw11 = (NSQR-1) | ((NCQR-1) << 16) 请求 queue 数；controller
+                // 在 CQE cdw0 回 (NSQA-1) | ((NCQA-1) << 16) 表示实际授予。
+                // 不响应正确 cdw0，nvme.sys 会 bail（无法决定开几个 IO queue）。
+                let mut cqe = Cqe::success(cid, 0, sq_head, phase);
+                if fid == 0x07 {
+                    // v1 仅给 1 IO SQ + 1 IO CQ；0-based。
+                    let nsqa = 0u32; // (count-1)
+                    let ncqa = 0u32;
+                    cqe.cdw0 = nsqa | (ncqa << 16);
+                    // 复制到本地变量避免 packed struct 字段取引用 UB。
+                    let req_cdw11 = sqe.cdw11;
+                    let granted_cdw0 = cqe.cdw0;
+                    tracing::info!(
+                        requested = format_args!("{:#x}", req_cdw11),
+                        granted = format_args!("{:#x}", granted_cdw0),
+                        "Set Features Number-of-Queues"
+                    );
+                } else {
+                    tracing::debug!(fid, "Set Features (no-op success)");
+                }
+                Some(cqe)
             }
             admin_opc::GET_FEATURES => {
                 let fid = (sqe.cdw10 & 0xff) as u8;
@@ -436,7 +455,7 @@ impl NvmeController {
             admin_opc::KEEP_ALIVE => Some(Cqe::success(cid, 0, sq_head, phase)),
             admin_opc::ASYNC_EVENT_REQUEST => {
                 // 不发，driver 会一直等；不返 CQE 实际上是符合 nvme.sys 期望的
-                tracing::trace!(cid, "AsyncEventRequest queued (no completion)");
+                tracing::debug!(cid, "AsyncEventRequest queued (no completion)");
                 None
             }
             admin_opc::GET_LOG_PAGE => {
@@ -503,11 +522,15 @@ impl NvmeController {
                 } else {
                     let half = NVME_PAGE_SIZE as usize;
                     let (b1, b2) = buf.split_at(half);
-                    let tok1 = ctx.dma_write(sqe.prp1, b1.to_vec());
-                    let _tok2 = ctx.dma_write(sqe.prp2, b2.to_vec());
-                    // 简化：只用 tok1 完成时 post CQE；tok2 完成会被 dropped
+                    // 双 PRP：必须保证两次 DMA 都完成后才 post CQE，否则
+                    // driver 看到 CQE 立即去读 buffer，后半段可能还在路上。
+                    // 简化做法：让 PRP2 的 DMA token 作 pending key（PRP2
+                    // 后入 outbound queue，flush 顺序后于 PRP1，对端
+                    // OpenHCL 按 FIFO 处理，PRP2 完成天然晚于 PRP1）。
+                    let _tok1 = ctx.dma_write(sqe.prp1, b1.to_vec());
+                    let tok2 = ctx.dma_write(sqe.prp2, b2.to_vec());
                     self.pending_ios.insert(
-                        tok1,
+                        tok2,
                         PendingIo {
                             sq_id, cid, sq_head, cq_id,
                             op: PendingOp::NvmReadDmaWrite,
@@ -613,24 +636,30 @@ impl NvmeController {
         };
         let expected_bytes = fctx.count as usize * SQE_BYTES as usize;
         if data.len() != expected_bytes {
-            tracing::warn!(
+            tracing::error!(
                 got = data.len(),
                 expected = expected_bytes,
-                "fetched SQE: byte count mismatch"
+                "fetched SQE: byte count mismatch; setting CSTS.CFS (fatal status)"
             );
+            // 让 driver 可见 fatal status 而不是 silent drop。
+            self.csts |= csts::CFS;
             return;
         }
         // advance SQ head（host 已 fetch 完，head = start_slot + count）。
+        let sq_size = self.sqs.get(&fctx.sq_id).map(|s| s.size).unwrap_or(1);
         if let Some(sq) = self.sqs.get_mut(&fctx.sq_id) {
             sq.head = (fctx.start_slot + fctx.count) % sq.size;
         }
-        // 拆成单条 SQE。
+        // 拆成单条 SQE，**每条带单调推进的 head_after_this**（CQE.sqhd 必须
+        // 反映 "controller 已 fetch 到的下一条 SQE 位置"；同批多条 cmd 不能
+        // 全部报 batch 末尾的 head）。
         for i in 0..fctx.count {
             let off = i as usize * SQE_BYTES as usize;
             let slice = &data[off..off + SQE_BYTES as usize];
+            let head_after_this = ((fctx.start_slot + i + 1) % sq_size) as u16;
             match Sqe::read_from_bytes(slice) {
                 Ok(sqe) => {
-                    self.sqe_inbox.push((fctx.sq_id, 0, sqe));
+                    self.sqe_inbox.push((fctx.sq_id, head_after_this, sqe));
                 }
                 Err(_) => {
                     tracing::warn!("fetched SQE: cast failed (alignment?); skipping");
@@ -669,27 +698,32 @@ impl PcieDevice for NvmeController {
         if bar != 0 {
             return 0;
         }
-        // Controller regs (0..0x1000)
-        let val = match offset {
-            0x00 => self.cap & 0xffff_ffff,
-            0x04 => self.cap >> 32,
-            0x08 => self.vs as u64,
-            0x0c => self.intms as u64,
-            0x10 => self.intmc as u64,
-            0x14 => self.cc as u64,
-            0x1c => self.csts as u64,
-            0x24 => self.aqa as u64,
-            0x28 => self.asq & 0xffff_ffff,
-            0x2c => self.asq >> 32,
-            0x30 => self.acq & 0xffff_ffff,
-            0x34 => self.acq >> 32,
-            _ if offset >= 0x1000 => 0, // doorbell reads return 0 (write-only)
+        // CAP 是 64-bit register；driver 可以一次 8 字节读全 CAP，或分两次
+        // 4 字节读 lo/hi。处理两种情况。
+        let val = match (offset, size) {
+            (0x00, 8) => self.cap,
+            (0x00, 4) => self.cap & 0xffff_ffff,
+            (0x04, 4) => self.cap >> 32,
+            (0x08, _) => self.vs as u64,
+            (0x0c, _) => self.intms as u64,
+            (0x10, _) => self.intmc as u64,
+            (0x14, _) => self.cc as u64,
+            (0x1c, _) => self.csts as u64,
+            (0x24, _) => self.aqa as u64,
+            // ASQ/ACQ 同理可 8-byte 读
+            (0x28, 8) => self.asq,
+            (0x28, 4) => self.asq & 0xffff_ffff,
+            (0x2c, 4) => self.asq >> 32,
+            (0x30, 8) => self.acq,
+            (0x30, 4) => self.acq & 0xffff_ffff,
+            (0x34, 4) => self.acq >> 32,
+            (o, _) if o >= 0x1000 => 0, // doorbell reads return 0 (write-only)
             _ => {
-                tracing::trace!(offset, size, "MMIO read: unknown offset");
+                tracing::debug!(offset, size, "MMIO read: unknown offset");
                 0
             }
         };
-        tracing::trace!(
+        tracing::debug!(
             offset = format_args!("{:#x}", offset),
             size,
             value = format_args!("{:#x}", val),
@@ -709,7 +743,7 @@ impl PcieDevice for NvmeController {
         if bar != 0 {
             return;
         }
-        tracing::trace!(
+        tracing::debug!(
             offset = format_args!("{:#x}", offset),
             size,
             value = format_args!("{:#x}", value),
@@ -734,6 +768,16 @@ impl PcieDevice for NvmeController {
                 self.acq = (self.acq & 0xffff_ffff) | (value << 32);
             }
             o if o >= 0x1000 => {
+                // doorbell 写**必须** 4 字节 access；其它尺寸视为 driver bug
+                // 直接忽略（不应该按 8/2/1 字节写 doorbell）。
+                if size != 4 {
+                    tracing::warn!(
+                        offset = format_args!("{:#x}", o),
+                        size,
+                        "doorbell write with non-4-byte size; ignored"
+                    );
+                    return;
+                }
                 if let Some((is_sq, qid)) = Self::parse_doorbell(o) {
                     if is_sq {
                         self.on_sq_tail_doorbell(ctx, qid, value as u32);
@@ -746,8 +790,8 @@ impl PcieDevice for NvmeController {
         }
         // 处理 inbox SQE（dispatch_sqe 可能 mutably borrow self → 借出再回填）
         let inbox = std::mem::take(&mut self.sqe_inbox);
-        for (sq_id, _slot, sqe) in inbox {
-            self.dispatch_sqe(ctx, sq_id, sqe);
+        for (sq_id, head, sqe) in inbox {
+            self.dispatch_sqe(ctx, sq_id, head, sqe);
         }
     }
 
@@ -778,8 +822,8 @@ impl PcieDevice for NvmeController {
             self.on_fetched_sqes(token, data);
             // 处理新入的 SQE
             let inbox = std::mem::take(&mut self.sqe_inbox);
-            for (sq_id, _slot, sqe) in inbox {
-                self.dispatch_sqe(ctx, sq_id, sqe);
+            for (sq_id, head, sqe) in inbox {
+                self.dispatch_sqe(ctx, sq_id, head, sqe);
             }
             return;
         }
@@ -819,6 +863,6 @@ impl PcieDevice for NvmeController {
             }
             return;
         }
-        tracing::trace!(token, "DMA completion for unknown token (likely 2nd PRP)");
+        tracing::debug!(token, "DMA completion for unknown token (likely 2nd PRP)");
     }
 }

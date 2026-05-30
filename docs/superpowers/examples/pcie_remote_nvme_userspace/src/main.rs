@@ -79,7 +79,11 @@ fn main() -> Result<()> {
 }
 
 fn run_main(args: Args) -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // 默认开 device + SDK debug log；用户可用 RUST_LOG 覆盖。
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        "pcie_remote_nvme_userspace=debug,pcie_remote_userspace_sdk=debug,info".into()
+    });
+    tracing_subscriber::fmt().with_env_filter(filter).init();
     pal_async::DefaultPool::run_with(|driver| async move {
         tracing::info!(
             backing_file = %args.backing_file,
