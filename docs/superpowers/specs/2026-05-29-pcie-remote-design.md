@@ -285,7 +285,7 @@ message CfgAccess { uint32 offset = 1; uint32 size = 2; uint32 value = 3; }
 message InterruptFire { uint32 msix_index = 1; }
 message ReadGpaRequest  { uint64 token = 1; uint64 gpa = 2; uint32 len = 3; }  // len ≤ 64 KiB
 message WriteGpaRequest { uint64 token = 1; uint64 gpa = 2; bytes data = 3; } // data ≤ 64 KiB
-message DmaCompletion   { uint64 token = 1; bool ok = 2; bytes data = 3; }
+message DmaCompletion   { uint64 token = 1; bool ok = 2; bytes data = 3; } // data ≤ 64 KiB (MAX_DMA_BYTES)
 message Reset           { uint32 kind = 1; }
 ```
 
