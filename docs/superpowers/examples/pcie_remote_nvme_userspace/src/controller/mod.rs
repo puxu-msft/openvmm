@@ -60,6 +60,17 @@ pub(super) enum PendingOp {
     NvmWriteDualPrp { op_id: u64, is_prp1: bool },
     /// 等 DMA-write 数据到 PRP1 完成 → success CQE。(在 NVM Read 路径)
     NvmReadDmaWrite,
+    /// **Phase E** — NVM Write with PRP list (> 2 page)。
+    /// Step 1: DMA-read PRP list page itself（4 KiB u64 数组）。
+    NvmWritePrpListFetch { op_id: u64 },
+    /// **Phase E** — NVM Write with PRP list, Step 2: per-page data DMA-read。
+    /// `page_idx` 是 PRP 中第几个数据页（PRP1=0，PRP list[0]=1，list[1]=2，…）。
+    NvmWritePrpListData { op_id: u64, page_idx: u32 },
+    /// **Phase E** — NVM Read with PRP list, Step 1: fetch PRP list 数组本身。
+    NvmReadPrpListFetch { op_id: u64 },
+    /// **Phase E** — NVM Read with PRP list, Step 2: per-page data DMA-write。
+    /// `page_idx` 是 PRP 中第几个数据页。
+    NvmReadPrpListData { op_id: u64, page_idx: u32 },
 }
 
 /// 双 PRP Write 累积：两段 DMA-read 任一先到都填到 prp1_data/prp2_data；
@@ -76,6 +87,45 @@ pub(super) struct WriteAccum {
     num_blocks: u32,
     prp1_data: Option<Vec<u8>>,
     prp2_data: Option<Vec<u8>>,
+}
+
+/// **Phase E** — PRP-list IO 累积（Write 或 Read，> 2 page）。
+///
+/// NVMe spec § 4.4 PRP layout：当 transfer > 2 page，PRP1 = 第一页，
+/// PRP2 = 指向 PRP list 页（4 KiB，512 个 u64 page pointer）。
+///
+/// 状态机：
+/// 1. dispatch_io 入口：分配 op_id + 入 prp_list_ops；DMA-read PRP1
+///    （writes：fetch data 到 prp1_data）/ dma_write PRP1（reads：从
+///    backing 读 data DMA 到 host）。同时 DMA-read PRP list 页本身。
+/// 2. PRP list 到达：parse u64 数组，存 list_entries；分别 issue 每页
+///    sub-DMA。
+/// 3. 每页 sub-DMA 完成：填 data_pages[idx]；全部到齐 →（Write）合并
+///    写文件 / （Read）只需 ack done。
+/// 4. 全部 sub-DMA 完成 → post CQE。
+pub(super) struct PrpListOp {
+    pub(super) sq_id: u16,
+    pub(super) cid: u16,
+    pub(super) sq_head: u16,
+    pub(super) cq_id: u16,
+    pub(super) lba: u64,
+    pub(super) num_blocks: u32,
+    /// true = Write (host→device data flow)；false = Read。
+    /// 暂未读取（PendingOp 变体已区分 read/write 路径），保留供未来
+    /// fault-injection 测试 / 真错误路径区分。
+    #[allow(dead_code)]
+    pub(super) is_write: bool,
+    /// PRP1 GPA — Read 路径 step-2 需要 dma_write 数据回 PRP1。
+    pub(super) prp1_gpa: u64,
+    /// PRP list 页本身的数据（512 个 u64 GPA pointer），lazy 填充。
+    pub(super) list_entries: Option<Vec<u64>>,
+    /// 总共多少数据页（PRP1 + PRP list 中条目）。
+    pub(super) total_pages: u32,
+    /// 已完成的数据 sub-DMA 数。
+    pub(super) pages_done: u32,
+    /// （仅 Write）每页 data buffer，filled by sub-DMA-read 完成。
+    /// 索引 0 = PRP1 数据；1..N = PRP list[0..N-1] 数据。
+    pub(super) data_pages: Vec<Option<Vec<u8>>>,
 }
 
 /// NVMe Controller 主结构 — 实现 `PcieDevice`。
@@ -113,6 +163,8 @@ pub struct NvmeController {
     dual_prp_writes: HashMap<u64, WriteAccum>,
     /// 双 PRP Write 的 op_id 计数器。
     next_op_id: u64,
+    /// **Phase E** — PRP-list IO 累积（Write/Read > 2 page）。
+    pub(super) prp_list_ops: HashMap<u64, PrpListOp>,
     /// 待 dispatch 的 SQE 队列（按 FIFO 顺序），dispatch 是 sync 逻辑但
     /// 触发 DMA 后异步完成。
     sqe_inbox: Vec<(u16, u16, Sqe)>, // (sq_id, sq_head_after_fetch, sqe)
@@ -170,6 +222,7 @@ impl NvmeController {
             pending_ios: HashMap::new(),
             dual_prp_writes: HashMap::new(),
             next_op_id: 1,
+            prp_list_ops: HashMap::new(),
             sqe_inbox: Vec::new(),
             vid,
             ssvid,
@@ -238,6 +291,7 @@ impl NvmeController {
         self.pending_fetches.clear();
         self.pending_ios.clear();
         self.dual_prp_writes.clear();
+        self.prp_list_ops.clear();
         self.sqe_inbox.clear();
         self.state = CtrlState::Disabled;
         self.csts &= !csts::RDY;
@@ -384,6 +438,14 @@ impl NvmeController {
     // dispatch_admin moved to controller/admin.rs (H6 reviewer split)
 
     // dispatch_io moved to controller/io.rs (H6 split)
+
+    /// 分配单调递增的 op_id（独立于 SDK DMA token），用于关联多段
+    /// DMA 完成回调（双 PRP / PRP list 等）。
+    pub(super) fn alloc_op_id(&mut self) -> u64 {
+        let id = self.next_op_id;
+        self.next_op_id = self.next_op_id.wrapping_add(1);
+        id
+    }
 
     /// **Phase C** — Log Page 0x01 Error Information Log。
     ///
@@ -802,9 +864,239 @@ impl PcieDevice for NvmeController {
                         self.post_cqe(ctx, accum.cq_id, cqe);
                     }
                 }
+                PendingOp::NvmWritePrpListFetch { op_id } => {
+                    // **Phase E**：PRP list 页 (4 KiB = 512 个 u64) 到达。
+                    // Parse 后为 list 中每个 entry dispatch 一个 sub-DMA
+                    // (dma_read 数据页到 controller)。
+                    let entries = parse_prp_list(&data);
+                    let needed: Option<(u32, Vec<u64>)> = self
+                        .prp_list_ops
+                        .get_mut(&op_id)
+                        .map(|op| (op.total_pages, entries.clone()))
+                        .map(|(tot, ent)| {
+                            let take = (tot - 1) as usize; // PRP1 已 dispatch
+                            (tot, ent.into_iter().take(take).collect())
+                        });
+                    let Some((total_pages, list)) = needed else {
+                        tracing::warn!(op_id, "PRP list fetch for unknown op_id");
+                        return;
+                    };
+                    if let Some(op) = self.prp_list_ops.get_mut(&op_id) {
+                        op.list_entries = Some(list.clone());
+                    }
+                    // Issue sub-DMA reads for each list entry (page_idx 1..total)
+                    for (i, gpa) in list.iter().enumerate() {
+                        let page_idx = (i + 1) as u32;
+                        let want_bytes = if page_idx == total_pages - 1 {
+                            // 末页可能不满 4 KiB
+                            let total_bytes =
+                                self.prp_list_ops[&op_id].num_blocks as u64 * SECTOR_SIZE;
+                            let last = total_bytes - (page_idx as u64) * NVME_PAGE_SIZE;
+                            last as u32
+                        } else {
+                            NVME_PAGE_SIZE as u32
+                        };
+                        let tok = ctx.dma_read(*gpa, want_bytes);
+                        // 借用 PendingIo 共用字段 sq_id/cid/sq_head/cq_id
+                        let (sq_id, cid, sq_head, cq_id) = {
+                            let op = &self.prp_list_ops[&op_id];
+                            (op.sq_id, op.cid, op.sq_head, op.cq_id)
+                        };
+                        self.pending_ios.insert(
+                            tok,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                op: PendingOp::NvmWritePrpListData { op_id, page_idx },
+                            },
+                        );
+                    }
+                }
+                PendingOp::NvmWritePrpListData { op_id, page_idx } => {
+                    // **Phase E**：单个数据页 DMA-read 到达。填入 data_pages，
+                    // 全部齐 → 合并写文件 → CQE。
+                    let done_all = if let Some(op) = self.prp_list_ops.get_mut(&op_id) {
+                        op.data_pages[page_idx as usize] = Some(data);
+                        op.pages_done += 1;
+                        op.pages_done == op.total_pages
+                    } else {
+                        tracing::warn!(op_id, page_idx, "PRP list data completion unknown");
+                        false
+                    };
+                    if done_all {
+                        let op = self.prp_list_ops.remove(&op_id).unwrap();
+                        // 合并 data_pages → 一段连续 buffer
+                        let total_bytes = op.num_blocks as u64 * SECTOR_SIZE;
+                        let mut full = Vec::with_capacity(total_bytes as usize);
+                        for page in op.data_pages.iter() {
+                            if let Some(b) = page {
+                                full.extend_from_slice(b);
+                            } else {
+                                tracing::warn!(op_id, "PRP list page missing on complete");
+                            }
+                        }
+                        full.truncate(total_bytes as usize);
+                        tracing::debug!(
+                            op_id,
+                            lba = op.lba,
+                            num_blocks = op.num_blocks,
+                            full_len = full.len(),
+                            "NVM Write PRP-list: all pages ready, writing"
+                        );
+                        let res = self
+                            .file
+                            .seek(SeekFrom::Start(op.lba * SECTOR_SIZE))
+                            .and_then(|_| self.file.write_all(&full));
+                        let cq = self.cqs.get(&op.cq_id);
+                        let phase = cq.map(|c| c.phase).unwrap_or(1);
+                        let cqe = match res {
+                            Ok(()) => Cqe::success(op.cid, op.sq_id, op.sq_head, phase),
+                            Err(e) => {
+                                tracing::warn!(error = %e, lba = op.lba, "PRP-list write failed");
+                                Cqe::error(
+                                    op.cid,
+                                    op.sq_id,
+                                    op.sq_head,
+                                    phase,
+                                    sc::DATA_TRANSFER_ERROR,
+                                    0,
+                                )
+                            }
+                        };
+                        self.post_cqe(ctx, op.cq_id, cqe);
+                    }
+                }
+                PendingOp::NvmReadPrpListFetch { op_id } => {
+                    // PRP list 页到达 (Read 路径)。Parse + 把 backing file
+                    // 数据 dma_write 到 PRP1 + list 中每个 GPA 页。
+                    let entries = parse_prp_list(&data);
+                    // PRP list 解析结果 + 当前 op 关键字段 — 提取出来一次性
+                    // 取走（避免后续多次借 self）。
+                    type ReadPrpListInfo = (u32, u64, u32, u64, Vec<u64>, Vec<u8>);
+                    let info: Option<ReadPrpListInfo> =
+                        self.prp_list_ops.get_mut(&op_id).map(|op| {
+                            let take = (op.total_pages - 1) as usize;
+                            let list: Vec<u64> = entries.into_iter().take(take).collect();
+                            // PRP1 数据已在 dispatch_io 时读入 data_pages[0]
+                            let prp1_buf = op.data_pages[0]
+                                .take()
+                                .unwrap_or_else(|| vec![0u8; NVME_PAGE_SIZE as usize]);
+                            (
+                                op.total_pages,
+                                op.lba,
+                                op.num_blocks,
+                                op.prp1_gpa,
+                                list,
+                                prp1_buf,
+                            )
+                        });
+                    let Some((total_pages, lba, nlb, prp1_gpa, list, prp1_buf)) = info else {
+                        tracing::warn!(op_id, "ReadPrpListFetch unknown op_id");
+                        return;
+                    };
+                    if let Some(op) = self.prp_list_ops.get_mut(&op_id) {
+                        op.list_entries = Some(list.clone());
+                    }
+                    let (sq_id, cid, sq_head, cq_id) = {
+                        let op = &self.prp_list_ops[&op_id];
+                        (op.sq_id, op.cid, op.sq_head, op.cq_id)
+                    };
+                    // **Step 2a**: dma_write PRP1 数据（page idx 0）。
+                    // 注：dispatch_io Read 分支已把 file→buf 读入 prp1_buf
+                    // 缓存在 data_pages[0]，这里发起 dma_write。完成回调
+                    // (PendingOp::NvmReadPrpListData{op_id, page_idx:0}) +
+                    // 其它 list 页完成回调汇总后 post CQE。
+                    let tok_prp1 = ctx.dma_write(prp1_gpa, prp1_buf);
+                    self.pending_ios.insert(
+                        tok_prp1,
+                        PendingIo {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            op: PendingOp::NvmReadPrpListData { op_id, page_idx: 0 },
+                        },
+                    );
+                    // **Step 2b**: 读 backing file 剩余页，dma_write 到 list GPA。
+                    let total_bytes = nlb as u64 * SECTOR_SIZE;
+                    for (i, gpa) in list.iter().enumerate() {
+                        let page_idx = (i + 1) as u32;
+                        let page_off = page_idx as u64 * NVME_PAGE_SIZE;
+                        let page_bytes = (total_bytes - page_off).min(NVME_PAGE_SIZE) as usize;
+                        let mut buf = vec![0u8; page_bytes];
+                        if let Err(e) = self
+                            .file
+                            .seek(SeekFrom::Start(lba * SECTOR_SIZE + page_off))
+                            .and_then(|_| std::io::Read::read_exact(&mut self.file, &mut buf))
+                        {
+                            tracing::warn!(error = %e, op_id, page_idx, "ReadPrpList file read failed");
+                            let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+                            let cqe =
+                                Cqe::error(cid, sq_id, sq_head, phase, sc::DATA_TRANSFER_ERROR, 0);
+                            self.prp_list_ops.remove(&op_id);
+                            self.post_cqe(ctx, cq_id, cqe);
+                            return;
+                        }
+                        let tok = ctx.dma_write(*gpa, buf);
+                        self.pending_ios.insert(
+                            tok,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                op: PendingOp::NvmReadPrpListData { op_id, page_idx },
+                            },
+                        );
+                    }
+                    let _ = total_pages; // 文档可读性
+                }
+                PendingOp::NvmReadPrpListData { op_id, page_idx } => {
+                    // 一个数据页 dma_write 完成（PRP1 或 list 中某页）。
+                    let done_all = if let Some(op) = self.prp_list_ops.get_mut(&op_id) {
+                        op.pages_done += 1;
+                        // Read 路径：PRP1 + list 中 (total_pages-1) 个 = total_pages 个 dma_write。
+                        op.pages_done >= op.total_pages
+                    } else {
+                        tracing::warn!(op_id, page_idx, "ReadPrpListData unknown op_id");
+                        false
+                    };
+                    let _ = data; // Read dma_write 完成 data 为空
+                    if done_all {
+                        let op = self.prp_list_ops.remove(&op_id).unwrap();
+                        tracing::debug!(
+                            op_id,
+                            lba = op.lba,
+                            num_blocks = op.num_blocks,
+                            "NVM Read PRP-list: all pages dma'd, posting CQE"
+                        );
+                        let cq = self.cqs.get(&op.cq_id);
+                        let phase = cq.map(|c| c.phase).unwrap_or(1);
+                        let cqe = Cqe::success(op.cid, op.sq_id, op.sq_head, phase);
+                        self.post_cqe(ctx, op.cq_id, cqe);
+                    }
+                }
             }
             return;
         }
         tracing::debug!(token, "DMA completion for unknown token (likely 2nd PRP)");
     }
+}
+
+/// Parse a PRP list page (4 KiB = 512 u64 entries) into Vec<u64>。
+/// 尾部全零 entry 视为终止。Phase E v1 不处理 list chaining（最后一个
+/// entry == 下一个 PRP list 页指针）；MDTS=5 = 32 page 远小于 1 page list
+/// 容量（512 entry），暂不会触发。
+fn parse_prp_list(data: &[u8]) -> Vec<u64> {
+    let mut out = Vec::new();
+    for chunk in data.chunks_exact(8) {
+        let v = u64::from_le_bytes(chunk.try_into().unwrap());
+        if v == 0 {
+            break;
+        }
+        out.push(v);
+    }
+    out
 }

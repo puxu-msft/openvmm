@@ -82,7 +82,10 @@ impl NvmeController {
                         0,
                     ));
                 }
-                // DMA write to PRP1（v1：bytes ≤ 8 KiB = 2 page = PRP1 + PRP2）
+                // 三档 PRP 分流（NVMe spec § 4.4）：
+                //   ≤ 1 page (4 KiB)：单 PRP1
+                //   ≤ 2 page (8 KiB)：PRP1 + PRP2 直接指针
+                //   > 2 page (≤ MDTS)：PRP1 + PRP2 指向 PRP list 页
                 if bytes <= NVME_PAGE_SIZE {
                     let tok = ctx.dma_write(prp1, buf);
                     self.pending_ios.insert(
@@ -95,7 +98,7 @@ impl NvmeController {
                             op: PendingOp::NvmReadDmaWrite,
                         },
                     );
-                } else {
+                } else if bytes <= 2 * NVME_PAGE_SIZE {
                     let half = NVME_PAGE_SIZE as usize;
                     let (b1, b2) = buf.split_at(half);
                     let _tok1 = ctx.dma_write(prp1, b1.to_vec());
@@ -108,6 +111,41 @@ impl NvmeController {
                             sq_head,
                             cq_id,
                             op: PendingOp::NvmReadDmaWrite,
+                        },
+                    );
+                } else {
+                    // **Phase E** — PRP list path (Read > 2 page)。
+                    // 1) DMA-read PRP list page (PRP2 指向)，4 KiB 含
+                    //    (total_pages-1) 个 u64 entry。
+                    // 2) list 到达后：写 PRP1 + 各 list page。
+                    let total_pages = bytes.div_ceil(NVME_PAGE_SIZE) as u32;
+                    let op_id = self.alloc_op_id();
+                    self.prp_list_ops.insert(
+                        op_id,
+                        crate::controller::PrpListOp {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            lba: slba,
+                            num_blocks: nlb,
+                            is_write: false,
+                            prp1_gpa: prp1,
+                            list_entries: None,
+                            total_pages,
+                            pages_done: 0,
+                            data_pages: vec![Some(buf)], // PRP1 数据已就绪
+                        },
+                    );
+                    let tok = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+                    self.pending_ios.insert(
+                        tok,
+                        PendingIo {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            op: PendingOp::NvmReadPrpListFetch { op_id },
                         },
                     );
                 }
@@ -148,7 +186,7 @@ impl NvmeController {
                         ));
                     }
                 }
-                // DMA read from PRP1 (+ 可选 PRP2)
+                // 三档 PRP 分流（同 READ 路径）：≤1page / ≤2page / PRP list。
                 if bytes <= NVME_PAGE_SIZE {
                     let tok = ctx.dma_read(prp1, bytes as u32);
                     self.pending_ios.insert(
@@ -164,7 +202,7 @@ impl NvmeController {
                             },
                         },
                     );
-                } else {
+                } else if bytes <= 2 * NVME_PAGE_SIZE {
                     // 双 PRP：PRP1 = 第一页 (4 KiB)，PRP2 = 第二页（最多 4 KiB）。
                     // 分配独立 op_id，PRP1/PRP2 完成回调通过 op_id 关联 ——
                     // 解决 PRP2 先到 PRP1 的乱序数据损坏 + leak 问题（C1）。
@@ -210,6 +248,59 @@ impl NvmeController {
                                 op_id,
                                 is_prp1: false,
                             },
+                        },
+                    );
+                } else {
+                    // **Phase E** — PRP list path (Write > 2 page)。
+                    // Step 1: 同时 DMA-read PRP1 数据 + PRP list 页。
+                    // Step 2: PRP list 到达后解析 + dma_read 每个 list 中数据页。
+                    // Step 3: 所有数据页齐 → 合并写文件 → CQE。
+                    let total_pages = bytes.div_ceil(NVME_PAGE_SIZE) as u32;
+                    let op_id = self.alloc_op_id();
+                    let mut data_pages: Vec<Option<Vec<u8>>> =
+                        Vec::with_capacity(total_pages as usize);
+                    for _ in 0..total_pages {
+                        data_pages.push(None);
+                    }
+                    self.prp_list_ops.insert(
+                        op_id,
+                        crate::controller::PrpListOp {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            lba: slba,
+                            num_blocks: nlb,
+                            is_write: true,
+                            prp1_gpa: prp1,
+                            list_entries: None,
+                            total_pages,
+                            pages_done: 0,
+                            data_pages,
+                        },
+                    );
+                    // 先 fetch PRP list 页本身
+                    let tok_list = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+                    self.pending_ios.insert(
+                        tok_list,
+                        PendingIo {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            op: PendingOp::NvmWritePrpListFetch { op_id },
+                        },
+                    );
+                    // 同时 fetch PRP1 数据页（页 idx 0）
+                    let tok_prp1 = ctx.dma_read(prp1, NVME_PAGE_SIZE as u32);
+                    self.pending_ios.insert(
+                        tok_prp1,
+                        PendingIo {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            op: PendingOp::NvmWritePrpListData { op_id, page_idx: 0 },
                         },
                     );
                 }

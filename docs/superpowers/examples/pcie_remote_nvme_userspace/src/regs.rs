@@ -20,10 +20,11 @@ pub const BAR0_SIZE: u64 = 8 * 1024;
 pub const NVME_PAGE_SHIFT: u32 = 12;
 pub const NVME_PAGE_SIZE: u64 = 1 << NVME_PAGE_SHIFT;
 
-/// MDTS = 1 → 单 cmd 最大 transfer = 2^1 = 2 page = 8 KiB。便于 v1 只
-/// 用 PRP1 + PRP2 两个指针，跳过 PRP list 解析。Windows nvme.sys 会按此
-/// 拆大 IO 为多 cmd。8 KiB < MAX_DMA_BYTES(64 KiB) 单次 DMA 可完成。
-pub const MDTS_PAGES_LOG2: u8 = 1;
+/// MDTS = 5 → 单 cmd 最大 transfer = 2^5 = 32 page = 128 KiB（Phase E
+/// 完成 PRP list 后启用）。NVMe 2.0c § 5.17.2.2 MDTS 是 log2 of max
+/// data transfer in MPSMIN units。Windows nvme.sys 会按此拆大 IO 为
+/// 多 cmd。
+pub const MDTS_PAGES_LOG2: u8 = 5;
 pub const MDTS_MAX_BYTES: u64 = NVME_PAGE_SIZE << MDTS_PAGES_LOG2 as u64;
 
 /// Admin / IO SQE / CQE 大小（NVMe spec 1.4 固定）。

@@ -286,10 +286,13 @@ impl IdentifyController {
         id.sn = ascii_padded::<20>(b"PCIE-REMOTE-USRSPACE");
         id.mn = ascii_padded::<40>(b"OpenHCL Userspace NVMe v2.0");
         id.fr = ascii_padded::<8>(b"v2.0    ");
-        // MDTS = 2 → max transfer = 2^2 * MPSMIN(4 KiB) = 16 KiB；
-        // 与现 dual-PRP (≤ 8 KiB) 兼容（driver 自觉拆 ≤ MDTS）；
-        // Phase E PRP list 完成后可放宽。
-        id.mdts = 2;
+        // MDTS = 5 → max single transfer = 2^5 * MPSMIN(4 KiB) = 128 KiB。
+        // Phase E 实现 PRP list (NVMe spec § 4.4) 后支持 > 2 page IO：
+        //   ≤ 1 page: 单 PRP1
+        //   ≤ 2 page: PRP1 + PRP2 直接指针
+        //   > 2 page: PRP2 指向 PRP list（u64 数组，1 page=512 entry）
+        // 128 KiB = 32 page 远小于单 PRP list 容量。
+        id.mdts = 5;
         id.cntlid = 1;
         id.ver = NVME_VERSION_2_0;
         id.cntrltype = nvme_spec::ControllerType::IO_CONTROLLER;
