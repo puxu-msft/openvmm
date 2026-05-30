@@ -130,6 +130,7 @@ async fn serve(
     use pcie_remote_protocol::InterruptFire;
     use pcie_remote_protocol::ReadGpaRequest;
     use pcie_remote_protocol::ToOpenhcl as OpenhclMsg;
+    use pcie_remote_protocol::WriteGpaRequest;
     use pcie_remote_protocol::to_openhcl::Body as OpenhclBody2;
     use std::time::Duration;
 
@@ -264,6 +265,29 @@ async fn serve(
                         "periodic ReadGpa gpa=0 len=4 → guest memory DMA"
                     );
                     codec::write_frame(&mut polled, &read_gpa).await?;
+                }
+
+                // 每 4 次 timer tick 发一次 WriteGpa（gpa=0x1000，写 4 字节 pattern）。
+                // gpa=0x1000 通常在 RAM 内（避开 0..0x1000 IVT 区）；写出去的
+                // 数据 noop 不验证—我们只看 worker stats.write_gpa_requests 递增。
+                if fire_count.is_multiple_of(4) {
+                    let token = 1_000_000 + fire_count;
+                    let dma_seq = next_int_seq;
+                    next_int_seq = next_int_seq.wrapping_add(1);
+                    let pattern = (fire_count as u32).to_le_bytes();
+                    let write_gpa = OpenhclMsg {
+                        seq: dma_seq,
+                        body: Some(OpenhclBody2::WriteGpa(WriteGpaRequest {
+                            token,
+                            gpa: 0x1000,
+                            data: pattern.to_vec(),
+                        })),
+                    };
+                    tracing::info!(
+                        token, dma_seq,
+                        "periodic WriteGpa gpa=0x1000 len=4 → guest memory DMA write"
+                    );
+                    codec::write_frame(&mut polled, &write_gpa).await?;
                 }
             }
         }
