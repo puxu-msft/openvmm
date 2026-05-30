@@ -95,7 +95,7 @@ impl NvmeController {
                             cid,
                             sq_head,
                             cq_id,
-                            op: PendingOp::NvmReadDmaWrite,
+                            op: PendingOp::NvmReadDmaWrite { num_blocks: nlb },
                         },
                     );
                 } else if bytes <= 2 * NVME_PAGE_SIZE {
@@ -110,7 +110,7 @@ impl NvmeController {
                             cid,
                             sq_head,
                             cq_id,
-                            op: PendingOp::NvmReadDmaWrite,
+                            op: PendingOp::NvmReadDmaWrite { num_blocks: nlb },
                         },
                     );
                 } else {

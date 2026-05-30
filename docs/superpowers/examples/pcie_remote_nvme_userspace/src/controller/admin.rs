@@ -182,8 +182,23 @@ impl NvmeController {
             }
             admin_opc::KEEP_ALIVE => Some(Cqe::success(cid, 0, sq_head, phase)),
             admin_opc::ASYNC_EVENT_REQUEST => {
-                // 不发，driver 会一直等；不返 CQE 实际上是符合 nvme.sys 期望的
-                tracing::debug!(cid, "AsyncEventRequest queued (no completion)");
+                // **Phase F** — NVMe spec § 5.2 Async Event Request。Driver
+                // 提交此命令后 controller 必须挂起（不立即返 CQE）；当任意
+                // 异步事件触发时（health critical、namespace change、log
+                // page available 等），controller 从挂起队列弹一条 AER 并
+                // 用 CQE.cdw0 编码事件类型/info/log page id 完成它。
+                //
+                // 设计选择：用 VecDeque 队列；驱动通常会预投 4 个 AER
+                // 让 controller 缓冲事件突发（Identify Controller AERL+1 个）。
+                // 暂未触发实际事件 → AER 永挂；在 disable() 清空。未来
+                // 加 fire_namespace_changed / fire_log_available 等时会调
+                // self.fire_aen()。
+                self.aen_pending.push_back((cid, 0, sq_head, cq_id));
+                tracing::debug!(
+                    cid,
+                    queued = self.aen_pending.len(),
+                    "AsyncEventRequest queued (Phase F: real queue, fire on event)"
+                );
                 None
             }
             admin_opc::GET_LOG_PAGE => {

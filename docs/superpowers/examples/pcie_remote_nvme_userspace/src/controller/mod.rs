@@ -58,8 +58,11 @@ pub(super) enum PendingOp {
     /// 两段都到了就触发 dispatch_dual_prp。**op_id 与 PRP2 共用**：靠
     /// `dual_prp_writes[op_id]` 中的状态决定何时写盘 + 发 CQE。
     NvmWriteDualPrp { op_id: u64, is_prp1: bool },
-    /// 等 DMA-write 数据到 PRP1 完成 → success CQE。(在 NVM Read 路径)
-    NvmReadDmaWrite,
+    /// 等 DMA-write 数据到 PRP1 完成 → success CQE。
+    /// （NVM Read 路径 + Admin Identify / Get Log Page 共用入口）
+    /// `num_blocks` = NVM Read 时 LBA 数；admin（Identify/Log）= 0，
+    /// 用于 SMART 统计区分（Phase F：只算真 IO，不算 admin 元数据）。
+    NvmReadDmaWrite { num_blocks: u32 },
     /// **Phase E** — NVM Write with PRP list (> 2 page)。
     /// Step 1: DMA-read PRP list page itself（4 KiB u64 数组）。
     NvmWritePrpListFetch { op_id: u64 },
@@ -169,6 +172,27 @@ pub struct NvmeController {
     /// 触发 DMA 后异步完成。
     sqe_inbox: Vec<(u16, u16, Sqe)>, // (sq_id, sq_head_after_fetch, sqe)
 
+    // ----- Phase F: SMART 统计 -----
+    /// 累计完成的 host 读命令数。
+    pub(super) stat_host_reads: u64,
+    /// 累计完成的 host 写命令数。
+    pub(super) stat_host_writes: u64,
+    /// 累计读 LBA 数（512B 单位）。SMART log data_units_read 单位是
+    /// 1000 × 512B sectors，发送时做除法换算。
+    pub(super) stat_lba_read: u64,
+    /// 累计写 LBA 数。
+    pub(super) stat_lba_written: u64,
+    /// Power-on 时刻（构造时记一次），SMART log 用作 power_on_hours。
+    pub(super) power_on_instant: std::time::Instant,
+    /// 累计错误命令数（CQE 携 non-zero status code 即计数）。
+    pub(super) stat_num_err_log_entries: u64,
+
+    // ----- Phase F: AEN (Async Event Notification) -----
+    /// AsyncEventRequest 已收到、待 fire 的 CID/SQ context FIFO。
+    /// 当有事件触发时弹一条，构造 CQE 带 event info → post 到 admin CQ。
+    /// 元组：(cid, sq_id, sq_head, cq_id)。
+    pub(super) aen_pending: std::collections::VecDeque<(u16, u16, u16, u16)>,
+
     // ----- 配置 -----
     vid: u16,
     ssvid: u16,
@@ -224,6 +248,13 @@ impl NvmeController {
             next_op_id: 1,
             prp_list_ops: HashMap::new(),
             sqe_inbox: Vec::new(),
+            stat_host_reads: 0,
+            stat_host_writes: 0,
+            stat_lba_read: 0,
+            stat_lba_written: 0,
+            power_on_instant: std::time::Instant::now(),
+            stat_num_err_log_entries: 0,
+            aen_pending: std::collections::VecDeque::new(),
             vid,
             ssvid,
             msix_count: 4, // admin (vec 0) + IO (vec 1) + 2 spare
@@ -293,6 +324,8 @@ impl NvmeController {
         self.dual_prp_writes.clear();
         self.prp_list_ops.clear();
         self.sqe_inbox.clear();
+        // AEN queue 跨 reset 不保留 (NVMe spec § 5.2 "Implicit Aborts on Reset")
+        self.aen_pending.clear();
         self.state = CtrlState::Disabled;
         self.csts &= !csts::RDY;
     }
@@ -447,6 +480,48 @@ impl NvmeController {
         id
     }
 
+    /// **Phase F** — 触发 AEN (Async Event Notification)。
+    ///
+    /// NVMe spec § 5.2：当 controller 发生 async 事件（health critical /
+    /// namespace change / log page available / firmware activate），从
+    /// 之前 driver 投入的 AsyncEventRequest pending 队列弹一条 (cid, sq,
+    /// head, cq)，构造 CQE 携 cdw0 = `[type:8 | info:8 | log_id:8 | rsvd:8]`，
+    /// post 到对应 CQ + raise interrupt。Driver 看到 CQE 后会读对应 log
+    /// page，然后再投新的 AER。
+    ///
+    /// 当前没有自然事件源（无温度传感器/无 namespace 添加），此函数提
+    /// 供基础设施 + tests 用；外部代码可调 `fire_aen(0x02, 0x00, 0x02)`
+    /// 模拟 SMART critical。返 true = AER 已 fire；false = 无 pending AER
+    /// 可弹（事件丢弃 — driver 下次投 AER 不会重发，与真硬件一致）。
+    #[allow(dead_code)]
+    pub(super) fn fire_aen(
+        &mut self,
+        ctx: &mut DeviceCtx<'_>,
+        aen_type: u8,
+        aen_info: u8,
+        log_id: u8,
+    ) -> bool {
+        let Some((cid, sq_id, sq_head, cq_id)) = self.aen_pending.pop_front() else {
+            tracing::debug!(
+                aen_type,
+                aen_info,
+                log_id,
+                "fire_aen: no pending AER, event dropped"
+            );
+            return false;
+        };
+        let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+        let mut cqe = Cqe::success(cid, sq_id, sq_head, phase);
+        // spec § 5.2 CDW0 layout: bits 2:0 = Async Event Type, bits 15:8 =
+        // Async Event Info, bits 23:16 = Log Page Identifier。
+        cqe.cdw0 = (aen_type as u32 & 0x7) | ((aen_info as u32) << 8) | ((log_id as u32) << 16);
+        // 复制 packed 字段到本地变量再 fmt（packed struct field 取引用 UB）。
+        let cdw0_local = cqe.cdw0;
+        tracing::info!(cid, cdw0 = format_args!("{:#x}", cdw0_local), "AEN: firing");
+        self.post_cqe(ctx, cq_id, cqe);
+        true
+    }
+
     /// **Phase C** — Log Page 0x01 Error Information Log。
     ///
     /// NVMe spec § 5.16.1.1。每个 entry 64 字节，含 Error Count / SQID /
@@ -462,14 +537,15 @@ impl NvmeController {
         buf
     }
 
-    /// **Phase C** — Log Page 0x02 SMART / Health Information。
+    /// **Phase C/F** — Log Page 0x02 SMART / Health Information。
     ///
-    /// NVMe spec § 5.16.1.2，512 字节固定。我们填合理 placeholder：
-    /// - critical_warning = 0（无温度/可靠性告警）
-    /// - composite_temp = 313 K = 40 °C（合理常温）
-    /// - available_spare = 100 / available_spare_threshold = 10
-    /// - percentage_used = 0
-    /// - host_read/write_commands / data_units_read/written 可后续真追踪
+    /// NVMe spec § 5.16.1.2，512 字节固定。Phase F：填入真追踪的
+    /// counters（host_read_commands / host_write_commands / data_units_*
+    /// / power_on_hours / num_err_log_entries），其余字段保持合理常量。
+    ///
+    /// data_units_read/written 单位：spec 定义为 "1000 × 512B sectors"
+    /// 的累计数，即 `lba_count / 1000`，向下取整。当 lba_count < 1000
+    /// 时回报 0（spec 允许，driver 不会因此告警）。
     fn build_smart_health_log(&self, bytes: usize) -> Vec<u8> {
         let mut buf = vec![0u8; bytes.max(512)];
         // Offset 0: critical_warning (1 byte) = 0
@@ -484,12 +560,35 @@ impl NvmeController {
         buf[5] = 0;
         // Offset 6: endurance_group_critical_warning_summary
         // Offset 7-31: reserved
-        // Offset 32-47: data_units_read (128-bit LE, units of 1000 * 512B)
+        let units_read = (self.stat_lba_read / 1000) as u128;
+        let units_written = (self.stat_lba_written / 1000) as u128;
+        let host_reads = self.stat_host_reads as u128;
+        let host_writes = self.stat_host_writes as u128;
+        // Offset 32-47: data_units_read (128-bit LE)
+        buf[32..48].copy_from_slice(&units_read.to_le_bytes());
         // Offset 48-63: data_units_written
+        buf[48..64].copy_from_slice(&units_written.to_le_bytes());
         // Offset 64-79: host_read_commands
+        buf[64..80].copy_from_slice(&host_reads.to_le_bytes());
         // Offset 80-95: host_write_commands
-        // Offset 96-111: controller_busy_time (minutes)
-        // ... 全 0 占位
+        buf[80..96].copy_from_slice(&host_writes.to_le_bytes());
+        // Offset 96-111: controller_busy_time (minutes) — 简化 = power_on_hours * 60
+        // 真实现需追踪 IO 累计时间；这里近似当作 always busy。
+        // 留 0 避免对 driver 误导。
+        // Offset 112-127: power_cycles — 1 (本进程启动算一次)
+        let one: u128 = 1;
+        buf[112..128].copy_from_slice(&one.to_le_bytes());
+        // Offset 128-143: power_on_hours
+        let hours = (self.power_on_instant.elapsed().as_secs() / 3600) as u128;
+        buf[128..144].copy_from_slice(&hours.to_le_bytes());
+        // Offset 144-159: unsafe_shutdowns — 0
+        // Offset 160-175: media_errors — 0
+        // Offset 176-191: num_err_log_entries
+        let nerr = self.stat_num_err_log_entries as u128;
+        buf[176..192].copy_from_slice(&nerr.to_le_bytes());
+        // Offset 192-195: warning_composite_temp_time (minutes above WCTEMP)
+        // Offset 196-199: critical_composite_temp_time
+        // Offset 200..: thermal sensors / endurance group stats — 0 占位
         buf.truncate(bytes); // 缩到 driver 请求的字节数
         buf
     }
@@ -529,7 +628,7 @@ impl NvmeController {
                 cid,
                 sq_head,
                 cq_id,
-                op: PendingOp::NvmReadDmaWrite,
+                op: PendingOp::NvmReadDmaWrite { num_blocks: 0 },
             },
         );
     }
@@ -791,17 +890,29 @@ impl PcieDevice for NvmeController {
                     let cq = self.cqs.get(&p.cq_id);
                     let phase = cq.map(|c| c.phase).unwrap_or(1);
                     let cqe = match res {
-                        Ok(()) => Cqe::success(p.cid, p.sq_id, p.sq_head, phase),
+                        Ok(()) => {
+                            // Phase F：真 IO 写完成 → 计数。
+                            self.stat_host_writes += 1;
+                            self.stat_lba_written += num_blocks as u64;
+                            Cqe::success(p.cid, p.sq_id, p.sq_head, phase)
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, lba, num_blocks, "NVM Write file write failed");
+                            self.stat_num_err_log_entries += 1;
                             Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR, 0)
                         }
                     };
                     self.post_cqe(ctx, p.cq_id, cqe);
                 }
-                PendingOp::NvmReadDmaWrite => {
+                PendingOp::NvmReadDmaWrite { num_blocks } => {
                     let cq = self.cqs.get(&p.cq_id);
                     let phase = cq.map(|c| c.phase).unwrap_or(1);
+                    // Phase F：num_blocks > 0 表示真 NVM Read；= 0 是 admin
+                    // Identify/Log Page，不计入 SMART host read。
+                    if num_blocks > 0 {
+                        self.stat_host_reads += 1;
+                        self.stat_lba_read += num_blocks as u64;
+                    }
                     let cqe = Cqe::success(p.cid, p.sq_id, p.sq_head, phase);
                     self.post_cqe(ctx, p.cq_id, cqe);
                 }
@@ -843,7 +954,12 @@ impl PcieDevice for NvmeController {
                         let cq = self.cqs.get(&accum.cq_id);
                         let phase = cq.map(|c| c.phase).unwrap_or(1);
                         let cqe = match res {
-                            Ok(()) => Cqe::success(accum.cid, accum.sq_id, accum.sq_head, phase),
+                            Ok(()) => {
+                                // Phase F：dual-PRP Write 完成 → 计数。
+                                self.stat_host_writes += 1;
+                                self.stat_lba_written += accum.num_blocks as u64;
+                                Cqe::success(accum.cid, accum.sq_id, accum.sq_head, phase)
+                            }
                             Err(e) => {
                                 tracing::warn!(
                                     error = %e,
@@ -851,6 +967,7 @@ impl PcieDevice for NvmeController {
                                     num_blocks = accum.num_blocks,
                                     "NVM Write dual-PRP file write failed"
                                 );
+                                self.stat_num_err_log_entries += 1;
                                 Cqe::error(
                                     accum.cid,
                                     accum.sq_id,
@@ -952,9 +1069,15 @@ impl PcieDevice for NvmeController {
                         let cq = self.cqs.get(&op.cq_id);
                         let phase = cq.map(|c| c.phase).unwrap_or(1);
                         let cqe = match res {
-                            Ok(()) => Cqe::success(op.cid, op.sq_id, op.sq_head, phase),
+                            Ok(()) => {
+                                // Phase F：PRP-list Write 完成 → 计数。
+                                self.stat_host_writes += 1;
+                                self.stat_lba_written += op.num_blocks as u64;
+                                Cqe::success(op.cid, op.sq_id, op.sq_head, phase)
+                            }
                             Err(e) => {
                                 tracing::warn!(error = %e, lba = op.lba, "PRP-list write failed");
+                                self.stat_num_err_log_entries += 1;
                                 Cqe::error(
                                     op.cid,
                                     op.sq_id,
@@ -1074,6 +1197,9 @@ impl PcieDevice for NvmeController {
                         );
                         let cq = self.cqs.get(&op.cq_id);
                         let phase = cq.map(|c| c.phase).unwrap_or(1);
+                        // Phase F：PRP-list Read 完成 → 计数。
+                        self.stat_host_reads += 1;
+                        self.stat_lba_read += op.num_blocks as u64;
                         let cqe = Cqe::success(op.cid, op.sq_id, op.sq_head, phase);
                         self.post_cqe(ctx, op.cq_id, cqe);
                     }
@@ -1099,4 +1225,91 @@ fn parse_prp_list(data: &[u8]) -> Vec<u64> {
         out.push(v);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造一个临时 backing file + NvmeController，仅用来跑非 DMA 单元逻辑
+    /// （SMART log builder / parse_prp_list / counter 累计）。
+    fn make_ctrl_with_tmp(tag: &str) -> NvmeController {
+        let path = std::env::temp_dir().join(format!(
+            "nvme_test_{}_{}_{:?}.img",
+            std::process::id(),
+            tag,
+            std::thread::current().id()
+        ));
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(1024 * 1024).unwrap(); // 1 MiB → 2048 LBA
+        drop(f);
+        let c = NvmeController::open(path.to_str().unwrap(), 0x1414, 0).unwrap();
+        // 不能立即 remove —— Windows 上仍持有的 File 句柄被删后导致后续操作
+        // 失败；Unix 下 unlink-while-open 没问题但为可移植性也 keep。测试
+        // 结束 OS tempdir 清理（best-effort）。
+        c
+    }
+
+    /// Phase F：SMART log 关键 offset + counter 写入校验。
+    #[test]
+    fn smart_log_byte_layout_and_counters() {
+        let mut c = make_ctrl_with_tmp("smart");
+        c.stat_host_reads = 5;
+        c.stat_host_writes = 7;
+        c.stat_lba_read = 12_345;
+        c.stat_lba_written = 67_890;
+        c.stat_num_err_log_entries = 3;
+        let buf = c.build_smart_health_log(512);
+        assert_eq!(buf.len(), 512);
+        // composite_temp @ 1..3 (KiB)
+        assert_eq!(u16::from_le_bytes([buf[1], buf[2]]), 313);
+        // available_spare @ 3 = 100
+        assert_eq!(buf[3], 100);
+        // data_units_read @ 32..48: 12345/1000 = 12
+        let units_read = u128::from_le_bytes(buf[32..48].try_into().unwrap());
+        assert_eq!(units_read, 12);
+        // data_units_written @ 48..64: 67890/1000 = 67
+        let units_written = u128::from_le_bytes(buf[48..64].try_into().unwrap());
+        assert_eq!(units_written, 67);
+        // host_read_commands @ 64..80 = 5
+        let hr = u128::from_le_bytes(buf[64..80].try_into().unwrap());
+        assert_eq!(hr, 5);
+        // host_write_commands @ 80..96 = 7
+        let hw = u128::from_le_bytes(buf[80..96].try_into().unwrap());
+        assert_eq!(hw, 7);
+        // power_cycles @ 112..128 = 1
+        let pc = u128::from_le_bytes(buf[112..128].try_into().unwrap());
+        assert_eq!(pc, 1);
+        // num_err_log_entries @ 176..192 = 3
+        let nerr = u128::from_le_bytes(buf[176..192].try_into().unwrap());
+        assert_eq!(nerr, 3);
+    }
+
+    /// Phase E：parse_prp_list 在尾部 0 处终止 + 正确解析 LE u64。
+    #[test]
+    fn prp_list_parses_until_zero() {
+        let mut bytes = vec![0u8; 64];
+        bytes[..8].copy_from_slice(&0x1000_u64.to_le_bytes());
+        bytes[8..16].copy_from_slice(&0x2000_u64.to_le_bytes());
+        bytes[16..24].copy_from_slice(&0x3000_u64.to_le_bytes());
+        // bytes[24..32] = 0 → 终止
+        bytes[32..40].copy_from_slice(&0xdead_u64.to_le_bytes()); // 应被忽略
+        let entries = parse_prp_list(&bytes);
+        assert_eq!(entries, vec![0x1000, 0x2000, 0x3000]);
+    }
+
+    /// Phase F：AEN queue 行为 — push 多次，弹出顺序 FIFO。
+    /// 注：fire_aen 需要 DeviceCtx 才能 dma_write CQE，这里只测 queue 状态。
+    #[test]
+    fn aen_queue_fifo_order() {
+        let mut c = make_ctrl_with_tmp("aen");
+        c.aen_pending.push_back((1, 0, 0, 0));
+        c.aen_pending.push_back((2, 0, 0, 0));
+        c.aen_pending.push_back((3, 0, 0, 0));
+        assert_eq!(c.aen_pending.len(), 3);
+        assert_eq!(c.aen_pending.pop_front().unwrap().0, 1);
+        assert_eq!(c.aen_pending.pop_front().unwrap().0, 2);
+        assert_eq!(c.aen_pending.pop_front().unwrap().0, 3);
+        assert!(c.aen_pending.is_empty());
+    }
 }
