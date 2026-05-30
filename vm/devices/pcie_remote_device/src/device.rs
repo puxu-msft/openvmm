@@ -98,6 +98,7 @@ impl PcieRemoteDevice {
     /// seq 空间约定（与 worker.rs `next_dma_seq` 配合）：
     /// - device.rs 用低半 u64（从 1 起，单调递增到 2^63-1）
     /// - worker.rs DMA reply 用高半（`1 << 63` 起）
+    ///
     /// 双方互不重叠，便于排查日志中 frame 来源。实践中 2^63 帧不可达。
     fn next_seq(&mut self) -> u64 {
         debug_assert!(

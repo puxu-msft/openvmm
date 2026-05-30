@@ -135,7 +135,7 @@ pub(crate) mod tests_helpers_assert_validate_ok {
 }
 
 #[cfg(test)]
-pub(crate) fn tests_helpers_assert_validate_ok(d: &pcie_remote_protocol::DeviceDescribe) {
+pub(crate) fn tests_helpers_assert_validate_ok(d: &DeviceDescribe) {
     tests_helpers_assert_validate_ok::_check(d);
 }
 

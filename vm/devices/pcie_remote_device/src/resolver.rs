@@ -280,7 +280,14 @@ fn assemble_device(
         "pcie_remote: device assembled, worker spawned"
     );
 
-    PcieRemoteDevice::new(state, to_worker, cfg_space, msix, side_effect_offsets, stats)
+    PcieRemoteDevice::new(
+        state,
+        to_worker,
+        cfg_space,
+        msix,
+        side_effect_offsets,
+        stats,
+    )
 }
 
 /// 用 DeviceDescribe 构造 HardwareIds。

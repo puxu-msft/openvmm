@@ -184,10 +184,9 @@ pub fn spawn_tcp_handshakes(
                     tracing::info!(CVM_ALLOWED, %id, "pcie_remote: TCP hot-reconnect → swapping transport to running worker");
                     let mut prep = prep;
                     let t = prep.take_transport();
-                    if swap_tx.is_closed() {
-                        tracing::warn!(CVM_ALLOWED, %id, "swap channel closed (worker exited); stopping listener");
-                        return;
-                    }
+                    // mesh::Sender::send fire-and-forget；若 worker 已退出则丢弃。
+                    // 不在此处 is_closed() 预检，否则 TOCTOU（预检后 worker 仍
+                    // 可能在 send 前退出）；listener 继续 loop 等下次重连。
                     swap_tx.send(t);
                 } else {
                     prepared.lock().insert(id, prep);
@@ -249,10 +248,9 @@ pub fn spawn_vsock_handshakes(
                     tracing::info!(CVM_ALLOWED, %id, "pcie_remote: vsock hot-reconnect → swapping transport to running worker");
                     let mut prep = prep;
                     let t = prep.take_transport();
-                    if swap_tx.is_closed() {
-                        tracing::warn!(CVM_ALLOWED, %id, "swap channel closed (worker exited); stopping listener");
-                        return;
-                    }
+                    // mesh::Sender::send fire-and-forget；若 worker 已退出则丢弃。
+                    // 不在此处 is_closed() 预检，否则 TOCTOU（预检后 worker 仍
+                    // 可能在 send 前退出）；listener 继续 loop 等下次重连。
                     swap_tx.send(t);
                 } else {
                     prepared.lock().insert(id, prep);

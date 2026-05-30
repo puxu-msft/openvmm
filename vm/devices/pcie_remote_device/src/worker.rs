@@ -20,8 +20,6 @@ use chipset_device::io::deferred::DeferredWrite;
 use cvm_tracing::CVM_ALLOWED;
 use futures::FutureExt;
 use futures::StreamExt;
-use futures::io::AsyncRead;
-use futures::io::AsyncWrite;
 use futures::select_biased;
 use guestmem::GuestMemory;
 use inspect::Inspect;
@@ -145,7 +143,7 @@ impl DmaRate {
 async fn read_inbound_or_pending(
     transport: &mut crate::prepared::BoxedTransport,
     is_lost: bool,
-) -> Result<ToOpenhcl, pcie_remote_protocol::codec::CodecError> {
+) -> Result<ToOpenhcl, codec::CodecError> {
     if is_lost {
         // 永远 pending（等 swap channel 或 shutdown / from_device）
         std::future::pending::<()>().await;
@@ -154,7 +152,6 @@ async fn read_inbound_or_pending(
         codec::read_frame::<_, ToOpenhcl>(transport).await
     }
 }
-
 
 ///
 /// **v2 hotplug 设计 (K-20)**：worker 不再 generic over `T`，transport 用
@@ -178,10 +175,14 @@ pub struct Worker {
     /// K-NEW-C: DMA rate state.
     dma_rate: DmaRate,
     /// 用于 DMA reply 帧的 seq（与 device.rs `next_seq` 配合）。
+    ///
     /// seq 空间约定：
     /// - device.rs 用低半 u64（从 1 起）
     /// - 本 worker DMA reply 用高半（`1u64 << 63` 起）
+    ///
     /// 两半互不重叠便于日志排查；host 关联请求实际用 token 不用 seq。
+    /// K-20 swap arm 故意**不**重置 `next_dma_seq`：跨重连保持单调，便于
+    /// 日志关联同一 device 在 hot-reconnect 前后的 DMA reply 帧。
     next_dma_seq: u64,
     /// 可观察 stats（与 device.rs 共享 Arc，inspect 暴露）。
     stats: SharedWorkerStats,
@@ -235,16 +236,10 @@ impl Worker {
                 }
                 new_transport = self.transport_swap.next().fuse() => {
                     let Some(new) = new_transport else {
-                        // listener task drop → sender 关闭，但 worker 可以继续
-                        // 用现有 transport（host 不会再重连，但当前连接仍工作）。
-                        // 这里我们什么都不做，避免 next().await 永远 pending。
-                        // 实际表现：select_biased 不会再选这条 arm，因 next() Pending。
-                        // 用 std::future::pending::<()>().await 等价
-                        // 但避免 busy-loop，需要 mark channel 关闭后忽略此 arm —
-                        // mesh::Receiver::next 返回 None 仅在所有 sender drop 后一次；
-                        // 之后再次 await 会 panic 或永远 pending。所以记 boolean 标记。
-                        // 简化做法：worker 直接退出，让 device 进入 Lost 永久。
-                        tracing::info!(CVM_ALLOWED, "pcie_remote: transport_swap closed, worker exiting");
+                        // 不变量：swap sender 由 TransportSwapMap (Arc) 持到
+                        // 进程退出（dispatch.rs / underhill_core/worker.rs 持有
+                        // Arc）。除非进程退出否则不会走到这里；保守起见 break。
+                        tracing::info!(CVM_ALLOWED, "pcie_remote: transport_swap closed (unexpected), worker exiting");
                         break;
                     };
                     tracing::info!(CVM_ALLOWED, "pcie_remote: transport refreshed via swap channel; resuming Live");
@@ -253,6 +248,7 @@ impl Worker {
                     self.consecutive_bad_frames = 0;
                     self.stats.consecutive_bad_frames.store(0, Ordering::Relaxed);
                     self.dma_rate = DmaRate::new();
+                    // 注：next_dma_seq 故意不重置 —— 保持跨重连单调，便于日志关联。
                     self.state.store(DeviceState::Live);
                 }
                 req = self.from_device.next().fuse() => {
@@ -328,7 +324,9 @@ impl Worker {
                     token.complete(&bytes[..access_size]);
                     self.stats.mmio_read_results.fetch_add(1, Ordering::Relaxed);
                     self.consecutive_bad_frames = 0;
-                    self.stats.consecutive_bad_frames.store(0, Ordering::Relaxed);
+                    self.stats
+                        .consecutive_bad_frames
+                        .store(0, Ordering::Relaxed);
                     true
                 } else {
                     // 未知 seq；非致命但记一次"非法"。
@@ -346,7 +344,9 @@ impl Worker {
                     intr.deliver();
                     self.stats.interrupts_fired.fetch_add(1, Ordering::Relaxed);
                     self.consecutive_bad_frames = 0;
-                    self.stats.consecutive_bad_frames.store(0, Ordering::Relaxed);
+                    self.stats
+                        .consecutive_bad_frames
+                        .store(0, Ordering::Relaxed);
                     true
                 } else {
                     self.stats.interrupts_oob.fetch_add(1, Ordering::Relaxed);
@@ -428,18 +428,24 @@ impl Worker {
             // 只有"消息结构非法"才计 bad-frame，故这里 reset 计数（含 stats）。
             let _ = self.reply_dma(token, false, Vec::new()).await;
             self.consecutive_bad_frames = 0;
-            self.stats.consecutive_bad_frames.store(0, Ordering::Relaxed);
+            self.stats
+                .consecutive_bad_frames
+                .store(0, Ordering::Relaxed);
             true
         } else {
             self.consecutive_bad_frames = 0;
-            self.stats.consecutive_bad_frames.store(0, Ordering::Relaxed);
+            self.stats
+                .consecutive_bad_frames
+                .store(0, Ordering::Relaxed);
             self.reply_dma(token, true, buf).await
         }
     }
 
     /// 处理 host 主动发起的 WriteGpa：写 data 到 guest gpa，回 DmaCompletion。
     async fn handle_write_gpa(&mut self, req: pcie_remote_protocol::WriteGpaRequest) -> bool {
-        self.stats.write_gpa_requests.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .write_gpa_requests
+            .fetch_add(1, Ordering::Relaxed);
         let pcie_remote_protocol::WriteGpaRequest { token, gpa, data } = req;
 
         if data.is_empty() || data.len() > MAX_DMA_BYTES {
@@ -481,7 +487,9 @@ impl Worker {
             );
         }
         self.consecutive_bad_frames = 0;
-        self.stats.consecutive_bad_frames.store(0, Ordering::Relaxed);
+        self.stats
+            .consecutive_bad_frames
+            .store(0, Ordering::Relaxed);
         self.reply_dma(token, ok, Vec::new()).await
     }
 
@@ -521,6 +529,14 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 构造一个测试用 transport_swap channel：sender 立刻 forget 保活，
+    /// 让 worker 主循环（如果跑）不会因 sender drop 走 None arm。返回 receiver。
+    fn test_swap_rx() -> Receiver<crate::prepared::BoxedTransport> {
+        let (tx, rx) = mesh::channel::<crate::prepared::BoxedTransport>();
+        std::mem::forget(tx);
+        rx
+    }
 
     #[test]
     fn dma_rate_allows_under_limit() {
@@ -562,17 +578,25 @@ mod tests {
         DefaultPool::run_with(|_| async move {
             let cursor = Cursor::new(Vec::<u8>::new());
             let (_dev_tx, dev_rx) = mesh::channel::<DeviceRequest>();
-            let state = crate::state::SharedState::new(crate::state::DeviceState::Live);
-            let gm = guestmem::GuestMemory::empty();
+            let state = SharedState::new(DeviceState::Live);
+            let gm = GuestMemory::empty();
             let stats: SharedWorkerStats = Arc::new(WorkerStats::default());
             let stats_for_check = stats.clone();
-            let (_swap_tx, swap_rx) = mesh::channel::<crate::prepared::BoxedTransport>();
-            std::mem::forget(_swap_tx);
-            let mut w = Worker::new(Box::new(cursor) as crate::prepared::BoxedTransport, state, dev_rx, Vec::new(), gm, stats, swap_rx);
+            let swap_rx = test_swap_rx();
+            let mut w = Worker::new(
+                Box::new(cursor) as crate::prepared::BoxedTransport,
+                state,
+                dev_rx,
+                Vec::new(),
+                gm,
+                stats,
+                swap_rx,
+            );
 
             // 手工把 2 个 InFlight 塞进 worker（模拟 device.rs 投递过来）。
-            let (_d1, t1) = defer_read();
-            let (_d2, t2) = defer_read();
+            // _t1/_t2 是对应 host-side wait future；测试不 await 它们。
+            let (_d1, _t1) = defer_read();
+            let (_d2, _t2) = defer_read();
             w.in_flight.insert(
                 10,
                 InFlight::Read {
@@ -640,13 +664,20 @@ mod tests {
             // 内存 cursor 作 transport；本测试不真走 transport，只测 dispatch_inbound。
             let cursor = Cursor::new(Vec::<u8>::new());
             let (_dev_tx, dev_rx) = mesh::channel::<DeviceRequest>();
-            let state = crate::state::SharedState::new(crate::state::DeviceState::Live);
-            let gm = guestmem::GuestMemory::empty();
+            let state = SharedState::new(DeviceState::Live);
+            let gm = GuestMemory::empty();
             let stats: SharedWorkerStats = Arc::new(WorkerStats::default());
             let stats_for_check = stats.clone();
-            let (_swap_tx, swap_rx) = mesh::channel::<crate::prepared::BoxedTransport>();
-            std::mem::forget(_swap_tx);
-            let mut w = Worker::new(Box::new(cursor) as crate::prepared::BoxedTransport, state, dev_rx, interrupts, gm, stats, swap_rx);
+            let swap_rx = test_swap_rx();
+            let mut w = Worker::new(
+                Box::new(cursor) as crate::prepared::BoxedTransport,
+                state,
+                dev_rx,
+                interrupts,
+                gm,
+                stats,
+                swap_rx,
+            );
 
             // msix_index = 0 valid。
             let ok_msg = ToOpenhcl {
@@ -676,7 +707,9 @@ mod tests {
             assert_eq!(w.consecutive_bad_frames, 1);
             assert_eq!(stats_for_check.interrupts_oob.load(Ordering::Relaxed), 1);
             assert_eq!(
-                stats_for_check.consecutive_bad_frames.load(Ordering::Relaxed),
+                stats_for_check
+                    .consecutive_bad_frames
+                    .load(Ordering::Relaxed),
                 1
             );
 
@@ -713,19 +746,35 @@ mod tests {
         DefaultPool::run_with(|_| async move {
             let cursor = Cursor::new(Vec::<u8>::new());
             let (_dev_tx, dev_rx) = mesh::channel::<DeviceRequest>();
-            let state = crate::state::SharedState::new(crate::state::DeviceState::Live);
-            let gm = guestmem::GuestMemory::empty();
+            let state = SharedState::new(DeviceState::Live);
+            let gm = GuestMemory::empty();
             let stats: SharedWorkerStats = Arc::new(WorkerStats::default());
             let stats_for_check = stats.clone();
-            let (_swap_tx, swap_rx) = mesh::channel::<crate::prepared::BoxedTransport>();
-            std::mem::forget(_swap_tx);
-            let mut w = Worker::new(Box::new(cursor) as crate::prepared::BoxedTransport, state, dev_rx, Vec::new(), gm, stats, swap_rx);
+            let swap_rx = test_swap_rx();
+            let mut w = Worker::new(
+                Box::new(cursor) as crate::prepared::BoxedTransport,
+                state,
+                dev_rx,
+                Vec::new(),
+                gm,
+                stats,
+                swap_rx,
+            );
 
             // len=0 → bounds reject + record_bad
-            let req0 = ReadGpaRequest { token: 1, gpa: 0, len: 0 };
+            let req0 = ReadGpaRequest {
+                token: 1,
+                gpa: 0,
+                len: 0,
+            };
             let _ = w.handle_read_gpa(req0).await;
             assert_eq!(stats_for_check.read_gpa_requests.load(Ordering::Relaxed), 1);
-            assert_eq!(stats_for_check.consecutive_bad_frames.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                stats_for_check
+                    .consecutive_bad_frames
+                    .load(Ordering::Relaxed),
+                1
+            );
 
             // len 太大 → bounds reject + record_bad
             let req_big = ReadGpaRequest {
@@ -735,15 +784,29 @@ mod tests {
             };
             let _ = w.handle_read_gpa(req_big).await;
             assert_eq!(stats_for_check.read_gpa_requests.load(Ordering::Relaxed), 2);
-            assert_eq!(stats_for_check.consecutive_bad_frames.load(Ordering::Relaxed), 2);
+            assert_eq!(
+                stats_for_check
+                    .consecutive_bad_frames
+                    .load(Ordering::Relaxed),
+                2
+            );
 
             // 合法 len（4 字节）→ guest_memory.read_at 在空 mem 上失败 →
             // reply ok=false 不计 bad-frame；read_gpa_requests 仍 ++；
             // consecutive_bad_frames 归零
-            let req_ok = ReadGpaRequest { token: 3, gpa: 0, len: 4 };
+            let req_ok = ReadGpaRequest {
+                token: 3,
+                gpa: 0,
+                len: 4,
+            };
             let _ = w.handle_read_gpa(req_ok).await;
             assert_eq!(stats_for_check.read_gpa_requests.load(Ordering::Relaxed), 3);
-            assert_eq!(stats_for_check.consecutive_bad_frames.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                stats_for_check
+                    .consecutive_bad_frames
+                    .load(Ordering::Relaxed),
+                0
+            );
         });
     }
 
@@ -757,19 +820,38 @@ mod tests {
         DefaultPool::run_with(|_| async move {
             let cursor = Cursor::new(Vec::<u8>::new());
             let (_dev_tx, dev_rx) = mesh::channel::<DeviceRequest>();
-            let state = crate::state::SharedState::new(crate::state::DeviceState::Live);
-            let gm = guestmem::GuestMemory::empty();
+            let state = SharedState::new(DeviceState::Live);
+            let gm = GuestMemory::empty();
             let stats: SharedWorkerStats = Arc::new(WorkerStats::default());
             let stats_for_check = stats.clone();
-            let (_swap_tx, swap_rx) = mesh::channel::<crate::prepared::BoxedTransport>();
-            std::mem::forget(_swap_tx);
-            let mut w = Worker::new(Box::new(cursor) as crate::prepared::BoxedTransport, state, dev_rx, Vec::new(), gm, stats, swap_rx);
+            let swap_rx = test_swap_rx();
+            let mut w = Worker::new(
+                Box::new(cursor) as crate::prepared::BoxedTransport,
+                state,
+                dev_rx,
+                Vec::new(),
+                gm,
+                stats,
+                swap_rx,
+            );
 
             // 空 data → bounds reject + record_bad
-            let req0 = WriteGpaRequest { token: 1, gpa: 0, data: vec![] };
+            let req0 = WriteGpaRequest {
+                token: 1,
+                gpa: 0,
+                data: vec![],
+            };
             let _ = w.handle_write_gpa(req0).await;
-            assert_eq!(stats_for_check.write_gpa_requests.load(Ordering::Relaxed), 1);
-            assert_eq!(stats_for_check.consecutive_bad_frames.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                stats_for_check.write_gpa_requests.load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(
+                stats_for_check
+                    .consecutive_bad_frames
+                    .load(Ordering::Relaxed),
+                1
+            );
 
             // data 超大 → bounds reject
             let req_big = WriteGpaRequest {
@@ -778,14 +860,34 @@ mod tests {
                 data: vec![0u8; MAX_DMA_BYTES + 1],
             };
             let _ = w.handle_write_gpa(req_big).await;
-            assert_eq!(stats_for_check.write_gpa_requests.load(Ordering::Relaxed), 2);
-            assert_eq!(stats_for_check.consecutive_bad_frames.load(Ordering::Relaxed), 2);
+            assert_eq!(
+                stats_for_check.write_gpa_requests.load(Ordering::Relaxed),
+                2
+            );
+            assert_eq!(
+                stats_for_check
+                    .consecutive_bad_frames
+                    .load(Ordering::Relaxed),
+                2
+            );
 
             // 合法 → guest_memory.write_at fail (empty mem) → ok=false 不 bad
-            let req_ok = WriteGpaRequest { token: 3, gpa: 0, data: vec![0xff; 8] };
+            let req_ok = WriteGpaRequest {
+                token: 3,
+                gpa: 0,
+                data: vec![0xff; 8],
+            };
             let _ = w.handle_write_gpa(req_ok).await;
-            assert_eq!(stats_for_check.write_gpa_requests.load(Ordering::Relaxed), 3);
-            assert_eq!(stats_for_check.consecutive_bad_frames.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                stats_for_check.write_gpa_requests.load(Ordering::Relaxed),
+                3
+            );
+            assert_eq!(
+                stats_for_check
+                    .consecutive_bad_frames
+                    .load(Ordering::Relaxed),
+                0
+            );
         });
     }
 
@@ -801,13 +903,20 @@ mod tests {
         DefaultPool::run_with(|_| async move {
             let cursor = Cursor::new(Vec::<u8>::new());
             let (_dev_tx, dev_rx) = mesh::channel::<DeviceRequest>();
-            let state = crate::state::SharedState::new(crate::state::DeviceState::Live);
-            let gm = guestmem::GuestMemory::empty();
+            let state = SharedState::new(DeviceState::Live);
+            let gm = GuestMemory::empty();
             let stats: SharedWorkerStats = Arc::new(WorkerStats::default());
             let stats_for_check = stats.clone();
-            let (_swap_tx, swap_rx) = mesh::channel::<crate::prepared::BoxedTransport>();
-            std::mem::forget(_swap_tx);
-            let mut w = Worker::new(Box::new(cursor) as crate::prepared::BoxedTransport, state, dev_rx, Vec::new(), gm, stats, swap_rx);
+            let swap_rx = test_swap_rx();
+            let mut w = Worker::new(
+                Box::new(cursor) as crate::prepared::BoxedTransport,
+                state,
+                dev_rx,
+                Vec::new(),
+                gm,
+                stats,
+                swap_rx,
+            );
 
             // 发 1100 个 64KB ReadGpa：1024 个允许（占满 64 MiB/s）+ 76 个被拒
             for i in 0..1100u64 {
@@ -824,7 +933,9 @@ mod tests {
             );
             // 1100 - 1024 = 76 被 rate limit 拒绝
             assert_eq!(
-                stats_for_check.dma_rate_limit_rejects.load(Ordering::Relaxed),
+                stats_for_check
+                    .dma_rate_limit_rejects
+                    .load(Ordering::Relaxed),
                 76
             );
         });

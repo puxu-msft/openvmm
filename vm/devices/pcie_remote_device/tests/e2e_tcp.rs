@@ -37,8 +37,13 @@ async fn handshake_e2e_via_tcp_loopback(driver: DefaultDriver) {
     let prepared: PreparedMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let addr = format!("127.0.0.1:{port}");
     let instances = vec![(id, addr.clone(), Duration::from_secs(5))];
-    let _listener_tasks =
-        spawn_tcp_handshakes(driver.clone(), driver.clone(), instances, prepared.clone(), Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())));
+    let _listener_tasks = spawn_tcp_handshakes(
+        driver.clone(),
+        driver.clone(),
+        instances,
+        prepared.clone(),
+        Arc::new(parking_lot::Mutex::new(HashMap::new())),
+    );
 
     // 等 server bind 后，作为 client connect 上去
     pal_async::timer::PolledTimer::new(&driver)
@@ -103,7 +108,7 @@ async fn handshake_e2e_via_tcp_loopback(driver: DefaultDriver) {
     assert_eq!(d.bars[0].size, 4096);
 
     // 保持 reader 一会儿避免 worker EOF 立即 Lost
-    let _ = polled.read(&mut [0u8; 1]);
+    drop(polled.read(&mut [0u8; 1]));
 }
 
 /// host stub 永远不来 → 总超时后 prepared_map 仍为空（绝不 boot fail）。
