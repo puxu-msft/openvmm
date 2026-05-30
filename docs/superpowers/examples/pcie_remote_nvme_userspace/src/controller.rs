@@ -535,11 +535,15 @@ impl NvmeController {
         let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
         match sqe.opcode() {
             nvm_opc::READ => {
-                // CDW10/11: SLBA (low/high)
-                // CDW12: bits 15:0 = NLB (zero-based; +1 for actual count)
-                let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
-                let nlb = (sqe.cdw12 & 0xffff) as u32 + 1;
+                let cdw10 = sqe.cdw10;
+                let cdw11 = sqe.cdw11;
+                let cdw12 = sqe.cdw12;
+                let prp1 = sqe.prp1;
+                let prp2 = sqe.prp2;
+                let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
+                let nlb = (cdw12 & 0xffff) as u32 + 1;
                 let bytes = nlb as u64 * SECTOR_SIZE;
+                tracing::debug!(slba, nlb, bytes, prp1 = format_args!("{:#x}", prp1), "NVM READ");
                 if bytes > MDTS_MAX_BYTES {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
@@ -562,7 +566,7 @@ impl NvmeController {
                 }
                 // DMA write to PRP1（v1：bytes ≤ 8 KiB = 2 page = PRP1 + PRP2）
                 if bytes <= NVME_PAGE_SIZE {
-                    let tok = ctx.dma_write(sqe.prp1, buf);
+                    let tok = ctx.dma_write(prp1, buf);
                     self.pending_ios.insert(
                         tok,
                         PendingIo {
@@ -573,13 +577,8 @@ impl NvmeController {
                 } else {
                     let half = NVME_PAGE_SIZE as usize;
                     let (b1, b2) = buf.split_at(half);
-                    // 双 PRP：必须保证两次 DMA 都完成后才 post CQE，否则
-                    // driver 看到 CQE 立即去读 buffer，后半段可能还在路上。
-                    // 简化做法：让 PRP2 的 DMA token 作 pending key（PRP2
-                    // 后入 outbound queue，flush 顺序后于 PRP1，对端
-                    // OpenHCL 按 FIFO 处理，PRP2 完成天然晚于 PRP1）。
-                    let _tok1 = ctx.dma_write(sqe.prp1, b1.to_vec());
-                    let tok2 = ctx.dma_write(sqe.prp2, b2.to_vec());
+                    let _tok1 = ctx.dma_write(prp1, b1.to_vec());
+                    let tok2 = ctx.dma_write(prp2, b2.to_vec());
                     self.pending_ios.insert(
                         tok2,
                         PendingIo {
@@ -591,9 +590,16 @@ impl NvmeController {
                 None
             }
             nvm_opc::WRITE => {
-                let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
-                let nlb = (sqe.cdw12 & 0xffff) as u32 + 1;
+                // 复制 packed 字段到本地变量（packed struct field 取引用 UB，
+                // 直接 as u64 在新 rustc 也会触发警告）。
+                let cdw10 = sqe.cdw10;
+                let cdw11 = sqe.cdw11;
+                let cdw12 = sqe.cdw12;
+                let prp1 = sqe.prp1;
+                let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
+                let nlb = (cdw12 & 0xffff) as u32 + 1;
                 let bytes = nlb as u64 * SECTOR_SIZE;
+                tracing::debug!(slba, nlb, bytes, prp1 = format_args!("{:#x}", prp1), "NVM WRITE");
                 if bytes > MDTS_MAX_BYTES {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
@@ -604,7 +610,7 @@ impl NvmeController {
                 }
                 // DMA read from PRP1
                 if bytes <= NVME_PAGE_SIZE {
-                    let tok = ctx.dma_read(sqe.prp1, bytes as u32);
+                    let tok = ctx.dma_read(prp1, bytes as u32);
                     self.pending_ios.insert(
                         tok,
                         PendingIo {
