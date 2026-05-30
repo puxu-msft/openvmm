@@ -450,3 +450,82 @@ OpenHCL → host 的 DMA 完成回执（用 token 关联请求，不依赖 seq�
 ### 关联 commit
 
 `ea928d5b feat(pcie_remote): v2 重构 - 完整 BAR/MSIX/MMIO/InterruptFire/DMA 闭环`
+
+---
+
+## 2026-05-30 v2 真 Hyper-V end-to-end 进 guest 已验证
+
+承前 v2 重构 (ea928d5b) + grace period fix (f5ec43c1)，本轮完成
+**Windows Server guest 实际看到 pcie_remote 设备** 的部署 + 验证。
+
+### 自动化流程
+
+1. **build VHDX from ISO**: SEAL Windows Server 2025 26100 ISO (6 GB)
+   → mount → diskpart GPT + EFI + Windows partitions → DISM /Apply-Image
+   → bcdboot → 注 unattend.xml (auto logon) + post_logon.ps1
+2. **新建 OpenHCL VM** (`-GuestStateIsolationType OpenHCL`)
+3. **配置**: VHDX attach SCSI + IGVM build w/ vpci feature override +
+   vssd VMBusMessageRedirection=1
+4. **启 noop_host_vsock.exe** (persistent reconnect loop) → Start-VM →
+   OpenHCL 内 grace period 等 prepared_map 填好 → resolver assemble
+   pcie_remote 完整 device → vpci channel publish 到 vmbus
+
+### 三轮 fix iteration（部署阶段才暴露）
+
+| 问题 | 错误 | 修复 |
+|---|---|---|
+| openvmm_hcl 默认 build 无 vpci feature | `failed to start VM error=built without vpci support` | `cargo xflowey build-igvm ... --override-openvmm-hcl-feature vpci` |
+| vpci device 需 VMBus message redirection | `vpci devices require vmbus redirection to be enabled` | WMI ModifySystemSettings: vssd.VMBusMessageRedirection=1（更正了之前文档中"非必需"的判断）|
+| underhill_core/worker.rs 没等 boot grace period | `pcie_remote handshake missing; serving AbsentPcieDevice` | commit f5ec43c1: 加同步 poll prepared_map 直到满或超时再 add_async_resolver |
+
+### Guest 内验证（PowerShell Direct）
+
+```powershell
+Enter-PSSession -VMName pcie-remote-exp -Credential Administrator
+# Inside guest:
+pnputil /scan-devices
+Get-PnpDevice -PresentOnly | ? { $_.InstanceId -like 'VMBUS*44C4F61D*11111111*' }
+# Output:
+#   Microsoft Hyper-V Virtual PCI Bus  OK  VMBUS\{44C4F61D-...}\{11111111-...}
+Get-PnpDevice -PresentOnly | ? { $_.InstanceId -like '*VEN_1414*' }
+# Output:
+#   Standard NVM Express Controller  Error (CM_PROB_FAILED_START)
+#   PCI\VEN_1414&DEV_C0DE&SUBSYS_00000000&REV_01\5&191D8A3A&0&0
+#   Class: SCSIAdapter, Service: stornvme
+```
+
+### 完整路径全部走通
+
+1. ✅ OpenHCL VTL2 启 pcie_remote vsock listener
+2. ✅ Host noop_vsock client Hello/HelloAck handshake 完成
+3. ✅ boot grace period 等到 → resolver assemble device + spawn worker
+4. ✅ device publish 到 OpenHCL vmbus (channel id 5, interface 44c4f61d=vpci)
+5. ✅ Guest VMBUS\{44C4F61D-...}\{11111111-...} `Microsoft Hyper-V Virtual PCI Bus` 状态 OK
+6. ✅ **Guest PnP 探测到 `PCI\VEN_1414&DEV_C0DE`**
+7. ⚠ Windows stornvme driver 加载失败 (CM_PROB_FAILED_START) — 因为
+   class_code=0x010802 (NVMe) 让 Windows 自动选 stornvme，但 noop_host
+   不响应 NVMe ABI；这是 **noop 的正确预期行为**
+
+### 关键发现
+
+- **vpci 是 OpenHCL 内置概念**：cmdline 注入的 pcie_remote 通过
+  `InitialControllers::new` → `controllers.vpci_devices` →
+  `build_vpci_device` 路径自动 publish 给 guest vmbus（不需要 vpci_relay；
+  vpci_relay 是 host 来的 vpci channel 转发给 guest，与 OpenHCL 自有
+  vpci device 是两条路径）
+- **next_seq 即使 guest 探测后仍 = 1**：cfg_read 走本地 ConfigSpaceType0Emulator,
+  不递增 seq；只有 MMIO Defer 或 cfg_write_side_effect 才递增。Windows
+  stornvme 在 cfg_read VEN/DEV 看到是 PCIe（不是 NVMe register 实现）后
+  试读 BAR0 NVMe registers → noop 返回 0 → stornvme bail → PROB_FAILED_START
+  在 cfg-read 阶段就失败，从未进 MMIO defer 路径
+- **要让 guest 真用上设备**：noop_host 要换 real device emulation
+  （或改 class_code 为 unclassified 0xff00 让 Windows 不自动绑 stornvme）
+
+### 工件
+
+- `/mnt/c/temp/pcie_remote_exp/openhcl-pcie-test-v2-vpci.bin` (含 vpci feature)
+- `/mnt/c/temp/pcie_remote_exp/openhcl-pcie-v2-grace.bin` (final v2 IGVM)
+- `/mnt/c/temp/pcie_remote_exp/guest.vhdx` (Windows Server 26100 with auto-login)
+- `/mnt/c/temp/pcie_remote_exp/build_winserver_vhdx.ps1` (ISO → VHDX)
+- `/mnt/c/temp/pcie_remote_exp/inject_unattend.ps1` (add unattend + post_logon)
+- `/mnt/c/temp/pcie_remote_exp/deploy_v2_e2e.ps1` (full deploy + start)
