@@ -1,0 +1,21 @@
+[package]
+name = "pcie_remote_userspace_sdk"
+version = "0.1.0"
+edition = "2024"
+description = "Userspace SDK for implementing PCIe devices over the pcie_remote vsock protocol."
+
+[dependencies]
+pcie_remote_protocol = { path = "../../../../vm/devices/pcie_remote_protocol" }
+pal_async = { path = "../../../../support/pal/pal_async" }
+mesh = { path = "../../../../support/mesh" }
+guid = { path = "../../../../support/guid", features = ["mesh"] }
+vmsocket = { path = "../../../../support/vmsocket" }
+anyhow = "1"
+async-trait = "0.1"
+futures = "0.3"
+tracing = "0.1"
+parking_lot = "0.12"
+socket2 = "0.5"
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
