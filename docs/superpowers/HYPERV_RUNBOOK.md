@@ -170,6 +170,26 @@ C:\temp\pcie_remote_exp\pcie_remote_noop_host_vsock.exe `
     --vm-id $vmid --port 50000 --retries 60 --retry-ms 500
 ```
 
+### 5b. (可选) Stress 模式 — 验证 K-NEW-C rate limit + A4 Lost
+
+noop_host 加了两个 stress 参数，可主动触发健壮性边界：
+
+```powershell
+# 验证 K-NEW-C: DMA 速率限制 (64 MiB/s)
+# burst 发 2048 个 64KB ReadGpa = 128 MiB → 1024 个应被 rate limit 拒绝
+pcie_remote_noop_host_vsock.exe --vm-id $vmid --port 50000 `
+    --stress-dma-count 2048
+# 然后看 ohcldiag-dev pcie-remote-exp inspect "vm/pcie_remote_vmbus:.../worker_stats"
+# 应见 dma_rate_limit_rejects 接近 1024
+
+# 验证 A4: 连续 ≥4 OOB InterruptFire → worker 进 Lost
+pcie_remote_noop_host_vsock.exe --vm-id $vmid --port 50000 `
+    --stress-bad-frames 8
+# 应见 consecutive_bad_frames=4，OpenHCL kmsg "going Lost consecutive=0x4"
+```
+
+不指定 stress 参数 = 默认 periodic 模式（每 5s InterruptFire，每 15s ReadGpa，每 20s WriteGpa）。
+
 ### 6. 验证端到端
 
 ```powershell
