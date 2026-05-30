@@ -644,15 +644,19 @@ impl PcieDevice for NvmeController {
     fn describe(&self) -> DeviceDescribe {
         DeviceDescribe {
             vendor_id: self.vid as u32,
-            device_id: self.ssvid as u32, // reuse field; nvme.sys cares about class_code
-            class_code: 0x01_08_02, // Mass Storage / NVMe
+            // PCI Device ID = 0xC0DE — matches OpenHCL noop convention 便于
+            // ohcldiag-dev / guest 区分本设备实例。
+            device_id: 0xc0de,
+            class_code: 0x01_08_02, // Mass Storage / NVMe (PCIe class 01.08.02)
             revision: 1,
-            subsystem_vendor: 0,
+            subsystem_vendor: self.ssvid as u32,
             subsystem_device: 0,
             bars: vec![BarInfo {
                 index: 0,
                 size: BAR0_SIZE,
-                kind: BarKind::Mmio64 as i32,
+                // NVMe spec 不强求 64-bit BAR；用 32-bit 简化 cfg space。
+                // BAR0 = MMIO 32 不消耗 BAR1，省 PCIe BAR slots。
+                kind: BarKind::Mmio32 as i32,
                 prefetchable: false,
             }],
             msix_count: self.msix_count as u32,

@@ -854,3 +854,61 @@ guest Windows Server 真见到
 本来就没注册任何 Microsoft driver；vmwp ↔ vpci channel ↔ OpenHCL bus 已
 打通才能枚举到设备）。
 
+
+## 2026-05-30 NVMe userspace 真 Hyper-V 部分验证（commit c32b364f）
+
+继 K-20/K-NEW-G/H 之后，完成"用户态写 PCIe 设备"工作的两步：
+
+1. **`pcie_remote_userspace_sdk` (commit 45f7ea19)**：把 noop 一次性 demo
+   抽成可复用 SDK；trait `PcieDevice` + `DeviceCtx`（含 DMA 完成回调）+
+   `run()` 主循环。NVMe 此后只关心 NVMe 语义，不重新写 wire protocol。
+
+2. **`pcie_remote_nvme_userspace` (commit c32b364f)**：~600 行 Rust 实现
+   NVMe spec 1.4 最小子集（regs/cmd/controller/main 四个模块）+ backing
+   文件支持。SDK + NVMe controller 都 build pass，全 Windows cross-compile
+   ok。
+
+### 真 Hyper-V 部分验证
+
+| 项 | 结果 | 证据 |
+|---|---|---|
+| NVMe userspace 启动 + vsock handshake | ✅ | `nvme_v1.log: "connected; SDK received Hello; SDK sent HelloAck"` |
+| guest Windows nvme.sys **绑定**设备 | ✅ | `Win32_PnPEntity` 显示 `Standard NVM Express Controller`，PNPDeviceID `PCI\\VEN_1414&DEV_0000&...` |
+| `mmio_read_results` 首次非零 | ✅ | 0 → 4（之前 noop class 0x070002 永远 0） |
+| `Get-Disk` 看到新 NVMe 盘 | ❌ | `ConfigManagerErrorCode=10 (CM_PROB_FAILED_START)` |
+| `stornvme` 服务正常 load | ❌ | Event 7026: "boot-start driver stornvme did not load" |
+
+### 已知问题（下一轮 debug）
+
+`mmio_read_results=4` 之后停止 + `inflight_current=1` 不归零，说明 nvme.sys
+读到第 5 个 reg 时遇到没回应，driver bail。可能原因：
+
+1. **CC.EN handshake 时序**：CSTS.RDY 0→1 应在 CC.EN=1 后立刻可见；
+   现实现是 sync 写入，理论无 race，但仍可能与 nvme.sys 期望的某种
+   read-after-write barrier 不符。
+2. **Identify Controller 字段布局**：static assert 已验证 size=4096，
+   但 nvme.sys 可能解 reserved 区域；需对比 stornvme 期望布局。
+3. **MSI-X capability 链**：OpenHCL ConfigSpaceType0Emulator 应自动
+   暴露 MsixEmulator 返回的 msix_cap；不确定 nvme.sys 是否能正确
+   walk capability list 找到它。
+4. **doorbell stride**：CAP.DSTRD=0 表示 4 bytes，与我们的 parse 一致；
+   但 nvme.sys 可能预期 8 bytes，需对比 Linux nvme.ko 源。
+
+### 下次 debug 起手式
+
+1. 跑 NVMe 时 `RUST_LOG=trace` 抓所有 MMIO read offset 序列（需要解决
+   PowerShell Start-Process env 不传播问题，或 wrap shell script）
+2. 用 `Get-WinEvent` 拉 nvme.sys 具体错误码
+3. 对比 OpenVMM 仓库内已工作的 `vm/devices/storage/nvme/` 看 reg/cap
+   layout 差异
+
+### 用户视角已闭环 vs 未闭环
+
+✅ **闭环**：userspace 程序 → vsock → OpenHCL → guest → nvme.sys 绑定
+✅ **闭环**：MMIO 路径首次真打通（mmio_read_results>0）
+❌ **未闭环**：guest `Get-Disk` 看不到 NVMe 盘，无法 format / read / write
+   实际数据
+
+距离用户最初想要的"暴露 PCIe/NVMe 给 userspace"目标 ~80% 完成；
+最后 20% 是 NVMe controller 模拟正确性 debug 迭代。
+
