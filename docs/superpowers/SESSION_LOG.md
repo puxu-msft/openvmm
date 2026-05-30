@@ -1185,3 +1185,81 @@ Hello from PCIe userspace SDK!                    ← file content
 NVMe SSD；guest 可以 partition、format、写文件、读文件；所有字节真实
 持久化到 host 文件系统的 backing file。
 
+
+
+## 2026-05-31 收尾：rust-reviewer #6 CRITICAL/HIGH 修复 + WriteAccum 重构
+
+v20 闭环（FAT32 + 读写文件）后跑 rust-reviewer 第 6 轮，发现 1 CRITICAL +
+4 HIGH，全部修复。落地 commit `ca21e0c8`。
+
+### C1 (CRITICAL) — 双 PRP Write 乱序 → 数据损坏假说
+
+**问题**：之前 PRP1/PRP2 用 `pending_write_accum[paired_token=tok2]` 关联。
+DMA 完成回调到达顺序不保证；如果 PRP2 数据先到 host：
+
+1. handler 在 accum 里查 PRP1，**找不到**，用 zeros 当 PRP1 写盘
+2. 之后 PRP1 真到达，写入 accum 但**永远不会被取走** → 4 KiB 永久泄漏
+3. driver 拿到 success CQE 以为整 8 KiB 写盘 OK → **silent data
+   corruption**
+4. 失败路径还会给同一 NVMe command 发两个 CQE（违反 spec § 4.6）
+
+虽然 v20 测试中没复现（PRP1 实际总先到 — 单连接 vsock + serial Hyper-V
+DMA），但 reviewer 正确指出这是无法保证的契约。
+
+**修复方案** — 新设计 `WriteAccum` + 独立 `op_id`：
+
+- 两个 `PendingOp::NvmWriteDualPrp{1,2}` 共用 `op_id`（不再依赖 token
+  配对）
+- 任一段到达：填入 `prp1_data` / `prp2_data` 对应槽
+- 两段都到达：merge 后一次 write_at + post **唯一** CQE
+- `pending_ios.remove` 后从 `dual_prp_writes` 一次性消费 entry
+- `disable()` 清空 `dual_prp_writes` 防止 controller reset 后 leak 累积
+
+### H1 — SQ doorbell 越界校验 + sq.tail 在校验后写
+
+之前 `sq.tail = new_tail` 先写，再判 wrap。若 `new_tail >= sq.size`
+（driver bug / fuzz）会读越界 SQ 内存。修复：校验通过后才写 `sq.tail`。
+
+### H3 — Identify CNS 0x03 改返空 list
+
+之前返 `NIDT=3` + NGUID 全 0 违反 NVMe spec § 5.15.2（NGUID 0h 表示
+"controller 不支持 NGUID"，不能作为有效 descriptor 返回）。改返 4 KiB
+零（header `NIDT=0` 表示 list 空，spec-compliant）。
+
+### H4 — OpenHCL device.rs MmioWrite fire-and-forget 回归测试
+
+commit `291d8645` 修了 nvme.sys OS hang（MMIO write 转成 fire-and-forget
+不等 CQE），但 0 测试覆盖。新增 3 个 unit test：
+
+- `mmio_write_returns_ok_immediately_fire_and_forget`
+- `mmio_write_lost_returns_err`
+- `mmio_write_invalid_size_returns_err`
+
+### H5 — 删 per-IO `sync_data`，配 IdentifyController VWC=1 走 NVMe FLUSH
+
+**性能改进**。之前每次 `NvmWrite` 都 `file.sync_data()` 阻塞整个 SDK 主
+循环（IOPS 上限 ~200-2000，2026-05-30 调试期为正确性故意加的兜底）。
+
+NVMe spec 允许设备有 volatile write cache，driver 通过显式 FLUSH
+(opcode 0x00) 拿持久化承诺。我们的 FLUSH handler 已经调 `sync_all()`，
+缺的是告诉 driver "我有 cache"：
+
+- `IdentifyController.VWC` bit 0 = 1 → driver 主动发 FLUSH
+- 删 `NvmWrite` 路径的 per-IO `sync_data`
+- `cmd.rs` 补 `IdentifyController` 的 `fuses` / `fna` / `vwc` 字段
+  （spec offset 522-525；之前 `_resv2: [u8; 4096 - 522]` 跨过了）
+
+结果：IOPS 上限取决于 vsock RTT 而不再被 fsync 阻塞；FAT32 format +
+文件读写依然正确（FAT 元数据更新走 FLUSH）。
+
+### 其它修复
+
+- `controller.rs`：dead variant 保留供未来 strict-ack 模式 +
+  `drain_in_flight` match 兜底
+- `main.rs`：示例性 clippy allow（`unnecessary_cast` /
+  `too_many_arguments` / `enum_variant_names`）— NVMe 代码按 spec
+  字段名照搬时这些 lint 反而损害可读性
+
+### 测试
+
+44 unit + 3 e2e + `clippy -D warnings` 全绿（之前 41+3）。
