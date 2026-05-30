@@ -135,10 +135,12 @@ async fn connect_with_retry(
         let r = try_one(driver, args).await;
         match r {
             Ok(t) => return Ok(t),
-            Err(e) if attempt < args.retries => {
+            // retries=0 表示无限重试（适合"NVMe 先于 VM 启动"的场景；VM
+            // VTL2 起来可能需要几分钟，不能让 retries 耗尽放弃）。
+            Err(e) if args.retries == 0 || attempt < args.retries => {
                 tracing::warn!(error = %e, attempt, "connect failed; retrying");
                 pal_async::timer::PolledTimer::new(driver)
-                    .sleep(Duration::from_millis(args.retry_ms))
+                    .sleep(std::time::Duration::from_millis(args.retry_ms))
                     .await;
             }
             Err(e) => return Err(e),

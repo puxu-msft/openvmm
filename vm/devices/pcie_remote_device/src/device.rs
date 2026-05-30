@@ -25,7 +25,6 @@ use chipset_device::ChipsetDevice;
 use chipset_device::io::IoError;
 use chipset_device::io::IoResult;
 use chipset_device::io::deferred::defer_read;
-use chipset_device::io::deferred::defer_write;
 use chipset_device::mmio::MmioIntercept;
 use chipset_device::pci::PciConfigSpace;
 use device_emulators::ReadWriteRequestType;
@@ -264,7 +263,10 @@ impl MmioIntercept for PcieRemoteDevice {
                 buf[..access_size].copy_from_slice(data);
                 let value = u64::from_le_bytes(buf);
 
-                let (deferred, token) = defer_write();
+                // MMIO write 是 fire-and-forget：协议设计上 host 不 ack 写，
+                // 立即 IoResult::Ok 让 guest driver 继续；否则 driver 永远
+                // 等不到 IoResult 完成会 hang（实测 Windows nvme.sys 初始化
+                // 写 CC.EN=0 后整个 OS 停在该 MMIO 上）。
                 let seq = self.next_seq();
                 let frame = ToHost {
                     seq,
@@ -281,9 +283,9 @@ impl MmioIntercept for PcieRemoteDevice {
                 self.to_worker.send(DeviceRequest {
                     seq,
                     frame,
-                    pending: Some(InFlight::Write { token: deferred }),
+                    pending: None, // 不等 host ack；写完即返
                 });
-                IoResult::Defer(token)
+                IoResult::Ok
             }
             None => IoResult::Err(IoError::InvalidRegister),
         }
