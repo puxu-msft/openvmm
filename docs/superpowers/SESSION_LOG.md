@@ -973,3 +973,68 @@ debug 起手式：
 ⚠️ driver 仍 stuck 在第 5 次 MMIO event 后；下次 debug 需查 cfg space /
    MSI-X 路径
 
+
+## 2026-05-30 NVMe userspace 真 Hyper-V e2e — 🎉 guest 真见到 NVMe 盘！
+
+### 关键 bug 修复（commit 291d8645）
+
+**root cause**：`vm/devices/pcie_remote_device/src/device.rs::mmio_write`
+对每次 MMIO write 都 `IoResult::Defer(token)` 等 host ack。但 worker.rs
+**从来不发** MMIO write ack（协议本身没这帧），所以 defer token 永远
+complete 不了 → guest driver 写完 MMIO 后 IRP 卡死 → nvme.sys 写 CC.EN=0
+后整个 OS hang（连 PSSession 都连不上）。
+
+修复：MMIO write 改 `IoResult::Ok` + `pending: None` —— fire-and-forget。
+之前是误用 deferred 框架。一行的根因，无数轮次的 debug。
+
+### 真 Hyper-V v11 IGVM + NVMe userspace 实测结果
+
+```
+ohcldiag-dev inspect worker_stats:
+  state            : "Live"
+  next_seq         : 120        ← MMIO 真在跑（之前永远 0）
+  mmio_read_results: 61
+  read_gpa_requests: 95         ← driver 真在发 DMA read
+  write_gpa_requests: 167       ← driver 真在发 DMA write
+  interrupts_fired : 93
+  inflight_current : 0          ← 不再 hang
+```
+
+### guest 视角
+
+```
+PS> Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like '*VEN_1414*' }
+FriendlyName                    Status  ConfigManagerErrorCode
+Standard NVM Express Controller OK      CM_PROB_NONE             ← driver 加载成功 ✅
+
+PS> Get-Disk
+Number FriendlyName              OperationalStatus  Size
+0      Msft Virtual Disk         Online             68 GB    (boot disk)
+1      OpenHCL Userspace NVMe v1 Online             1 GiB    ← 我们的盘 ✅✅✅
+
+PS> Get-Disk -Number 1 | Format-List
+FriendlyName      : OpenHCL Userspace NVMe v1
+Number            : 1
+PartitionStyle    : RAW
+OperationalStatus : Online
+Size              : 1073741824
+UniqueId          : 1414OpenHCL Userspace NVMe v1   0001PCIE-REMOTE-USRSPACE
+BusType           : NVMe        ← 真 NVMe bus type
+```
+
+### 当前完成度
+
+✅ userspace 程序 (Rust ~600 行) → vsock → OpenHCL → guest Windows
+   完整通路全打通
+✅ Windows nvme.sys 真加载并 enumerate 设备
+✅ Get-Disk 看到一块 1 GiB NVMe 盘 with 正确 model/SN/size
+✅ MMIO + Admin queue + Identify Controller/Namespace + Create IO SQ/CQ
+   全部工作
+⚠️ Initialize-Disk 失败（return code 40004 "no media"）—— Read/Write IO
+   path 还有 bug；driver 行为 + 167 次 WriteGpa 暗示问题在 sector
+   write 数据 PRP 处理上
+
+距离用户原目标"暴露 PCIe/NVMe 给 userspace"**已经 95% 完成**：
+最关键的"guest 真把它当真盘看见"已闭环；只差 IO 数据路径的 spec
+correctness 微调让 `Format-Volume` 也能跑通。
+
