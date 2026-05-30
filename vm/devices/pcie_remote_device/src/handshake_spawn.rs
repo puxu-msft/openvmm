@@ -35,11 +35,17 @@ use std::time::Duration;
 const MAX_ACCEPT_ATTEMPTS: u32 = 32;
 
 /// Listener 类型擦除：抽离 listener 接收 + accept + 返回 boxed transport 的能力。
+/// Listener 类型擦除：在**已 polled** 的 listener 上 accept 一个 connection
+/// + 做 application-level handshake。
+///
+/// **K-20 hotplug**：本函数借用 polled_listener 而非拿走所有权，让外层
+/// listener 持久存活；返回 None 后调用方可继续循环 accept 下一个 connection
+/// （host 重连场景）。
 ///
 /// 返回 Some(prepared) 表示 handshake 成功；None 表示超时 / 重试耗尽。
 async fn accept_and_handshake<L>(
     driver: impl Driver + Clone,
-    listener: L,
+    polled_listener: &mut PolledSocket<L>,
     instance_id: guid::Guid,
     handshake_timeout: Duration,
 ) -> Option<PreparedPcieRemoteDevice>
@@ -48,23 +54,10 @@ where
     L::Socket: 'static + Send,
     PolledSocket<L::Socket>: futures::io::AsyncRead + futures::io::AsyncWrite + Unpin + Send,
 {
-    let mut polled_listener = match PolledSocket::new(&driver, listener) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(
-                CVM_ALLOWED,
-                %instance_id,
-                error = %e,
-                "pcie_remote: PolledSocket::new(listener) failed"
-            );
-            return None;
-        }
-    };
-
     let mut ctx = CancelContext::new().with_timeout(handshake_timeout);
     let driver_for_backoff = driver.clone();
     let outcome = ctx
-        .until_cancelled(async move {
+        .until_cancelled(async {
             let mut attempts: u32 = 0;
             loop {
                 if attempts >= MAX_ACCEPT_ATTEMPTS {
@@ -167,48 +160,20 @@ pub fn spawn_tcp_handshakes(
                 tracing::error!(CVM_ALLOWED, %id, error = %e, "pcie_remote: set_nonblocking failed");
                 return;
             }
-            // K-20 hotplug: listen forever
-            let mut first = true;
+            // K-20 hotplug: 一次构造 PolledSocket，循环 accept（不重 bind）。
+            let mut polled_listener = match PolledSocket::new(&driver, listener) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(
+                        CVM_ALLOWED, %id, error = %e,
+                        "pcie_remote: PolledSocket::new(TCP listener) failed"
+                    );
+                    return;
+                }
+            };
             loop {
-                // 用 std::net::TcpListener 不能直接 reuse — accept_and_handshake
-                // 接管 polled_listener。这里我们重新 bind 也不行（port 占用）。
-                // 解决：把 listener 留在外面，accept_and_handshake 调成只
-                // accept 一个 connection。
-                // 但当前 accept_and_handshake 签名拿走 listener。
-                // **简化**：每轮重新 bind（前轮 listener drop 让 port 释放）。
-                // 实际更好做法是改 accept_and_handshake 接受 polled_listener
-                // 引用而非 owned listener，但那需要 listener 的 polled wrapper
-                // 跨 await 持久存活。
-                //
-                // 折中：第一轮用 owned listener；后续 reconnect 时 bind 同
-                // 地址（SO_REUSEADDR 让重 bind 成功，TIME_WAIT 也能复用）。
-                let l = if first {
-                    // listener 已经 bind 好了，复用一次
-                    first = false;
-                    match listener.try_clone() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::error!(CVM_ALLOWED, %id, error = %e, "TCP try_clone failed");
-                            return;
-                        }
-                    }
-                } else {
-                    // 后续轮：旧 listener drop 后重新 bind
-                    match std::net::TcpListener::bind(&addr) {
-                        Ok(l) => {
-                            let _ = l.set_nonblocking(true);
-                            l
-                        }
-                        Err(e) => {
-                            tracing::warn!(CVM_ALLOWED, %id, addr, error = %e, "TCP rebind failed; sleep + retry");
-                            PolledTimer::new(&driver)
-                                .sleep(Duration::from_secs(1))
-                                .await;
-                            continue;
-                        }
-                    }
-                };
-                let Some(prep) = accept_and_handshake(driver.clone(), l, id, timeout).await
+                let Some(prep) =
+                    accept_and_handshake(driver.clone(), &mut polled_listener, id, timeout).await
                 else {
                     tracing::warn!(CVM_ALLOWED, %id, "pcie_remote: TCP handshake timeout/exhausted; will keep listening");
                     continue;
@@ -251,26 +216,31 @@ pub fn spawn_vsock_handshakes(
         let prepared = prepared.clone();
         let swap_map = swap_map.clone();
         let task = spawner.spawn(format!("pcie_remote_vsock_{id}"), async move {
-            // K-20: 每轮重 bind vsock（旧 listener drop 后端口释放）。
+            // K-20: 一次 bind + 构造 PolledSocket，循环 accept。
+            let listener =
+                match vmsocket::VmListener::bind(vmsocket::VmAddress::vsock_any(port)) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::error!(
+                            CVM_ALLOWED, %id, port, error = %e,
+                            "pcie_remote: vsock bind failed"
+                        );
+                        return;
+                    }
+                };
+            let mut polled_listener = match PolledSocket::new(&driver, listener) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(
+                        CVM_ALLOWED, %id, error = %e,
+                        "pcie_remote: PolledSocket::new(vsock listener) failed"
+                    );
+                    return;
+                }
+            };
             loop {
-                let listener =
-                    match vmsocket::VmListener::bind(vmsocket::VmAddress::vsock_any(port)) {
-                        Ok(l) => l,
-                        Err(e) => {
-                            tracing::warn!(
-                                CVM_ALLOWED,
-                                %id, port,
-                                error = %e,
-                                "pcie_remote: vsock bind failed; sleep + retry"
-                            );
-                            PolledTimer::new(&driver)
-                                .sleep(Duration::from_secs(1))
-                                .await;
-                            continue;
-                        }
-                    };
                 let Some(prep) =
-                    accept_and_handshake(driver.clone(), listener, id, timeout).await
+                    accept_and_handshake(driver.clone(), &mut polled_listener, id, timeout).await
                 else {
                     tracing::warn!(CVM_ALLOWED, %id, "pcie_remote: vsock handshake timeout; will keep listening");
                     continue;
