@@ -227,58 +227,69 @@ impl NvmeController {
     }
 
     /// SQyTDBL 写入：driver 通告新 SQE。host 立即 DMA-read 新 entries。
+    /// 支持 wrap：[old_tail..size) + [0..new_tail) 拆两段独立 DMA fetch。
     fn on_sq_tail_doorbell(&mut self, ctx: &mut DeviceCtx<'_>, sq_id: u16, new_tail: u32) {
-        let Some(sq) = self.sqs.get_mut(&sq_id) else {
-            tracing::warn!(sq_id, "SQ tail doorbell to unknown SQ");
-            return;
+        let (base_gpa, size, old_tail) = {
+            let Some(sq) = self.sqs.get_mut(&sq_id) else {
+                tracing::warn!(sq_id, "SQ tail doorbell to unknown SQ");
+                return;
+            };
+            let old = sq.tail;
+            sq.tail = new_tail;
+            (sq.base_gpa, sq.size, old)
         };
-        let old_tail = sq.tail;
-        sq.tail = new_tail;
         if old_tail == new_tail {
             return;
         }
-        // 计算 [old_tail, new_tail) 范围内的 entries（考虑 wrap）。
-        let count = if new_tail >= old_tail {
-            new_tail - old_tail
+        // 分两段：上半 [old_tail..end_of_q) + 下半 [0..new_tail)。
+        // 非 wrap 时下半 count=0，跳过。
+        let (first_count, second_count) = if new_tail > old_tail {
+            (new_tail - old_tail, 0)
         } else {
-            sq.size - old_tail + new_tail
+            (size - old_tail, new_tail)
         };
-        // 简化：若 wrap，发两个 DMA fetch；否则一个。这里只处理非 wrap 情况
-        // （admin queue 容量 64，nvme.sys 起步阶段不太可能 wrap）。
-        if new_tail >= old_tail {
-            let bytes = count * SQE_BYTES as u32;
-            let gpa = sq.base_gpa + old_tail as u64 * SQE_BYTES;
-            let raw_token = ctx.dma_read(gpa, bytes);
+
+        // 段 1：[old_tail .. old_tail + first_count)
+        let bytes1 = first_count * SQE_BYTES as u32;
+        let gpa1 = base_gpa + old_tail as u64 * SQE_BYTES;
+        let tok1 = ctx.dma_read(gpa1, bytes1);
+        self.pending_fetches.insert(
+            tok1,
+            FetchCtx {
+                sq_id,
+                count: first_count,
+                start_slot: old_tail,
+            },
+        );
+        tracing::debug!(
+            sq_id,
+            start_slot = old_tail,
+            count = first_count,
+            gpa = format_args!("{:#x}", gpa1),
+            tok1,
+            "SQ doorbell: fetch segment 1"
+        );
+
+        // 段 2：[0 .. second_count) — 仅 wrap 时
+        if second_count > 0 {
+            let bytes2 = second_count * SQE_BYTES as u32;
+            let gpa2 = base_gpa;
+            let tok2 = ctx.dma_read(gpa2, bytes2);
             self.pending_fetches.insert(
-                raw_token,
+                tok2,
                 FetchCtx {
                     sq_id,
-                    count,
-                    start_slot: old_tail,
+                    count: second_count,
+                    start_slot: 0,
                 },
             );
             tracing::debug!(
                 sq_id,
-                start_slot = old_tail,
-                count,
-                gpa = format_args!("{:#x}", gpa),
-                raw_token,
-                "SQ doorbell: fetching SQ entries via DMA"
-            );
-        } else {
-            // wrap：简化处理，发到 size 即可，剩下下一轮 doorbell 处理
-            tracing::warn!(sq_id, old_tail, new_tail, "SQ doorbell wrap — only fetching to end");
-            let count_to_end = sq.size - old_tail;
-            let bytes = count_to_end * SQE_BYTES as u32;
-            let gpa = sq.base_gpa + old_tail as u64 * SQE_BYTES;
-            let raw_token = ctx.dma_read(gpa, bytes);
-            self.pending_fetches.insert(
-                raw_token,
-                FetchCtx {
-                    sq_id,
-                    count: count_to_end,
-                    start_slot: old_tail,
-                },
+                start_slot = 0,
+                count = second_count,
+                gpa = format_args!("{:#x}", gpa2),
+                tok2,
+                "SQ doorbell: fetch segment 2 (wrap)"
             );
         }
     }
@@ -357,9 +368,28 @@ impl NvmeController {
                         buf[..4].copy_from_slice(&1u32.to_le_bytes());
                         buf
                     }
+                    0x03 => {
+                        // Namespace Identification Descriptor list (NVMe 1.3+)
+                        // 4 KiB；driver 期望至少一个 descriptor。我们返回 NIDT=3
+                        // (NGUID, 16 bytes) 全零 — 表示"namespace identifier
+                        // 不可用，但 list 有效"，避免 Windows 报 invalid field。
+                        let mut buf = vec![0u8; 4096];
+                        buf[0] = 0x03; // NIDT = NGUID
+                        buf[1] = 16; // NIDL = 16 bytes
+                        // buf[2..4] reserved；buf[4..20] NGUID = 全 0（"no NGUID"）
+                        // 后续 NIDT=0 终止 list
+                        buf
+                    }
+                    0x06 => {
+                        // CNS 0x06 = Identify Controller for the controller list /
+                        // I/O Command Set Independent for NS. 返 4 KiB 零即可，
+                        // 让 driver 走默认；不发错保证 Windows 后续 init 继续。
+                        vec![0u8; 4096]
+                    }
                     _ => {
-                        tracing::warn!(cns, "Identify: unsupported CNS");
-                        return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                        tracing::warn!(cns, "Identify: unsupported CNS, returning zeros");
+                        // 比 INVALID_FIELD 友好：返 4 KiB 零让 driver 继续。
+                        vec![0u8; 4096]
                     }
                 };
                 // DMA write to PRP1
@@ -464,9 +494,30 @@ impl NvmeController {
                 self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, 0, sq_head, cq_id);
                 None
             }
+            admin_opc::DELETE_IO_SQ => {
+                let qid = (sqe.cdw10 & 0xffff) as u16;
+                tracing::info!(qid, "Delete IO SQ");
+                self.sqs.remove(&qid);
+                Some(Cqe::success(cid, 0, sq_head, phase))
+            }
+            admin_opc::DELETE_IO_CQ => {
+                let qid = (sqe.cdw10 & 0xffff) as u16;
+                tracing::info!(qid, "Delete IO CQ");
+                self.cqs.remove(&qid);
+                Some(Cqe::success(cid, 0, sq_head, phase))
+            }
+            admin_opc::ABORT => {
+                tracing::debug!(cid, "Abort (no-op success)");
+                let mut cqe = Cqe::success(cid, 0, sq_head, phase);
+                cqe.cdw0 = 1; // bit 0 = "Could Not Abort" — driver 不报错
+                Some(cqe)
+            }
             opc => {
-                tracing::warn!(opc, "unsupported admin opcode");
-                Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_OPCODE, 0))
+                tracing::warn!(opc, "unsupported admin opcode; returning success to keep driver alive");
+                // 返 success 而非 INVALID_OPCODE：很多 driver 在
+                // boot 期会探测可选 opcode，遇 INVALID_OPCODE 会进入 fallback
+                // 路径或直接 fail device。返 success（CQE cdw0=0）通常更安全。
+                Some(Cqe::success(cid, 0, sq_head, phase))
             }
         }
     }
