@@ -483,6 +483,73 @@ mod tests {
         assert!(r.try_consume(1024));
     }
 
+    /// inflight 计数器：MmioReadResult 处理后从 in_flight map 移除 → counter 减；
+    /// drain_in_flight 触发归零。
+    ///
+    /// 不依赖真 guest driver — 用直接构造的 DeferredRead/Write token 模拟
+    /// device.rs → worker 的 DeviceRequest 流向（e2e 时 guest 无 driver 不
+    /// 会触发，这里单元测试覆盖该路径）。
+    #[test]
+    fn inflight_counter_tracks_in_flight_map() {
+        use chipset_device::io::deferred::defer_read;
+        use futures::io::Cursor;
+        use pal_async::DefaultPool;
+        use pcie_remote_protocol::MmioReadResult as Mrr;
+        use pcie_remote_protocol::to_openhcl::Body;
+
+        DefaultPool::run_with(|_| async move {
+            let cursor = Cursor::new(Vec::<u8>::new());
+            let (_dev_tx, dev_rx) = mesh::channel::<DeviceRequest>();
+            let state = crate::state::SharedState::new(crate::state::DeviceState::Live);
+            let gm = guestmem::GuestMemory::empty();
+            let stats: SharedWorkerStats = Arc::new(WorkerStats::default());
+            let stats_for_check = stats.clone();
+            let mut w = Worker::new(cursor, state, dev_rx, Vec::new(), gm, stats);
+
+            // 手工把 2 个 InFlight 塞进 worker（模拟 device.rs 投递过来）。
+            let (_d1, t1) = defer_read();
+            let (_d2, t2) = defer_read();
+            w.in_flight.insert(
+                10,
+                InFlight::Read {
+                    token: _d1,
+                    access_size: 4,
+                },
+            );
+            w.in_flight.insert(
+                11,
+                InFlight::Read {
+                    token: _d2,
+                    access_size: 8,
+                },
+            );
+            // 模拟 device.rs 投递时 worker 主循环更新 stats：
+            let cur = w.in_flight.len() as u64;
+            w.stats.inflight_current.store(cur, Ordering::Relaxed);
+            w.stats.inflight_peak.fetch_max(cur, Ordering::Relaxed);
+            assert_eq!(stats_for_check.inflight_current.load(Ordering::Relaxed), 2);
+            assert_eq!(stats_for_check.inflight_peak.load(Ordering::Relaxed), 2);
+
+            // host 回 seq=10 → in_flight 减 1，counter 更新
+            let reply1 = ToOpenhcl {
+                seq: 10,
+                body: Some(Body::MmioReadResult(Mrr { value: 0xdead })),
+            };
+            assert!(w.dispatch_inbound(reply1).await);
+            assert_eq!(stats_for_check.inflight_current.load(Ordering::Relaxed), 1);
+            // peak 保持 2（fetch_max 单调）
+            assert_eq!(stats_for_check.inflight_peak.load(Ordering::Relaxed), 2);
+            assert_eq!(stats_for_check.mmio_read_results.load(Ordering::Relaxed), 1);
+
+            // drain（模拟 worker 进 Lost）→ inflight_current 归零
+            w.drain_in_flight();
+            assert_eq!(stats_for_check.inflight_current.load(Ordering::Relaxed), 0);
+            // 但 peak 仍 2
+            assert_eq!(stats_for_check.inflight_peak.load(Ordering::Relaxed), 2);
+            assert!(w.in_flight.is_empty());
+        });
+    }
+
     /// 验证 InterruptFire dispatch 的边界：
     /// - 合法 msix_index 在范围内 → 不增 bad-frame 计数
     /// - 越界 msix_index → 增 bad-frame 计数
