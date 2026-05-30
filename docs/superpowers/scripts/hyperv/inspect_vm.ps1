@@ -20,7 +20,7 @@ Write-Host ("FirmwareParameters       : " + ($vssd.FirmwareParameters | Measure-
 Write-Host ("BootSourceOrder          : " + ($vssd.BootSourceOrder -join ','))
 Write-Host ("SecureBootEnabled        : " + $vssd.SecureBootEnabled)
 Write-Host ("GuestStateFile           : '" + $vssd.GuestStateFile + "'")
-Write-Host ("VMBusMessageRedirection  : " + $vssd.VMBusMessageRedirection + "  (非必需; 用 -GuestStateIsolationType OpenHCL 创建后 0/1 都 OK)")
+Write-Host ("VMBusMessageRedirection  : " + $vssd.VMBusMessageRedirection + "  (vsock/diag 不需要; 但 vpci 设备 [pcie_remote / NVMe takeover] 要求 = 1)")
 Write-Host ("Version                  : " + $vssd.Version)
 Write-Host ("ConfigurationID          : " + $vssd.ConfigurationID)
 Write-Host "=== All non-empty string/UInt32/Bool props ==="

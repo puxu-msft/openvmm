@@ -1,16 +1,21 @@
 # Enable VMBusMessageRedirection on the VM via WMI.
 #
-# ⚠ DEPRECATED (2026-05-30): 本脚本基于"VMBusMessageRedirection=1 是 OpenHCL
-#   diag vsock 必需"的旧假设。实测发现：用
+# ⚠ 半 DEPRECATED (2026-05-30): 本脚本基于"VMBusMessageRedirection=1 是 OpenHCL
+#   diag vsock 必需"的旧假设。该假设**对 vsock/diag 路径不成立** —— 用
 #   `New-VM -GuestStateIsolationType OpenHCL` 正确创建的 VM 默认
-#   VMBusMessageRedirection=0，**ohcldiag-dev 依然正常工作**。
+#   VMBusMessageRedirection=0，ohcldiag-dev 依然正常工作。
 #
-#   真实必要条件是 VM 创建时带 -GuestStateIsolationType OpenHCL（见
-#   create_openhcl_vm_correct.ps1）。retrofit vssd 字段（含本脚本）对
-#   "vssd 缺 isolation type" 的根因无法补救。
+#   **但**：当 OpenHCL 配置 vpci 设备（cmdline pcie_remote 注入 / NVMe
+#   takeover 等），VMBusMessageRedirection=1 **是必需的**：OpenHCL 启动会
+#   报 `vpci devices require vmbus redirection to be enabled`。
 #
-#   旧脚本保留作 ModifySystemSettings + CimSerializer + 异步 Job 等待
-#   的代码范例参考。
+#   所以本脚本在 vpci 场景仍有效；在纯 diag 场景则非必要。当前推荐：
+#   - 没用 pcie_remote 等 vpci 设备 → 不需要本脚本
+#   - 用了 vpci 设备 → 本脚本 OR 在 deploy 时一并设 vssd
+#
+#   旧 deprecation note "无法补救" 已被纠正：retrofit 编辑 vssd 的
+#   VMBusMessageRedirection 字段对**已经用 -GuestStateIsolationType
+#   OpenHCL 创建的 VM** 是有效的；retrofit 不行的是 isolation type 本身。
 
 param([string]$VmName = 'pcie-remote-exp')
 $ErrorActionPreference = 'Stop'

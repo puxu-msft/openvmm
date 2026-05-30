@@ -293,8 +293,12 @@ OpenHCL VTL2 完全启动并响应 diag！🎉
 
 ### 副产品发现
 
-- `VMBusMessageRedirection=1` **不是必需的**（GuestStateIsolationType=OpenHCL
-  路径自动处理 vsock routing）
+- `VMBusMessageRedirection=1` **对 vsock / ohcldiag-dev 路径不是必需的**
+  （GuestStateIsolationType=OpenHCL 路径自动处理 vsock routing）。
+  > **2026-05-30 后续修正**：当 OpenHCL 配置了 **vpci 设备**（cmdline 或
+  > NVMe takeover 注入 pcie_remote 等），VMBusMessageRedirection=1 **是
+  > 必需的**，否则 OpenHCL 启动失败：`vpci devices require vmbus
+  > redirection to be enabled`。详见末尾 "v2 真 Hyper-V end-to-end" 段。
 - 用 `-GuestStateIsolationType OpenHCL` 创建后，vssd 上 `GuestFeatureSet=0x513`
   （含 isolation flags），用 `Set-OpenHCL-HyperV-VM.ps1` 设了 FirmwareFile
   后变成 `0x201`，但 OpenHCL 仍 boot —— 说明真正决定是创建时的 isolation
