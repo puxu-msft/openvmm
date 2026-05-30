@@ -79,7 +79,8 @@ ln -sf $(rustup which rust-lld) ~/.local/bin/lld-link-20
 ### §C Service GUID 注册
 ```powershell
 gsudo cache on --duration 00:05:00
-gsudo -d powershell -NoProfile -ExecutionPolicy Bypass -File register_openhcl_diag_guids.ps1
+gsudo -d powershell -NoProfile -ExecutionPolicy Bypass `
+  -File docs\superpowers\scripts\hyperv\register_openhcl_diag_guids.ps1
 ```
 
 ### §D 创建 OpenHCL VM (正确方法 — 关键！)

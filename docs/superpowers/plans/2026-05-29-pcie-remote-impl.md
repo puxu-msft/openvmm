@@ -5,8 +5,9 @@
 > **2026-05-30 STATUS：实施计划已全部完成。** Phase 1 ~ 10 落地完毕，
 > 真 Linux KVM (OpenVMM 路径) + 真 Hyper-V (OpenHCL 路径) 端到端
 > 全部验证通过。最新成果详见 [../SESSION_LOG.md](../SESSION_LOG.md)
-> "🎉🎉🎉 真 Hyper-V 端到端验证" 段；K-IDs 表见
-> [../specs/2026-05-29-pcie-remote-design.md](../specs/2026-05-29-pcie-remote-design.md) §10。
+> 的"2026-05-30 🎉🎉🎉 真 Hyper-V 端到端验证"段（emoji 标题，
+> 用 `grep -n "真 Hyper-V 端到端验证" docs/superpowers/SESSION_LOG.md` 定位）；
+> K-IDs 表见 [../specs/2026-05-29-pcie-remote-design.md](../specs/2026-05-29-pcie-remote-design.md) §10。
 
 **Goal:** 实现 OpenHCL/OpenVMM 远程 PCIe 实验设备 v1 —— guest 看到通用 PCIe 设备，所有语义在 Windows host 用户态程序，OpenHCL 内薄壳；同时把 OpenVMM 路径的半成品补齐。
 
@@ -48,19 +49,21 @@
 
 ## Phase 编排（v2）
 
-| Phase | 主题 | 阻塞 | 验证 |
-|-------|------|------|------|
-| 0 | 落 spec + plan + log（已完成 commit 60a100f5） | — | — |
-| 1 | `pcie_remote_protocol` crate | — | crate `cargo test` |
-| 2 | `pcie_remote_resources` 扩 + `pcie_remote_device` 骨架 + `AbsentPcieDevice` + state/error | P1 | crate `cargo test` + `cargo check -p openvmm_entry`（不破坏 build） |
-| 3 | worker.rs + dead-man（mock transport） | P2 | 单测 |
-| 4 | handshake.rs + prepared.rs（mock transport） | P3 | 单测 |
-| 5 | transport.rs + dma.rs + device.rs | P4 | 单测 |
-| **6** | **OpenVMM 端真实接线（resolver + handshake spawn + CLI 迁移）** —— 一次性把 OpenVMM 路径走通，不留 absent-stub 窗口 | P5 | `cargo build -p openvmm` + 启动 noop host stub 后 VM 能枚举设备 |
-| 7 | OpenHCL 端 handle/CLI/takeover/resolver 注入 | P5 | `cargo check --target x86_64-unknown-linux-musl -p underhill_core` |
-| 8 | host SDK 示例（noop 设备）+ setup.ps1 + Guide 文档 | P6 | host stub 独立 `cargo run` |
-| 9 | OpenVMM + Linux guest 在本机 VM 实验 | P6+P8 | guest dmesg 能看到设备 |
-| 10 | OpenHCL IGVM build（WSL 交叉编译）+ 启动 Linux guest 验证（可选） | P7 | IGVM 启动 + handshake ok |
+> 所有 Phase 已完成（2026-05-30）；详细完成状态见末尾"任务分级"表。
+
+| Phase | 主题 | 状态 | 阻塞 | 验证 |
+|-------|------|------|------|------|
+| 0 | 落 spec + plan + log（已完成 commit 60a100f5） | ✅ | — | — |
+| 1 | `pcie_remote_protocol` crate | ✅ | — | crate `cargo test` |
+| 2 | `pcie_remote_resources` 扩 + `pcie_remote_device` 骨架 + `AbsentPcieDevice` + state/error | ✅ | P1 | crate `cargo test` + `cargo check -p openvmm_entry`（不破坏 build） |
+| 3 | worker.rs + dead-man（mock transport） | ✅ | P2 | 单测 |
+| 4 | handshake.rs + prepared.rs（mock transport） | ✅ | P3 | 单测 |
+| 5 | transport.rs + dma.rs + device.rs | ✅ | P4 | 单测 |
+| **6** | **OpenVMM 端真实接线（resolver + handshake spawn + CLI 迁移）** —— 一次性把 OpenVMM 路径走通，不留 absent-stub 窗口 | ✅ | P5 | `cargo build -p openvmm` + 启动 noop host stub 后 VM 能枚举设备 |
+| 7 | OpenHCL 端 handle/CLI/takeover/resolver 注入 | ✅ | P5 | `cargo check --target x86_64-unknown-linux-musl -p underhill_core` |
+| 8 | host SDK 示例（noop 设备）+ setup.ps1 + Guide 文档 | ✅ | P6 | host stub 独立 `cargo run` |
+| 9 | OpenVMM + Linux guest 在本机 VM 实验 | ✅ | P6+P8 | guest dmesg 能看到设备（真 KVM e2e）|
+| 10 | OpenHCL IGVM build（WSL 交叉编译）+ 启动 Linux guest 验证（可选） | ✅ | P7 | IGVM 启动 + 真 Hyper-V vsock handshake ok |
 
 ---
 
@@ -2397,13 +2400,18 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ### Step 9.1 — 准备 minimal Linux 镜像
 
-- [ ] Run: 检查仓库 fixtures。`ls petri/test_artifacts/ 2>/dev/null` 或下载一个 ~20MB 的 alpine kernel + initrd。
+> **2026-05-30 实际结果**：未走 wget alpine 路径；最终用 `--linux-direct` +
+> 仓库 OpenVMM-friendly kernel（来自 cargo xflowey 拉取的 fixture）跑通
+> 真 KVM end-to-end。详见 [../SESSION_LOG.md](../SESSION_LOG.md) 真 KVM
+> 端到端证据段。下面的探索性占位代码保留作历史。
+
+- [x] Run: 检查仓库 fixtures。`ls petri/test_artifacts/ 2>/dev/null` 或下载一个 ~20MB 的 alpine kernel + initrd。
   - 如果 fixture 缺，从公网取一个 alpine-mini-rootfs（无人值守可接受）：
 
 ```bash
 mkdir -p /tmp/pcie_remote_exp
 cd /tmp/pcie_remote_exp
-wget -nv https://github.com/alpinelinux/aports/raw/master/main/linux-virt/...   # 视具体可下载源
+wget -nv https://github.com/alpinelinux/aports/raw/master/main/linux-virt/...   # 视具体可下载源 — 占位，未实际使用
 # 或使用 OpenVMM 仓库 README 推荐的 OpenVMM-friendly linux image
 ```
 

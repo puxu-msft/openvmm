@@ -30,6 +30,8 @@ Claude 可从 WSL 用 `/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell
 ```powershell
 # 从 WSL 调：
 # /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -Command "..."
+# (Windows PowerShell 5.x；如果装了 PowerShell 7+，路径是
+#  /mnt/c/Program Files/PowerShell/7/pwsh.exe，参数兼容。)
 
 Get-Service vmms,vmcompute | Format-Table
 # 期望：vmms = Automatic+Running，vmcompute = Manual+Running
@@ -103,6 +105,8 @@ cp flowey-out/artifacts/build-igvm/ship/pcie-test/openhcl-pcie-test.bin /mnt/c/t
 
 ```powershell
 $VmName = 'pcie-remote-exp'
+# 如果你只跑了 §1 第一条 cargo xflowey build-igvm 命令，IGVM 是 'openhcl-x64.bin'；
+# 如果跑了 --override-manifest 的第二条，IGVM 是 'openhcl-pcie-test.bin'。
 $IgvmFile = 'C:\temp\pcie_remote_exp\openhcl-pcie-test.bin'
 
 # 如果有旧的，先删
@@ -136,8 +140,9 @@ Get-VM $VmName | Select-Object Name,Version,State,Generation,IsolationType
 > 在 vsock 路径上由 Hyper-V 自动处理 routing；ohcldiag-dev 直接走 AF_HYPERV
 > 高 VTL channel 工作，不依赖 GuestCommunicationServices reg key。
 >
-> 如果你想为**用户态自定义 service**（如 pcie_remote_noop_host_vsock.exe
-> 在 host 端 connect 到 VTL2 vsock port 50000）注册 ACL：
+> 如果你的 host 端程序是本仓库提供的 `pcie_remote_noop_host_vsock.exe`，
+> AF_HYPERV connect 内核会自动处理 ACL，**跳过本节即可**。本节只在你想
+> 给**任意第三方用户态 service** 注册 GUID 白名单时才需要。
 
 ```powershell
 & C:\temp\pcie_remote_exp\setup-pcie-remote.ps1 -VsockPort 50000
@@ -160,7 +165,7 @@ C:\temp\pcie_remote_exp\ohcldiag-dev.exe $VmName inspect vm | Select-Object -Fir
 
 ```powershell
 $vmid = (Get-VM pcie-remote-exp).Id
-# AF_HYPERV 客户端，跨编自 docs/superpowers/examples/pcie_remote_noop_host
+# AF_HYPERV 客户端（vsock_main.rs 跨编自 docs/superpowers/examples/pcie_remote_noop_host）
 C:\temp\pcie_remote_exp\pcie_remote_noop_host_vsock.exe `
     --vm-id $vmid --port 50000 --retries 60 --retry-ms 500
 ```
@@ -257,5 +262,5 @@ host stub: received Hello ... sent HelloAck
 | `docs/superpowers/scripts/setup-pcie-remote.ps1` | 注册 vsock service GUID + ACL |
 | `docs/superpowers/scripts/hyperv/` | 历史 PS 脚本（部分已过时，见各文件头部 deprecation note）|
 | `docs/superpowers/examples/pcie_remote_noop_host/` | host 端 TCP 与 vsock client（OpenVMM / OpenHCL 对端）|
-| `docs/superpowers/examples/vmrs_log_scanner/` | `.vmrs` RAM 字符串扫描器（OpenHCL 启动失败时诊断用）|
+| `docs/superpowers/examples/vmrs_log_scanner/` | `.vmrs` RAM 字符串扫描器（OpenHCL 启动失败时诊断用；已用于定位本节"真根因发现"中的 retrofit 路径加载失败问题，详见 [SESSION_LOG.md](SESSION_LOG.md)）|
 | `Guide/src/user_guide/openhcl/run/hyperv.md` | Microsoft 官方 OpenHCL on Hyper-V 文档（本 runbook 的依据）|

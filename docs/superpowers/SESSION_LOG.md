@@ -16,9 +16,9 @@
 | Phase 1-5（crate / handshake / worker / dead-man / device） | ✅ | 54 unit + integration tests pass |
 | Phase 6 OpenVMM wiring | ✅ | `cargo build -p openvmm` ✅ |
 | Phase 7 OpenHCL wiring + CLI（INSTANCE） | ✅ | musl 跨编通过 |
-| Phase 7+ OpenHCL Path C (NVMe takeover) | ✅ | `4ecd7b9b` create_storage_controllers_from_vtl2_settings 分流 |
+| Phase 7+ OpenHCL Path C (NVMe takeover) | ✅ | `create_storage_controllers_from_vtl2_settings` 分流（早期 commit；squash 后 hash 已变）|
 | Phase 8 host SDK + setup.ps1 + Guide | ✅ | host stub 改为 client 角色 |
-| Phase 9 真 KVM 端到端 | ✅ | `2917dfbd` boot grace period + 持久 worker |
+| Phase 9 真 KVM 端到端 | ✅ | boot grace period + 持久 worker（早期 commit；squash 后 hash 已变）|
 | IGVM build | ✅ | `flowey-out/artifacts/build-igvm/ship/x64/openhcl-x64.bin` 19MB |
 | 单测 / resolver fallback / options parser | ✅ | 27 + 3 + 8 = 38 tests in pcie_remote_* + underhill_core::options |
 
@@ -165,6 +165,12 @@ OpenHCL 在 OpenVMM 上启动需要 **WHP 或 mshv** hypervisor（提供 VTL2）
 
 ### Path C（真 Hyper-V）实战进展
 
+> **2026-05-30 后续修正**：本段及下文 "🔥 关键发现：IGVM 没被加载" 段内
+> 所有 "VMBusMessageRedirection 必需"、"COM3 不可用"、"diag_server 仍不可达"、
+> "下一步建议跑 Set-OpenHCL-HyperV-VM.ps1" 等表述都是**误判时期的诊断快照**。
+> 真根因（VM 创建时未指定 `-GuestStateIsolationType OpenHCL`）见本文档
+> 最末"🎉🎉🎉 真 Hyper-V 端到端验证"段。**本段保留作侦查日志参考。**
+
 **新增工件**：
 - `docs/superpowers/examples/pcie_remote_noop_host/src/vsock_main.rs` —— Windows AF_HYPERV 客户端变体，跨编 `pcie_remote_noop_host_vsock.exe` 成功
 - `/mnt/c/temp/pcie_remote_exp/enable_vmbus_redirect.ps1` —— 通过 WMI ModifySystemSettings 设置 `vssd.VMBusMessageRedirection = 1`（VTL2 vsock listener 必需）
@@ -192,6 +198,10 @@ OpenHCL 在 OpenVMM 上启动需要 **WHP 或 mshv** hypervisor（提供 VTL2）
 ---
 
 ## 2026-05-30 关键发现：IGVM 没被加载
+
+> **2026-05-30 后续修正**：以下"4 个可能原因（待用户验证）"全部被否决。
+> 真根因是 VM 创建时未指定 `-GuestStateIsolationType OpenHCL`（详见末尾
+> "🎉🎉🎉 真 Hyper-V 端到端验证"段）。本段保留作侦查日志参考。
 
 `vmrs_log_scanner_win.exe`（新工具，调 VmSavedStateDumpProvider.dll 自动解
 XPRESS-HUFF）扫描 `pcie-remote-exp` VM 的 Save-VM 后 .vmrs：

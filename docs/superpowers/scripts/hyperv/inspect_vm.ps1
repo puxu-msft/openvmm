@@ -13,13 +13,13 @@ if (-not $vssd) {
     exit 1
 }
 Write-Host "=== $VmName vssd ==="
+Write-Host ("GuestStateIsolationType  : " + $vssd.GuestStateIsolationType + "  (期望 'OpenHCL'; 'Disabled' = retrofit 路径，加载不上 IGVM)")
+Write-Host ("GuestFeatureSet          : 0x" + ('{0:X}' -f $vssd.GuestFeatureSet))
 Write-Host ("FirmwareFile             : '" + $vssd.FirmwareFile + "'")
 Write-Host ("FirmwareParameters       : " + ($vssd.FirmwareParameters | Measure-Object).Count + " bytes")
 Write-Host ("BootSourceOrder          : " + ($vssd.BootSourceOrder -join ','))
 Write-Host ("SecureBootEnabled        : " + $vssd.SecureBootEnabled)
 Write-Host ("GuestStateFile           : '" + $vssd.GuestStateFile + "'")
-Write-Host ("GuestStateIsolationType  : " + $vssd.GuestStateIsolationType + "  (期望 'OpenHCL'; 'Disabled' = retrofit 路径，加载不上 IGVM)")
-Write-Host ("GuestFeatureSet          : 0x" + ('{0:X}' -f $vssd.GuestFeatureSet))
 Write-Host ("VMBusMessageRedirection  : " + $vssd.VMBusMessageRedirection + "  (非必需; 用 -GuestStateIsolationType OpenHCL 创建后 0/1 都 OK)")
 Write-Host ("Version                  : " + $vssd.Version)
 Write-Host ("ConfigurationID          : " + $vssd.ConfigurationID)

@@ -417,14 +417,10 @@ message Reset           { uint32 kind = 1; }
   pub struct AbsentPcieDevice { hardware_ids: HardwareIds }
 
   impl ChipsetDevice for AbsentPcieDevice { ... }
-  impl GenericPciBusDevice for AbsentPcieDevice {
-      fn pci_cfg_read(&mut self, _offset: u16, value: &mut u32) -> Option<IoResult> {
-          *value = !0; Some(IoResult::Ok)
-      }
-      fn pci_cfg_write(&mut self, _offset: u16, _value: u32) -> Option<IoResult> {
-          Some(IoResult::Ok)
-      }
-  }
+  // 实现按 plan F-3 修订：**不 impl GenericPciBusDevice**；pci_bus 通过
+  // ChipsetDevice::supports_pci() 自动适配。实际接口见
+  // vm/devices/pcie_remote_device/src/absent.rs。
+  // 早期 spec 在此曾示例 impl GenericPciBusDevice，已废弃。
   ```
 
   Resolver 返回 `Ok(ResolvedPciDevice(Box::new(AbsentPcieDevice::new())))`。同时 `tracing::error!(CVM_ALLOWED, "BUG: pcie_remote leaked into CVM resolver; returning absent")`。
@@ -720,7 +716,8 @@ Write-Host "Registered service GUID: $ServiceGuid (ACL: Admin/SYSTEM only)"
 
 ### P1：必须在 v1 实施期处理
 
-> 状态列：✅ 已完成 / ⚠ 部分 / ❌ 未做。**所有 P1 已全部完成（2026-05-30）。**
+> 状态列：✅ 已完成 / ⚠ 部分 / ❌ 未做。**P1 代码功能已全部完成（2026-05-30）。
+> K-10（spec 拆分整理）是非功能性文档清理任务，保留到 v2。**
 
 | ID | 状态 | 严重度·层 | 问题 | 处理方案 | 落地 commit |
 |----|------|----------|------|----------|-------------|
@@ -787,8 +784,9 @@ Path C **完全闭环**：
 - 症状：ohcldiag-dev `WSA 10060 ETIMEDOUT`；`Microsoft-Windows-Hyper-V-Compute-Operational`
   event id 2000 `Create compute system, result 0xC0370103`；
   Worker-Admin event id 18605 `No bootable devices configured`
-- 诊断工具：`docs/superpowers/examples/vmrs_log_scanner_win.exe` 扫 RAM 发现
-  只有 stock Msvm UEFI 字符串，无 openhcl/underhill
+- 诊断工具：`docs/superpowers/examples/vmrs_log_scanner/`（编译后产出
+  `vmrs_log_scanner_win.exe`），扫 RAM 发现只有 stock Msvm UEFI 字符串，
+  无 openhcl/underhill
 - 正解：`New-VM -GuestStateIsolationType OpenHCL` 在创建时指定（参 `openhcl/Set-OpenHCL-HyperV-VM.ps1`
   和 `Guide/src/user_guide/openhcl/run/hyperv.md`）
 

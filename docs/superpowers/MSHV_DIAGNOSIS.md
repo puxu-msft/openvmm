@@ -2,6 +2,7 @@
 
 > **2026-05-30 更新：Path C 已端到端闭环，不再需要 mshv。** 本文档保留作为
 > 历史诊断记录 + 未来想跑 Linux + mshv backend OpenVMM 时的参考。
+> （结尾 §"何时再考虑 mshv" 列了未来重新启用 mshv 的触发条件。）
 
 ## 诊断结果
 
@@ -36,9 +37,7 @@ modprobe mshv     : FATAL: Module mshv not found
 **Path C（Hyper-V on Windows + OpenHCL IGVM）已经完整闭环**，详见
 [HYPERV_RUNBOOK.md](HYPERV_RUNBOOK.md) 和 [SESSION_LOG.md](SESSION_LOG.md)。
 该路径不依赖 WSL 内的 `/dev/mshv`，所有 Hyper-V 操作都通过
-`/mnt/c/Windows/System32/.../powershell.exe` 完成。
-
-**结论**：mshv 不再是当前阻塞，可保持现状。
+`/mnt/c/Windows/System32/.../powershell.exe` 完成。mshv 可保持现状。
 
 ## 历史方案（如未来需要 mshv 再启用）
 
