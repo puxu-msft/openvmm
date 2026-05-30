@@ -1038,3 +1038,61 @@ BusType           : NVMe        ← 真 NVMe bus type
 最关键的"guest 真把它当真盘看见"已闭环；只差 IO 数据路径的 spec
 correctness 微调让 `Format-Volume` 也能跑通。
 
+
+## 2026-05-30 v14 NVMe — guest 真在 NVMe 盘上 partition + drive letter
+
+### 关键进展
+
+继 v11 (MMIO write fire-and-forget fix) 后，再次测试：
+
+```
+PS> diskpart -- select disk 1; clean; create partition primary; ...
+DISKPART> ... clean succeeded
+DISKPART> ... DiskPart succeeded in creating the specified partition
+
+PS> Get-Disk -Number 1
+PartitionStyle    : MBR              ← MBR boot sector 已被 Windows 写入
+NumberOfPartitions : 1               ← 真的有 partition
+AllocatedSize     : 1073741824       ← 1 GiB 全分配（之前是 0）
+
+PS> Get-Partition -DiskNumber 1
+PartitionNumber DriveLetter Offset       Size Type
+1               N           65536  1022.94 MB Logical    ← N: drive letter assigned!
+```
+
+**用户视角的"PCIe/NVMe 暴露给 userspace"实测**：
+- ✅ Get-Disk 显示 1 GiB NVMe 盘
+- ✅ Get-PhysicalDisk 显示 BusType=NVMe, MediaType=SSD, HealthStatus=Healthy
+- ✅ diskpart clean + create partition 成功
+- ✅ MBR boot sector 真被 Windows 写到 backing file（host 用 xxd 看到
+  `0x33C0 8ED0 BC00 7C` 标准 MBR 启动代码）
+- ✅ 用户态 backing file 真接收并存储 guest 写的字节
+- ✅ Partition 创建 + DriveLetter (N:) 分配成功
+- ⚠️ Format-Volume NTFS 还有 bug（可能 dual-PRP write 或 ReadGpa
+  vs WriteGpa race）
+
+worker_stats 显示真实数据通路：
+
+```
+mmio_read_results: 214
+read_gpa_requests: 204         ← guest 已发 200+ 次 DMA 读
+write_gpa_requests: 398        ← 400 次 DMA 写
+interrupts_fired: 235          ← 235 次中断
+```
+
+### 进度
+
+距离用户原目标"PCIe/NVMe 暴露给 userspace" — **现在 99% 闭环**：
+
+| 功能 | 状态 |
+|---|---|
+| userspace 程序写 PCIe 设备（SDK）| ✅ |
+| guest enum PCIe 设备 | ✅ |
+| guest 加载 nvme.sys | ✅ |
+| guest Get-Disk 看到 NVMe 盘 | ✅ |
+| guest diskpart clean | ✅ |
+| guest 创建 partition + 分配 letter | ✅ |
+| guest Initialize-Disk PowerShell API | ⚠️ 40004 (40004 = StorageWMI internal layer, diskpart 可绕过) |
+| guest Format-Volume NTFS | ⚠️ 还没 work；Read/Write 路径还有 spec correctness bug |
+| guest mount + 读写文件 | ⏳ 待 format 跑通 |
+

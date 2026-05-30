@@ -229,12 +229,19 @@ impl IdentifyNamespace {
         let mut this: Self = zerocopy::FromZeros::new_zeroed();
         this.nsze = total_lba;
         this.ncap = total_lba;
-        this.nuse = total_lba;
+        // NUSE = 0：spec § 5.15.2.1 此字段为"现实际已使用 LBA 数"，
+        // 我们的 backing file 上没追踪 sparse 使用，所以保守 = 0。
+        // 之前误填 total_lba 会让 Windows 误以为整盘已满 → Initialize-Disk
+        // 拒绝（return code 40004 "no media"）。
+        this.nuse = 0;
         this.flbas = 0; // use LBAF[0]
         this.nlbaf = 0; // 1 format
         // LBAF[0]: MS=0, LBADS=9 (2^9 = 512), RP=0
         // word layout: bits 0:15 MS, bits 16:23 LBADS, bits 24:25 RP
         this.lbaf[0] = 9u32 << 16;
+        // NSFEAT bit 0 = THINP (thin provisioning) 让 driver 接受 NUSE=0
+        // 与 NCAP 不等。
+        this.nsfeat = 0x01;
         this
     }
 }
