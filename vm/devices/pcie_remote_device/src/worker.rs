@@ -366,12 +366,14 @@ where
                 "pcie_remote: guest_memory.read_at failed; replying ok=false"
             );
             // 注：合法 host 可能问到 MMIO 洞或越界，是协议范围内错误响应；
-            // 只有"消息结构非法"才计 bad-frame，故这里 reset 计数。
+            // 只有"消息结构非法"才计 bad-frame，故这里 reset 计数（含 stats）。
             let _ = self.reply_dma(token, false, Vec::new()).await;
             self.consecutive_bad_frames = 0;
+            self.stats.consecutive_bad_frames.store(0, Ordering::Relaxed);
             true
         } else {
             self.consecutive_bad_frames = 0;
+            self.stats.consecutive_bad_frames.store(0, Ordering::Relaxed);
             self.reply_dma(token, true, buf).await
         }
     }
@@ -420,6 +422,7 @@ where
             );
         }
         self.consecutive_bad_frames = 0;
+        self.stats.consecutive_bad_frames.store(0, Ordering::Relaxed);
         self.reply_dma(token, ok, Vec::new()).await
     }
 
@@ -631,6 +634,129 @@ mod tests {
             assert_eq!(
                 stats_for_check.interrupts_oob.load(Ordering::Relaxed),
                 1 + (MAX_BAD_FRAMES - 1) as u64
+            );
+        });
+    }
+
+    /// DMA ReadGpa bounds check: len=0 / len > MAX_DMA_BYTES 应被拒绝 +
+    /// 计为 bad-frame；合法 len 走 GuestMemory.read_at（空 GuestMemory 上会
+    /// 失败但不算 bad-frame，read_gpa_requests 仍 ++）。
+    #[test]
+    fn read_gpa_bounds_and_stats() {
+        use futures::io::Cursor;
+        use pal_async::DefaultPool;
+        use pcie_remote_protocol::ReadGpaRequest;
+
+        DefaultPool::run_with(|_| async move {
+            let cursor = Cursor::new(Vec::<u8>::new());
+            let (_dev_tx, dev_rx) = mesh::channel::<DeviceRequest>();
+            let state = crate::state::SharedState::new(crate::state::DeviceState::Live);
+            let gm = guestmem::GuestMemory::empty();
+            let stats: SharedWorkerStats = Arc::new(WorkerStats::default());
+            let stats_for_check = stats.clone();
+            let mut w = Worker::new(cursor, state, dev_rx, Vec::new(), gm, stats);
+
+            // len=0 → bounds reject + record_bad
+            let req0 = ReadGpaRequest { token: 1, gpa: 0, len: 0 };
+            let _ = w.handle_read_gpa(req0).await;
+            assert_eq!(stats_for_check.read_gpa_requests.load(Ordering::Relaxed), 1);
+            assert_eq!(stats_for_check.consecutive_bad_frames.load(Ordering::Relaxed), 1);
+
+            // len 太大 → bounds reject + record_bad
+            let req_big = ReadGpaRequest {
+                token: 2,
+                gpa: 0,
+                len: (MAX_DMA_BYTES + 1) as u32,
+            };
+            let _ = w.handle_read_gpa(req_big).await;
+            assert_eq!(stats_for_check.read_gpa_requests.load(Ordering::Relaxed), 2);
+            assert_eq!(stats_for_check.consecutive_bad_frames.load(Ordering::Relaxed), 2);
+
+            // 合法 len（4 字节）→ guest_memory.read_at 在空 mem 上失败 →
+            // reply ok=false 不计 bad-frame；read_gpa_requests 仍 ++；
+            // consecutive_bad_frames 归零
+            let req_ok = ReadGpaRequest { token: 3, gpa: 0, len: 4 };
+            let _ = w.handle_read_gpa(req_ok).await;
+            assert_eq!(stats_for_check.read_gpa_requests.load(Ordering::Relaxed), 3);
+            assert_eq!(stats_for_check.consecutive_bad_frames.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    /// WriteGpa 同样 bounds 检查 + stats 计数。
+    #[test]
+    fn write_gpa_bounds_and_stats() {
+        use futures::io::Cursor;
+        use pal_async::DefaultPool;
+        use pcie_remote_protocol::WriteGpaRequest;
+
+        DefaultPool::run_with(|_| async move {
+            let cursor = Cursor::new(Vec::<u8>::new());
+            let (_dev_tx, dev_rx) = mesh::channel::<DeviceRequest>();
+            let state = crate::state::SharedState::new(crate::state::DeviceState::Live);
+            let gm = guestmem::GuestMemory::empty();
+            let stats: SharedWorkerStats = Arc::new(WorkerStats::default());
+            let stats_for_check = stats.clone();
+            let mut w = Worker::new(cursor, state, dev_rx, Vec::new(), gm, stats);
+
+            // 空 data → bounds reject + record_bad
+            let req0 = WriteGpaRequest { token: 1, gpa: 0, data: vec![] };
+            let _ = w.handle_write_gpa(req0).await;
+            assert_eq!(stats_for_check.write_gpa_requests.load(Ordering::Relaxed), 1);
+            assert_eq!(stats_for_check.consecutive_bad_frames.load(Ordering::Relaxed), 1);
+
+            // data 超大 → bounds reject
+            let req_big = WriteGpaRequest {
+                token: 2,
+                gpa: 0,
+                data: vec![0u8; MAX_DMA_BYTES + 1],
+            };
+            let _ = w.handle_write_gpa(req_big).await;
+            assert_eq!(stats_for_check.write_gpa_requests.load(Ordering::Relaxed), 2);
+            assert_eq!(stats_for_check.consecutive_bad_frames.load(Ordering::Relaxed), 2);
+
+            // 合法 → guest_memory.write_at fail (empty mem) → ok=false 不 bad
+            let req_ok = WriteGpaRequest { token: 3, gpa: 0, data: vec![0xff; 8] };
+            let _ = w.handle_write_gpa(req_ok).await;
+            assert_eq!(stats_for_check.write_gpa_requests.load(Ordering::Relaxed), 3);
+            assert_eq!(stats_for_check.consecutive_bad_frames.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    /// 验证 DmaRate 与 dma_rate_limit_rejects 计数器配合：64 个 64KB
+    /// 全允许（== 4 MiB << 64 MiB/s）；同窗口再 1024 个 → 第 1025 起拒。
+    /// 间接也是 K-NEW-C e2e stress 模式的 unit-test 等价物。
+    #[test]
+    fn dma_rate_counter_increments_on_reject() {
+        use futures::io::Cursor;
+        use pal_async::DefaultPool;
+        use pcie_remote_protocol::ReadGpaRequest;
+
+        DefaultPool::run_with(|_| async move {
+            let cursor = Cursor::new(Vec::<u8>::new());
+            let (_dev_tx, dev_rx) = mesh::channel::<DeviceRequest>();
+            let state = crate::state::SharedState::new(crate::state::DeviceState::Live);
+            let gm = guestmem::GuestMemory::empty();
+            let stats: SharedWorkerStats = Arc::new(WorkerStats::default());
+            let stats_for_check = stats.clone();
+            let mut w = Worker::new(cursor, state, dev_rx, Vec::new(), gm, stats);
+
+            // 发 1100 个 64KB ReadGpa：1024 个允许（占满 64 MiB/s）+ 76 个被拒
+            for i in 0..1100u64 {
+                let req = ReadGpaRequest {
+                    token: i,
+                    gpa: 0,
+                    len: 65536,
+                };
+                let _ = w.handle_read_gpa(req).await;
+            }
+            assert_eq!(
+                stats_for_check.read_gpa_requests.load(Ordering::Relaxed),
+                1100
+            );
+            // 1100 - 1024 = 76 被 rate limit 拒绝
+            assert_eq!(
+                stats_for_check.dma_rate_limit_rejects.load(Ordering::Relaxed),
+                76
             );
         });
     }
