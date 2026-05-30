@@ -220,7 +220,9 @@ impl NvmeController {
         self.state = CtrlState::Ready;
         self.csts |= csts::RDY;
         tracing::info!(
-            asqs, acqs, asq = format_args!("{:#x}", self.asq),
+            asqs,
+            acqs,
+            asq = format_args!("{:#x}", self.asq),
             acq = format_args!("{:#x}", self.acq),
             "NVMe: ready"
         );
@@ -348,7 +350,13 @@ impl NvmeController {
     /// Dispatch SQE 单条命令。可能立即完成（构造 CQE 发出去）或入 pending（等
     /// PRP DMA）。`head_after_this` = controller 已 fetch 到的下一条 SQE 位置
     /// （CQE.sqhd 字段），由 `on_fetched_sqes` 按批内 index 单调推算给出。
-    fn dispatch_sqe(&mut self, ctx: &mut DeviceCtx<'_>, sq_id: u16, head_after_this: u16, sqe: Sqe) {
+    fn dispatch_sqe(
+        &mut self,
+        ctx: &mut DeviceCtx<'_>,
+        sq_id: u16,
+        head_after_this: u16,
+        sqe: Sqe,
+    ) {
         let cid = sqe.cid();
         let opc = sqe.opcode();
         tracing::debug!(
@@ -609,7 +617,7 @@ impl PcieDevice for NvmeController {
             "MMIO write"
         );
         match offset {
-            0x0c => self.intms |= value as u32, // mask set
+            0x0c => self.intms |= value as u32,    // mask set
             0x10 => self.intms &= !(value as u32), // mask clear (INTMC sets bits to clear)
             0x14 => self.write_cc(value as u32),
             0x24 => self.aqa = value as u32,
@@ -697,7 +705,8 @@ impl PcieDevice for NvmeController {
                         0
                     };
                     tracing::debug!(
-                        lba, num_blocks,
+                        lba,
+                        num_blocks,
                         data_len = data.len(),
                         expected = bytes,
                         first8 = format_args!("{:#x}", first8),
@@ -781,8 +790,12 @@ impl PcieDevice for NvmeController {
                                     "NVM Write dual-PRP file write failed"
                                 );
                                 Cqe::error(
-                                    accum.cid, accum.sq_id, accum.sq_head, phase,
-                                    sc::DATA_TRANSFER_ERROR, 0,
+                                    accum.cid,
+                                    accum.sq_id,
+                                    accum.sq_head,
+                                    phase,
+                                    sc::DATA_TRANSFER_ERROR,
+                                    0,
                                 )
                             }
                         };

@@ -131,10 +131,7 @@ fn run_main(args: Args) -> Result<()> {
     })
 }
 
-async fn connect_with_retry(
-    driver: &pal_async::DefaultDriver,
-    args: &Args,
-) -> Result<Transport> {
+async fn connect_with_retry(driver: &pal_async::DefaultDriver, args: &Args) -> Result<Transport> {
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -160,7 +157,10 @@ async fn try_one(driver: &pal_async::DefaultDriver, args: &Args) -> Result<Trans
     }
     #[cfg(windows)]
     {
-        let vm_id_str = args.vm_id.as_ref().ok_or_else(|| anyhow!("missing --vm-id"))?;
+        let vm_id_str = args
+            .vm_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("missing --vm-id"))?;
         let vm_id: guid::Guid = vm_id_str
             .parse()
             .map_err(|e| anyhow!("invalid vm_id: {e}"))?;

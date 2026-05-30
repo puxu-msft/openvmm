@@ -94,7 +94,14 @@ impl NvmeController {
                 if !pc {
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
-                tracing::info!(qid, qsize, ien, iv, gpa = format_args!("{:#x}", prp1), "Create IO CQ");
+                tracing::info!(
+                    qid,
+                    qsize,
+                    ien,
+                    iv,
+                    gpa = format_args!("{:#x}", prp1),
+                    "Create IO CQ"
+                );
                 self.cqs.insert(
                     qid,
                     CompletionQueue {
@@ -122,7 +129,13 @@ impl NvmeController {
                 if !self.cqs.contains_key(&cqid) {
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
-                tracing::info!(qid, qsize, cqid, gpa = format_args!("{:#x}", prp1), "Create IO SQ");
+                tracing::info!(
+                    qid,
+                    qsize,
+                    cqid,
+                    gpa = format_args!("{:#x}", prp1),
+                    "Create IO SQ"
+                );
                 self.sqs.insert(
                     qid,
                     SubmissionQueue {
@@ -181,20 +194,57 @@ impl NvmeController {
                 let numd_lo = ((sqe.cdw10 >> 16) & 0xffff) as u32;
                 let numd_hi = (sqe.cdw11 & 0xffff) as u32;
                 let numd = ((numd_hi << 16) | numd_lo) as u64 + 1; // zero-based dwords
-                let bytes = (numd * 4).min(4096) as usize; // 我们最多返一 page
-                tracing::debug!(lid, bytes, "Get Log Page");
+                let bytes_req = numd * 4; // bytes
+                tracing::debug!(lid, bytes = bytes_req, "Get Log Page");
+                // **H1 修复**：我们目前没实现 PRP list（Phase E TODO），
+                // 单次最多用 PRP1+PRP2 = 8 KiB；超过返 INVALID_FIELD 让
+                // driver 明确知道（不再 silent truncate）。
+                if bytes_req > 8192 {
+                    tracing::warn!(
+                        lid,
+                        bytes = bytes_req,
+                        "Get Log Page: request > 8 KiB unsupported (no PRP list yet)"
+                    );
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
+                let bytes = bytes_req as usize;
                 let buf: Vec<u8> = match lid {
+                    // NVMe 2.0c spec 表 5-105 标准 LID：
+                    // 0x01 Error Information
+                    // 0x02 SMART / Health Information
+                    // 0x03 Firmware Slot Information
+                    // 0x04 Changed Namespace List
+                    // 0x05 Commands Supported and Effects
+                    // 0x06 Device Self-test
+                    // 0x07 Telemetry Host-Initiated
+                    // 0x08 Telemetry Controller-Initiated
+                    // 0x09 Endurance Group
+                    // 0x0a Predictable Latency Per NVM Set
+                    // 0x0b Predictable Latency Event Aggregate
+                    // 0x0c Asymmetric Namespace Access
+                    // 0x0d Persistent Event Log
+                    // 0x0e LBA Status Information
+                    // 0x0f Endurance Group Event Aggregate
+                    // 0x80 Reservation Notification
+                    // 0x81 Sanitize Status
                     0x01 => self.build_error_info_log(bytes),
                     0x02 => self.build_smart_health_log(bytes),
                     0x03 => self.build_fw_slot_info_log(bytes),
                     0x06 => {
-                        // Reservation Notification — 我们不支持 reservations，
-                        // 返全零（spec 允许 controller 无 reservation 事件时
-                        // 返 zero notification record）。
+                        // Device Self-Test — 我们 OACS.self_test=true 但
+                        // 不真追踪 self-test 进度；返全零（spec 允许 "no
+                        // self-test in progress, never run"）。
+                        vec![0u8; bytes]
+                    }
+                    0x80 => {
+                        // Reservation Notification — 不支持 reservations。
                         vec![0u8; bytes]
                     }
                     _ => {
-                        tracing::debug!(lid, "Get Log Page: unknown LID, returning zeros");
+                        tracing::debug!(
+                            lid = format_args!("{:#x}", lid),
+                            "Get Log Page: unknown LID, returning zeros"
+                        );
                         vec![0u8; bytes]
                     }
                 };
@@ -220,38 +270,66 @@ impl NvmeController {
                 Some(cqe)
             }
             admin_opc::FORMAT_NVM => {
-                // NVMe spec § 5.14 Format NVM Command。CDW10 含 LBA Format
-                // Index (LBAFL) / Secure Erase Settings (SES) / Protection
-                // Information (PI/PIL) / Metadata Settings (MSET)。我们只
-                // 实现最基本：对单一 LBAF=0 (512B) 的 namespace 做"逻辑
-                // 格式化" — 不真去把 backing file 清零（那是 SES≠0 的事），
-                // 仅 return success 让 driver 信任格式已完成。真要清零数据
-                // 可在 file.set_len(0) + 再扩容；可选实现。
+                // NVMe spec § 5.14 Format NVM Command。CDW10 字段位段
+                // （spec 表 5-72）：
+                //   bits 3:0   LBAFL — LBA Format Index (low 4 bits)
+                //   bit 4      MSET — Metadata Settings (0=as-is, 1=inline)
+                //   bits 7:5   PI   — Protection Information (0..7)
+                //   bit 8      PIL  — Protection Info Location
+                //   bits 11:9  SES  — Secure Erase Settings (0=no, 1=user
+                //                     data erase, 2=cryptographic erase)
+                //   bits 13:12 ZF / LBAFU (NVMe 2.0 LBAF index 高 2 位)
                 let lbafl = (sqe.cdw10 & 0xf) as u8;
-                let ses = ((sqe.cdw10 >> 9) & 0x7) as u8;
-                let pil = ((sqe.cdw10 >> 8) & 0x1) as u8;
-                let pi = ((sqe.cdw10 >> 5) & 0x7) as u8;
                 let mset = ((sqe.cdw10 >> 4) & 0x1) as u8;
-                let ms = ((sqe.cdw10 >> 4) & 0x1) as u8;
-                tracing::info!(lbafl, ses, pil, pi, mset, ms, "Format NVM");
-                if lbafl != 0 || pi != 0 || mset != 0 || ms != 0 {
-                    // 我们只支持 LBAF[0] (512B, no metadata, no PI)。
+                let pi = ((sqe.cdw10 >> 5) & 0x7) as u8;
+                let pil = ((sqe.cdw10 >> 8) & 0x1) as u8;
+                let ses = ((sqe.cdw10 >> 9) & 0x7) as u8;
+                tracing::info!(lbafl, mset, pi, pil, ses, "Format NVM");
+                if lbafl != 0 || pi != 0 || mset != 0 {
+                    // 只支持 LBAF[0] (512B, no metadata, no PI)；PIL 我们
+                    // 不关心（无 PI 时 PIL 无意义）。
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
-                if ses == 1 {
-                    // User Data Erase：把 backing file 全清零。
-                    if let Ok(size) = self.file.metadata().map(|m| m.len()) {
-                        use std::io::Write as _;
-                        let _ = self.file.set_len(0).and_then(|_| self.file.set_len(size));
-                        let _ = self.file.flush();
-                        tracing::info!(size, "Format NVM: user data erased");
+                // **C1 修复**：FORMAT 不能在有 in-flight IO 时执行。否则
+                // outstanding dma_read 完成后 write_all 到已被 truncate 后
+                // 重新分配的 sparse hole，导致 driver 视角"擦除前的写已
+                // 完成"但盘上随机残留 in-flight 写。返 sc=0x84 (Format
+                // In Progress) 让 driver 重试。
+                if !self.pending_ios.is_empty() || !self.dual_prp_writes.is_empty() {
+                    tracing::warn!(
+                        pending_ios = self.pending_ios.len(),
+                        pending_dual = self.dual_prp_writes.len(),
+                        "Format NVM rejected: IO in flight"
+                    );
+                    // SC 0x84 Format In Progress (NVMe 1.4 § 4.6.1.2.1)。
+                    return Some(Cqe::error(cid, 0, sq_head, phase, 0x84, 0));
+                }
+                if ses == 1 || ses == 2 {
+                    // SES=1 User Data Erase / SES=2 Cryptographic Erase。
+                    // **教学说明**：这里用 `set_len(0) + set_len(size)` 创
+                    // 建 sparse hole — host filesystem 看 hole 区域返零，
+                    // 但底层物理扇区**未真写零**（不是 SCSI BLKZEROOUT /
+                    // ATA TRIM 那种擦除）。真安全擦除需 write 全零 + fsync
+                    // 或调 fallocate(FALLOC_FL_ZERO_RANGE)。本 example 教学
+                    // 用，sparse hole 行为对 guest 而言等价 "全零盘"。SES=2
+                    // 没有加密 key 销毁概念，因为我们没加密；行为等价 SES=1。
+                    let size = match self.file.metadata() {
+                        Ok(m) => m.len(),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Format NVM: stat failed");
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INTERNAL_ERROR, 0));
+                        }
+                    };
+                    if let Err(e) = self.file.set_len(0).and_then(|_| self.file.set_len(size)) {
+                        tracing::warn!(error = %e, "Format NVM: truncate failed");
+                        return Some(Cqe::error(cid, 0, sq_head, phase, sc::INTERNAL_ERROR, 0));
                     }
-                } else if ses == 2 {
-                    // Cryptographic Erase — 我们的 backing 没加密，等价 SES=1。
-                    if let Ok(size) = self.file.metadata().map(|m| m.len()) {
-                        let _ = self.file.set_len(0).and_then(|_| self.file.set_len(size));
-                        tracing::info!(size, "Format NVM: cryptographic erase (= user data erase here)");
+                    use std::io::Write as _;
+                    if let Err(e) = self.file.flush() {
+                        tracing::warn!(error = %e, "Format NVM: flush failed");
+                        return Some(Cqe::error(cid, 0, sq_head, phase, sc::INTERNAL_ERROR, 0));
                     }
+                    tracing::info!(size, ses, "Format NVM: sparse-hole erase done");
                 }
                 Some(Cqe::success(cid, 0, sq_head, phase))
             }
@@ -304,7 +382,10 @@ impl NvmeController {
                 Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0))
             }
             opc => {
-                tracing::warn!(opc, "unsupported admin opcode; returning success to keep driver alive");
+                tracing::warn!(
+                    opc,
+                    "unsupported admin opcode; returning success to keep driver alive"
+                );
                 // 返 success 而非 INVALID_OPCODE：很多 driver 在
                 // boot 期会探测可选 opcode，遇 INVALID_OPCODE 会进入 fallback
                 // 路径或直接 fail device。返 success（CQE cdw0=0）通常更安全。

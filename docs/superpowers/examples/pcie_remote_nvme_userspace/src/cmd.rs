@@ -27,10 +27,12 @@
 /// nvme_spec NVMe 2.0c 完整 opcode 表 — re-export 让本 crate 内一处
 /// 看到所有可能的命令名字。我们目前只实现一部分，其它对应 admin_opc /
 /// nvm_opc 中的占位常量 + dispatch_admin/io 中"unsupported"分支。
-#[allow(unused_imports)] pub use nvme_spec::AdminOpcode as SpecAdminOpcode;
+#[allow(unused_imports)]
+pub use nvme_spec::AdminOpcode as SpecAdminOpcode;
 pub use nvme_spec::IdentifyController as SpecIdentifyController;
 pub use nvme_spec::nvm::IdentifyNamespace as SpecIdentifyNamespace;
-#[allow(unused_imports)] pub use nvme_spec::nvm::NvmOpcode as SpecNvmOpcode;
+#[allow(unused_imports)]
+pub use nvme_spec::nvm::NvmOpcode as SpecNvmOpcode;
 
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
@@ -166,7 +168,12 @@ impl Cqe {
     pub fn success(cid: u16, sq_id: u16, sq_head: u16, phase: u8) -> Self {
         let dw2 = ((sq_id as u32) << 16) | sq_head as u32;
         let dw3 = (cid as u32) | ((phase as u32 & 1) << 16); // SC=0 = success
-        Cqe { cdw0: 0, cdw1: 0, dw2, dw3 }
+        Cqe {
+            cdw0: 0,
+            cdw1: 0,
+            dw2,
+            dw3,
+        }
     }
 
     /// 构造一个 ERROR CQE，sc=status code, sct=status code type。
@@ -175,7 +182,12 @@ impl Cqe {
         // SF layout: bits 17..=24 SC, bits 25..=27 SCT, bit 28 CRD, bit 29 M (more), bit 30 DNR
         let sf = ((sc as u32) << 1) | ((sct as u32 & 0x7) << 9);
         let dw3 = (cid as u32) | ((phase as u32 & 1) << 16) | (sf << 16);
-        Cqe { cdw0: 0, cdw1: 0, dw2, dw3 }
+        Cqe {
+            cdw0: 0,
+            cdw1: 0,
+            dw2,
+            dw3,
+        }
     }
 }
 
@@ -185,41 +197,41 @@ impl Cqe {
 #[repr(C, packed)]
 #[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct IdentifyController {
-    pub vid: u16,        // 0
-    pub ssvid: u16,      // 2
-    pub sn: [u8; 20],    // 4
-    pub mn: [u8; 40],    // 24
-    pub fr: [u8; 8],     // 64
-    pub rab: u8,         // 72
-    pub ieee: [u8; 3],   // 73
-    pub cmic: u8,        // 76
-    pub mdts: u8,        // 77
-    pub cntlid: u16,     // 78
-    pub ver: u32,        // 80
+    pub vid: u16,               // 0
+    pub ssvid: u16,             // 2
+    pub sn: [u8; 20],           // 4
+    pub mn: [u8; 40],           // 24
+    pub fr: [u8; 8],            // 64
+    pub rab: u8,                // 72
+    pub ieee: [u8; 3],          // 73
+    pub cmic: u8,               // 76
+    pub mdts: u8,               // 77
+    pub cntlid: u16,            // 78
+    pub ver: u32,               // 80
     pub _resv1: [u8; 256 - 84], // pad to 256
     // Admin command set attributes
-    pub oacs: u16,       // 256
-    pub acl: u8,         // 258
-    pub aerl: u8,        // 259
-    pub frmw: u8,        // 260
-    pub lpa: u8,         // 261
-    pub elpe: u8,        // 262
-    pub npss: u8,        // 263
-    pub avscc: u8,       // 264
-    pub apsta: u8,       // 265
+    pub oacs: u16, // 256
+    pub acl: u8,   // 258
+    pub aerl: u8,  // 259
+    pub frmw: u8,  // 260
+    pub lpa: u8,   // 261
+    pub elpe: u8,  // 262
+    pub npss: u8,  // 263
+    pub avscc: u8, // 264
+    pub apsta: u8, // 265
     pub _resv2: [u8; 512 - 266],
     // NVM command set attributes
-    pub sqes: u8,        // 512
-    pub cqes: u8,        // 513
-    pub maxcmd: u16,     // 514
-    pub nn: u32,         // 516
-    pub oncs: u16,       // 520
-    pub fuses: u16,      // 522
-    pub fna: u8,         // 524
+    pub sqes: u8,    // 512
+    pub cqes: u8,    // 513
+    pub maxcmd: u16, // 514
+    pub nn: u32,     // 516
+    pub oncs: u16,   // 520
+    pub fuses: u16,  // 522
+    pub fna: u8,     // 524
     /// Volatile Write Cache (offset 525) — bit 0 = "present"。
     /// 设 1 让 driver 主动发 NVM FLUSH (opcode 0x00) 拿持久化承诺，
     /// 我们的 backing file 默认 write-back，靠 FLUSH 触发 sync_all。
-    pub vwc: u8,         // 525
+    pub vwc: u8, // 525
     pub _resv3: [u8; 4096 - 526],
 }
 
@@ -228,7 +240,8 @@ impl IdentifyController {
     #[allow(dead_code)]
     /// **Deprecated** — Phase A 后用 build_v2_bytes (\n    /// nvme_spec 完整 200+ 字段)。保留方法是为了 spec
     /// 学习对照（hand-written vs spec-corrected）。
-    pub fn build(vid: u16, ssvid: u16) -> Self {        let mut this: Self = zerocopy::FromZeros::new_zeroed();
+    pub fn build(vid: u16, ssvid: u16) -> Self {
+        let mut this: Self = zerocopy::FromZeros::new_zeroed();
         this.vid = vid;
         this.ssvid = ssvid;
         // Serial Number "PCIE-REMOTE-USRSPACE" 左对齐 ASCII，padding = ' '。
@@ -267,7 +280,6 @@ impl IdentifyController {
     /// FGUID/HMPRE/SANICAP/ANATT/SUBNQN/IOCCSZ/SGLS 等之前我们 padding
     /// 字段的位置）。
     pub fn build_v2_bytes(vid: u16, ssvid: u16) -> Vec<u8> {
-
         let mut id = SpecIdentifyController::new_zeroed();
         id.vid = vid;
         id.ssvid = ssvid;
@@ -286,6 +298,14 @@ impl IdentifyController {
         id.frmw = nvme_spec::FirmwareUpdates::new()
             .with_ffsro(true)
             .with_nofs(1);
+        // 温度阈值（NVMe spec § 5.17.2.2）：
+        //   WCTEMP — over-temperature warning, °K
+        //   CCTEMP — critical composite temperature, °K
+        // SMART log 的 composite_temp 应落在 [当前温度, CCTEMP)；
+        // CCTEMP 一旦被超就触发 critical warning bit。我们 SMART 报
+        // 313 K=40°C，WCTEMP=350 K=77°C，CCTEMP=360 K=87°C — 合理 SSD 阈值。
+        id.wctemp = 350;
+        id.cctemp = 360;
         // OACS — admin command support。Phase C 后 Format NVM / FW
         // Commit / FW Image Download / Self-Test / NS Attachment 都
         // 已 dispatch（虽然有的是 no-op success），告诉 driver 这些
@@ -317,22 +337,22 @@ impl IdentifyController {
 #[repr(C, packed)]
 #[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct IdentifyNamespace {
-    pub nsze: u64,    // 0  Namespace Size (total LBAs)
-    pub ncap: u64,    // 8  Namespace Capacity
-    pub nuse: u64,    // 16 Namespace Utilization
-    pub nsfeat: u8,   // 24
-    pub nlbaf: u8,    // 25 number of LBA formats supported (0 = 1 format)
-    pub flbas: u8,    // 26 formatted LBA size index
-    pub mc: u8,       // 27 metadata caps
-    pub dpc: u8,      // 28
-    pub dps: u8,      // 29
-    pub nmic: u8,     // 30
-    pub rescap: u8,   // 31
-    pub fpi: u8,      // 32
-    pub dlfeat: u8,   // 33
-    pub nawun: u16,   // 34
-    pub nawupf: u16,  // 36
-    pub nacwu: u16,   // 38
+    pub nsze: u64,   // 0  Namespace Size (total LBAs)
+    pub ncap: u64,   // 8  Namespace Capacity
+    pub nuse: u64,   // 16 Namespace Utilization
+    pub nsfeat: u8,  // 24
+    pub nlbaf: u8,   // 25 number of LBA formats supported (0 = 1 format)
+    pub flbas: u8,   // 26 formatted LBA size index
+    pub mc: u8,      // 27 metadata caps
+    pub dpc: u8,     // 28
+    pub dps: u8,     // 29
+    pub nmic: u8,    // 30
+    pub rescap: u8,  // 31
+    pub fpi: u8,     // 32
+    pub dlfeat: u8,  // 33
+    pub nawun: u16,  // 34
+    pub nawupf: u16, // 36
+    pub nacwu: u16,  // 38
     pub _resv1: [u8; 128 - 40],
     /// LBAF[16]：每个 4 字节。LBAF[0].lbads = log2(sector size)。
     /// 整个数组共 64 字节 (4*16)。
@@ -380,7 +400,7 @@ impl IdentifyNamespace {
         ns.nlbaf = 0;
         ns.lbaf[0] = nvme_spec::nvm::Lbaf::new()
             .with_ms(0)
-            .with_lbads(9)  // 2^9 = 512 byte sector
+            .with_lbads(9) // 2^9 = 512 byte sector
             .with_rp(0);
         ns.as_bytes().to_vec()
     }
@@ -399,4 +419,52 @@ fn ascii_padded<const N: usize>(src: &[u8]) -> storage_string::AsciiString<N> {
     let copy_len = src.len().min(N);
     arr[..copy_len].copy_from_slice(&src[..copy_len]);
     storage_string::AsciiString::<N>::from(arr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// IdentifyController 4 KiB serialization byte layout 关键 offset 校验。
+    /// VID/SSVID 在 0/2，VER 在 80，VWC 在 525，全部 spec § 5.17.2.2。
+    #[test]
+    fn identify_controller_byte_layout() {
+        let buf = IdentifyController::build_v2_bytes(0x1414, 0xc0de);
+        assert_eq!(buf.len(), 4096, "Identify Controller must be 4 KiB");
+        // VID = u16 LE @ 0
+        assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 0x1414);
+        // SSVID = u16 LE @ 2
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0xc0de);
+        // VER = u32 LE @ 80
+        assert_eq!(
+            u32::from_le_bytes([buf[80], buf[81], buf[82], buf[83]]),
+            NVME_VERSION_2_0
+        );
+        // VWC @ 525, bit 0 = present
+        assert_eq!(buf[525] & 0x1, 0x1, "VWC.present must be 1");
+        // SN/MN 前缀检查
+        assert_eq!(&buf[4..24], b"PCIE-REMOTE-USRSPACE");
+        assert!(buf[24..64].starts_with(b"OpenHCL Userspace NVMe v2.0"));
+    }
+
+    /// IdentifyNamespace LBAF[0] 必须落在 offset 128，spec § 5.17.2.1。
+    #[test]
+    fn identify_namespace_byte_layout() {
+        let buf = IdentifyNamespace::build_v2_bytes(2097152); // 1 GiB / 512
+        assert_eq!(buf.len(), 4096);
+        // NSZE/NCAP/NUSE u64 LE @ 0/8/16
+        assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 2097152);
+        assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 2097152);
+        assert_eq!(
+            u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+            0,
+            "NUSE must be 0 (thin)"
+        );
+        // NSFEAT @ 24 bit 0 = THINP
+        assert_eq!(buf[24] & 0x1, 0x1, "NSFEAT.THINP must be 1");
+        // LBAF[0] @ 128, u32 LE; LBADS=9 在 bits 23:16
+        let lbaf0 = u32::from_le_bytes(buf[128..132].try_into().unwrap());
+        let lbads = (lbaf0 >> 16) & 0xff;
+        assert_eq!(lbads, 9, "LBAF[0].LBADS must be 9 (2^9=512B sectors)");
+    }
 }

@@ -20,7 +20,6 @@ use std::io::Seek;
 use std::io::SeekFrom;
 
 impl NvmeController {
-
     /// IO command dispatch。Read/Write 走 DMA。
     pub(super) fn dispatch_io(
         &mut self,
@@ -42,14 +41,29 @@ impl NvmeController {
                 let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
                 let nlb = (cdw12 & 0xffff) as u32 + 1;
                 let bytes = nlb as u64 * SECTOR_SIZE;
-                tracing::debug!(slba, nlb, bytes, prp1 = format_args!("{:#x}", prp1), "NVM READ");
+                tracing::debug!(
+                    slba,
+                    nlb,
+                    bytes,
+                    prp1 = format_args!("{:#x}", prp1),
+                    "NVM READ"
+                );
                 if bytes > MDTS_MAX_BYTES {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
-                if slba + nlb as u64 > self.total_lba {
-                    return Some(Cqe::error(
-                        cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE, 0,
-                    ));
+                // H4：checked_add 防 slba + nlb 溢出（driver bug / 恶意输入）。
+                match slba.checked_add(nlb as u64) {
+                    Some(end) if end <= self.total_lba => {}
+                    _ => {
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::LBA_OUT_OF_RANGE,
+                            0,
+                        ));
+                    }
                 }
                 // 从文件读到 buf
                 let mut buf = vec![0u8; bytes as usize];
@@ -60,7 +74,12 @@ impl NvmeController {
                 {
                     tracing::warn!(error = %e, slba, nlb, "READ: backing file read failed");
                     return Some(Cqe::error(
-                        cid, sq_id, sq_head, phase, sc::DATA_TRANSFER_ERROR, 0,
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::DATA_TRANSFER_ERROR,
+                        0,
                     ));
                 }
                 // DMA write to PRP1（v1：bytes ≤ 8 KiB = 2 page = PRP1 + PRP2）
@@ -69,7 +88,10 @@ impl NvmeController {
                     self.pending_ios.insert(
                         tok,
                         PendingIo {
-                            sq_id, cid, sq_head, cq_id,
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
                             op: PendingOp::NvmReadDmaWrite,
                         },
                     );
@@ -81,7 +103,10 @@ impl NvmeController {
                     self.pending_ios.insert(
                         tok2,
                         PendingIo {
-                            sq_id, cid, sq_head, cq_id,
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
                             op: PendingOp::NvmReadDmaWrite,
                         },
                     );
@@ -99,14 +124,29 @@ impl NvmeController {
                 let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
                 let nlb = (cdw12 & 0xffff) as u32 + 1;
                 let bytes = nlb as u64 * SECTOR_SIZE;
-                tracing::debug!(slba, nlb, bytes, prp1 = format_args!("{:#x}", prp1), "NVM WRITE");
+                tracing::debug!(
+                    slba,
+                    nlb,
+                    bytes,
+                    prp1 = format_args!("{:#x}", prp1),
+                    "NVM WRITE"
+                );
                 if bytes > MDTS_MAX_BYTES {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
-                if slba + nlb as u64 > self.total_lba {
-                    return Some(Cqe::error(
-                        cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE, 0,
-                    ));
+                // H4：checked_add 防 slba + nlb 溢出（driver bug / 恶意输入）。
+                match slba.checked_add(nlb as u64) {
+                    Some(end) if end <= self.total_lba => {}
+                    _ => {
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::LBA_OUT_OF_RANGE,
+                            0,
+                        ));
+                    }
                 }
                 // DMA read from PRP1 (+ 可选 PRP2)
                 if bytes <= NVME_PAGE_SIZE {
@@ -114,8 +154,14 @@ impl NvmeController {
                     self.pending_ios.insert(
                         tok,
                         PendingIo {
-                            sq_id, cid, sq_head, cq_id,
-                            op: PendingOp::NvmWriteDmaRead { lba: slba, num_blocks: nlb },
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            op: PendingOp::NvmWriteDmaRead {
+                                lba: slba,
+                                num_blocks: nlb,
+                            },
                         },
                     );
                 } else {
@@ -127,9 +173,14 @@ impl NvmeController {
                     self.dual_prp_writes.insert(
                         op_id,
                         WriteAccum {
-                            sq_id, cid, sq_head, cq_id,
-                            lba: slba, num_blocks: nlb,
-                            prp1_data: None, prp2_data: None,
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            lba: slba,
+                            num_blocks: nlb,
+                            prp1_data: None,
+                            prp2_data: None,
                         },
                     );
                     let prp2_bytes = (bytes - NVME_PAGE_SIZE) as u32;
@@ -138,47 +189,108 @@ impl NvmeController {
                     self.pending_ios.insert(
                         tok1,
                         PendingIo {
-                            sq_id, cid, sq_head, cq_id,
-                            op: PendingOp::NvmWriteDualPrp { op_id, is_prp1: true },
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            op: PendingOp::NvmWriteDualPrp {
+                                op_id,
+                                is_prp1: true,
+                            },
                         },
                     );
                     self.pending_ios.insert(
                         tok2,
                         PendingIo {
-                            sq_id, cid, sq_head, cq_id,
-                            op: PendingOp::NvmWriteDualPrp { op_id, is_prp1: false },
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            op: PendingOp::NvmWriteDualPrp {
+                                op_id,
+                                is_prp1: false,
+                            },
                         },
                     );
                 }
                 None
             }
             nvm_opc::FLUSH => {
-                let _ = self.file.sync_all();
-                Some(Cqe::success(cid, sq_id, sq_head, phase))
+                // **H3 修复**：FLUSH 失败必须返 DATA_TRANSFER_ERROR。
+                // VWC=present 让 driver 依赖 FLUSH 做 durability 承诺；
+                // 吞错会让 driver 误信数据已落盘。
+                match self.file.sync_all() {
+                    Ok(()) => Some(Cqe::success(cid, sq_id, sq_head, phase)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "FLUSH sync_all failed");
+                        Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::DATA_TRANSFER_ERROR,
+                            0,
+                        ))
+                    }
+                }
             }
             nvm_opc::WRITE_ZEROES => {
                 // NVMe NVM CS Spec § 3.3.4 Write Zeroes — 把 [SLBA, SLBA+NLB)
                 // 范围内的 LBA 全清零。CDW10/11 = SLBA，CDW12 bits 15:0 = NLB
-                // (zero-based)。无 DMA，单 cmd 可写最多 NSZE LBAs（无 MDTS
-                // 限制；spec § 3.3.4）。
+                // (zero-based)。无 DMA，无 MDTS 限制（spec 允许整盘 nlb）。
                 let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
                 let nlb = (sqe.cdw12 & 0xffff) as u32 + 1;
                 let bytes = nlb as u64 * SECTOR_SIZE;
                 tracing::debug!(slba, nlb, bytes, "NVM WRITE ZEROES");
-                if slba + nlb as u64 > self.total_lba {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE, 0));
-                }
-                // 写零到 backing file。无 DMA 所以 sync 完成 → CQE。
-                let zeros = vec![0u8; bytes as usize];
-                let res = self.file.seek(SeekFrom::Start(slba * SECTOR_SIZE))
-                    .and_then(|_| std::io::Write::write_all(&mut self.file, &zeros));
-                Some(match res {
-                    Ok(()) => Cqe::success(cid, sq_id, sq_head, phase),
-                    Err(e) => {
-                        tracing::warn!(error = %e, slba, nlb, "WRITE ZEROES failed");
-                        Cqe::error(cid, sq_id, sq_head, phase, sc::DATA_TRANSFER_ERROR, 0)
+                // **H4 修复**：用 checked_add 防 slba + nlb 溢出。
+                match slba.checked_add(nlb as u64) {
+                    Some(end) if end <= self.total_lba => {} // 范围合法
+                    _ => {
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::LBA_OUT_OF_RANGE,
+                            0,
+                        ));
                     }
-                })
+                }
+                // **C2 修复**：分块写复用 4 KiB 零 buffer，避免大 nlb 时
+                // 一次性分配 32 MiB+ Vec OOM。每块独立 write，spec 允许
+                // controller 在中途因 error abort（我们这里若中途失败直接返）。
+                const CHUNK: usize = 4096;
+                let zero_buf = [0u8; CHUNK];
+                let mut remaining = bytes as usize;
+                let mut off = slba * SECTOR_SIZE;
+                if let Err(e) = self.file.seek(SeekFrom::Start(off)) {
+                    tracing::warn!(error = %e, slba, "WRITE ZEROES seek failed");
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::DATA_TRANSFER_ERROR,
+                        0,
+                    ));
+                }
+                while remaining > 0 {
+                    let n = remaining.min(CHUNK);
+                    if let Err(e) = std::io::Write::write_all(&mut self.file, &zero_buf[..n]) {
+                        tracing::warn!(error = %e, slba, nlb, off, "WRITE ZEROES chunk failed");
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::DATA_TRANSFER_ERROR,
+                            0,
+                        ));
+                    }
+                    remaining -= n;
+                    off += n as u64;
+                }
+                Some(Cqe::success(cid, sq_id, sq_head, phase))
             }
             nvm_opc::DSM => {
                 // NVMe NVM CS Spec § 3.3.5 Dataset Management — TRIM/UNMAP
@@ -209,12 +321,22 @@ impl NvmeController {
             nvm_opc::VERIFY => {
                 // NVMe 2.0 NVM CS Spec § 3.3.10 Verify — 读 LBA + 校验 ECC/
                 // CRC，无 data transfer。CDW10/11 = SLBA, CDW12 bits 15:0 =
-                // NLB-1。我们 backing 没 ECC，永远 success。
+                // NLB-1。我们 backing 没 ECC，永远 success；H4 checked_add 边界。
                 let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
                 let nlb = (sqe.cdw12 & 0xffff) as u32 + 1;
                 tracing::debug!(slba, nlb, "Verify (no-op success)");
-                if slba + nlb as u64 > self.total_lba {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE, 0));
+                match slba.checked_add(nlb as u64) {
+                    Some(end) if end <= self.total_lba => {}
+                    _ => {
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::LBA_OUT_OF_RANGE,
+                            0,
+                        ));
+                    }
                 }
                 Some(Cqe::success(cid, sq_id, sq_head, phase))
             }
@@ -225,13 +347,26 @@ impl NvmeController {
                 // 我们 backing 无 ECC 概念；返 INVALID_OPCODE 让 driver
                 // 走 fallback。
                 tracing::debug!(cid, "Write Uncorrectable (INVALID_OPCODE)");
-                Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_OPCODE, 0))
+                Some(Cqe::error(
+                    cid,
+                    sq_id,
+                    sq_head,
+                    phase,
+                    sc::INVALID_OPCODE,
+                    0,
+                ))
             }
             opc => {
                 tracing::warn!(opc, "unsupported NVM opcode");
-                Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_OPCODE, 0))
+                Some(Cqe::error(
+                    cid,
+                    sq_id,
+                    sq_head,
+                    phase,
+                    sc::INVALID_OPCODE,
+                    0,
+                ))
             }
         }
     }
-
 }

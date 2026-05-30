@@ -33,17 +33,17 @@ pub const CQE_BYTES: u64 = 16;
 /// Controller 寄存器 byte offset（NVMe spec 1.4 § 3.1）。
 #[repr(u64)]
 pub enum Reg {
-    Cap = 0x00,      // 8 bytes
-    Vs = 0x08,       // 4 bytes
-    Intms = 0x0c,    // 4 bytes
-    Intmc = 0x10,    // 4 bytes
-    Cc = 0x14,       // 4 bytes
+    Cap = 0x00,   // 8 bytes
+    Vs = 0x08,    // 4 bytes
+    Intms = 0x0c, // 4 bytes
+    Intmc = 0x10, // 4 bytes
+    Cc = 0x14,    // 4 bytes
     /// 0x18 reserved
-    Csts = 0x1c,     // 4 bytes
+    Csts = 0x1c, // 4 bytes
     /// 0x20 NSSR
-    Aqa = 0x24,      // 4 bytes
-    Asq = 0x28,      // 8 bytes
-    Acq = 0x30,      // 8 bytes
+    Aqa = 0x24, // 4 bytes
+    Asq = 0x28,   // 8 bytes
+    Acq = 0x30,   // 8 bytes
 }
 
 /// CC (Controller Configuration) bit layout。
