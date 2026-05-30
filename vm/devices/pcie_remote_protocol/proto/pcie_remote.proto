@@ -57,6 +57,9 @@ message ToHost {
         MmioAccess mmio_write = 11;
         MmioAccess mmio_read = 12;
         CfgAccess cfg_write_side_effect = 13;
+        // DMA 完成回执：OpenHCL 把 host 发来的 ReadGpa/WriteGpa 处理结果
+        // 用同样的 token 回给 host（token 由 host 在请求时填）。
+        DmaCompletion dma_completion = 14;
         Reset reset = 16;
     }
 }

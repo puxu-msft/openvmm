@@ -2086,6 +2086,10 @@ impl InitializedVm {
         // 不在 #[cfg(target_os = "linux")] 内 —— Windows OpenVMM 也要走。
         let pcie_remote_prepared: pcie_remote_device::PreparedMap =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        // v2: worker spawn 推迟到 resolver assemble_device，worker tasks 通过
+        // 此 Arc 持有；进程结束时 drop。
+        let pcie_remote_worker_tasks: pcie_remote_device::WorkerTasks =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
         let _pcie_remote_listener_tasks = if cfg.pcie_remote_tcp_instances.is_empty() {
             Vec::new()
         } else {
@@ -2122,6 +2126,8 @@ impl InitializedVm {
             tracing::info!(expected, got, "pcie_remote: handshake wait done");
             tasks
         };
+        // worker_tasks 也要持到进程结束（resolver 会往里 push）。
+        let _pcie_remote_worker_tasks_keep = pcie_remote_worker_tasks.clone();
         resolver.add_async_resolver::<
             vm_resource::kind::PciDeviceHandleKind,
             _,
@@ -2129,6 +2135,7 @@ impl InitializedVm {
             _,
         >(pcie_remote_device::PcieRemoteTcpResolver::new(
             pcie_remote_prepared,
+            pcie_remote_worker_tasks,
         ));
 
         // Resolve PCIe devices concurrently.

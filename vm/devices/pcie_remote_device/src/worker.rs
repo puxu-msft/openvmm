@@ -1,12 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! 后台 worker：通过 Transport 收发 protobuf 帧。
+//! 后台 worker：通过 Transport 收发 protobuf 帧（v2 完整实现）。
 //!
-//! 设计要点（spec §3.3 / §3.5 / §3.8）：
-//! - worker 拥有 transport、in-flight map、dead-man、SharedState
+//! 设计要点（spec §3.3 / §3.5 / §3.7 / §3.8）：
+//! - worker 拥有 transport、in-flight map、dead-man、SharedState、
+//!   **Vec<Interrupt>**（MSI-X 路由）、**GuestMemory**（DMA 读写）
 //! - 进 Lost 时同步 drain in-flight (complete_error NoResponse)
 //! - 关闭信号通过 mesh::Receiver<()> 接收
+//! - A4 / K-NEW-A: 连续 ≥ MAX_BAD_FRAMES 个非法/越界 inbound → Lost
+//! - K-NEW-C: DMA 累积速率限制（默认 64 MiB/s）防止 host 饱和 guest 内存带宽
 
 use crate::deadman::DeadMan;
 use crate::state::DeviceState;
@@ -20,11 +23,26 @@ use futures::StreamExt;
 use futures::io::AsyncRead;
 use futures::io::AsyncWrite;
 use futures::select_biased;
+use guestmem::GuestMemory;
 use mesh::Receiver;
+use pcie_remote_protocol::DmaCompletion;
+use pcie_remote_protocol::MAX_DMA_BYTES;
 use pcie_remote_protocol::ToHost;
 use pcie_remote_protocol::ToOpenhcl;
 use pcie_remote_protocol::codec;
 use std::collections::HashMap;
+use std::time::Duration;
+use std::time::Instant;
+use vmcore::interrupt::Interrupt;
+
+/// A4：连续非法/越界 inbound 数 ≥ 此阈值 → 立即进 Lost。
+const MAX_BAD_FRAMES: u32 = 4;
+
+/// K-NEW-C：DMA 累积速率限制窗口。
+const DMA_RATE_WINDOW: Duration = Duration::from_secs(1);
+/// K-NEW-C：DMA 累积速率上限（字节/秒），默认 64 MiB/s。host 在 1s 窗口内
+/// 累积请求字节超过此值的多余 DMA 直接拒绝（DmaCompletion ok=false）。
+const DMA_RATE_LIMIT_BYTES_PER_SEC: u64 = 64 * 1024 * 1024;
 
 /// Pending request stored against a sequence number.
 pub enum InFlight {
@@ -53,6 +71,37 @@ pub struct DeviceRequest {
     pub pending: Option<InFlight>,
 }
 
+/// DMA 速率限制状态（K-NEW-C）。窗口起点 + 窗口内字节数。
+struct DmaRate {
+    window_start: Instant,
+    bytes_in_window: u64,
+}
+
+impl DmaRate {
+    fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            bytes_in_window: 0,
+        }
+    }
+
+    /// 申请 `bytes` 配额。返回 true 表示允许。
+    fn try_consume(&mut self, bytes: u64) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.window_start) >= DMA_RATE_WINDOW {
+            self.window_start = now;
+            self.bytes_in_window = 0;
+        }
+        let new_total = self.bytes_in_window.saturating_add(bytes);
+        if new_total > DMA_RATE_LIMIT_BYTES_PER_SEC {
+            false
+        } else {
+            self.bytes_in_window = new_total;
+            true
+        }
+    }
+}
+
 /// Worker —— 后台 task 持有它，跑 `run()`。
 pub struct Worker<T> {
     transport: T,
@@ -60,6 +109,21 @@ pub struct Worker<T> {
     in_flight: HashMap<u64, InFlight>,
     _deadman: DeadMan,
     from_device: Receiver<DeviceRequest>,
+    /// MSI-X 中断向量（resolver 阶段从 `MsixEmulator::interrupt(i)` 构造）。
+    /// 长度 = describe.msix_count；index 越界由 `.get()` 安全处理。
+    interrupts: Vec<Interrupt>,
+    /// GuestMemory 用以处理 host 的 ReadGpa/WriteGpa DMA 请求。
+    guest_memory: GuestMemory,
+    /// A4：连续非法 inbound 帧计数。
+    consecutive_bad_frames: u32,
+    /// K-NEW-C: DMA rate state.
+    dma_rate: DmaRate,
+    /// 用于 DMA reply 帧的 seq（与 device.rs `next_seq` 配合）。
+    /// seq 空间约定：
+    /// - device.rs 用低半 u64（从 1 起）
+    /// - 本 worker DMA reply 用高半（`1u64 << 63` 起）
+    /// 两半互不重叠便于日志排查；host 关联请求实际用 token 不用 seq。
+    next_dma_seq: u64,
 }
 
 impl<T> Worker<T>
@@ -71,6 +135,8 @@ where
         transport: T,
         state: SharedState,
         from_device: Receiver<DeviceRequest>,
+        interrupts: Vec<Interrupt>,
+        guest_memory: GuestMemory,
     ) -> Self {
         Self {
             transport,
@@ -78,6 +144,11 @@ where
             in_flight: HashMap::new(),
             _deadman: DeadMan::new(),
             from_device,
+            interrupts,
+            guest_memory,
+            consecutive_bad_frames: 0,
+            dma_rate: DmaRate::new(),
+            next_dma_seq: 1 << 63,
         }
     }
 
@@ -104,7 +175,17 @@ where
                 }
                 inbound = codec::read_frame::<_, ToOpenhcl>(&mut self.transport).fuse() => {
                     match inbound {
-                        Ok(m) => self.dispatch_inbound(m),
+                        Ok(m) => {
+                            if !self.dispatch_inbound(m).await {
+                                // dispatch_inbound 返回 false = 致命 / 应进 Lost
+                                tracing::warn!(
+                                    CVM_ALLOWED,
+                                    consecutive = self.consecutive_bad_frames,
+                                    "pcie_remote: dispatch failed, going Lost"
+                                );
+                                break;
+                            }
+                        }
                         Err(e) => {
                             tracing::warn!(CVM_ALLOWED, error = %e, "read_frame failed; going Lost");
                             break;
@@ -117,14 +198,14 @@ where
         self.state.store(DeviceState::Lost);
     }
 
-    fn dispatch_inbound(&mut self, msg: ToOpenhcl) {
+    /// 处理一个 inbound ToOpenhcl 帧。返回 false 表示应立即终止 worker
+    /// （A4：连续非法帧超阈值；或致命协议错）。
+    async fn dispatch_inbound(&mut self, msg: ToOpenhcl) -> bool {
         use pcie_remote_protocol::to_openhcl::Body;
         let seq = msg.seq;
         match msg.body {
             Some(Body::MmioReadResult(r)) => {
-                if let Some(InFlight::Read { token, access_size }) =
-                    self.in_flight.remove(&seq)
-                {
+                if let Some(InFlight::Read { token, access_size }) = self.in_flight.remove(&seq) {
                     // K-18: MMIO 访问尺寸严格 ∈ {1,2,4,8}。其他值是协议错。
                     if !matches!(access_size, 1 | 2 | 4 | 8) {
                         tracing::warn!(
@@ -134,22 +215,169 @@ where
                             "pcie_remote: invalid access_size for MMIO read; failing request"
                         );
                         token.complete_error(IoError::InvalidRegister);
-                        return;
+                        return self.record_bad();
                     }
                     let bytes = r.value.to_le_bytes();
                     token.complete(&bytes[..access_size]);
+                    self.consecutive_bad_frames = 0;
+                    true
+                } else {
+                    // 未知 seq；非致命但记一次"非法"。
+                    tracing::warn!(
+                        CVM_ALLOWED,
+                        seq,
+                        "pcie_remote: MmioReadResult with unknown seq"
+                    );
+                    self.record_bad()
                 }
             }
-            Some(Body::ReadGpa(_) | Body::WriteGpa(_)) => {
-                tracing::warn!(CVM_ALLOWED, "DMA messages not yet implemented (Phase 5+)");
+            Some(Body::InterruptFire(f)) => {
+                let idx = f.msix_index as usize;
+                if let Some(intr) = self.interrupts.get(idx) {
+                    intr.deliver();
+                    self.consecutive_bad_frames = 0;
+                    true
+                } else {
+                    tracing::warn!(
+                        CVM_ALLOWED,
+                        msix_index = f.msix_index,
+                        count = self.interrupts.len(),
+                        "pcie_remote: InterruptFire msix_index out of bounds"
+                    );
+                    self.record_bad()
+                }
             }
-            Some(Body::InterruptFire(_)) => {
-                tracing::warn!(CVM_ALLOWED, "InterruptFire delivery lands when device.rs holds Vec<Interrupt>");
-            }
+            Some(Body::ReadGpa(req)) => self.handle_read_gpa(req).await,
+            Some(Body::WriteGpa(req)) => self.handle_write_gpa(req).await,
             None => {
                 tracing::warn!(CVM_ALLOWED, "ToOpenhcl missing body");
+                self.record_bad()
             }
         }
+    }
+
+    /// 累加 bad-frame 计数。返回 true 表示尚未到阈值（worker 继续）；
+    /// false 表示超阈值（worker 应退出）。
+    fn record_bad(&mut self) -> bool {
+        self.consecutive_bad_frames = self.consecutive_bad_frames.saturating_add(1);
+        self.consecutive_bad_frames < MAX_BAD_FRAMES
+    }
+
+    /// 处理 host 主动发起的 ReadGpa：从 guest 内存读 len 字节，回 DmaCompletion。
+    async fn handle_read_gpa(&mut self, req: pcie_remote_protocol::ReadGpaRequest) -> bool {
+        let pcie_remote_protocol::ReadGpaRequest { token, gpa, len } = req;
+        let len = len as usize;
+
+        // 协议级别尺寸限制（K-NEW-C 一部分）：单次 ≤ MAX_DMA_BYTES。
+        if len == 0 || len > MAX_DMA_BYTES {
+            tracing::warn!(
+                CVM_ALLOWED,
+                token,
+                gpa,
+                len,
+                max = MAX_DMA_BYTES,
+                "pcie_remote: ReadGpa len out of bounds; replying ok=false"
+            );
+            let _ = self.reply_dma(token, false, Vec::new()).await;
+            return self.record_bad();
+        }
+
+        // K-NEW-C 速率限制：超 64 MiB/s 拒绝（不算 bad-frame，host 可能合法繁忙）。
+        if !self.dma_rate.try_consume(len as u64) {
+            tracing::warn!(
+                CVM_ALLOWED,
+                token,
+                gpa,
+                len,
+                "pcie_remote: DMA rate limit exceeded; replying ok=false"
+            );
+            let _ = self.reply_dma(token, false, Vec::new()).await;
+            return true;
+        }
+
+        let mut buf = vec![0u8; len];
+        let ok = self.guest_memory.read_at(gpa, &mut buf).is_ok();
+        if !ok {
+            tracing::warn!(
+                CVM_ALLOWED,
+                token,
+                gpa,
+                len,
+                "pcie_remote: guest_memory.read_at failed; replying ok=false"
+            );
+            // 注：合法 host 可能问到 MMIO 洞或越界，是协议范围内错误响应；
+            // 只有"消息结构非法"才计 bad-frame，故这里 reset 计数。
+            let _ = self.reply_dma(token, false, Vec::new()).await;
+            self.consecutive_bad_frames = 0;
+            true
+        } else {
+            self.consecutive_bad_frames = 0;
+            self.reply_dma(token, true, buf).await
+        }
+    }
+
+    /// 处理 host 主动发起的 WriteGpa：写 data 到 guest gpa，回 DmaCompletion。
+    async fn handle_write_gpa(&mut self, req: pcie_remote_protocol::WriteGpaRequest) -> bool {
+        let pcie_remote_protocol::WriteGpaRequest { token, gpa, data } = req;
+
+        if data.is_empty() || data.len() > MAX_DMA_BYTES {
+            tracing::warn!(
+                CVM_ALLOWED,
+                token,
+                gpa,
+                len = data.len(),
+                max = MAX_DMA_BYTES,
+                "pcie_remote: WriteGpa len out of bounds; replying ok=false"
+            );
+            let _ = self.reply_dma(token, false, Vec::new()).await;
+            return self.record_bad();
+        }
+
+        if !self.dma_rate.try_consume(data.len() as u64) {
+            tracing::warn!(
+                CVM_ALLOWED,
+                token,
+                gpa,
+                len = data.len(),
+                "pcie_remote: DMA rate limit exceeded; replying ok=false"
+            );
+            let _ = self.reply_dma(token, false, Vec::new()).await;
+            return true;
+        }
+
+        let ok = self.guest_memory.write_at(gpa, &data).is_ok();
+        if !ok {
+            tracing::warn!(
+                CVM_ALLOWED,
+                token,
+                gpa,
+                len = data.len(),
+                "pcie_remote: guest_memory.write_at failed; replying ok=false"
+            );
+        }
+        self.consecutive_bad_frames = 0;
+        self.reply_dma(token, ok, Vec::new()).await
+    }
+
+    /// 发 DmaCompletion 给 host。返回 true 表示 worker 继续；false 表示
+    /// transport 已死，worker 应退出。
+    ///
+    /// 注：DmaCompletion 走 **ToHost** 方向（OpenHCL → host），用 token
+    /// 而不是 seq 跟踪请求；这里 frame 的 seq 自分配（不会被 host 用来
+    /// 关联请求），便于 inflight map 调试。
+    async fn reply_dma(&mut self, token: u64, ok: bool, data: Vec<u8>) -> bool {
+        use pcie_remote_protocol::to_host::Body;
+        let seq = self.next_dma_seq;
+        self.next_dma_seq = self.next_dma_seq.wrapping_add(1);
+        let frame = ToHost {
+            seq,
+            body: Some(Body::DmaCompletion(DmaCompletion { token, ok, data })),
+        };
+        if let Err(e) = codec::write_frame(&mut self.transport, &frame).await {
+            tracing::warn!(CVM_ALLOWED, error = %e, "pcie_remote: DmaCompletion write_frame failed");
+            return false;
+        }
+        true
     }
 
     fn drain_in_flight(&mut self) {
@@ -159,5 +387,103 @@ where
                 InFlight::Write { token } => token.complete_error(IoError::NoResponse),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dma_rate_allows_under_limit() {
+        let mut r = DmaRate::new();
+        assert!(r.try_consume(1024 * 1024));
+        assert!(r.try_consume(1024 * 1024));
+    }
+
+    #[test]
+    fn dma_rate_rejects_over_limit() {
+        let mut r = DmaRate::new();
+        assert!(r.try_consume(DMA_RATE_LIMIT_BYTES_PER_SEC));
+        assert!(!r.try_consume(1));
+    }
+
+    #[test]
+    fn dma_rate_resets_after_window() {
+        let mut r = DmaRate::new();
+        assert!(r.try_consume(DMA_RATE_LIMIT_BYTES_PER_SEC));
+        // 不真等 1s — 直接构造已过期窗口
+        r.window_start = Instant::now() - Duration::from_secs(2);
+        assert!(r.try_consume(1024));
+    }
+
+    /// 验证 InterruptFire dispatch 的边界：
+    /// - 合法 msix_index 在范围内 → 不增 bad-frame 计数
+    /// - 越界 msix_index → 增 bad-frame 计数
+    ///
+    /// 用 MsiTarget::disconnected() 构造 MsixEmulator；deliver() 是 no-op。
+    /// 用 futures::io::Cursor 当 "transport"（async read/write 兼容）。
+    /// 实际帧不通过 cursor 流，只直接调 dispatch_inbound。
+    #[test]
+    fn interrupt_fire_bounds() {
+        use futures::io::Cursor;
+        use pal_async::DefaultPool;
+        use pci_core::capabilities::msix::MsixEmulator;
+        use pci_core::msi::MsiTarget;
+        use pcie_remote_protocol::InterruptFire;
+        use pcie_remote_protocol::to_openhcl::Body;
+
+        DefaultPool::run_with(|_| async move {
+            let target = MsiTarget::disconnected();
+            let (msix, _cap) = MsixEmulator::new(4, 2, &target);
+            let interrupts = (0..2)
+                .map(|i| msix.interrupt(i).unwrap())
+                .collect::<Vec<_>>();
+
+            // 内存 cursor 作 transport；本测试不真走 transport，只测 dispatch_inbound。
+            let cursor = Cursor::new(Vec::<u8>::new());
+            let (_dev_tx, dev_rx) = mesh::channel::<DeviceRequest>();
+            let state = crate::state::SharedState::new(crate::state::DeviceState::Live);
+            let gm = guestmem::GuestMemory::empty();
+            let mut w = Worker::new(cursor, state, dev_rx, interrupts, gm);
+
+            // msix_index = 0 valid。
+            let ok_msg = ToOpenhcl {
+                seq: 1,
+                body: Some(Body::InterruptFire(InterruptFire { msix_index: 0 })),
+            };
+            assert!(w.dispatch_inbound(ok_msg).await);
+            assert_eq!(w.consecutive_bad_frames, 0);
+
+            // msix_index = 1 valid。
+            let ok_msg2 = ToOpenhcl {
+                seq: 2,
+                body: Some(Body::InterruptFire(InterruptFire { msix_index: 1 })),
+            };
+            assert!(w.dispatch_inbound(ok_msg2).await);
+            assert_eq!(w.consecutive_bad_frames, 0);
+
+            // msix_index = 2 → out of bounds → bad-frame +1，仍 < 阈值。
+            let oob = ToOpenhcl {
+                seq: 3,
+                body: Some(Body::InterruptFire(InterruptFire { msix_index: 2 })),
+            };
+            assert!(w.dispatch_inbound(oob).await);
+            assert_eq!(w.consecutive_bad_frames, 1);
+
+            // 累计到 MAX_BAD_FRAMES 应让 dispatch_inbound 返回 false。
+            for i in 0..(MAX_BAD_FRAMES - 1) {
+                let bad = ToOpenhcl {
+                    seq: 100 + i as u64,
+                    body: Some(Body::InterruptFire(InterruptFire { msix_index: 99 })),
+                };
+                let cont = w.dispatch_inbound(bad).await;
+                if i < (MAX_BAD_FRAMES - 2) {
+                    assert!(cont, "i={i} should continue");
+                } else {
+                    assert!(!cont, "i={i} should stop (达阈值)");
+                }
+            }
+        });
     }
 }

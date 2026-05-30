@@ -2310,6 +2310,10 @@ async fn new_underhill_vm(
     // 第二层兜底（spec §3.10）：resolver 找不到 prepared 时返回 AbsentPcieDevice。
     let pcie_remote_prepared: pcie_remote_device::PreparedMap =
         Arc::new(Mutex::new(HashMap::new()));
+    // v2: worker spawn 推迟到 resolver assemble_device；worker tasks 通过此
+    // Arc 持有，进程结束随 OpenHCL 退出 drop。
+    let pcie_remote_worker_tasks: pcie_remote_device::WorkerTasks =
+        Arc::new(Mutex::new(Vec::new()));
     let pcie_remote_listener_tasks = if isolation.is_hardware_isolated() {
         tracing::warn!(
             CVM_ALLOWED,
@@ -2352,6 +2356,7 @@ async fn new_underhill_vm(
         _,
     >(pcie_remote_device::PcieRemoteVmbusResolver::new(
         pcie_remote_prepared,
+        pcie_remote_worker_tasks,
     ));
 
     let periodic_telemetry_task = tp.spawn(

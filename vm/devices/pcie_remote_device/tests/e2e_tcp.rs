@@ -37,12 +37,8 @@ async fn handshake_e2e_via_tcp_loopback(driver: DefaultDriver) {
     let prepared: PreparedMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let addr = format!("127.0.0.1:{port}");
     let instances = vec![(id, addr.clone(), Duration::from_secs(5))];
-    let _listener_tasks = spawn_tcp_handshakes(
-        driver.clone(),
-        driver.clone(),
-        instances,
-        prepared.clone(),
-    );
+    let _listener_tasks =
+        spawn_tcp_handshakes(driver.clone(), driver.clone(), instances, prepared.clone());
 
     // 等 server bind 后，作为 client connect 上去
     pal_async::timer::PolledTimer::new(&driver)
@@ -80,7 +76,9 @@ async fn handshake_e2e_via_tcp_loopback(driver: DefaultDriver) {
             cfg_write_side_effect_offsets: vec![],
         }),
     };
-    codec::write_frame(&mut polled, &ack).await.expect("send ack");
+    codec::write_frame(&mut polled, &ack)
+        .await
+        .expect("send ack");
 
     // 等 handshake task 把 prepared 填好
     for _ in 0..40 {

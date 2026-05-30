@@ -31,5 +31,6 @@ pub use prepared::PreparedPcieRemoteDevice;
 pub use resolver::PcieRemoteTcpResolver;
 pub use resolver::PcieRemoteVmbusResolver;
 pub use resolver::PreparedMap;
+pub use resolver::WorkerTasks;
 pub use state::DeviceState;
 pub use state::SharedState;
