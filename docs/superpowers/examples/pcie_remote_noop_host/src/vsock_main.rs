@@ -127,7 +127,6 @@ async fn serve(
     mut polled: pal_async::socket::PolledSocket<vmsocket::VmStream>,
 ) -> Result<()> {
     use futures::FutureExt;
-    use futures::select_biased;
     use pcie_remote_protocol::InterruptFire;
     use pcie_remote_protocol::ToOpenhcl as OpenhclMsg;
     use pcie_remote_protocol::to_openhcl::Body as OpenhclBody2;

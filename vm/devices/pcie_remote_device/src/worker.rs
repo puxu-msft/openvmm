@@ -41,13 +41,17 @@ use vmcore::interrupt::Interrupt;
 
 /// 可观察的 worker 计数器（device.rs 也持 clone 用于 inspect 暴露）。
 ///
-/// 全是 AtomicU64，worker 单写、device.rs / ohcldiag-dev 只读 —— 不需要锁。
-/// Relaxed ordering 即可：这是诊断数据，不影响 program correctness。
+/// 全是 AtomicU64，**单写者不变量：仅 `Worker::run` 持的 worker task
+/// 写入**；ohcldiag-dev 通过 Inspect 只读。所以 Relaxed ordering 足够：
+/// 这是诊断数据，不影响 program correctness。
+///
+/// 字段含义（每个都对应 worker hot path 中的一处 fetch_add/store）：
 #[derive(Inspect, Default)]
 pub struct WorkerStats {
     /// 处理过的 MmioReadResult 帧数（host → OpenHCL）。
     pub mmio_read_results: AtomicU64,
-    /// 处理过的 InterruptFire 数（成功 deliver）。
+    /// 处理过的 InterruptFire 数（已调用 `Interrupt::deliver()`；
+    /// 不代表 guest 已收到 — deliver 是 fire-and-forget）。
     pub interrupts_fired: AtomicU64,
     /// 越界 InterruptFire 数（msix_index 超 msix_count）。
     pub interrupts_oob: AtomicU64,
@@ -57,9 +61,9 @@ pub struct WorkerStats {
     pub write_gpa_requests: AtomicU64,
     /// DMA 速率限制拒绝次数。
     pub dma_rate_limit_rejects: AtomicU64,
-    /// 当前 inflight 请求数（MMIO read/write 等待 host 回包）。
+    /// 当前 inflight 请求数；drain_in_flight 后归零。
     pub inflight_current: AtomicU64,
-    /// 历史 inflight 峰值（仅写不重置）。
+    /// 历史 inflight 峰值（fetch_max 单调递增，仅写不重置）。
     pub inflight_peak: AtomicU64,
     /// 连续 bad-frame 计数（达 MAX_BAD_FRAMES 即 Lost；这里实时反映）。
     pub consecutive_bad_frames: AtomicU64,
@@ -204,13 +208,10 @@ where
                     };
                     if let Some(pending) = req.pending {
                         self.in_flight.insert(req.seq, pending);
-                        // 更新 inflight 计数器 + 峰值
+                        // 更新 inflight 计数器 + 峰值（fetch_max race-free）
                         let cur = self.in_flight.len() as u64;
                         self.stats.inflight_current.store(cur, Ordering::Relaxed);
-                        let prev_peak = self.stats.inflight_peak.load(Ordering::Relaxed);
-                        if cur > prev_peak {
-                            self.stats.inflight_peak.store(cur, Ordering::Relaxed);
-                        }
+                        self.stats.inflight_peak.fetch_max(cur, Ordering::Relaxed);
                     }
                     if let Err(e) = codec::write_frame(&mut self.transport, &req.frame).await {
                         tracing::warn!(CVM_ALLOWED, error = %e, "write_frame failed; going Lost");
@@ -312,11 +313,15 @@ where
     /// false 表示超阈值（worker 应退出）。
     fn record_bad(&mut self) -> bool {
         self.consecutive_bad_frames = self.consecutive_bad_frames.saturating_add(1);
+        self.stats
+            .consecutive_bad_frames
+            .store(self.consecutive_bad_frames as u64, Ordering::Relaxed);
         self.consecutive_bad_frames < MAX_BAD_FRAMES
     }
 
     /// 处理 host 主动发起的 ReadGpa：从 guest 内存读 len 字节，回 DmaCompletion。
     async fn handle_read_gpa(&mut self, req: pcie_remote_protocol::ReadGpaRequest) -> bool {
+        self.stats.read_gpa_requests.fetch_add(1, Ordering::Relaxed);
         let pcie_remote_protocol::ReadGpaRequest { token, gpa, len } = req;
         let len = len as usize;
 
@@ -336,6 +341,9 @@ where
 
         // K-NEW-C 速率限制：超 64 MiB/s 拒绝（不算 bad-frame，host 可能合法繁忙）。
         if !self.dma_rate.try_consume(len as u64) {
+            self.stats
+                .dma_rate_limit_rejects
+                .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 CVM_ALLOWED,
                 token,
@@ -370,6 +378,7 @@ where
 
     /// 处理 host 主动发起的 WriteGpa：写 data 到 guest gpa，回 DmaCompletion。
     async fn handle_write_gpa(&mut self, req: pcie_remote_protocol::WriteGpaRequest) -> bool {
+        self.stats.write_gpa_requests.fetch_add(1, Ordering::Relaxed);
         let pcie_remote_protocol::WriteGpaRequest { token, gpa, data } = req;
 
         if data.is_empty() || data.len() > MAX_DMA_BYTES {
@@ -386,6 +395,9 @@ where
         }
 
         if !self.dma_rate.try_consume(data.len() as u64) {
+            self.stats
+                .dma_rate_limit_rejects
+                .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 CVM_ALLOWED,
                 token,
@@ -439,6 +451,8 @@ where
                 InFlight::Write { token } => token.complete_error(IoError::NoResponse),
             }
         }
+        // drain 完归零 inflight_current 让 ohcldiag-dev 反映真实状态。
+        self.stats.inflight_current.store(0, Ordering::Relaxed);
     }
 }
 
@@ -498,6 +512,7 @@ mod tests {
             let state = crate::state::SharedState::new(crate::state::DeviceState::Live);
             let gm = guestmem::GuestMemory::empty();
             let stats: SharedWorkerStats = Arc::new(WorkerStats::default());
+            let stats_for_check = stats.clone();
             let mut w = Worker::new(cursor, state, dev_rx, interrupts, gm, stats);
 
             // msix_index = 0 valid。
@@ -507,6 +522,7 @@ mod tests {
             };
             assert!(w.dispatch_inbound(ok_msg).await);
             assert_eq!(w.consecutive_bad_frames, 0);
+            assert_eq!(stats_for_check.interrupts_fired.load(Ordering::Relaxed), 1);
 
             // msix_index = 1 valid。
             let ok_msg2 = ToOpenhcl {
@@ -515,6 +531,8 @@ mod tests {
             };
             assert!(w.dispatch_inbound(ok_msg2).await);
             assert_eq!(w.consecutive_bad_frames, 0);
+            assert_eq!(stats_for_check.interrupts_fired.load(Ordering::Relaxed), 2);
+            assert_eq!(stats_for_check.interrupts_oob.load(Ordering::Relaxed), 0);
 
             // msix_index = 2 → out of bounds → bad-frame +1，仍 < 阈值。
             let oob = ToOpenhcl {
@@ -523,6 +541,11 @@ mod tests {
             };
             assert!(w.dispatch_inbound(oob).await);
             assert_eq!(w.consecutive_bad_frames, 1);
+            assert_eq!(stats_for_check.interrupts_oob.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                stats_for_check.consecutive_bad_frames.load(Ordering::Relaxed),
+                1
+            );
 
             // 累计到 MAX_BAD_FRAMES 应让 dispatch_inbound 返回 false。
             for i in 0..(MAX_BAD_FRAMES - 1) {
@@ -537,6 +560,11 @@ mod tests {
                     assert!(!cont, "i={i} should stop (达阈值)");
                 }
             }
+            // 总越界数：1 (msix_index=2) + (MAX_BAD_FRAMES-1) 个 99
+            assert_eq!(
+                stats_for_check.interrupts_oob.load(Ordering::Relaxed),
+                1 + (MAX_BAD_FRAMES - 1) as u64
+            );
         });
     }
 }
