@@ -16,12 +16,14 @@
 //! 用 token 直接路由 `on_dma_complete` 回到对应处理函数，避免 host 端
 //! 维护 token → context map（O(1) match）。
 
+mod admin;
+mod io;
+
 use crate::cmd::*;
 use crate::regs::*;
 use pcie_remote_userspace_sdk::*;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
@@ -29,15 +31,15 @@ use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
 /// 单 namespace 总容量（LBA 数）= 文件长度 / 512。
-const SECTOR_SHIFT: u32 = 9;
-const SECTOR_SIZE: u64 = 1 << SECTOR_SHIFT;
+pub(super) const SECTOR_SHIFT: u32 = 9;
+pub(super) const SECTOR_SIZE: u64 = 1 << SECTOR_SHIFT;
 
 // 注：本实现用 SDK 分配的 raw DMA token 直接作 HashMap key 路由完成回调；
 // 不再做 token 高位 tagging（早期设计想用 tag 标 op 类别，实测 raw token
 // 已唯一，多此一举）。
 
 /// Pending IO command 等 DMA 完成。
-struct PendingIo {
+pub(super) struct PendingIo {
     sq_id: u16,
     cid: u16,
     sq_head: u16,
@@ -48,7 +50,7 @@ struct PendingIo {
     op: PendingOp,
 }
 
-enum PendingOp {
+pub(super) enum PendingOp {
     /// 等 PRP1 内的 data DMA-read 完成 → 写文件 → success CQE。
     /// (单 PRP Write 路径)
     NvmWriteDmaRead { lba: u64, num_blocks: u32 },
@@ -65,7 +67,7 @@ enum PendingOp {
 /// `NvmeController::next_op_id` 单调分配，**两个 PendingOp::NvmWriteDualPrp
 /// 共用同一 op_id**，乱序到达也正确处理；只要双 PRP DMA 都失败才不发 CQE
 /// （由 `on_dma_complete` 失败路径专门处理）。
-struct WriteAccum {
+pub(super) struct WriteAccum {
     sq_id: u16,
     cid: u16,
     sq_head: u16,
@@ -371,336 +373,9 @@ impl NvmeController {
         }
     }
 
-    /// Admin command dispatch。多数即时完成 → 返回 Some(CQE)；Identify 需
-    /// DMA-write 4 KiB 到 PRP1 → 入 pending → 返 None。
-    fn dispatch_admin(
-        &mut self,
-        ctx: &mut DeviceCtx<'_>,
-        sqe: Sqe,
-        cid: u16,
-        sq_head: u16,
-        cq_id: u16,
-    ) -> Option<Cqe> {
-        let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
-        match sqe.opcode() {
-            admin_opc::IDENTIFY => {
-                // CDW10 bits 7:0 = CNS (Controller or Namespace Structure)
-                let cns = (sqe.cdw10 & 0xff) as u8;
-                let nsid = sqe.nsid;
-                tracing::info!(cns, nsid, "Identify");
-                let buf: Vec<u8> = match cns {
-                    0x00 => {
-                        // Identify Namespace
-                        if nsid != 1 {
-                            // invalid NSID
-                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
-                        }
-                        let ns = IdentifyNamespace::build(self.total_lba);
-                        ns.as_bytes().to_vec()
-                    }
-                    0x01 => {
-                        // Identify Controller
-                        let ctrl = IdentifyController::build(self.vid, self.ssvid);
-                        ctrl.as_bytes().to_vec()
-                    }
-                    0x02 => {
-                        // Active NSID list (4 KiB of u32, list active NSIDs)
-                        let mut buf = vec![0u8; 4096];
-                        buf[..4].copy_from_slice(&1u32.to_le_bytes());
-                        buf
-                    }
-                    0x03 => {
-                        // Namespace Identification Descriptor list (NVMe 1.3+)。
-                        // 4 KiB；header NIDT=0 表示 list 空 — spec-compliant
-                        // 路径，driver 走 EUI64/默认。
-                        // 之前返 NGUID 全 0 违反 spec § 5.15.2（"NGUID 0h
-                        // indicates the controller does not support NGUID"
-                        // → 不应作为 descriptor 返回）。
-                        vec![0u8; 4096]
-                    }
-                    0x06 => {
-                        // CNS 0x06 = Identify Controller for the controller list /
-                        // I/O Command Set Independent for NS. 返 4 KiB 零即可，
-                        // 让 driver 走默认；不发错保证 Windows 后续 init 继续。
-                        vec![0u8; 4096]
-                    }
-                    _ => {
-                        tracing::warn!(cns, "Identify: unsupported CNS, returning zeros");
-                        // 比 INVALID_FIELD 友好：返 4 KiB 零让 driver 继续。
-                        vec![0u8; 4096]
-                    }
-                };
-                // DMA write to PRP1
-                self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, 0, sq_head, cq_id);
-                None
-            }
-            admin_opc::CREATE_IO_CQ => {
-                // CDW10: bits 15:0 = QID, bits 31:16 = QSIZE-1
-                let qid = (sqe.cdw10 & 0xffff) as u16;
-                let qsize = ((sqe.cdw10 >> 16) & 0xffff) as u32 + 1;
-                // CDW11: bit 0 PC (physically contiguous), bit 1 IEN (interrupts enabled),
-                //        bits 31:16 IV (interrupt vector)
-                let pc = sqe.cdw11 & 1 != 0;
-                let ien = sqe.cdw11 & 2 != 0;
-                let iv = ((sqe.cdw11 >> 16) & 0xffff) as u16;
-                let prp1 = sqe.prp1;
-                if !pc {
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
-                }
-                tracing::info!(qid, qsize, ien, iv, gpa = format_args!("{:#x}", prp1), "Create IO CQ");
-                self.cqs.insert(
-                    qid,
-                    CompletionQueue {
-                        base_gpa: prp1,
-                        size: qsize,
-                        tail: 0,
-                        phase: 1,
-                        head: 0,
-                        interrupt_vector: iv,
-                        interrupt_enabled: ien,
-                    },
-                );
-                Some(Cqe::success(cid, 0, sq_head, phase))
-            }
-            admin_opc::CREATE_IO_SQ => {
-                let qid = (sqe.cdw10 & 0xffff) as u16;
-                let qsize = ((sqe.cdw10 >> 16) & 0xffff) as u32 + 1;
-                let pc = sqe.cdw11 & 1 != 0;
-                // CDW11 bits 31:16 = CQID
-                let cqid = ((sqe.cdw11 >> 16) & 0xffff) as u16;
-                let prp1 = sqe.prp1;
-                if !pc {
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
-                }
-                if !self.cqs.contains_key(&cqid) {
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
-                }
-                tracing::info!(qid, qsize, cqid, gpa = format_args!("{:#x}", prp1), "Create IO SQ");
-                self.sqs.insert(
-                    qid,
-                    SubmissionQueue {
-                        base_gpa: prp1,
-                        size: qsize,
-                        head: 0,
-                        tail: 0,
-                        cq_id: cqid,
-                    },
-                );
-                Some(Cqe::success(cid, 0, sq_head, phase))
-            }
-            admin_opc::SET_FEATURES => {
-                let fid = (sqe.cdw10 & 0xff) as u8;
-                // NVMe spec § 5.21.1.7 (Feature 0x07 = Number of Queues)：driver
-                // 写 cdw11 = (NSQR-1) | ((NCQR-1) << 16) 请求 queue 数；controller
-                // 在 CQE cdw0 回 (NSQA-1) | ((NCQA-1) << 16) 表示实际授予。
-                // 不响应正确 cdw0，nvme.sys 会 bail（无法决定开几个 IO queue）。
-                let mut cqe = Cqe::success(cid, 0, sq_head, phase);
-                if fid == 0x07 {
-                    // v1 仅给 1 IO SQ + 1 IO CQ；0-based。
-                    let nsqa = 0u32; // (count-1)
-                    let ncqa = 0u32;
-                    cqe.cdw0 = nsqa | (ncqa << 16);
-                    // 复制到本地变量避免 packed struct 字段取引用 UB。
-                    let req_cdw11 = sqe.cdw11;
-                    let granted_cdw0 = cqe.cdw0;
-                    tracing::info!(
-                        requested = format_args!("{:#x}", req_cdw11),
-                        granted = format_args!("{:#x}", granted_cdw0),
-                        "Set Features Number-of-Queues"
-                    );
-                } else {
-                    tracing::debug!(fid, "Set Features (no-op success)");
-                }
-                Some(cqe)
-            }
-            admin_opc::GET_FEATURES => {
-                let fid = (sqe.cdw10 & 0xff) as u8;
-                tracing::debug!(fid, "Get Features (return cdw0=0)");
-                let mut cqe = Cqe::success(cid, 0, sq_head, phase);
-                cqe.cdw0 = 0; // 默认值
-                Some(cqe)
-            }
-            admin_opc::KEEP_ALIVE => Some(Cqe::success(cid, 0, sq_head, phase)),
-            admin_opc::ASYNC_EVENT_REQUEST => {
-                // 不发，driver 会一直等；不返 CQE 实际上是符合 nvme.sys 期望的
-                tracing::debug!(cid, "AsyncEventRequest queued (no completion)");
-                None
-            }
-            admin_opc::GET_LOG_PAGE => {
-                // 简化：返 4 KiB 零，DMA write 到 PRP1
-                let buf = vec![0u8; 4096];
-                self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, 0, sq_head, cq_id);
-                None
-            }
-            admin_opc::DELETE_IO_SQ => {
-                let qid = (sqe.cdw10 & 0xffff) as u16;
-                tracing::info!(qid, "Delete IO SQ");
-                self.sqs.remove(&qid);
-                Some(Cqe::success(cid, 0, sq_head, phase))
-            }
-            admin_opc::DELETE_IO_CQ => {
-                let qid = (sqe.cdw10 & 0xffff) as u16;
-                tracing::info!(qid, "Delete IO CQ");
-                self.cqs.remove(&qid);
-                Some(Cqe::success(cid, 0, sq_head, phase))
-            }
-            admin_opc::ABORT => {
-                tracing::debug!(cid, "Abort (no-op success)");
-                let mut cqe = Cqe::success(cid, 0, sq_head, phase);
-                cqe.cdw0 = 1; // bit 0 = "Could Not Abort" — driver 不报错
-                Some(cqe)
-            }
-            opc => {
-                tracing::warn!(opc, "unsupported admin opcode; returning success to keep driver alive");
-                // 返 success 而非 INVALID_OPCODE：很多 driver 在
-                // boot 期会探测可选 opcode，遇 INVALID_OPCODE 会进入 fallback
-                // 路径或直接 fail device。返 success（CQE cdw0=0）通常更安全。
-                Some(Cqe::success(cid, 0, sq_head, phase))
-            }
-        }
-    }
+    // dispatch_admin moved to controller/admin.rs (H6 reviewer split)
 
-    /// IO command dispatch。Read/Write 走 DMA。
-    fn dispatch_io(
-        &mut self,
-        ctx: &mut DeviceCtx<'_>,
-        sq_id: u16,
-        sqe: Sqe,
-        cid: u16,
-        sq_head: u16,
-        cq_id: u16,
-    ) -> Option<Cqe> {
-        let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
-        match sqe.opcode() {
-            nvm_opc::READ => {
-                let cdw10 = sqe.cdw10;
-                let cdw11 = sqe.cdw11;
-                let cdw12 = sqe.cdw12;
-                let prp1 = sqe.prp1;
-                let prp2 = sqe.prp2;
-                let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
-                let nlb = (cdw12 & 0xffff) as u32 + 1;
-                let bytes = nlb as u64 * SECTOR_SIZE;
-                tracing::debug!(slba, nlb, bytes, prp1 = format_args!("{:#x}", prp1), "NVM READ");
-                if bytes > MDTS_MAX_BYTES {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
-                }
-                if slba + nlb as u64 > self.total_lba {
-                    return Some(Cqe::error(
-                        cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE, 0,
-                    ));
-                }
-                // 从文件读到 buf
-                let mut buf = vec![0u8; bytes as usize];
-                if let Err(e) = self
-                    .file
-                    .seek(SeekFrom::Start(slba * SECTOR_SIZE))
-                    .and_then(|_| self.file.read_exact(&mut buf))
-                {
-                    tracing::warn!(error = %e, slba, nlb, "READ: backing file read failed");
-                    return Some(Cqe::error(
-                        cid, sq_id, sq_head, phase, sc::DATA_TRANSFER_ERROR, 0,
-                    ));
-                }
-                // DMA write to PRP1（v1：bytes ≤ 8 KiB = 2 page = PRP1 + PRP2）
-                if bytes <= NVME_PAGE_SIZE {
-                    let tok = ctx.dma_write(prp1, buf);
-                    self.pending_ios.insert(
-                        tok,
-                        PendingIo {
-                            sq_id, cid, sq_head, cq_id,
-                            op: PendingOp::NvmReadDmaWrite,
-                        },
-                    );
-                } else {
-                    let half = NVME_PAGE_SIZE as usize;
-                    let (b1, b2) = buf.split_at(half);
-                    let _tok1 = ctx.dma_write(prp1, b1.to_vec());
-                    let tok2 = ctx.dma_write(prp2, b2.to_vec());
-                    self.pending_ios.insert(
-                        tok2,
-                        PendingIo {
-                            sq_id, cid, sq_head, cq_id,
-                            op: PendingOp::NvmReadDmaWrite,
-                        },
-                    );
-                }
-                None
-            }
-            nvm_opc::WRITE => {
-                // 复制 packed 字段到本地变量（packed struct field 取引用 UB，
-                // 直接 as u64 在新 rustc 也会触发警告）。
-                let cdw10 = sqe.cdw10;
-                let cdw11 = sqe.cdw11;
-                let cdw12 = sqe.cdw12;
-                let prp1 = sqe.prp1;
-                let prp2 = sqe.prp2;
-                let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
-                let nlb = (cdw12 & 0xffff) as u32 + 1;
-                let bytes = nlb as u64 * SECTOR_SIZE;
-                tracing::debug!(slba, nlb, bytes, prp1 = format_args!("{:#x}", prp1), "NVM WRITE");
-                if bytes > MDTS_MAX_BYTES {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
-                }
-                if slba + nlb as u64 > self.total_lba {
-                    return Some(Cqe::error(
-                        cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE, 0,
-                    ));
-                }
-                // DMA read from PRP1 (+ 可选 PRP2)
-                if bytes <= NVME_PAGE_SIZE {
-                    let tok = ctx.dma_read(prp1, bytes as u32);
-                    self.pending_ios.insert(
-                        tok,
-                        PendingIo {
-                            sq_id, cid, sq_head, cq_id,
-                            op: PendingOp::NvmWriteDmaRead { lba: slba, num_blocks: nlb },
-                        },
-                    );
-                } else {
-                    // 双 PRP：PRP1 = 第一页 (4 KiB)，PRP2 = 第二页（最多 4 KiB）。
-                    // 分配独立 op_id，PRP1/PRP2 完成回调通过 op_id 关联 ——
-                    // 解决 PRP2 先到 PRP1 的乱序数据损坏 + leak 问题（C1）。
-                    let op_id = self.next_op_id;
-                    self.next_op_id = self.next_op_id.wrapping_add(1);
-                    self.dual_prp_writes.insert(
-                        op_id,
-                        WriteAccum {
-                            sq_id, cid, sq_head, cq_id,
-                            lba: slba, num_blocks: nlb,
-                            prp1_data: None, prp2_data: None,
-                        },
-                    );
-                    let prp2_bytes = (bytes - NVME_PAGE_SIZE) as u32;
-                    let tok1 = ctx.dma_read(prp1, NVME_PAGE_SIZE as u32);
-                    let tok2 = ctx.dma_read(prp2, prp2_bytes);
-                    self.pending_ios.insert(
-                        tok1,
-                        PendingIo {
-                            sq_id, cid, sq_head, cq_id,
-                            op: PendingOp::NvmWriteDualPrp { op_id, is_prp1: true },
-                        },
-                    );
-                    self.pending_ios.insert(
-                        tok2,
-                        PendingIo {
-                            sq_id, cid, sq_head, cq_id,
-                            op: PendingOp::NvmWriteDualPrp { op_id, is_prp1: false },
-                        },
-                    );
-                }
-                None
-            }
-            nvm_opc::FLUSH => {
-                let _ = self.file.sync_all();
-                Some(Cqe::success(cid, sq_id, sq_head, phase))
-            }
-            opc => {
-                tracing::warn!(opc, "unsupported NVM opcode");
-                Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_OPCODE, 0))
-            }
-        }
-    }
+    // dispatch_io moved to controller/io.rs (H6 split)
 
     /// 帮助函数：DMA-write `data` 到 `gpa`，完成后构造 success CQE 提交。
     /// 用 PendingOp::NvmReadDmaWrite 通用入口（Identify 也走这条）。
