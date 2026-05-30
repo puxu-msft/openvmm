@@ -2337,12 +2337,38 @@ async fn new_underhill_vm(
         if instances.is_empty() {
             Vec::new()
         } else {
-            pcie_remote_device::handshake_spawn::spawn_vsock_handshakes(
+            // spec §3.3：handshake_spawn 启 listener；下面 boot grace period
+            // 同步等 prepared_map 填好（或超时），保证 resolver assemble_device
+            // 调用时 prep 已就位、不走 absent fallback。
+            let max_timeout = instances
+                .iter()
+                .map(|(_, _, t)| *t)
+                .max()
+                .unwrap_or(Duration::ZERO);
+            let expected = instances.len();
+            let tasks = pcie_remote_device::handshake_spawn::spawn_vsock_handshakes(
                 driver_source.simple(),
                 tp.clone(),
                 instances,
                 pcie_remote_prepared.clone(),
-            )
+            );
+            // 同步等 prepared_map 满或超时（每 10ms 轮询）。max_timeout 是
+            // 所有 instance 的最大 handshake_timeout，覆盖最慢的那个 host。
+            let deadline = std::time::Instant::now() + max_timeout;
+            while std::time::Instant::now() < deadline {
+                if pcie_remote_prepared.lock().len() >= expected {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let got = pcie_remote_prepared.lock().len();
+            tracing::info!(
+                CVM_ALLOWED,
+                expected,
+                got,
+                "pcie_remote: boot grace period done"
+            );
+            tasks
         }
     };
     // 把 listener tasks 转入 detach；OpenHCL 进程退出时它们随 Spawn 一同终止。

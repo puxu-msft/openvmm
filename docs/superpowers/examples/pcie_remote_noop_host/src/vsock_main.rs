@@ -55,24 +55,42 @@ fn main() -> Result<()> {
             .vm_id
             .parse()
             .map_err(|e| anyhow!("invalid vm_id {}: {e}", args.vm_id))?;
-        tracing::info!(?vm_id, port = args.port, "vsock client connecting");
+        tracing::info!(?vm_id, port = args.port, "vsock client starting (persistent reconnect loop)");
 
-        let mut attempts = 0;
-        let polled = loop {
-            attempts += 1;
-            match try_connect(&driver, vm_id, args.port).await {
-                Ok(p) => break p,
-                Err(e) if attempts < args.retries => {
-                    tracing::warn!(error = %e, attempt = attempts, "connect failed; retrying");
-                    pal_async::timer::PolledTimer::new(&driver)
-                        .sleep(Duration::from_millis(args.retry_ms))
-                        .await;
+        // 外层 reconnect loop：guest OOBE 期间 VM 会 reboot 多次，每次
+        // OpenHCL 重起新的 vsock listener，host 端需要重连维持设备 live。
+        loop {
+            let mut attempts = 0;
+            let polled = loop {
+                attempts += 1;
+                match try_connect(&driver, vm_id, args.port).await {
+                    Ok(p) => break p,
+                    Err(e) if attempts < args.retries => {
+                        tracing::warn!(error = %e, attempt = attempts, "connect failed; retrying");
+                        pal_async::timer::PolledTimer::new(&driver)
+                            .sleep(Duration::from_millis(args.retry_ms))
+                            .await;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "connect retries exhausted");
+                        return Err(e);
+                    }
                 }
-                Err(e) => return Err(e),
+            };
+            tracing::info!("connected");
+            // serve 直到 EOF 或 error → 立刻重连
+            match serve(polled).await {
+                Ok(()) => {
+                    tracing::info!("serve returned normally; reconnecting after 1s");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "serve ended; reconnecting after 1s");
+                }
             }
-        };
-        tracing::info!("connected");
-        serve(polled).await
+            pal_async::timer::PolledTimer::new(&driver)
+                .sleep(Duration::from_secs(1))
+                .await;
+        }
     })
 }
 
@@ -158,6 +176,10 @@ async fn serve(
             }
             Some(HostBody::Reset(r)) => {
                 tracing::info!(seq, kind = r.kind, "reset (ignored)");
+            }
+            Some(HostBody::DmaCompletion(d)) => {
+                // OpenHCL → host 的 DMA 完成回执（host 自身没发 DMA 时不该收到）。
+                tracing::debug!(seq, token = d.token, ok = d.ok, data_len = d.data.len(), "DmaCompletion (unexpected on noop client)");
             }
             None => {
                 tracing::warn!(seq, "ToHost missing body");
