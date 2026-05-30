@@ -37,6 +37,11 @@ struct Args {
     /// Per-retry sleep (ms).
     #[arg(long, default_value_t = 500)]
     retry_ms: u64,
+    /// **Stress** DMA：handshake 完后立即 burst 发 N 次 ReadGpa(gpa=0, len=65536=64KB)
+    /// 触发 K-NEW-C rate limit (64 MiB/s)。设非 0 启用；默认 0 不 stress。
+    /// 推荐 2048（128 MiB total）确保超阈。
+    #[arg(long, default_value_t = 0)]
+    stress_dma_count: u32,
 }
 
 #[cfg(not(windows))]
@@ -79,7 +84,7 @@ fn main() -> Result<()> {
             };
             tracing::info!("connected");
             // serve 直到 EOF 或 error → 立刻重连
-            match serve(&driver, polled).await {
+            match serve(&driver, polled, args.stress_dma_count).await {
                 Ok(()) => {
                     tracing::info!("serve returned normally; reconnecting after 1s");
                 }
@@ -125,6 +130,7 @@ async fn try_connect(
 async fn serve(
     driver: &pal_async::DefaultDriver,
     mut polled: pal_async::socket::PolledSocket<vmsocket::VmStream>,
+    stress_dma_count: u32,
 ) -> Result<()> {
     use futures::FutureExt;
     use pcie_remote_protocol::InterruptFire;
@@ -170,6 +176,27 @@ async fn serve(
     };
     codec::write_frame(&mut polled, &ack).await?;
     tracing::info!("sent HelloAck");
+
+    // 可选：handshake 完成立即 burst 发 N 个 64 KB ReadGpa 触发 K-NEW-C
+    // rate limit (64 MiB/s = 1024 个 64 KB / 秒 上限)。
+    // stress_dma_count=2048 → 128 MiB 一次发送，应至少 1024 个被 rate limit 拒绝。
+    if stress_dma_count > 0 {
+        tracing::info!(stress_dma_count, "STRESS: burst sending ReadGpa(len=64KB)");
+        for i in 0..stress_dma_count {
+            let req = ToOpenhcl {
+                seq: (1u64 << 50) + i as u64,
+                body: Some(pcie_remote_protocol::to_openhcl::Body::ReadGpa(
+                    pcie_remote_protocol::ReadGpaRequest {
+                        token: 9_000_000 + i as u64,
+                        gpa: 0,
+                        len: 65536, // 64 KB = MAX_DMA_BYTES
+                    },
+                )),
+            };
+            codec::write_frame(&mut polled, &req).await?;
+        }
+        tracing::info!(stress_dma_count, "STRESS: burst done, switching to normal serve");
+    }
 
     // 主循环：在读 inbound 时设短超时；超时则发 InterruptFire（不占 polled
     // 借用），有 inbound 则正常处理。避免 select_biased 内同时双借
