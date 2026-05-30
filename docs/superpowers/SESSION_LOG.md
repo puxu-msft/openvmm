@@ -387,3 +387,66 @@ OpenHCL VTL2 kmsg:
 - 真 Hyper-V e2e (OpenHCL, **此次**): 上面的输出
 
 Path C 闭环。
+
+---
+
+## 2026-05-30 v2 重构：完整 BAR/MSIX/MMIO/InterruptFire/DMA 闭环
+
+承前 Path C 真 Hyper-V 已通；本次把 v1 cfg-only skeleton 升级到真正
+能服务 guest PCIe MMIO + MSI-X 中断 + host-initiated DMA 的完整设备。
+
+### 流程
+
+严格按用户要求：
+1. **architect subagent review** 在动手前（提出 10 modifications，全采纳）
+2. **rust-reviewer subagent review** 在 commit 前（1 HIGH + 多 MEDIUM/LOW，全修）
+3. **LOW 处理规则**：有价值直接做、不打算做的记到 `REVIEW_PENDING.md`
+
+### 主要变更
+
+| 维度 | v1 | v2 |
+|---|---|---|
+| cfg space | `[u32; 64]` 镜像 | `ConfigSpaceType0Emulator`（标准实现）|
+| MMIO | 不支持 | `MmioIntercept` 完整路由：MSIX 本地 + 其它走 worker `Defer` |
+| MSI-X | 协议层有但 dead code | `MsixEmulator` + Vec<Interrupt>，BAR4 专用 |
+| InterruptFire | warn 占位 | 真 `interrupts[i].deliver()` + bounds + ≥4 bad→Lost |
+| DMA | warn "not implemented" | `ReadGpa/WriteGpa → GuestMemory + DmaCompletion`，含 64 MiB/s 速率限制 |
+| Worker spawn | handshake 完立刻 | 推迟到 resolver `assemble_device`（拿全 `msi_target/register_mmio/guest_memory`）|
+| cfg_write_side_effect | "Phase 6+" 注释 | 实现，**仅成功 write 才 forward** |
+
+### 安全 + 健壮性新增
+
+- **K-NEW-A** MSI-X 表数据永远不离开 OpenHCL（绝不转发给 host）
+- **K-NEW-B** BAR1/3/5 在 handshake 拒绝（DeviceBars upstream API v1 限制）；BAR4 给 MSI-X 保留
+- **K-NEW-C** DMA 累积速率限制 64 MiB/s
+- **A4** 连续 ≥4 个非法 inbound 帧 → 立即进 Lost
+
+### 测试统计 53/53 全过
+
+| 层 | 数 | 备注 |
+|----|---|---|
+| pcie_remote_device 单元 | 33 | v1 是 28；+5 (DMA rate × 3 + interrupt_fire_bounds + rejects_unsupported_bar_index) |
+| pcie_remote_device e2e_tcp 集成 | 3 | 未变 |
+| pcie_remote_protocol | 7 | 未变 |
+| underhill_core::options | 10 | 未变 |
+| **TOTAL** | **53** | v1 是 48 |
+
+### 构建验证
+
+- `cargo build -p openvmm` (linux-gnu, KVM) ✅
+- `cargo check -p underhill_core --target x86_64-unknown-linux-musl` (OpenHCL) ✅
+
+### 协议变更
+
+`pcie_remote.proto` `ToHost` 加 `DmaCompletion dma_completion = 14;` —
+OpenHCL → host 的 DMA 完成回执（用 token 关联请求，不依赖 seq）。
+
+### Callsite 适配
+
+- `openvmm/openvmm_core/src/worker/dispatch.rs`：`PcieRemoteTcpResolver::new(prepared, worker_tasks)`
+- `openhcl/underhill_core/src/worker.rs`：`PcieRemoteVmbusResolver::new(prepared, worker_tasks)`
+- worker_tasks: `Arc<Mutex<Vec<Task<()>>>>` 由调用方持到进程结束
+
+### 关联 commit
+
+`ea928d5b feat(pcie_remote): v2 重构 - 完整 BAR/MSIX/MMIO/InterruptFire/DMA 闭环`

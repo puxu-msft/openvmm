@@ -757,6 +757,21 @@ Write-Host "Registered service GUID: $ServiceGuid (ACL: Admin/SYSTEM only)"
 - K-20 ~ K-22 在 v1 PR 合入同时开 v2 跟踪 issue。
 - 任何新发现的问题追加到本表（保留编号连续）。
 
+### v2 重构新增 K-NEW-* 项（2026-05-30 完成）
+
+| ID | 状态 | 严重度·层 | 主旨 | 落地 |
+|----|------|----------|------|------|
+| K-NEW-A | ✅ | P1·安全 | MSI-X 表数据**永远不离开 OpenHCL**：MMIO 路由时 BAR4 命中走本地 `MsixEmulator::read_u32/write_u32`，绝不转发给 host | device.rs::mmio_read/write 分支 |
+| K-NEW-B | ✅ | P1·架构 | host 不得占用 MSI-X 专用 BAR；DeviceBars upstream API v1 限制下 BAR1/3/5 也拒绝 | handshake.rs::validate_describe |
+| K-NEW-C | ✅ | P2·安全 | DMA 累积速率限制 64 MiB/s 防止恶意 host 饱和 guest 内存带宽 | worker.rs::DmaRate (3 unit tests) |
+| K-NEW-D | ✅ | P1·安全 | `cfg_write_side_effect` 仅在 `cfg_space.write_u32` 成功时 forward；失败 write 不应让 host 收到事件，否则违反 spec §3.6 "host 只看到成功的 cfg writes" 不变量 | device.rs::pci_cfg_write (rust-reviewer HIGH 修正) |
+| K-NEW-E | ✅ | P2·健壮 | worker 连续 ≥4 个非法 inbound 帧 → 立即进 Lost，防止恶意 host 用 OOB msix_index / 未知 seq 等耗资源 | worker.rs::dispatch_inbound |
+
+K-NEW-A/B/D 是 v2 重构在 BAR + MSIX + MMIO + cfg_write_side_effect 真正
+接通后才浮现的新安全约束；v1 cfg-only 时这些数据通路根本不存在，故不
+适用。K-NEW-C/E 是新增的健壮性约束（v2 worker 真正处理 host inbound 后
+才有可能）。
+
 ### 真 Hyper-V end-to-end 验证（2026-05-30 新增）
 
 Path C **完全闭环**：

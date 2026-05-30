@@ -8,6 +8,13 @@
 > 的"2026-05-30 🎉🎉🎉 真 Hyper-V 端到端验证"段（emoji 标题，
 > 用 `grep -n "真 Hyper-V 端到端验证" docs/superpowers/SESSION_LOG.md` 定位）；
 > K-IDs 表见 [../specs/2026-05-29-pcie-remote-design.md](../specs/2026-05-29-pcie-remote-design.md) §10。
+>
+> **2026-05-30 v2 重构：完整 BAR/MSIX/MMIO/InterruptFire/DMA 闭环。**
+> v1 是 cfg-only skeleton；v2 用 `ConfigSpaceType0Emulator + MsixEmulator +
+> MmioIntercept + GuestMemory-aware worker` 把 spec §3.5/§3.6/§3.7 完整
+> 实现。worker spawn 推迟到 resolver assemble_device 拿全 msi_target/
+> register_mmio/guest_memory 后才 spawn。详见 SESSION_LOG "v2 重构" 段
+> 和 spec §10 K-NEW-A..E 表。落地 commit: `ea928d5b`。
 
 **Goal:** 实现 OpenHCL/OpenVMM 远程 PCIe 实验设备 v1 —— guest 看到通用 PCIe 设备，所有语义在 Windows host 用户态程序，OpenHCL 内薄壳；同时把 OpenVMM 路径的半成品补齐。
 
