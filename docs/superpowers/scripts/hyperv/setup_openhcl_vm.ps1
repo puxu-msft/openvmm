@@ -1,5 +1,14 @@
 # Properly configure vm-ws25-1 as OpenHCL VM using petri's powershell module.
 # Stops VM, sets GuestFeatureSet (OpenHCL bit), sets IGVM, sets cmdline.
+#
+# ⚠ DEPRECATED (2026-05-30): 本脚本试图在**现有** VM 上 retrofit OpenHCL
+#   配置（修 vssd 字段）。实测 Hyper-V 会静默忽略：原 VM 没有用
+#   -GuestStateIsolationType OpenHCL 创建，怎么改 vssd 也加载不上 OpenHCL
+#   IGVM，VM 启动到 stock Msvm UEFI，VTL2 不存在。
+#
+#   正确流程：用同目录 create_openhcl_vm_correct.ps1 **重建** VM。
+#
+#   旧脚本保留作历史 + petri Set-OpenHCLFirmware cmdlet 使用范例。
 
 param(
     [string]$VmName = 'vm-ws25-1',

@@ -2,6 +2,12 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **2026-05-30 STATUS：实施计划已全部完成。** Phase 1 ~ 10 落地完毕，
+> 真 Linux KVM (OpenVMM 路径) + 真 Hyper-V (OpenHCL 路径) 端到端
+> 全部验证通过。最新成果详见 [../SESSION_LOG.md](../SESSION_LOG.md)
+> "🎉🎉🎉 真 Hyper-V 端到端验证" 段；K-IDs 表见
+> [../specs/2026-05-29-pcie-remote-design.md](../specs/2026-05-29-pcie-remote-design.md) §10。
+
 **Goal:** 实现 OpenHCL/OpenVMM 远程 PCIe 实验设备 v1 —— guest 看到通用 PCIe 设备，所有语义在 Windows host 用户态程序，OpenHCL 内薄壳；同时把 OpenVMM 路径的半成品补齐。
 
 **Architecture:** 2 个 in-tree crate (`pcie_remote_protocol` + `pcie_remote_device`)；vsock (OpenHCL) / TCP loopback (OpenVMM) 双 transport；resolver 动态注册自持 `prepared_map`；CVM 静默过滤 + 兜底 `AbsentPcieDevice`。
@@ -2464,13 +2470,19 @@ git commit -m "docs: Phase 10 — OpenHCL IGVM + vsock handshake validated"
 
 ## 任务分级（用于无人值守模式）
 
-| 级别 | Phase | 必须无人值守完成 |
-|------|-------|------------------|
-| **MUST** | 1, 2, 3, 4, 5 | crate 全部单测通过 |
-| **MUST** | 6 | OpenVMM 能编 + 启动（不强求成功 enumerate guest） |
-| **SHOULD** | 7 | OpenHCL `cargo check` 通过 |
-| **SHOULD** | 8 | host SDK 能 `cargo build`；setup.ps1 + Guide 文档落盘 |
-| **NICE** | 9 | OpenVMM + linux guest 真实跑通设备枚举 |
-| **NICE** | 10 | IGVM build + vsock 真实跑通 |
+| 级别 | Phase | 必须无人值守完成 | 状态 |
+|------|-------|------------------|------|
+| **MUST** | 1, 2, 3, 4, 5 | crate 全部单测通过 | ✅ 完成 (28+7+10 = 45 单测，3 集成测试通过) |
+| **MUST** | 6 | OpenVMM 能编 + 启动（不强求成功 enumerate guest） | ✅ 完成（真 KVM e2e 通过）|
+| **SHOULD** | 7 | OpenHCL `cargo check` 通过 | ✅ 完成 |
+| **SHOULD** | 8 | host SDK 能 `cargo build`；setup.ps1 + Guide 文档落盘 | ✅ 完成（TCP + vsock 两个 bin）|
+| **NICE** | 9 | OpenVMM + linux guest 真实跑通设备枚举 | ✅ 完成（真 KVM e2e）|
+| **NICE** | 10 | IGVM build + vsock 真实跑通 | ✅ **完成（真 Hyper-V vsock handshake ok, worker spawned）** |
 
 无人值守模式：MUST 卡住即停止并写 SESSION_LOG；SHOULD/NICE 任何一步失败也写日志，但继续尝试下一 phase。
+
+**实际执行额外达成（计划外）：**
+- K-1 到 K-19 全部 spec gap 已实现并通过测试
+- Path C Hyper-V 创建陷阱（`-GuestStateIsolationType OpenHCL`）已定位 + 文档化（[../HYPERV_RUNBOOK.md](../HYPERV_RUNBOOK.md)）
+- 诊断工具 `vmrs_log_scanner` + `vmrs_log_scanner_win` 已实现并 commit
+- Hyper-V 自定义 VM 重建脚本 `docs/superpowers/scripts/hyperv/create_openhcl_vm_correct.ps1`

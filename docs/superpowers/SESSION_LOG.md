@@ -105,12 +105,16 @@ OpenHCL 在 OpenVMM 上启动需要 **WHP 或 mshv** hypervisor（提供 VTL2）
 
 ## 未完成 / 需要用户配合
 
-详见 [USER_TODO.md](USER_TODO.md)。简要：
+> **2026-05-30 修正**：本段所列项 1 + 2 都**已完成**（真 Hyper-V Path C 闭环；
+> 见末尾 "🎉🎉🎉 真 Hyper-V 端到端验证" 段）。只剩项 3 (跨编 openvmm.exe，
+> 用户可选) 和项 4 (CVM 真机，需硬件)。当前 USER_TODO 已对应更新。
 
-1. **OpenHCL 真 VTL2 验证** —— 需要 Windows 11 host 的 Hyper-V 或 WSL2 启用 mshv（`nestedVirtualization=true`）。
-2. **生产 Hyper-V 上 Path C 真验证** —— 需要 Windows 管理员权限运行 Hyper-V cmdlets + setup-pcie-remote.ps1。
-3. **跨编 openvmm.exe** —— 用户在 Windows 原生 `cargo build` 更简单（VS Build Tools 已装）。
-4. **CVM 端到端** —— 需要 SNP/TDX/VBS 真机。
+详见 [USER_TODO.md](USER_TODO.md)。简要（**原始历史快照**）：
+
+1. ~~OpenHCL 真 VTL2 验证~~ ✅ 已完成（Path C 已端到端通过）
+2. ~~生产 Hyper-V 上 Path C 真验证~~ ✅ 已完成（noop_host_vsock ↔ VTL2 handshake ok）
+3. **跨编 openvmm.exe** —— 用户在 Windows 原生 `cargo build` 更简单（可选）
+4. **CVM 端到端** —— 需要 SNP/TDX/VBS 真机（可选）
 
 ## 关键经验教训（持续追加）
 
@@ -130,6 +134,13 @@ OpenHCL 在 OpenVMM 上启动需要 **WHP 或 mshv** hypervisor（提供 VTL2）
 ---
 
 ## 2026-05-29 ~ 05-30 后续：K-IDs 清零 + Path C 实战
+
+> **2026-05-30 后续修正**：本段所述的 "VMBusMessageRedirection=1 必需"、
+> "ohcldiag-dev 10060" 等表象都来自一个误判：原 VM 是用
+> `New-CustomVM` 创建的（没有 `-GuestStateIsolationType OpenHCL`），
+> Hyper-V 完全忽略 retrofit 的 OpenHCL 配置。真正的解决方案见本文档
+> 末尾的 "🎉🎉🎉 真 Hyper-V 端到端验证" 段。
+> 本段保留作历史诊断记录。
 
 ### K-8/K-11/K-15/K-17/K-18/K-19 全部清零
 

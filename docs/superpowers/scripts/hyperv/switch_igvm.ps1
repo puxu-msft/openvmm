@@ -1,5 +1,18 @@
 # Switch existing VM to a different OpenHCL IGVM via WMI ModifySystemSettings.
 # Uses Get-CimInstance (modern CIM) so CimSerializer works.
+#
+# ⚠ 半失效 (2026-05-30): 仅在 VM 原本是用
+#   `New-VM -GuestStateIsolationType OpenHCL` 创建的情况下有效（vssd 已是
+#   OpenHCL-flavored，只换 FirmwareFile）。对**非** OpenHCL-isolation VM 上
+#   retrofit OpenHCL 字段，Hyper-V 会静默忽略 — 即使本脚本 ModifySystemSettings
+#   返回 success，VM 实际启动仍加载 stock Msvm UEFI。
+#
+#   正确建 VM 的脚本：create_openhcl_vm_correct.ps1（同目录）。
+#
+#   另注：硬编 GuestFeatureSet=0x201 可能覆盖 -GuestStateIsolationType OpenHCL
+#   创建时的 0x513 标志位。实测后者 0x513 / 0x201 在 boot 行为上等价（IGVM
+#   都能加载），但保险起见正确做法是用 Set-OpenHCL-HyperV-VM.ps1（仓库根
+#   openhcl/）而不是本脚本。
 
 param(
     [string]$VmName = 'pcie-remote-exp',

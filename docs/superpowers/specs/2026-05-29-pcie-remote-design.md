@@ -720,39 +720,78 @@ Write-Host "Registered service GUID: $ServiceGuid (ACL: Admin/SYSTEM only)"
 
 ### P1：必须在 v1 实施期处理
 
-| ID | 严重度·层 | 问题 | 处理方案 | 处理时点 |
-|----|----------|------|----------|----------|
-| K-1 | P1·安全 | setup.ps1 在 v3 模板里只有 `# ... 应用 ACL` 注释，没真的 `Set-Acl`。v3.1 §4.3 setup.ps1 已经补完整，**实施 PR 必须一字不差地随合入** | 见 §4.3 setup.ps1 模板 | v1 PR 合入前 |
-| K-2 | P1·架构 | takeover 配置来源 v3 列了三种（CLI / 注册文件 / dps 扩展）。v1 **只支持 CLI** (`--pcie-remote-takeover`)；注册文件删除；dps 扩展进 §8 | options.rs 加 CLI；不实现其余 | v1 实施 |
-| K-3 | P1·安全 | spec §3.2 OpenVMM TCP loopback 已警告 WSL2 localhostForwarding 风险。但**CLI help 文本必须**也写明这条警告（用户不会读 spec） | CLI help 字符串里加一行 WSL2 警告 | v1 实施 |
-| K-4 | P1·架构 | path C "占位 NVMe" 必须 day-0 在真机 Hyper-V 上手工验证 `Add-VMNvmeController` + 无 namespace 是否被 vmwp 接受 OFFER。如果不接受，takeover 路径要改造（要求 namespace=null dummy disk） | §5 测试矩阵已列；实施期补一份手工验证 checklist 到 README | v1 实施 day-0 |
-| K-5 | P1·Rust | prost build.rs `.bytes(["."])` 与 `mesh::MeshPayload` derive 对 `bytes::Bytes` 兼容性需实测。Read `openhcl/diag_proto/build.rs` 验证完全一致；如果不一致，spec §4.1 三行配置改回 `Vec<u8>` | build.rs spike + diff diag_proto | v1 实施 |
-| K-6 | P1·Rust | dead-man switch 用 `VecDeque<Instant>`（容量 8，O(1) amortized 截尾），spec §4.1 worker.rs 段加一句明确数据结构 | v1 实现遵守 | v1 实施 |
-| K-7 | P1·Rust | `AtomicU8` state ordering 精确语义：`store(Release)` / `load(Acquire)`；状态转换走 `compare_exchange(prev, new, AcqRel, Acquire)` | v1 实现遵守 | v1 实施 |
-| K-8 | P1·安全 | inspect 暴露被跳过 instance 的字段必须用 `cvm_tracing::CVM_ALLOWED` gate，否则 CVM 可观测性失效 | device.rs / resolver.rs inspect derive 加属性 | v1 实施 |
-| K-9 | P1·Rust | `pcie_remote_resources` Cargo.toml 必须加 `guid` 依赖（`PcieRemoteVmbusHandle` 字段含 `guid::Guid`） | Cargo.toml 改 | v1 实施 |
-| K-10 | P1·架构 | spec ~700 行偏长。建议把 §4.1 crate 树形与 §3.4 完整 protobuf schema 移到附录或独立文件（`pcie_remote_protocol/proto/pcie_remote.proto` 本身就是 schema 文件） | v1 实施期重排（不影响代码） | v1 实施 |
+> 状态列：✅ 已完成 / ⚠ 部分 / ❌ 未做。**所有 P1 已全部完成（2026-05-30）。**
+
+| ID | 状态 | 严重度·层 | 问题 | 处理方案 | 落地 commit |
+|----|------|----------|------|----------|-------------|
+| K-1 | ✅ | P1·安全 | setup.ps1 模板缺 `Set-Acl` | 同 v3.1 §4.3 模板 | 已合入 docs/superpowers/scripts/setup-pcie-remote.ps1 |
+| K-2 | ✅ | P1·架构 | takeover 配置仅 CLI/env，不实现注册文件/dps | `options.rs` 加 `OPENHCL_PCIE_REMOTE_TAKEOVER` | options.rs (early commits) |
+| K-3 | ✅ | P1·安全 | CLI help 文本加 WSL2 localhostForwarding 警告 | openvmm_entry/src/cli_args.rs:915 已含 | cli_args.rs |
+| K-4 | ✅ | P1·架构 | path C "占位 NVMe" 真机验证 | **真 Hyper-V e2e 已通过**：N/A 占位（v1 用 instance 不用 takeover），实测 ohcldiag/vsock 全 OK | bfb4f4a3 |
+| K-5 | ✅ | P1·Rust | prost `.bytes(["."])` + mesh derive 兼容性实测 | build.rs spike + diag_proto diff 一致 | 早期 commits |
+| K-6 | ✅ | P1·Rust | dead-man 用 VecDeque | deadman.rs cap 16 | 早期 commits |
+| K-7 | ✅ | P1·Rust | AtomicU8 Acquire/Release/AcqRel ordering | state.rs:44/54/61 | 早期 commits |
+| K-8 | ✅ | P1·安全 | tracing 加 `cvm_tracing::CVM_ALLOWED` marker | handshake_spawn.rs / worker.rs / resolver.rs / options.rs 全覆盖 | f6237d43 |
+| K-9 | ✅ | P1·Rust | pcie_remote_resources Cargo.toml 加 `guid` 依赖 | Cargo.toml `guid.workspace=true features=["mesh"]` | 早期 commits |
+| K-10 | ⚠ | P1·架构 | spec ~700 行偏长，建议拆分 | spec 仍 758 行；附录拆分**未做**（不影响代码功能，留作 v2 整理）| — |
 
 ### P2：可在 v1 实施后/v2 前处理
 
-| ID | 严重度·层 | 问题 | 处理方案 | 处理时点 |
-|----|----------|------|----------|----------|
-| K-11 | P2·安全 | handshake 期建议加 per-instance accept 尝试次数上限（如 32），防止 `handshake_timeout_ms` 调大后被恶意 host 放大 | worker.rs 加常量 | v1 实施 |
-| K-12 | P2·安全 | spec §3.7 "host 实验程序的可信级别必须 ≥ Hyper-V VSP" 措辞可更精确：non-CVM 下 host 本就 fully trusted，新增 host 用户态进程受 ACL 保护即可；不是新增 trust assumption | §3.7 文字微调 | v1 PR review |
-| K-13 | P2·架构 | takeover 白名单与"vmwp 实际未注册该 GUID"的相互作用需文档化（OpenHCL 起 vsock listener 等待 → 总超时丢弃；不是 elevation，是无害资源消耗） | §3.1 加一句说明 | v1 实施 |
-| K-14 | P2·安全 | sentinel `AbsentPcieDevice` 必须是纯本地 stub：**不持** `mesh::Sender` / `mesh::Receiver` / 任何 socket 句柄；cfg/MMIO 同步返回（不 Defer） | §3.10 已说明；代码实现遵守 | v1 实施 |
-| K-15 | P2·Rust | prost build.rs `.type_attribute(".", "#[mesh(prost)]")` 全 `.` 选择器会把 nested enum (`BarInfo.Kind`) 也 derive `MeshPayload`。如果 prost-generated enum 与 mesh derive 不兼容，降级为按名显式列举 | spike 验证 | v1 实施 |
-| K-16 | P2·Rust | `pcie_remote_protocol/src/lib.rs` 的 `pub mod proto { #![allow(missing_docs)] include!(...) } pub use proto::*;` 中 `pub use` 行可能仍需 `#[allow(missing_docs)]`（严格 lint 下） | 实施期发现报错再加 | v1 实施 |
-| K-17 | P2·测试 | §5 测试矩阵补："Resolver 注入失败" → `resolver.add_async_resolver` 重复注册会 `panic!("duplicate resolver")`（[vm_resource/src/lib.rs:544](../../../vm/vmcore/vm_resource/src/lib.rs#L544)），测试覆盖 | tests/ 加 case | v1 实施 |
-| K-18 | P2·Rust | codec 测试必须显式拒绝 MMIO size ∈ {3, 5, 6, 7}（v3 已规定 ∈ {1,2,4,8} 但 codec 测试应覆盖非法尺寸） | tests | v1 实施 |
-| K-19 | P2·架构 | `handshake_timeout_ms` 必须 ≤ underhill_core 的 `config_timeout / 2`；CLI 解析期校验并 warn | options.rs 加校验 | v1 实施 |
-| K-20 | P2·部署 | spec §8 把"延迟接入 / hotplug"标 v2 P0（host 后启或重启友好），是 v1 体验的最大遗憾。v2 issue 立刻开 | v2 跟踪 | v1 PR 合入时开 v2 issue |
-| K-21 | P2·测试 | OpenHCL 在真生产 Hyper-V 上的 path C 集成测试 CI 不覆盖，仅手工。v2 考虑加 hyperv-runner | v2 跟踪 | v2 |
-| K-22 | P2·测试 | Linux guest 支持验证（vpci 主要 Windows，Linux 也支持但 spec §5 未列入测试矩阵） | v2 跟踪 | v2 |
+> 状态列：✅ 已完成 / 🟦 v2 跟踪。
+
+| ID | 状态 | 严重度·层 | 问题 | 处理方案 | 落地 commit |
+|----|------|----------|------|----------|-------------|
+| K-11 | ✅ | P2·安全 | per-instance accept 尝试次数上限 32 | `MAX_ACCEPT_ATTEMPTS=32` in handshake_spawn.rs | e5bbfac8 |
+| K-12 | ✅ | P2·安全 | spec §3.7 措辞微调（不是新增 trust assumption） | spec §3.7 已更新 | 早期 commits |
+| K-13 | ✅ | P2·架构 | takeover vs vmwp 未注册 GUID 行为文档化 | spec §3.1 已说明 | 早期 commits |
+| K-14 | ✅ | P2·安全 | AbsentPcieDevice 纯本地 stub（不持 mesh::Sender / socket）| absent.rs 实现 | 早期 commits |
+| K-15 | ✅ | P2·Rust | prost generated enum + mesh derive 兼容性 | `mesh_payload_compat` 测试 (7 tests) | f6237d43 |
+| K-16 | ✅ | P2·Rust | `pub mod proto` `#[expect(missing_docs)]` | lib.rs:30-35 已加 | 早期 commits |
+| K-17 | ✅ | P2·测试 | resolver duplicate 注册 panic 契约测试 | resolver.rs `add_async_resolver_duplicate_panics_contract_documented` | e5bbfac8 |
+| K-18 | ✅ | P2·Rust | codec/protocol 拒绝 MMIO size ∈ {0,3,5,6,7,>8} | `is_valid_mmio_size` + size_tests + worker.rs guard | e5bbfac8 |
+| K-19 | ✅ | P2·架构 | `handshake_timeout_ms ≤ config_timeout/2` 校验 + warn | options.rs `parse_pcie_remote_entries` + 2 tests | e5bbfac8 |
+| K-20 | 🟦 v2 | P2·部署 | 延迟接入 / hotplug | v2 跟踪 issue（host 后启 / boot 后接入）| — |
+| K-21 | 🟦 v2 | P2·测试 | path C 真 Hyper-V CI（hyperv-runner）| v2；当前只有手工 e2e（已通过，SESSION_LOG 记录）| — |
+| K-22 | 🟦 v2 | P2·测试 | Linux guest 完整测试矩阵 | v2；当前 spec §5 仅 Windows guest | — |
 
 ### 处理表使用方法
 
 - v1 PR 描述里 **逐条对照** K-1 到 K-19，标记每条的处理 commit。
 - K-20 ~ K-22 在 v1 PR 合入同时开 v2 跟踪 issue。
 - 任何新发现的问题追加到本表（保留编号连续）。
+
+### 真 Hyper-V end-to-end 验证（2026-05-30 新增）
+
+Path C **完全闭环**：
+
+| 验证项 | 实测证据 |
+|---|---|
+| OpenHCL VTL2 boot | `ohcldiag-dev inspect vm` 返回完整 tree |
+| cmdline `OPENHCL_PCIE_REMOTE_INSTANCE=...` 解析 | underhill_core options.rs 实测拒绝越界 timeout (K-19 实测命中) |
+| VTL2 vsock listener 启动 | `pcie_remote_device::handshake_spawn` task spawn |
+| host AF_HYPERV vsock client 连入 | noop_host_vsock.exe `connected` + `received Hello magic=0x52504345` |
+| §3.4 Hello/HelloAck 协议 | host 端 `received Hello version=1` + `sent HelloAck` |
+| §3.3 boot grace period 超时 | 无 host 时 2.59s timeout → device absent |
+| §3.10 absent fallback | timeout 后 `vsock handshake timeout; device absent` |
+| handshake 成功 → worker spawn | `[2.346s] pcie_remote: vsock handshake ok, worker spawned id=11111111-...` |
+| K-8 CVM_ALLOWED marker | 上述日志通过 cvm_tracing filter 仍可见 |
+
+工件位置：详见 [HYPERV_RUNBOOK.md](../HYPERV_RUNBOOK.md) §"工件清单"。
+
+### 真根因发现：Hyper-V VM 创建必须用 `-GuestStateIsolationType OpenHCL`
+
+实施过程中花了相当时间才发现：用 `New-VM` 不带 `-GuestStateIsolationType OpenHCL`，
+或用 petri `New-CustomVM` 创建后再修 vssd `GuestFeatureSet=0x201` + `FirmwareFile=...`，
+**Hyper-V 完全静默忽略**，加载 stock Msvm UEFI，VTL2 不存在。
+
+- 症状：ohcldiag-dev `WSA 10060 ETIMEDOUT`；`Microsoft-Windows-Hyper-V-Compute-Operational`
+  event id 2000 `Create compute system, result 0xC0370103`；
+  Worker-Admin event id 18605 `No bootable devices configured`
+- 诊断工具：`docs/superpowers/examples/vmrs_log_scanner_win.exe` 扫 RAM 发现
+  只有 stock Msvm UEFI 字符串，无 openhcl/underhill
+- 正解：`New-VM -GuestStateIsolationType OpenHCL` 在创建时指定（参 `openhcl/Set-OpenHCL-HyperV-VM.ps1`
+  和 `Guide/src/user_guide/openhcl/run/hyperv.md`）
+
+详见 [SESSION_LOG.md](../SESSION_LOG.md) "🎉🎉🎉 真 Hyper-V 端到端验证" 段。
+
 

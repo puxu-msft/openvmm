@@ -1,6 +1,16 @@
 # Enable VMBusMessageRedirection on the VM via WMI.
-# This is REQUIRED for OpenHCL diag vsock (port 1/2) to be reachable from host.
-# Without it, OpenHCL doesn't even create a VmbusServer (see openhcl/underhill_core/src/worker.rs:1697).
+#
+# ⚠ DEPRECATED (2026-05-30): 本脚本基于"VMBusMessageRedirection=1 是 OpenHCL
+#   diag vsock 必需"的旧假设。实测发现：用
+#   `New-VM -GuestStateIsolationType OpenHCL` 正确创建的 VM 默认
+#   VMBusMessageRedirection=0，**ohcldiag-dev 依然正常工作**。
+#
+#   真实必要条件是 VM 创建时带 -GuestStateIsolationType OpenHCL（见
+#   create_openhcl_vm_correct.ps1）。retrofit vssd 字段（含本脚本）对
+#   "vssd 缺 isolation type" 的根因无法补救。
+#
+#   旧脚本保留作 ModifySystemSettings + CimSerializer + 异步 Job 等待
+#   的代码范例参考。
 
 param([string]$VmName = 'pcie-remote-exp')
 $ErrorActionPreference = 'Stop'

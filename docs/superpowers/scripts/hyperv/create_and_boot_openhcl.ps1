@@ -1,4 +1,17 @@
 # Create a minimal OpenHCL VM from scratch (delete prior if exists), boot, capture serial.
+#
+# ⚠ DEPRECATED (2026-05-30): 本脚本用 petri New-CustomVM 创建 VM，**不带
+#   -GuestStateIsolationType OpenHCL**，Hyper-V 实测会静默忽略后续 vssd
+#   的 OpenHCL 配置，加载 stock Msvm UEFI（"No bootable devices configured"），
+#   VTL2 不会启动。
+#
+#   正确流程：用 create_openhcl_vm_correct.ps1 取代本脚本。
+#   该脚本同目录，使用 New-VM -GuestStateIsolationType OpenHCL，已实测端到端
+#   验证通过（OpenHCL VTL2 + pcie_remote vsock handshake ok）。
+#
+#   旧脚本保留作历史诊断参考；如果需要 petri 路径请同时
+#   ImportModule hyperv.psm1，但仍要先 New-VM ... -GuestStateIsolationType OpenHCL。
+
 param(
     [string]$VmName = 'pcie-remote-exp',
     [string]$IgvmFile = 'C:\temp\pcie_remote_exp\openhcl-x64.bin',

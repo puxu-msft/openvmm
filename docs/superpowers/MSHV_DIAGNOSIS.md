@@ -1,6 +1,7 @@
 # `/dev/mshv` 排查总结
 
-> 2026-05-30：你配了 `kernelCommandLine = "hyperv_default_partition=1"` 但 `/dev/mshv` 没出现。完整诊断 + 解决路径如下。
+> **2026-05-30 更新：Path C 已端到端闭环，不再需要 mshv。** 本文档保留作为
+> 历史诊断记录 + 未来想跑 Linux + mshv backend OpenVMM 时的参考。
 
 ## 诊断结果
 
@@ -30,47 +31,44 @@ modprobe mshv     : FATAL: Module mshv not found
 
 **与 Windows 端无关** —— 你的 Windows host Hyper-V Platform / HypervisorPlatform / VirtualMachinePlatform feature 都已 Installed，bug 在 WSL guest 内核。
 
-## 解决路径
+## 当前决策
 
-### A. 用 dev WSL kernel（短期，不可靠）
+**Path C（Hyper-V on Windows + OpenHCL IGVM）已经完整闭环**，详见
+[HYPERV_RUNBOOK.md](HYPERV_RUNBOOK.md) 和 [SESSION_LOG.md](SESSION_LOG.md)。
+该路径不依赖 WSL 内的 `/dev/mshv`，所有 Hyper-V 操作都通过
+`/mnt/c/Windows/System32/.../powershell.exe` 完成。
 
-Microsoft Linux WSL kernel repo (github.com/microsoft/WSL2-Linux-Kernel) 的某些 branch 可能带 `CONFIG_MSHV_ROOT=y`，但 main release 不带。需要：
+**结论**：mshv 不再是当前阻塞，可保持现状。
 
-1. clone repo + 找 `Microsoft/config-wsl-arm64` 或 `Microsoft/config-wsl` 看是否含 `CONFIG_MSHV_ROOT`
-2. 没有的话，自己改 `.config` 加：
+## 历史方案（如未来需要 mshv 再启用）
+
+### A. 编自定义 WSL kernel 加 `CONFIG_MSHV_ROOT`
+
+1. clone [microsoft/WSL2-Linux-Kernel](https://github.com/microsoft/WSL2-Linux-Kernel)
+2. 找 `Microsoft/config-wsl` 看是否含 `CONFIG_MSHV_ROOT`；没有就加：
    ```
    CONFIG_MSHV_ROOT=y
    CONFIG_HYPERV=y
    ```
-3. `make -j$(nproc)` 编译，得到 `arch/x86/boot/bzImage`
-4. 在 `.wslconfig` 加 `kernel = C:\\path\\to\\bzImage`
-5. `wsl --shutdown` → 重启 WSL
+3. `make -j$(nproc)` → 得 `arch/x86/boot/bzImage`
+4. `.wslconfig` 加 `kernel = C:\path\to\bzImage`
+5. `wsl --shutdown` 重启
 
-工期：2~4 小时（首次编 WSL kernel）；可靠性低（Microsoft 不官方支持）。
+工期：2–4 小时（首次编 WSL kernel）；可靠性不保证（Microsoft 不官方支持）。
 
-### B. 跳过 mshv 改用 Hyper-V WMI 路径（推荐）
+### B. Hyper-V 起完整 Linux VM 在里面跑 OpenVMM+mshv
 
-**这正是我们现在的 Path C 已经在做的事**：
-- 不需要 WSL 内 `/dev/mshv`
-- 直接从 WSL 通过 `/mnt/c/Windows/System32/powershell.exe` 调 Windows Hyper-V cmdlets / WMI
-- 已经成功：创建 OpenHCL VM、加载 IGVM、配 service GUID、跨编 ohcldiag-dev.exe
+1. Hyper-V 起 Ubuntu Server VM（不是 WSL）
+2. 启用 nested virt
+3. VM 内装支持 mshv 的 distro / 自编内核
+4. VM 内跑 OpenVMM with mshv backend
 
-**当前阻塞点**（USER_TODO.md §阻塞）：自建 IGVM 的 OpenHCL diag_server 没响应。这跟 mshv 无关。
+工期：数小时；多一层 VM nesting。
 
-### C. 用 Hyper-V 起一个完整 Linux VM 在里面跑 OpenVMM-with-mshv（最绕但最干净）
+## 何时再考虑 mshv
 
-1. Hyper-V 起一个 Ubuntu Server VM（不是 WSL）
-2. 该 VM 启用 nested virt
-3. 在 VM 内装支持 mshv 的 Linux distro / 编内核
-4. 内嵌 KVM 或 mshv backend 跑 OpenVMM/OpenHCL
+- 想在 WSL 内直接跑 OpenVMM + VTL2，不通过 Hyper-V WMI（避免每次都跳 PowerShell）
+- 想跑 OpenVMM 自带 CVM/SNP 测试，且没有真 SNP 硬件（mshv 可以模拟）
+- 想脱离 Hyper-V 主管 VM lifecycle
 
-工期：数小时；远离用户当前流程。
-
-## 我的建议
-
-**不要折腾 mshv**。当前 Path C 用 WSL → Windows PowerShell → Hyper-V 已经走通 95%。最后 5%（OpenHCL diag listener timeout）是独立技术问题，跟 mshv 无关，应该用 **USER_TODO §A/B** 路径继续：
-
-- §A：让 Claude 写 `.vmrs` 解析工具抽 VTL2 boot log
-- §B：你跑 `openhcl/Set-OpenHCL-HyperV-VM.ps1` 验证 baseline
-
-请确认是否继续走 Path C，或者明确说 "我就是要 /dev/mshv"，我帮你编 WSL kernel。
+当前 Path C 都覆盖了上述场景的可用替代，所以不需要 mshv。
