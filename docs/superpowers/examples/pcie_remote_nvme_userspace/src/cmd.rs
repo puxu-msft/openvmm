@@ -63,7 +63,24 @@ pub mod admin_opc {
     pub const SET_FEATURES: u8 = 0x09;
     pub const GET_FEATURES: u8 = 0x0a;
     pub const ASYNC_EVENT_REQUEST: u8 = 0x0c;
+    /// NS Management (NVMe 1.2+，spec § 5.22)。
+    pub const NS_MANAGEMENT: u8 = 0x0d;
+    /// FW Commit (NVMe 1.0，spec § 5.16)。
+    pub const FW_COMMIT: u8 = 0x10;
+    /// FW Image Download (spec § 5.17)。
+    pub const FW_IMAGE_DOWNLOAD: u8 = 0x11;
+    /// Device Self-Test (NVMe 1.3，spec § 5.11)。
+    pub const DEVICE_SELF_TEST: u8 = 0x14;
+    /// NS Attachment (NVMe 1.2+，spec § 5.20)。
+    pub const NS_ATTACHMENT: u8 = 0x15;
     pub const KEEP_ALIVE: u8 = 0x18;
+    /// Format NVM (spec § 5.14)。
+    pub const FORMAT_NVM: u8 = 0x80;
+    /// Security Send / Receive (spec § 5.27/5.28)。
+    pub const SECURITY_SEND: u8 = 0x81;
+    pub const SECURITY_RECEIVE: u8 = 0x82;
+    /// Sanitize (NVMe 1.3，spec § 5.26)。
+    pub const SANITIZE: u8 = 0x84;
 }
 
 /// NVM (IO) command opcodes (NVMe spec 1.4 NVM § 6)。
@@ -71,6 +88,16 @@ pub mod nvm_opc {
     pub const FLUSH: u8 = 0x00;
     pub const WRITE: u8 = 0x01;
     pub const READ: u8 = 0x02;
+    /// Write Uncorrectable (NVM CS § 3.3.6)。
+    pub const WRITE_UNCORRECTABLE: u8 = 0x04;
+    /// Compare (NVM CS § 3.3.2)。
+    pub const COMPARE: u8 = 0x05;
+    /// Write Zeroes (NVM CS § 3.3.4)。
+    pub const WRITE_ZEROES: u8 = 0x08;
+    /// Dataset Management = TRIM/UNMAP (NVM CS § 3.3.5)。
+    pub const DSM: u8 = 0x09;
+    /// Verify (NVMe 2.0 NVM CS § 3.3.10)。
+    pub const VERIFY: u8 = 0x0c;
 }
 
 /// CQE.SC (Status Code) — Generic Command Status (NVMe spec 1.4 § 4.6.1.2.1).
@@ -259,17 +286,26 @@ impl IdentifyController {
         id.frmw = nvme_spec::FirmwareUpdates::new()
             .with_ffsro(true)
             .with_nofs(1);
-        // OACS 现阶段全 0（Phase C 实现 Format/FW/Self-Test/Sanitize 等
-        // admin opcode 后逐位翻 true）。
-        id.oacs = nvme_spec::OptionalAdminCommandSupport::new();
+        // OACS — admin command support。Phase C 后 Format NVM / FW
+        // Commit / FW Image Download / Self-Test / NS Attachment 都
+        // 已 dispatch（虽然有的是 no-op success），告诉 driver 这些
+        // opcode 它可以发。
+        id.oacs = nvme_spec::OptionalAdminCommandSupport::new()
+            .with_format_nvm(true)
+            .with_firmware_activate_firmware_download(true)
+            .with_self_test(true);
         // SQES/CQES：NVMe spec 固定 SQE=64B (2^6) / CQE=16B (2^4)。
         id.sqes = nvme_spec::QueueEntrySize::new().with_min(6).with_max(6);
         id.cqes = nvme_spec::QueueEntrySize::new().with_min(4).with_max(4);
         id.maxcmd = 64;
         id.nn = 1;
-        // ONCS 现阶段全 0（Phase D 实现 DSM/Compare/WriteZeroes/Verify/
-        // Reservations 后逐位翻 true）。
-        id.oncs = nvme_spec::Oncs::new();
+        // ONCS — NVM optional command support。Phase D 后 Dataset
+        // Management (DSM/TRIM) / Write Zeroes / Verify 都已 dispatch。
+        // Compare / Copy 留下次完善。
+        id.oncs = nvme_spec::Oncs::new()
+            .with_dataset_management(true)
+            .with_write_zeroes(true)
+            .with_verify(true);
         // VWC.bit0 = present → driver 主动发 NVM FLUSH (opc 0x00) 拿持久化
         // 承诺；我们 FLUSH handler 调 sync_all() 落盘。
         id.vwc = nvme_spec::VolatileWriteCache::new().with_present(true);

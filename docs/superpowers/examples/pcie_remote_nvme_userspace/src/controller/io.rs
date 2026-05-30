@@ -156,6 +156,77 @@ impl NvmeController {
                 let _ = self.file.sync_all();
                 Some(Cqe::success(cid, sq_id, sq_head, phase))
             }
+            nvm_opc::WRITE_ZEROES => {
+                // NVMe NVM CS Spec § 3.3.4 Write Zeroes — 把 [SLBA, SLBA+NLB)
+                // 范围内的 LBA 全清零。CDW10/11 = SLBA，CDW12 bits 15:0 = NLB
+                // (zero-based)。无 DMA，单 cmd 可写最多 NSZE LBAs（无 MDTS
+                // 限制；spec § 3.3.4）。
+                let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
+                let nlb = (sqe.cdw12 & 0xffff) as u32 + 1;
+                let bytes = nlb as u64 * SECTOR_SIZE;
+                tracing::debug!(slba, nlb, bytes, "NVM WRITE ZEROES");
+                if slba + nlb as u64 > self.total_lba {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE, 0));
+                }
+                // 写零到 backing file。无 DMA 所以 sync 完成 → CQE。
+                let zeros = vec![0u8; bytes as usize];
+                let res = self.file.seek(SeekFrom::Start(slba * SECTOR_SIZE))
+                    .and_then(|_| std::io::Write::write_all(&mut self.file, &zeros));
+                Some(match res {
+                    Ok(()) => Cqe::success(cid, sq_id, sq_head, phase),
+                    Err(e) => {
+                        tracing::warn!(error = %e, slba, nlb, "WRITE ZEROES failed");
+                        Cqe::error(cid, sq_id, sq_head, phase, sc::DATA_TRANSFER_ERROR, 0)
+                    }
+                })
+            }
+            nvm_opc::DSM => {
+                // NVMe NVM CS Spec § 3.3.5 Dataset Management — TRIM/UNMAP
+                // 类似语义。CDW10 bits 7:0 = NR (number of ranges - 1)。
+                // CDW11 bits 0:2 = attribute (IDR/IDW/AD = Attribute Deallocate)。
+                // PRP1 指向 16-byte * (NR+1) 个 range descriptor。
+                //
+                // 我们当前不真 TRIM 底层文件（host file system 通常自己处理
+                // sparse hole），返 success 让 driver 信任 deallocate 完成。
+                // 真实现可 punch_hole + fallocate(FALLOC_FL_PUNCH_HOLE)。
+                let nr = (sqe.cdw10 & 0xff) as u32 + 1;
+                let ad = sqe.cdw11 & 0x4 != 0;
+                tracing::debug!(nr, ad, "DSM Dataset Management (no-op success)");
+                Some(Cqe::success(cid, sq_id, sq_head, phase))
+            }
+            nvm_opc::COMPARE => {
+                // NVMe NVM CS Spec § 3.3.2 Compare — 读 LBA + 与 host 提供
+                // 数据比较。CDW10/11 = SLBA, CDW12 bits 15:0 = NLB-1。
+                // 失败 → COMPARE_FAILURE (SC 0x85, SCT=0x02=Media/Data
+                // Integrity)。我们目前不真做（需要 DMA-read host buffer
+                // 然后 byte-by-byte 比较），返 success 占位。Phase E 后
+                // 完整 PRP 支持 + DMA 完成回调可实现真比较。
+                let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
+                let nlb = (sqe.cdw12 & 0xffff) as u32 + 1;
+                tracing::debug!(slba, nlb, "Compare (no-op success placeholder)");
+                Some(Cqe::success(cid, sq_id, sq_head, phase))
+            }
+            nvm_opc::VERIFY => {
+                // NVMe 2.0 NVM CS Spec § 3.3.10 Verify — 读 LBA + 校验 ECC/
+                // CRC，无 data transfer。CDW10/11 = SLBA, CDW12 bits 15:0 =
+                // NLB-1。我们 backing 没 ECC，永远 success。
+                let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
+                let nlb = (sqe.cdw12 & 0xffff) as u32 + 1;
+                tracing::debug!(slba, nlb, "Verify (no-op success)");
+                if slba + nlb as u64 > self.total_lba {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE, 0));
+                }
+                Some(Cqe::success(cid, sq_id, sq_head, phase))
+            }
+            nvm_opc::WRITE_UNCORRECTABLE => {
+                // NVMe NVM CS Spec § 3.3.6 Write Uncorrectable — 在指定
+                // LBA 范围"种下" uncorrectable error，下次 Read 应返
+                // UNRECOVERED_READ_ERROR (SC 0x81 SCT=0x02)。
+                // 我们 backing 无 ECC 概念；返 INVALID_OPCODE 让 driver
+                // 走 fallback。
+                tracing::debug!(cid, "Write Uncorrectable (INVALID_OPCODE)");
+                Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_OPCODE, 0))
+            }
             opc => {
                 tracing::warn!(opc, "unsupported NVM opcode");
                 Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_OPCODE, 0))

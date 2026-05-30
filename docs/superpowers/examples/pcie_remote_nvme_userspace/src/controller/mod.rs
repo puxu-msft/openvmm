@@ -377,6 +377,68 @@ impl NvmeController {
 
     // dispatch_io moved to controller/io.rs (H6 split)
 
+    /// **Phase C** — Log Page 0x01 Error Information Log。
+    ///
+    /// NVMe spec § 5.16.1.1。每个 entry 64 字节，含 Error Count / SQID /
+    /// CMDID / Status Field / Param Error Loc / LBA / NSID / Vendor /
+    /// Cmd Specific Info。我们当前不追踪 per-cmd error history，返单条
+    /// 全零 entry 作 "no errors" 占位。
+    fn build_error_info_log(&self, bytes: usize) -> Vec<u8> {
+        // Spec：每 entry 64 字节，list 长度 = ELPE+1 (Identify Controller
+        // .elpe，我们当前 = 0 → 1 entry)。NUMDL 给的 bytes 通常 ≥ 64。
+        let mut buf = vec![0u8; bytes];
+        // Entry 0 全 0 表示 "no error logged yet"，spec allowed。
+        let _ = &mut buf; // 显式 mark used
+        buf
+    }
+
+    /// **Phase C** — Log Page 0x02 SMART / Health Information。
+    ///
+    /// NVMe spec § 5.16.1.2，512 字节固定。我们填合理 placeholder：
+    /// - critical_warning = 0（无温度/可靠性告警）
+    /// - composite_temp = 313 K = 40 °C（合理常温）
+    /// - available_spare = 100 / available_spare_threshold = 10
+    /// - percentage_used = 0
+    /// - host_read/write_commands / data_units_read/written 可后续真追踪
+    fn build_smart_health_log(&self, bytes: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; bytes.max(512)];
+        // Offset 0: critical_warning (1 byte) = 0
+        // Offset 1-2: composite_temperature (2 byte LE, in Kelvin)
+        let temp_kelvin: u16 = 313;
+        buf[1..3].copy_from_slice(&temp_kelvin.to_le_bytes());
+        // Offset 3: available_spare (%) — set 100 = full spare available
+        buf[3] = 100;
+        // Offset 4: available_spare_threshold (%)
+        buf[4] = 10;
+        // Offset 5: percentage_used (%) — controller wear indicator
+        buf[5] = 0;
+        // Offset 6: endurance_group_critical_warning_summary
+        // Offset 7-31: reserved
+        // Offset 32-47: data_units_read (128-bit LE, units of 1000 * 512B)
+        // Offset 48-63: data_units_written
+        // Offset 64-79: host_read_commands
+        // Offset 80-95: host_write_commands
+        // Offset 96-111: controller_busy_time (minutes)
+        // ... 全 0 占位
+        buf.truncate(bytes); // 缩到 driver 请求的字节数
+        buf
+    }
+
+    /// **Phase C** — Log Page 0x03 Firmware Slot Information。
+    ///
+    /// NVMe spec § 5.16.1.3，512 字节固定。AFI bit 2:0 = 当前激活槽，
+    /// bits 6:4 = 下次启动激活槽。FRS[N] = 8 字节 ASCII FW revision。
+    fn build_fw_slot_info_log(&self, bytes: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; bytes.max(512)];
+        // AFI: 当前激活槽 = 1, 下次启动激活槽 = 1
+        buf[0] = 0x11; // bits 2:0 = 1, bits 6:4 = 1
+        // FRS[0] (offset 8-15): firmware revision string (ASCII)
+        let fr = b"v2.0    ";
+        buf[8..16].copy_from_slice(fr);
+        buf.truncate(bytes);
+        buf
+    }
+
     /// 帮助函数：DMA-write `data` 到 `gpa`，完成后构造 success CQE 提交。
     /// 用 PendingOp::NvmReadDmaWrite 通用入口（Identify 也走这条）。
     fn dma_write_then_complete(
