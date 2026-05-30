@@ -1,0 +1,18 @@
+{
+    "_comment": "OpenHCL IGVM build manifest for pcie_remote experiments. Used by docs/superpowers/scripts/hyperv/build_pcie_igvm.sh. handshake_timeout_ms=8000 配合 OPENHCL_CONFIG_TIMEOUT_IN_SECONDS=20 让 NVMe / 其它 userspace 设备有 8s 窗口连进来；超过 8s OpenHCL 自动 fallback 到 AbsentPcieDevice (spec §3.10)。",
+    "guest_arch": "x64",
+    "guest_configs": [
+        {
+            "guest_svn": 1,
+            "max_vtl": 2,
+            "isolation_type": "none",
+            "image": {
+                "openhcl": {
+                    "command_line": "OPENHCL_CONFIG_TIMEOUT_IN_SECONDS=20 OPENHCL_PCIE_REMOTE_INSTANCE=11111111-2222-3333-4444-555555555555:50000,handshake_timeout_ms=8000",
+                    "memory_page_count": 131072,
+                    "uefi": true
+                }
+            }
+        }
+    ]
+}
