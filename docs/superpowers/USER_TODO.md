@@ -42,16 +42,26 @@ flag)，但 SNP/TDX/VBS 隔离 VM 上的真机端到端需要 confidential VM �
 ### §2 (可选) VTL0 guest OS 中真的 PCI 探测
 
 当前实验 VM 没装 OS（用 `MemoryStartupBytes 2GB` 直接跑 OpenHCL/UEFI）。
-要观察 VTL0 OS 真的把 emulated PCIe device "看到"，需要：
+要观察 VTL0 OS 真的把 emulated PCIe device "看到"，已经有：
+
+1. **自建 VHDX**：用 `build_winserver_vhdx.ps1` 从 SEAL ISO 装 Windows Server
+   （已在 `C:\temp\pcie_remote_exp\guest.vhdx` 完成 16GB 镜像）。
+2. **挂盘 + 校验脚本**：
 
 ```powershell
-# 加 VHD
-$vmOsDisk = "C:\path\to\ubuntu-25.04-server.vhdx"
-Set-VM -VM $vm -AutomaticCheckpointsEnabled $false
-Add-VMHardDiskDrive -VMName pcie-remote-exp -Path $vmOsDisk
+# 一键挂 + 验证（已封装）
+.\docs\superpowers\scripts\hyperv\attach_vhdx_and_verify_lspci.ps1 `
+    -VMName pcie-remote-exp `
+    -VhdxPath C:\temp\pcie_remote_exp\guest.vhdx `
+    -OhcldiagDevPath C:\path\to\ohcldiag-dev.exe
 ```
 
-然后启动后在 guest 内 `lspci -nn | grep 1414:c0de` 应可见。
+脚本执行：Stop-VM → Add-VMHardDiskDrive (idempotent) → 设硬盘首启 →
+Start-VM → PSSession 等就绪 → guest 内 `Get-CimInstance Win32_PnPEntity`
+过滤 `VEN_1414&DEV_C0DE`。退出码 0 = guest 真见到设备。
+
+> 用 `Win32_PnPEntity` 而不是 `lspci`（Windows 没自带），结果包含
+> `Status` / `ConfigManagerErrorCode` 便于诊断 driver bind 状态。
 
 ### §3 (可选) WSL2 /dev/mshv
 
