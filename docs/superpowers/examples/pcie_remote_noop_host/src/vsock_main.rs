@@ -42,6 +42,11 @@ struct Args {
     /// 推荐 2048（128 MiB total）确保超阈。
     #[arg(long, default_value_t = 0)]
     stress_dma_count: u32,
+    /// **Stress** bad-frame: handshake 完后立即 burst 发 N 个 OOB InterruptFire
+    /// (msix_index=99，远超 msix_count=1)，触发 A4 ≥4 → Lost。设 ≥4 验证；
+    /// 默认 0 不 stress。
+    #[arg(long, default_value_t = 0)]
+    stress_bad_frames: u32,
 }
 
 #[cfg(not(windows))]
@@ -84,7 +89,14 @@ fn main() -> Result<()> {
             };
             tracing::info!("connected");
             // serve 直到 EOF 或 error → 立刻重连
-            match serve(&driver, polled, args.stress_dma_count).await {
+            match serve(
+                &driver,
+                polled,
+                args.stress_dma_count,
+                args.stress_bad_frames,
+            )
+            .await
+            {
                 Ok(()) => {
                     tracing::info!("serve returned normally; reconnecting after 1s");
                 }
@@ -131,6 +143,7 @@ async fn serve(
     driver: &pal_async::DefaultDriver,
     mut polled: pal_async::socket::PolledSocket<vmsocket::VmStream>,
     stress_dma_count: u32,
+    stress_bad_frames: u32,
 ) -> Result<()> {
     use futures::FutureExt;
     use pcie_remote_protocol::InterruptFire;
@@ -176,6 +189,36 @@ async fn serve(
     };
     codec::write_frame(&mut polled, &ack).await?;
     tracing::info!("sent HelloAck");
+
+    // 可选：handshake 完成立即 burst 发 N 个 OOB InterruptFire (msix_index=99)
+    // 触发 A4 ≥4 个连续 bad-frame → worker Lost。
+    if stress_bad_frames > 0 {
+        tracing::info!(
+            stress_bad_frames,
+            "STRESS: burst sending OOB InterruptFire(msix_index=99)"
+        );
+        for i in 0..stress_bad_frames {
+            let req = ToOpenhcl {
+                seq: (1u64 << 51) + i as u64,
+                body: Some(pcie_remote_protocol::to_openhcl::Body::InterruptFire(
+                    InterruptFire { msix_index: 99 },
+                )),
+            };
+            // write 可能 fail（worker 进 Lost 后 transport EOF/close）
+            if let Err(e) = codec::write_frame(&mut polled, &req).await {
+                tracing::info!(
+                    sent = i,
+                    error = %e,
+                    "STRESS: transport closed after sending bad frames (worker Lost as expected)"
+                );
+                return Ok(()); // 正常结束 serve；外层 reconnect loop 会重连
+            }
+        }
+        tracing::info!(
+            stress_bad_frames,
+            "STRESS: all bad frames sent; worker should have transitioned to Lost"
+        );
+    }
 
     // 可选：handshake 完成立即 burst 发 N 个 64 KB ReadGpa 触发 K-NEW-C
     // rate limit (64 MiB/s = 1024 个 64 KB / 秒 上限)。
