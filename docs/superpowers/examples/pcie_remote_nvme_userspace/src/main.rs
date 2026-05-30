@@ -5,6 +5,7 @@
 #![allow(clippy::unnecessary_cast)] // u32 spec 字段保留 `as u32` 增强可读性
 #![allow(clippy::too_many_arguments)] // NVMe SQE/CQE 字段多，wrap struct 反而绕
 #![allow(clippy::enum_variant_names)] // PendingOp 全 Nvm 前缀强调 NVMe 语义
+#![allow(unused_imports)] // cmd.rs 把 IntoBytes 既用于 derive 又用于函数体；该 lint 误判
 
 //! Userspace NVMe controller — connects to OpenHCL via pcie_remote vsock
 //! and exposes a real NVMe block device backed by a host file.

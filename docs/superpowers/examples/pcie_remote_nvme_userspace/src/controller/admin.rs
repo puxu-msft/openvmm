@@ -42,13 +42,13 @@ impl NvmeController {
                             // invalid NSID
                             return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                         }
-                        let ns = IdentifyNamespace::build(self.total_lba);
-                        ns.as_bytes().to_vec()
+                        /* Phase A: spec-correct 200+ fields via nvme_spec */
+                        IdentifyNamespace::build_v2_bytes(self.total_lba)
                     }
                     0x01 => {
                         // Identify Controller
-                        let ctrl = IdentifyController::build(self.vid, self.ssvid);
-                        ctrl.as_bytes().to_vec()
+                        /* Phase A: spec-correct 200+ fields via nvme_spec */
+                        IdentifyController::build_v2_bytes(self.vid, self.ssvid)
                     }
                     0x02 => {
                         // Active NSID list (4 KiB of u32, list active NSIDs)

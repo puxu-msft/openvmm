@@ -3,10 +3,37 @@
 
 //! NVMe SQE/CQE layouts + Admin/IO command opcodes + Identify payloads。
 //!
+//! # Phase A 注：渐进式复用 nvme_spec crate
+//!
+//! 仓库内 [`nvme_spec`] crate 提供完整 NVMe Base 2.0c + NVM CS 1.0c 定义
+//! （200+ 字段的 IdentifyController、35 个 admin opcode、12 个 NVM opcode、
+//! 完整 Cap/Cc/Csts bitfield 等）。我们的本 controller 此前手写了一个最
+//! 小子集 — 容易踩字段错位 / spec 升级跟不上的 bug。
+//!
+//! Phase A 选择**渐进**而非一次性大重构：本模块保留原 Sqe/Cqe（与 wire
+//! 协议直接 cast 简单）+ 原 admin_opc/nvm_opc/sc 常量（旧 dispatch 还在
+//! 用），但**重写 `IdentifyController::build` / `IdentifyNamespace::build`
+//! 内部使用 nvme_spec 的完整结构填充**——这样：
+//!
+//! 1. 200+ Identify 字段全 spec-correct，driver 看到正确 byte offset
+//! 2. 通过 [`SpecAdminOpcode`] / [`SpecNvmOpcode`] re-export，可看到
+//!    NVMe 2.0 完整 opcode 表（教学价值）
+//! 3. Phase C/D 实现具体 opcode 时直接 match `SpecAdminOpcode::FORMAT_NVM`
+//!    等 spec 名字，不会手写错。
+//!
 //! 全部 little-endian。`zerocopy::FromBytes` 让我们从 `Vec<u8>` 直接
 //! cast，避免手写 byte-shuffling。
 
+/// nvme_spec NVMe 2.0c 完整 opcode 表 — re-export 让本 crate 内一处
+/// 看到所有可能的命令名字。我们目前只实现一部分，其它对应 admin_opc /
+/// nvm_opc 中的占位常量 + dispatch_admin/io 中"unsupported"分支。
+#[allow(unused_imports)] pub use nvme_spec::AdminOpcode as SpecAdminOpcode;
+pub use nvme_spec::IdentifyController as SpecIdentifyController;
+pub use nvme_spec::nvm::IdentifyNamespace as SpecIdentifyNamespace;
+#[allow(unused_imports)] pub use nvme_spec::nvm::NvmOpcode as SpecNvmOpcode;
+
 use zerocopy::FromBytes;
+use zerocopy::FromZeros;
 use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 use zerocopy::KnownLayout;
@@ -171,6 +198,9 @@ pub struct IdentifyController {
 
 impl IdentifyController {
     /// 构造 Windows nvme.sys 可成功 enumerate 的最小 Identify Controller。
+    #[allow(dead_code)]
+    /// **Deprecated** — Phase A 后用 build_v2_bytes (\n    /// nvme_spec 完整 200+ 字段)。保留方法是为了 spec
+    /// 学习对照（hand-written vs spec-corrected）。
     pub fn build(vid: u16, ssvid: u16) -> Self {        let mut this: Self = zerocopy::FromZeros::new_zeroed();
         this.vid = vid;
         this.ssvid = ssvid;
@@ -203,6 +233,48 @@ impl IdentifyController {
         this.aerl = 3;
         this
     }
+
+    /// **Phase A 新增**：用 nvme_spec 完整 200+ 字段构造 IdentifyController
+    /// 并 serialize 成 4 KiB 字节。教学版本：取代手写最小子集，driver 看
+    /// 到 spec-correct byte layout（含 RTD3R/RTD3E/OAES/CTRATT/CNTRLTYPE/
+    /// FGUID/HMPRE/SANICAP/ANATT/SUBNQN/IOCCSZ/SGLS 等之前我们 padding
+    /// 字段的位置）。
+    pub fn build_v2_bytes(vid: u16, ssvid: u16) -> Vec<u8> {
+
+        let mut id = SpecIdentifyController::new_zeroed();
+        id.vid = vid;
+        id.ssvid = ssvid;
+        id.sn = ascii_padded::<20>(b"PCIE-REMOTE-USRSPACE");
+        id.mn = ascii_padded::<40>(b"OpenHCL Userspace NVMe v2.0");
+        id.fr = ascii_padded::<8>(b"v2.0    ");
+        // MDTS = 2 → max transfer = 2^2 * MPSMIN(4 KiB) = 16 KiB；
+        // 与现 dual-PRP (≤ 8 KiB) 兼容（driver 自觉拆 ≤ MDTS）；
+        // Phase E PRP list 完成后可放宽。
+        id.mdts = 2;
+        id.cntlid = 1;
+        id.ver = NVME_VERSION_2_0;
+        id.cntrltype = nvme_spec::ControllerType::IO_CONTROLLER;
+        id.acl = 3;
+        id.aerl = 3;
+        id.frmw = nvme_spec::FirmwareUpdates::new()
+            .with_ffsro(true)
+            .with_nofs(1);
+        // OACS 现阶段全 0（Phase C 实现 Format/FW/Self-Test/Sanitize 等
+        // admin opcode 后逐位翻 true）。
+        id.oacs = nvme_spec::OptionalAdminCommandSupport::new();
+        // SQES/CQES：NVMe spec 固定 SQE=64B (2^6) / CQE=16B (2^4)。
+        id.sqes = nvme_spec::QueueEntrySize::new().with_min(6).with_max(6);
+        id.cqes = nvme_spec::QueueEntrySize::new().with_min(4).with_max(4);
+        id.maxcmd = 64;
+        id.nn = 1;
+        // ONCS 现阶段全 0（Phase D 实现 DSM/Compare/WriteZeroes/Verify/
+        // Reservations 后逐位翻 true）。
+        id.oncs = nvme_spec::Oncs::new();
+        // VWC.bit0 = present → driver 主动发 NVM FLUSH (opc 0x00) 拿持久化
+        // 承诺；我们 FLUSH handler 调 sync_all() 落盘。
+        id.vwc = nvme_spec::VolatileWriteCache::new().with_present(true);
+        id.as_bytes().to_vec()
+    }
 }
 
 /// Identify Namespace data structure (NVMe spec 1.4 § 5.15.2.1) 4 KiB。
@@ -234,6 +306,8 @@ pub struct IdentifyNamespace {
 
 impl IdentifyNamespace {
     /// 构造一个总容量 = `total_lba * 512` 的 namespace（512B sectors）。
+    #[allow(dead_code)]
+    /// **Deprecated** — Phase A 后用 build_v2_bytes。
     pub fn build(total_lba: u64) -> Self {
         let mut this: Self = zerocopy::FromZeros::new_zeroed();
         this.nsze = total_lba;
@@ -253,4 +327,40 @@ impl IdentifyNamespace {
         this.nsfeat = 0x01;
         this
     }
+}
+
+impl IdentifyNamespace {
+    /// **Phase A 新增**：用 nvme_spec 完整字段构造 IdentifyNamespace + serialize 4 KiB。
+    /// 之前手写版本只 ~8 字段（nsze/ncap/nuse/nsfeat/nlbaf/flbas/lbaf[0]/_resv），
+    /// 现在通过 nvme_spec::nvm::IdentifyNamespace 拿到完整 60+ 字段（含 mssrl/mcl/
+    /// msrc/anagrpid/nvmsetid/endgid/eui64 等 spec 后续版本字段）。
+    pub fn build_v2_bytes(total_lba: u64) -> Vec<u8> {
+        let mut ns = SpecIdentifyNamespace::new_zeroed();
+        ns.nsze = total_lba;
+        ns.ncap = total_lba;
+        ns.nuse = 0;
+        ns.nsfeat = 0x01.into(); // THINP
+        ns.flbas = 0.into();
+        ns.nlbaf = 0;
+        ns.lbaf[0] = nvme_spec::nvm::Lbaf::new()
+            .with_ms(0)
+            .with_lbads(9)  // 2^9 = 512 byte sector
+            .with_rp(0);
+        ns.as_bytes().to_vec()
+    }
+}
+
+/// NVMe Base 2.0c 版本号常量（用于 IdentifyController.ver + VS register）。
+pub const NVME_VERSION_2_0: u32 = 0x0002_0000;
+
+/// 把 src 字节复制成 AsciiString<N>，右侧空格填充。
+///
+/// NVMe spec 要求 SN/MN/FR 等字段是 left-justified ASCII with trailing
+/// spaces；`storage_string::AsciiString::from(arr)` 接受 `[u8; N]`，
+/// 这里 wrap 一下方便填可变长字面常量。
+fn ascii_padded<const N: usize>(src: &[u8]) -> storage_string::AsciiString<N> {
+    let mut arr = [b' '; N];
+    let copy_len = src.len().min(N);
+    arr[..copy_len].copy_from_slice(&src[..copy_len]);
+    storage_string::AsciiString::<N>::from(arr)
 }
