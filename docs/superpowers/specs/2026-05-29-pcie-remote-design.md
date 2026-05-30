@@ -749,7 +749,7 @@ Write-Host "Registered service GUID: $ServiceGuid (ACL: Admin/SYSTEM only)"
 | K-19 | ✅ | P2·架构 | `handshake_timeout_ms ≤ config_timeout/2` 校验 + warn | options.rs `parse_pcie_remote_entries` + 2 tests | e5bbfac8 |
 | K-20 | ✅ v2 实施 + 真 Hyper-V 验证 | P2·部署 | 延迟接入 / hotplug | listener 永不退 + worker transport_swap + Lost 不退 worker + state Lost → Live 复活；详 [../K20_HOTPLUG_DESIGN.md](../K20_HOTPLUG_DESIGN.md)、commits a99cdc63 + 64da8fb6 | 真 Hyper-V 实测：kill noop → worker Lost 但保留 → 重起 noop → interrupts_fired 持续递增 (214 = 7 旧 + 207 新) |
 | K-21 | 🟦 v2 | P2·测试 | path C 真 Hyper-V CI（hyperv-runner）| v2；当前只有手工 e2e（已通过，SESSION_LOG 记录）| — |
-| K-22 | 🟦 v2 | P2·测试 | Linux guest 完整测试矩阵 | v2；当前 spec §5 仅 Windows guest | — |
+| K-22 | 🟦 v2 | P2·测试 | Linux guest 完整测试矩阵 | v2；当前 spec §5 仅 Windows guest。2026-05-30 补：Windows guest 验证已有一键脚本 `docs/superpowers/scripts/hyperv/attach_vhdx_and_verify_lspci.ps1`（挂 VHDX + Start-VM + PSSession + `Win32_PnPEntity` 过滤 VEN_1414&DEV_C0DE），Linux guest 矩阵仍是 v2 backlog | — |
 
 ### 处理表使用方法
 
@@ -767,12 +767,22 @@ Write-Host "Registered service GUID: $ServiceGuid (ACL: Admin/SYSTEM only)"
 | K-NEW-D | ✅ | P1·安全 | `cfg_write_side_effect` 仅在 `cfg_space.write_u32` 成功时 forward；失败 write 不应让 host 收到事件 | device.rs::pci_cfg_write (rust-reviewer HIGH 修正) | 代码 review 验证 (matches! IoResult::Ok) |
 | K-NEW-E | ✅ | P2·健壮 | worker 连续 ≥4 个非法 inbound 帧 → 立即进 Lost | worker.rs::dispatch_inbound | **真 Hyper-V 实测**：noop `--stress-bad-frames 8` → consecutive_bad_frames=4 + kmsg "going Lost consecutive=0x4" |
 | K-NEW-F | ✅ | P2·观察性 | worker_stats 9-counter inspect 暴露（mmio_read_results / interrupts_fired / interrupts_oob / read_gpa_requests / write_gpa_requests / dma_rate_limit_rejects / inflight_current / inflight_peak / consecutive_bad_frames）| worker.rs::WorkerStats + Inspect derive；device.rs 持 Arc | **真 Hyper-V e2e**：8/9 counter 数值与 noop 端发送数 100% 对应（math 验证 80/3=26、108/4=27、64MiB/64KB=1024 等）|
+| K-NEW-G | ✅ | P2·观察性 | Lost/Revive 诊断字段：`last_lost_at_ms` / `last_revive_at_ms` / `revive_count` / `last_lost_reason`（位标记 `READ_ERR=1`，`WRITE_ERR=2`，`DISPATCH_FAIL=4`，`WORKER_EXIT=8`，可 OR）。配合 K-NEW-F 的 9-counter 用 `ohcldiag-dev inspect` 直接看到 host 重连前的离线时长 + 复活次数 + 最近一次 Lost 触发原因 | worker.rs::WorkerStats + worker.rs::lost_reason 模块；worker/worker_tests.rs 中 record_lost / record_revive 单测覆盖 | 单测：reason 位 OR 累加、revive_count 单调递增、`last_lost_at_ms` 写入 unix-ms |
+| K-NEW-H | ✅ | P2·部署 | DMA 速率限制 env override：`OPENHCL_PCIE_REMOTE_DMA_BPS=<bytes/sec>`（u64）。`0` = 禁用速率限制（仅协议 `MAX_DMA_BYTES` 仍生效）；`>0` = 自定义阈值；未设置 = 沿用 64 MiB/s 默认。**env 仅在 `Worker::new` 启动期读一次并缓存到 `dma_rate_limit_bps_cached`；K-20 swap-arm 复活路径不重读**，避免运行期 env 漂移导致诊断混乱 | worker.rs::`dma_rate_limit_bps()` + `DMA_RATE_LIMIT_DEFAULT_BPS` | 启动 log `pcie_remote: DMA rate limit override via env bps=…`；解析失败 fall back + warn |
 
 K-NEW-A/B/D 是 v2 重构在 BAR + MSIX + MMIO + cfg_write_side_effect 真正
 接通后才浮现的新安全约束；v1 cfg-only 时这些数据通路根本不存在，故不
 适用。K-NEW-C/E 是新增的健壮性约束（v2 worker 真正处理 host inbound 后
 才有可能）。K-NEW-F 是 v3 加的可观察性，让 ohcldiag-dev 能从 host
-诊断 OpenHCL ↔ host noop 之间的实际 traffic。
+诊断 OpenHCL ↔ host noop 之间的实际 traffic。K-NEW-G 在 K-20 hotplug
+基础上把 Lost↔Live 周期完整暴露给运维（reason 位标记可 OR）；K-NEW-H
+让现场可在不重编 IGVM 的前提下临时关掉 / 调整 DMA 速率门限。
+
+**inspect 暴露的 device state**：除 9-counter + Lost/Revive 字段外，`SharedState`
+自身实现 `Inspect`（state.rs L49），把当前枚举渲染为稳定字符串
+`Connecting` / `Live` / `Lost`。`ohcldiag-dev inspect pcie_remote` 节点
+直接显示该字段，免去从 counter 间接推断。device.rs L56-58 注释说明该字段
+专门为运行时 troubleshoot 暴露。
 
 ### 真 Hyper-V end-to-end 验证（2026-05-30 新增）
 

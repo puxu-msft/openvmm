@@ -752,6 +752,52 @@ polled_listener。TCP/vsock 两条路径统一改造。
 |---|---|
 | K-1..K-19 (v1 spec) | ✅ 全部完成 |
 | K-NEW-A..K-NEW-F (v2/v3) | ✅ 全部完成 + e2e |
+| K-NEW-G (Lost/Revive 诊断字段) | ✅ 2026-05-30 完成（单测覆盖） |
+| K-NEW-H (DMA env override) | ✅ 2026-05-30 完成 |
 | K-20 (hotplug) | ✅ **v9 完成** |
 | K-21 (CI for path C) | 🟦 v2+ (需 hyperv-runner) |
-| K-22 (Linux guest) | 🟦 v2+ |
+| K-22 (Linux guest) | 🟦 v2+（Windows guest 已有 VHDX 一键脚本） |
+
+---
+
+## 2026-05-30 收尾增强（5 个 commit）
+
+继 v9 K-20 hotplug 后，再补一批运行时观察性 + 部署可调性 + guest 验证脚本。
+五个 commit 全部走 rust-reviewer 收口；最终 commit `e049a6c4` 闭掉 reviewer
+HIGH/MEDIUM 一轮（H1/H2/M2/M3/M4/M7）。
+
+| commit | 主旨 |
+|---|---|
+| `243d0d44` | `feat(pcie_remote)`: inspect 暴露 device state — `SharedState: Inspect`，`ohcldiag-dev inspect pcie_remote` 节点直接看到 `Connecting` / `Live` / `Lost` 字符串，免去从 9-counter 间接推断 |
+| `0e970266` | `feat(pcie_remote)`: worker tests 拆分到 `worker/worker_tests.rs`；新增 `WorkerStats` 4 字段 `last_lost_at_ms` / `last_revive_at_ms` / `revive_count` / `last_lost_reason`（位标记 OR：`READ_ERR=1` / `WRITE_ERR=2` / `DISPATCH_FAIL=4` / `WORKER_EXIT=8`）；新增 `OPENHCL_PCIE_REMOTE_DMA_BPS` env override（`0`=禁用、`>0`=自定义、未设置=64 MiB/s 默认；启动期读一次缓存，K-20 swap 复活不重读） |
+| `d793a830` | `feat(hyperv)`: VTL0 guest VHDX 一键挂盘 + 验证脚本 `docs/superpowers/scripts/hyperv/attach_vhdx_and_verify_lspci.ps1`（Stop-VM → idempotent `Add-VMHardDiskDrive` → 设硬盘首启 → Start-VM → PSSession 等就绪 → guest 内 `Get-CimInstance Win32_PnPEntity` 过滤 `VEN_1414&DEV_C0DE`；退出码 0 = guest 真见到设备）；用 `Win32_PnPEntity` 代替 `lspci`（Windows 没自带），结果含 `Status` + `ConfigManagerErrorCode` 便于诊断 driver bind |
+| `6bdac648` | `fix(pcie_remote)`: rust-reviewer #3 收尾 — fmt + clippy + 注释整理 |
+| `e049a6c4` | `fix(pcie_remote)`: rust-reviewer #4 收口 H1/H2/M2/M3/M4/M7 |
+
+### 用户可见 surface 变化
+
+- **新 inspect 字段**（worker 节点下）：`last_lost_at_ms`、`last_revive_at_ms`、
+  `revive_count`、`last_lost_reason`。配合现有 9 counter 完整描绘
+  Lost↔Live 周期。
+- **新 inspect 字段**（device 节点下）：`state` = `Connecting` / `Live` / `Lost`
+  稳定字符串。
+- **新环境变量**：`OPENHCL_PCIE_REMOTE_DMA_BPS`（OpenHCL VTL2 cmdline / env 注入）。
+- **新脚本**：`docs/superpowers/scripts/hyperv/attach_vhdx_and_verify_lspci.ps1`。
+
+### 文件位置
+
+- `vm/devices/pcie_remote_device/src/worker.rs` — `WorkerStats` 新字段、
+  `lost_reason` 位标记、`dma_rate_limit_bps()` env 解析、`DMA_RATE_LIMIT_DEFAULT_BPS`
+  常量、`record_lost` / `record_revive` 集中入口。
+- `vm/devices/pcie_remote_device/src/worker/worker_tests.rs` — 原 worker.rs
+  内联 tests 拆出；新增 record_lost OR / record_revive 单调递增 / `last_lost_at_ms`
+  写入 unix-ms 单测。
+- `vm/devices/pcie_remote_device/src/state.rs` — `SharedState: Inspect`
+  渲染为稳定字符串。
+- `vm/devices/pcie_remote_device/src/device.rs` — `state: SharedState` 字段
+  暴露给 inspect（L56-58 注释解释为何不 skip）。
+
+### spec 同步
+
+`specs/2026-05-29-pcie-remote-design.md` §10 K-NEW-* 表新增 K-NEW-G / K-NEW-H
+两行 + K-22 备注 Windows guest VHDX 脚本已闭环。

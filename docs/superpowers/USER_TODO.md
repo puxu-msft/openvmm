@@ -16,6 +16,8 @@
 | OpenHCL VTL2 diag_server | ✅ ohcldiag-dev 完全工作 | `ohcldiag-dev pcie-remote-exp inspect vm` 返回完整 inspect 树 |
 | pcie_remote 真 vsock 握手 e2e | ✅ **vsock handshake ok, worker spawned** | host noop_host_vsock.exe ↔ VTL2 |
 | K-8/K-11/K-15/K-17/K-18/K-19 spec gaps | ✅ 全部清零 | 48 tests pass |
+| inspect 暴露 device state + Lost/Revive 诊断 | ✅ 2026-05-30 | `ohcldiag-dev inspect pcie_remote` 节点直接看到 `Connecting`/`Live`/`Lost` + `last_lost_at_ms` / `last_revive_at_ms` / `revive_count` / `last_lost_reason`（位标记 READ_ERR=1 / WRITE_ERR=2 / DISPATCH_FAIL=4 / WORKER_EXIT=8）|
+| DMA 速率限制 env override | ✅ 2026-05-30 | `OPENHCL_PCIE_REMOTE_DMA_BPS=<bytes/sec>`：`0`=禁用、`>0`=自定义、未设置=64 MiB/s。启动期读一次缓存，K-20 swap 复活不重读 |
 
 ## ✅ 已闭环路径
 
