@@ -22,6 +22,7 @@ pub enum DeviceState {
 
 impl DeviceState {
     /// 用于 ohcldiag-dev inspect 显示的稳定字符串名。
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             DeviceState::Connecting => "Connecting",

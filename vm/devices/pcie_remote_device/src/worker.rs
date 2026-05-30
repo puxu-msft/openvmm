@@ -65,6 +65,11 @@ pub struct WorkerStats {
     pub inflight_peak: AtomicU64,
     /// 连续 bad-frame 计数（达 MAX_BAD_FRAMES 即 Lost；这里实时反映）。
     pub consecutive_bad_frames: AtomicU64,
+    // ---
+    // 注：以下 4 字段独立用 Relaxed atomic 写入；inspect 单次快照可能跨多
+    // 个 Lost↔Revive 周期看到字段间不一致（例如 reason 是旧的、revive_count
+    // 是新的）。读者应当作"最近若干周期的指示"而非强一致快照。
+    // ---
     /// 最近一次进入 Lost 的 unix 毫秒时间戳；0 = 从未 Lost。
     /// 配合 `last_revive_at_ms` 计算 host 重连前的离线时长。
     pub last_lost_at_ms: AtomicU64,
@@ -96,6 +101,10 @@ pub mod lost_reason {
     pub const WRITE_ERR: u64 = 1 << 1;
     /// dispatch_inbound 返 false（连续 bad-frame ≥ 阈值）。
     pub const DISPATCH_FAIL: u64 = 1 << 2;
+    /// worker 主循环正常退出（shutdown 信号 / from_device 全 drop /
+    /// transport_swap channel 关闭）。区别于异常 Lost：诊断时见到此 bit
+    /// 说明设备是被有序卸载，不是 transport 真死了。
+    pub const WORKER_EXIT: u64 = 1 << 3;
 }
 
 /// 取当前 unix 毫秒。fallback 0 若 system clock 异常（保留显式 0 = 未记录）。
@@ -116,7 +125,9 @@ const DMA_RATE_WINDOW: Duration = Duration::from_secs(1);
 /// - 0 = 禁用速率限制（仅协议 MAX_DMA_BYTES 上限仍生效）
 /// - >0 = 自定义阈值
 ///
-/// env 仅在进程启动后第一次创建 DmaRate 时读取，之后不感知变化。
+/// **env 只在 `Worker::new` 时读一次并缓存到 `dma_rate_limit_bps_cached`；
+/// 之后 K-20 swap-arm 复用缓存值，绝不重读 env**。运行期 env 漂移
+/// （另一线程 setenv）不影响阈值，避免诊断混乱。
 const DMA_RATE_LIMIT_DEFAULT_BPS: u64 = 64 * 1024 * 1024;
 
 /// 解析 env override；非法值（非数字 / 解析失败）退回默认 + warn。
@@ -182,11 +193,13 @@ struct DmaRate {
 }
 
 impl DmaRate {
-    fn new() -> Self {
+    /// 用指定 limit 构造（启动期 Worker::new 缓存 + K-20 swap-arm 复用 +
+    /// 测试直接指定）。limit=0 表示禁用速率限制。
+    fn with_limit(limit_bps: u64) -> Self {
         Self {
             window_start: Instant::now(),
             bytes_in_window: 0,
-            limit_bps: dma_rate_limit_bps(),
+            limit_bps,
         }
     }
 
@@ -248,6 +261,10 @@ pub struct Worker {
     consecutive_bad_frames: u32,
     /// K-NEW-C: DMA rate state.
     dma_rate: DmaRate,
+    /// 缓存的 DMA 限速阈值（启动期一次性从 env 读取）。K-20 swap-arm 复活
+    /// 时复用此值构造新 DmaRate，**不**重读 env —— 避免运行期 env 漂移
+    /// 导致诊断混乱。
+    dma_rate_limit_bps_cached: u64,
     /// 用于 DMA reply 帧的 seq（与 device.rs `next_seq` 配合）。
     ///
     /// seq 空间约定：
@@ -276,6 +293,7 @@ impl Worker {
         stats: SharedWorkerStats,
         transport_swap: Receiver<crate::prepared::BoxedTransport>,
     ) -> Self {
+        let dma_rate_limit_bps_cached = dma_rate_limit_bps();
         Self {
             transport,
             state,
@@ -285,7 +303,8 @@ impl Worker {
             interrupts,
             guest_memory,
             consecutive_bad_frames: 0,
-            dma_rate: DmaRate::new(),
+            dma_rate: DmaRate::with_limit(dma_rate_limit_bps_cached),
+            dma_rate_limit_bps_cached,
             next_dma_seq: 1 << 63,
             stats,
             transport_swap,
@@ -293,9 +312,16 @@ impl Worker {
     }
 
     /// 集中处理 transport 死亡 → Lost 转换：记录时间戳 + 原因 bit。
-    /// 调用方负责 `drain_in_flight()` + `state.store(Lost)`（顺序约定：
-    /// 先 store Lost 让外部观察者看到状态变化，再 drain in-flight，避免
-    /// 中间窗口暴露 inflight 还在但 state 已死的不一致快照）。
+    ///
+    /// 调用方应按下述顺序，保证 device.rs 一读到 state=Lost 就短路新请求
+    /// （即便 inflight 还在 drain）：
+    /// ```ignore
+    /// self.record_lost(reason);
+    /// self.state.store(DeviceState::Lost);   // 让外部 reader 立刻短路
+    /// self.drain_in_flight();                // 再失败既有 inflight
+    /// ```
+    /// 中间窗口可能短暂出现 `state=Lost && inflight_current > 0`；inspect
+    /// 消费者（ohcldiag-dev）应将其视为合法 transient — 表示 drain 正在进行。
     fn record_lost(&self, reason_bit: u64) {
         self.stats
             .last_lost_at_ms
@@ -342,7 +368,7 @@ impl Worker {
                     self.transport = new;
                     self.consecutive_bad_frames = 0;
                     self.stats.consecutive_bad_frames.store(0, Ordering::Relaxed);
-                    self.dma_rate = DmaRate::new();
+                    self.dma_rate = DmaRate::with_limit(self.dma_rate_limit_bps_cached);
                     // 注：next_dma_seq 故意不重置 —— 保持跨重连单调，便于日志关联。
                     self.record_revive();
                     self.state.store(DeviceState::Live);
@@ -394,6 +420,7 @@ impl Worker {
             }
         }
         self.drain_in_flight();
+        self.record_lost(lost_reason::WORKER_EXIT);
         self.state.store(DeviceState::Lost);
     }
 

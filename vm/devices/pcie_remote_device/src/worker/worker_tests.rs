@@ -19,30 +19,25 @@ fn test_swap_rx() -> Receiver<crate::prepared::BoxedTransport> {
 
 #[test]
 fn dma_rate_allows_under_limit() {
-    let mut r = DmaRate::new();
+    // 显式 64 MiB/s 限值，与 env 解耦：避免 CI 误设 OPENHCL_PCIE_REMOTE_DMA_BPS
+    // 时 silent skip。
+    let mut r = DmaRate::with_limit(64 * 1024 * 1024);
     assert!(r.try_consume(1024 * 1024));
     assert!(r.try_consume(1024 * 1024));
 }
 
 #[test]
 fn dma_rate_rejects_over_limit() {
-    let mut r = DmaRate::new();
-    let limit = r.limit_bps;
-    // 跳过此用例当 env 把 limit 设成 0（disabled）；CI 不传 env 时正常跑。
-    if limit == 0 {
-        return;
-    }
+    let limit = 64 * 1024 * 1024;
+    let mut r = DmaRate::with_limit(limit);
     assert!(r.try_consume(limit));
     assert!(!r.try_consume(1));
 }
 
 #[test]
 fn dma_rate_resets_after_window() {
-    let mut r = DmaRate::new();
-    let limit = r.limit_bps;
-    if limit == 0 {
-        return;
-    }
+    let limit = 64 * 1024 * 1024;
+    let mut r = DmaRate::with_limit(limit);
     assert!(r.try_consume(limit));
     // 不真等 1s — 直接构造已过期窗口
     r.window_start = Instant::now() - Duration::from_secs(2);
@@ -52,12 +47,7 @@ fn dma_rate_resets_after_window() {
 /// env override = 0 → 永远允许（rate limit disabled），仍受协议尺寸上限。
 #[test]
 fn dma_rate_env_zero_disables_limit() {
-    // 直接构造（绕过 env 读取，模拟用户设 OPENHCL_PCIE_REMOTE_DMA_BPS=0）
-    let mut r = DmaRate {
-        window_start: Instant::now(),
-        bytes_in_window: 0,
-        limit_bps: 0,
-    };
+    let mut r = DmaRate::with_limit(0);
     // 巨量请求也允许
     assert!(r.try_consume(u64::MAX / 2));
     assert!(r.try_consume(u64::MAX / 2));
@@ -66,11 +56,7 @@ fn dma_rate_env_zero_disables_limit() {
 /// env override = 自定义阈值；模拟构造 limit=1MB 验证拒收路径。
 #[test]
 fn dma_rate_custom_limit_rejects_above() {
-    let mut r = DmaRate {
-        window_start: Instant::now(),
-        bytes_in_window: 0,
-        limit_bps: 1024 * 1024,
-    };
+    let mut r = DmaRate::with_limit(1024 * 1024);
     assert!(r.try_consume(1024 * 1024));
     assert!(!r.try_consume(1));
 }
@@ -432,11 +418,14 @@ fn dma_rate_counter_increments_on_reject() {
             swap_rx,
         );
 
-        // 跳过此用例当 env 把 limit 设成 0（disabled）或非默认值。
+        // 此测试需要默认 64 MiB/s 阈值；如果 env 污染则 fail-loud（不
+        // silent skip，避免 CI 误以为通过）。
         let limit = w.dma_rate.limit_bps;
-        if limit != 64 * 1024 * 1024 {
-            return;
-        }
+        assert_eq!(
+            limit,
+            64 * 1024 * 1024,
+            "test requires default DMA limit; unset OPENHCL_PCIE_REMOTE_DMA_BPS"
+        );
 
         // 发 1100 个 64KB ReadGpa：1024 个允许（占满 64 MiB/s）+ 76 个被拒
         for i in 0..1100u64 {
