@@ -747,7 +747,7 @@ Write-Host "Registered service GUID: $ServiceGuid (ACL: Admin/SYSTEM only)"
 | K-17 | ✅ | P2·测试 | resolver duplicate 注册 panic 契约测试 | resolver.rs `add_async_resolver_duplicate_panics_contract_documented` | e5bbfac8 |
 | K-18 | ✅ | P2·Rust | codec/protocol 拒绝 MMIO size ∈ {0,3,5,6,7,>8} | `is_valid_mmio_size` + size_tests + worker.rs guard | e5bbfac8 |
 | K-19 | ✅ | P2·架构 | `handshake_timeout_ms ≤ config_timeout/2` 校验 + warn | options.rs `parse_pcie_remote_entries` + 2 tests | e5bbfac8 |
-| K-20 | 🟦 v2 | P2·部署 | 延迟接入 / hotplug | v2 跟踪 issue（host 后启 / boot 后接入）| — |
+| K-20 | ✅ v2 实施 + 真 Hyper-V 验证 | P2·部署 | 延迟接入 / hotplug | listener 永不退 + worker transport_swap + Lost 不退 worker + state Lost → Live 复活；详 [../K20_HOTPLUG_DESIGN.md](../K20_HOTPLUG_DESIGN.md)、commits a99cdc63 + 64da8fb6 | 真 Hyper-V 实测：kill noop → worker Lost 但保留 → 重起 noop → interrupts_fired 持续递增 (214 = 7 旧 + 207 新) |
 | K-21 | 🟦 v2 | P2·测试 | path C 真 Hyper-V CI（hyperv-runner）| v2；当前只有手工 e2e（已通过，SESSION_LOG 记录）| — |
 | K-22 | 🟦 v2 | P2·测试 | Linux guest 完整测试矩阵 | v2；当前 spec §5 仅 Windows guest | — |
 

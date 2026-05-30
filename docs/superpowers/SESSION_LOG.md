@@ -681,3 +681,77 @@ kmsg:
 - `--stress-bad-frames 8` → A4 Lost 验证
 - `--stress-dma-count 0 --stress-bad-frames 0`（默认）→ periodic 模式仅
   InterruptFire / ReadGpa / WriteGpa
+
+---
+
+## 2026-05-30 v8+v9: K-20 hotplug 实施 + 真 Hyper-V 验证
+
+承前 v7 (a6c36b5b) A4 Lost 转换实测；本轮按 K20_HOTPLUG_DESIGN.md 完整
+实施 spec §10 K-20（"v1 体验最大遗憾"），并真 Hyper-V e2e 验证。
+
+### v8 (commit a99cdc63 + 64da8fb6) — 实施
+
+**架构变更：**
+- `Worker<T> generic` → `Worker { transport: BoxedTransport }` — 让 runtime
+  swap transport 成为可能
+- 加 `transport_swap: Receiver<BoxedTransport>` 字段 + `run()` 主循环
+  swap arm：drain inflight + 替换 transport + state Lost → Live + reset
+  bad_frames + reset dma_rate
+- `read_inbound_or_pending` helper：Lost 状态下 read 永远 pending
+  （防 dead-transport busy-loop），由 swap channel/from_device 决定下一步
+- 进 Lost **不再 break worker**：state.store(Lost) + drain_in_flight，
+  等 swap channel 唤醒；只有 from_device 全 drop / shutdown 才真正退出
+- listener 永不退出：一次 bind + PolledSocket 包装，循环 accept
+  （首次走 prepared_map；之后通过 swap_map 投递给 running worker）
+
+**routing 逻辑（handshake_spawn.rs）：**
+```rust
+if let Some(swap_tx) = swap_map.lock().get(&id).cloned() {
+    // worker 已 spawn (resolver 已 register sender) → hot-reconnect
+    swap_tx.send(prep.take_transport());
+} else {
+    // 首次 / boot grace → prepared_map 走 resolver assemble
+    prepared.lock().insert(id, prep);
+}
+```
+
+### 真 Hyper-V e2e 验证（v9 IGVM）
+
+```
+[boot] noop #1 PID 78308 → interrupts_fired=7 / read_gpa=2 / write_gpa=1
+[kill] Stop-Process noop_vsock → 8s 后看 kmsg:
+       [52.158] worker: read_frame failed; transport dead, going Lost (awaiting refresh)
+       [continued] listener: handshake timeout; will keep listening (×N)
+       ← worker Lost 但**不退**，listener 不断 accept ✓
+[reconnect] start noop #2 → transport swap 路径
+[verify]   interrupts_fired = 214 = 7 (旧) + 207 (新 noop2)
+           ← 完全对应，hot-reconnect 通路验证 ✓
+```
+
+K-20 P2·部署 标 ✅ 完成。
+
+### v8 修复（commit 64da8fb6）
+
+a99cdc63 初版假设 'listener drop → port 释放' 可每轮重 bind；vsock 实测
+报 'Address in use (os error 98)' — vsock 无 SO_REUSEADDR 保护。修：
+listener 一次 bind 后用 `PolledSocket` 包装，`accept_and_handshake`
+改成接 `&mut PolledSocket` 借用（不再拿所有权），外层 loop 复用同一个
+polled_listener。TCP/vsock 两条路径统一改造。
+
+### v1 → v9 完整里程碑回顾
+
+| v1 | v2 (ea928d5b) | v3-v7 | v8/v9 |
+|---|---|---|---|
+| cfg-only skeleton | 完整 BAR/MSIX/MMIO/Int/DMA 闭环 | worker_stats + InterruptFire/DMA stress 9-counter 全覆盖 | K-20 hotplug + listener forever + worker transport refresh + Lost recovery |
+| Lost = terminal | Lost = terminal | Lost = terminal | **Lost 可恢复**（host 重连即 Live） |
+| 48 tests | 53 tests | 57 tests | 57 + e2e proof |
+
+### K-IDs 表最终状态
+
+| ID | 状态 |
+|---|---|
+| K-1..K-19 (v1 spec) | ✅ 全部完成 |
+| K-NEW-A..K-NEW-F (v2/v3) | ✅ 全部完成 + e2e |
+| K-20 (hotplug) | ✅ **v9 完成** |
+| K-21 (CI for path C) | 🟦 v2+ (需 hyperv-runner) |
+| K-22 (Linux guest) | 🟦 v2+ |
