@@ -1353,3 +1353,76 @@ Phase E/F/G 的正确性由单测充分覆盖（7/7 pass + clippy --tests -D war
 干净 + MSVC cross-build release 干净）。e2e 中验证 PRP list 路径需要 guest
 issue > 8 KiB 单次 IO（NTFS large file copy），SMART 验证需要 Get-
 StorageReliabilityCounter；这两条留 USER_TODO（需先解决 guest 凭据）。
+
+---
+
+## 2026-05-31 Phase H + I — NVMe 中高优先级 feature + 第二个 example
+
+按 user "修复中高优先级问题然后实现长期目标" 推完一整批中高 ROI 项：
+
+### Phase H1+H2+H3 — Features + Multi-Queue + Compare (commit 800fb44b)
+
+- Set Features 14 个标准 fid 真追踪（之前只识别 NumberOfQueues）；Get
+  Features 回填 cdw11；VWC 强制 WCE=1；NumberOfQueues 受 IO_QUEUE_CAP
+- IO_QUEUE_CAP = 4 (之前 1)；driver 现在能开多 SQ/CQ
+- Compare 真实现 (≤4 KiB DMA-read + byte 比较)；ONCS.compare=true
+
+### Phase H4 — Multiple namespaces (commit 3a01dff9)
+
+NvmeController 字段 file/total_lba 拆出 `Namespace` struct +
+`namespaces: HashMap<u32, Namespace>`。--backing-file 改 Vec<String> 重
+复 / 逗号分隔。所有 IO/Compare 入口 self.ns(nsid) 校验，PendingIo/
+WriteAccum/PrpListOp 加 nsid 字段，completion 路径按 NSID 查 ns.file。
+Identify Active NSID list 动态枚举；Format NVM 支持 NSID broadcast；
+FLUSH NSID broadcast。
+
+### Phase H5 — Firmware 状态机 (commit a83d9e77)
+
+fw_download_buf (8 MiB cap) + fw_active_slot + fw_slot_revisions[8] +
+fw_next_active_slot。FW_IMAGE_DOWNLOAD 真 DMA-read chunk 累积；
+FW_COMMIT 4 action (0/1/2/3) + slot 替换 / 立即激活 / next-boot 标记。
+Log Page 0x03 Firmware Slot Info 真序列化 AFI + FRS[1..7]。
+
+### Phase H6 — Reservation (commit facc992e)
+
+新 4 个 NVM opcode (0x0d/0x0e/0x11/0x15)；Namespace 加 registrants +
+reservation。apply_reservation_cmd 处理 Register/Acquire/Release 完整
+action matrix。RESERVATION_CONFLICT (SC 0x83) 在冲突时返。
+build_reservation_report 按 spec § 6.14 Figure 197 序列化。
+ONCS.reservations=true；Identify NS.rescap 声明支持 type 1-4。
+
+### Phase H7 — Protection Information capability (commit 81a3c0dd)
+
+Identify Namespace 加 LBAF[1] (4096B+8B meta) + DPC=T1+first-8。
+Format 接受 LBAF[0/1] + PI Type 0/1。Read/Write 检 CDW12 bit 29
+PRACT，若 driver 期望真 PI 校验则 INVALID_FIELD（我们没 CRC 引擎）。
+
+### Phase I1 — ZNS (deferred, design doc)
+
+完整 ZNS 实现 ~1500 行新代码 + zone state machine + 单测，ROI 不对等
+（NVM CS 路径已覆盖核心教学价值）。写 [ZNS_DESIGN.md](docs/superpowers/
+examples/pcie_remote_nvme_userspace/ZNS_DESIGN.md) 记录设计 + deferred
+原因。
+
+### Phase I2 — README + 架构图 (commit 58ef924c)
+
+[README.md](docs/superpowers/examples/pcie_remote_nvme_userspace/README.md)
+含 ASCII 架构图 (host → vsock → VTL2 → VTL0)、完整 opcode 覆盖矩阵、
+Windows 真 e2e PowerShell 用法、TCP 模式、代码导览、"how to write next
+PcieDevice" 教程、设计哲学。
+
+### Phase I3 — 第二个 PCIe device example (commit 7402dd62)
+
+[pcie_remote_rng_userspace](docs/superpowers/examples/
+pcie_remote_rng_userspace/)：~360 行实现一个最小 PCI 硬件 RNG (BAR0
+6 reg + 1 MSI-X + DMA-write)。证明 SDK 不止能写 NVMe；作为下一个
+PcieDevice 教学模板。splitmix64 LCG (无外部依赖)；--seed 可复现。
+
+### 测试 + 验证
+
+- 单测：9 → 11 (新 features + multi-NS + fw_slot 各加 1) + RNG 2 个
+- cargo fmt / build / clippy --tests -D warnings / MSVC cross-build
+  release：每 commit 全清
+- 待跑 e2e：Hyper-V 真跑 multi-NS / multi-queue / reservation / PI
+  reject 路径（需先解决 guest 凭据）
+- 待跑：rust-reviewer Phase H + I3 完整 review
