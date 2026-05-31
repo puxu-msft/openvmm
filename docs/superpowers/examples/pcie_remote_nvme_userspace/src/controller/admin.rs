@@ -193,7 +193,7 @@ impl NvmeController {
                 // 暂未触发实际事件 → AER 永挂；在 disable() 清空。未来
                 // 加 fire_namespace_changed / fire_log_available 等时会调
                 // self.fire_aen()。
-                self.aen_pending.push_back((cid, 0, sq_head, cq_id));
+                self.aen_pending.push_back((cid, 0, cq_id));
                 tracing::debug!(
                     cid,
                     queued = self.aen_pending.len(),
@@ -353,40 +353,45 @@ impl NvmeController {
                 Some(Cqe::success(cid, 0, sq_head, phase))
             }
             admin_opc::DEVICE_SELF_TEST => {
-                // **Phase G** — NVMe spec § 5.11 Device Self-test。
-                // CDW10 bits 3:0 = STC：
+                // **Phase G (rev. CRITICAL fix)** — NVMe spec § 5.11
+                // Device Self-test。CDW10 bits 3:0 = STC：
                 //   0x0 = abort current self-test
-                //   0x1 = short self-test (≤ 2 min spec 推荐)
-                //   0x2 = extended self-test (≤ 2 hour spec 推荐)
+                //   0x1 = short self-test
+                //   0x2 = extended self-test
                 //   0xf = vendor specific
                 // 教学：把时间常数压成秒级（5 s / 20 s），让 tick 推进
-                // percent_complete + Get Log Page 0x06 反映；完成后自动
-                // fire AEN Notice (type=0x02, info=0x01) 通知 driver。
+                // percent_complete + Get Log Page 0x06 反映；完成时一次性
+                // (transition 边沿) fire AEN Notice 通知 driver。
                 let stc = (sqe.cdw10 & 0xf) as u8;
                 match stc {
                     0x0 => {
-                        // Abort：清掉 in-progress（last_result 设 0x09 = aborted
-                        // by host，spec § 5.16.1.6 Table）
-                        if let Some(st) = self.self_test.as_mut() {
-                            st.stc = 0;
-                            st.last_result = 0x09;
-                            tracing::info!("Self-Test aborted by host");
+                        // Abort：清掉 in_progress 并把结果 0x09=aborted 记
+                        // 进 self_test_last（spec § 5.16.1.6 Self-Test
+                        // Result Codes）。take() 保证 tick 不会再当作
+                        // in-progress 推进。
+                        if let Some(in_prog) = self.self_test_in_progress.take() {
+                            let poh = self.power_on_instant.elapsed().as_secs() / 3600;
+                            self.self_test_last = Some(crate::controller::SelfTestCompleted {
+                                stc: in_prog.stc,
+                                result: 0x09,
+                                completed_at_poh: poh,
+                            });
+                            tracing::info!(stc = in_prog.stc, "Self-Test aborted by host");
                         }
                         Some(Cqe::success(cid, 0, sq_head, phase))
                     }
                     0x1 | 0x2 => {
-                        if self.self_test.as_ref().is_some_and(|s| s.stc != 0) {
+                        if self.self_test_in_progress.is_some() {
                             // Spec：已在进行 → 0x1d Self-Test In Progress
                             tracing::warn!(stc, "Self-Test rejected: already in progress");
                             return Some(Cqe::error(cid, 0, sq_head, phase, 0x1d, 0));
                         }
                         let total = if stc == 0x1 { 5 } else { 20 };
-                        self.self_test = Some(crate::controller::SelfTestState {
+                        self.self_test_in_progress = Some(crate::controller::SelfTestInProgress {
                             started_at: std::time::Instant::now(),
                             stc,
                             total_seconds: total,
                             percent_complete: 0,
-                            last_result: 0,
                         });
                         tracing::info!(stc, total, "Self-Test started");
                         Some(Cqe::success(cid, 0, sq_head, phase))
