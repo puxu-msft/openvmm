@@ -209,6 +209,18 @@ impl NvmeController {
                         );
                         // 不写入 features map：Get 时直接根据 granted_io_queues 重算
                     }
+                    cmd::fid::POWER_MANAGEMENT => {
+                        // **Phase K8** — cdw11 bits 4:0 = Power State，
+                        // bits 7:5 = Workload Hint。spec § 5.21.1.2。
+                        let ps = (cdw11 & 0x1F) as u8;
+                        if ps >= 8 {
+                            // Identify Controller .npss = 7 (8 states)
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                        }
+                        self.current_ps = ps;
+                        self.features.insert(fid, cdw11);
+                        tracing::info!(ps, "Set Features Power Management");
+                    }
                     cmd::fid::VOLATILE_WRITE_CACHE => {
                         // VWC bit 0 = WCE (Write Cache Enable)。我们 backing
                         // file 始终有 host page cache → WCE 实际不可关；
@@ -256,6 +268,10 @@ impl NvmeController {
                     cmd::fid::VOLATILE_WRITE_CACHE => {
                         // 始终回 WCE=1（参 Set 路径）
                         *self.features.get(&fid).unwrap_or(&0x1)
+                    }
+                    cmd::fid::POWER_MANAGEMENT => {
+                        // Phase K8：返实时 current_ps（不从 features map）
+                        self.current_ps as u32
                     }
                     _ => {
                         // 其它：未 Set 过返 0 = spec 默认（多数 fid 默认 0
@@ -338,6 +354,7 @@ impl NvmeController {
                     0x03 => super::logs::build_fw_slot_info(self, bytes),
                     0x06 => super::logs::build_self_test(self, bytes),
                     0x80 => super::logs::build_reservation_notification(self, bytes),
+                    0x81 => super::logs::build_sanitize_status(self, bytes),
                     _ => {
                         tracing::debug!(
                             lid = format_args!("{:#x}", lid),
@@ -759,11 +776,52 @@ impl NvmeController {
                 Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_OPCODE, 0))
             }
             admin_opc::SANITIZE => {
-                // NVMe spec § 5.26 Sanitize。需要 sanicap > 0 才支持，我们
-                // build_v2_bytes 未设 sanicap → 不应被发；驱动若发，
-                // 返 INVALID_FIELD。
-                tracing::warn!(cid, "Sanitize (sanicap=0; INVALID_FIELD)");
-                Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0))
+                // **Phase K5** — NVMe spec § 5.26 Sanitize。CDW10 字段：
+                //   bits 2:0   SANACT — 1=Exit Failure / 2=Block Erase /
+                //                       3=Overwrite / 4=Crypto Erase
+                //   bit 3      AUSE   — Allow Unrestricted Sanitize Exit
+                //   bits 7:4   OWPASS — Overwrite Pass Count
+                //   bit 8      OIPBP  — Overwrite Invert Pattern Between Passes
+                //   bit 9      NDAS   — No Deallocate After Sanitize
+                let sanact = (sqe.cdw10 & 0x7) as u8;
+                if sanact == 0 || sanact > 4 {
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
+                if sanact == 1 {
+                    // Exit Failure：清失败状态
+                    if self.sanitize_last_status == 3 {
+                        self.sanitize_last_status = 0;
+                    }
+                    return Some(Cqe::success(cid, 0, sq_head, phase));
+                }
+                // 已在进行 → spec § 5.26 'Sanitize In Progress' (SC 0x12)
+                if self.sanitize.is_some() {
+                    return Some(Cqe::error(cid, 0, sq_head, phase, 0x12, 0));
+                }
+                self.sanitize = Some(crate::controller::SanitizeState {
+                    started_at: std::time::Instant::now(),
+                    sanact,
+                    total_seconds: 3, // 教学短时长
+                    percent_complete: 0,
+                });
+                self.sanitize_last_status = 2; // in-progress
+                tracing::info!(sanact, "Sanitize started");
+                Some(Cqe::success(cid, 0, sq_head, phase))
+            }
+            admin_opc::DOORBELL_BUFFER_CONFIG => {
+                // **Phase K6** — NVMe spec § 5.7。PRP1 = shadow doorbell GPA，
+                // PRP2 = event idx GPA。我们存下来但不真做 polling（vsock
+                // 模型 MMIO 已 OK）；driver 信任 controller 偶尔会 poll。
+                let prp1 = sqe.prp1;
+                let prp2 = sqe.prp2;
+                self.doorbell_shadow_gpa = prp1;
+                self.doorbell_event_idx_gpa = prp2;
+                tracing::info!(
+                    shadow = format_args!("{:#x}", prp1),
+                    event_idx = format_args!("{:#x}", prp2),
+                    "Doorbell Buffer Config (stored, not actively polled)"
+                );
+                Some(Cqe::success(cid, 0, sq_head, phase))
             }
             opc => {
                 tracing::warn!(

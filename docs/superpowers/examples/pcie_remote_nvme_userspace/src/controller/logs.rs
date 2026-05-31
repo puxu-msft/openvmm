@@ -125,3 +125,24 @@ pub(super) fn build_reservation_notification(_c: &NvmeController, bytes: usize) 
     buf.truncate(bytes);
     buf
 }
+
+/// **Phase K5** — Log Page 0x81 Sanitize Status (spec § 5.16.1.18, 512 byte)。
+///
+/// - offset 0..2 SPROG (sanitize progress) — 0..=65535 (=100% 时 0xFFFF)
+/// - offset 2..4 SSTAT (sanitize status):
+///   bits 2:0 = status (0=never, 1=success, 2=in-progress, 3=failed)
+///   bits 7:3 = sanitize action causing 最近一次
+///   bit 8    = global data erased
+/// - offset 4..8 SCDW10 — driver 发起 Sanitize 时的 cdw10 副本
+/// - offset 8..16 ETFO / ETFBE / ETFCE / ETFOW (estimated time)
+pub(super) fn build_sanitize_status(c: &NvmeController, bytes: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; bytes.max(512)];
+    // SPROG @ 0..2
+    let sprog = c.sanitize.as_ref().map(|s| s.percent_complete).unwrap_or(0);
+    buf[0..2].copy_from_slice(&sprog.to_le_bytes());
+    // SSTAT @ 2..4，bits 2:0 = sanitize status
+    let sstat = (c.sanitize_last_status as u16) & 0x7;
+    buf[2..4].copy_from_slice(&sstat.to_le_bytes());
+    buf.truncate(bytes);
+    buf
+}

@@ -83,6 +83,12 @@ pub mod admin_opc {
     pub const SECURITY_RECEIVE: u8 = 0x82;
     /// Sanitize (NVMe 1.3，spec § 5.26)。
     pub const SANITIZE: u8 = 0x84;
+    /// **Phase K6** — Doorbell Buffer Config (NVMe 1.3+，spec § 5.7)。
+    /// driver 提供 shadow doorbell buffer，让 controller 通过 polling
+    /// guest memory 检测 tail update，省一次 MMIO write。本 example 不
+    /// 真做 polling（vsock 模型用 MMIO 已 OK），返 success 让 driver
+    /// 满意。
+    pub const DOORBELL_BUFFER_CONFIG: u8 = 0x7c;
 }
 
 /// **Phase H1** — Feature Identifier (NVMe spec § 5.21.1 Table 134)。
@@ -376,7 +382,17 @@ impl IdentifyController {
         id.oacs = nvme_spec::OptionalAdminCommandSupport::new()
             .with_format_nvm(true)
             .with_firmware_activate_firmware_download(true)
-            .with_self_test(true);
+            .with_self_test(true)
+            .with_ns_management(true) // Phase K3
+            .with_doorbell_buffer_config(true); // Phase K6
+        // **Phase K5** — SANICAP：bit 0 CES Crypto Erase / bit 1 BES Block
+        // Erase / bit 2 OWS Overwrite (spec § 5.17.2.2)。NDI / NODMMAS 留 0。
+        id.sanicap = 0b0000_0111u32;
+        // **Phase K8** — NPSS = Number of Power States Supported - 1。
+        // 我们声明 8 个 PS (0..7)；driver 默认在 PS0 (max performance)。
+        // PSD[0..7] in spec @ offset 2048+N*32 — 我们让 zero-init buffer
+        // 默认（教学 OK；真硬件 PSD 含 MP/MPS/NOPS/ENLAT 等）。
+        id.npss = 7;
         // SQES/CQES：NVMe spec 固定 SQE=64B (2^6) / CQE=16B (2^4)。
         id.sqes = nvme_spec::QueueEntrySize::new().with_min(6).with_max(6);
         id.cqes = nvme_spec::QueueEntrySize::new().with_min(4).with_max(4);

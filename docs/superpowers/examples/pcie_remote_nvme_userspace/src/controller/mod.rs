@@ -338,6 +338,27 @@ pub struct NvmeController {
     /// 待下次启动激活的 slot（Commit Action=2 设置）；0 = 立即激活。
     pub(super) fw_next_active_slot: u8,
 
+    // ----- Phase K5: Sanitize 状态机 -----
+    /// 当前 Sanitize 进度（None = idle / 完成；Some = 进行中）。
+    /// NVMe spec § 5.26。简化：用 tick 推进 percent_complete；完成时
+    /// fire AEN type=0x02 info=0x05 'Sanitize Operation Completed'。
+    pub(super) sanitize: Option<SanitizeState>,
+    /// 最近一次 Sanitize 完成的 Sanitize Status Log 0x81 数据。
+    pub(super) sanitize_last_status: u8, // 0=never, 1=success, 2=in-progress, 3=failed
+
+    // ----- Phase K6: Doorbell Buffer Config -----
+    /// driver 提供的 shadow doorbell buffer GPA（PRP1）+ event idx buffer
+    /// (PRP2)。我们存下来但不做 polling（vsock 模型 MMIO 已是事件源）。
+    #[allow(dead_code)]
+    pub(super) doorbell_shadow_gpa: u64,
+    #[allow(dead_code)]
+    pub(super) doorbell_event_idx_gpa: u64,
+
+    // ----- Phase K8: Power States -----
+    /// 当前 power state index (0..31)。Set Features 0x02 Power Management
+    /// 修改；Identify Controller .psd[N] 描述每个 state（spec § 5.17.2.2）。
+    pub(super) current_ps: u8,
+
     // ----- 配置 -----
     vid: u16,
     ssvid: u16,
@@ -394,6 +415,23 @@ pub(super) struct SelfTestCompleted {
     /// 完成时的 power-on-hours 快照（spec 要求 run-time POH，
     /// 不是 "读 log 此刻" POH）。
     pub(super) completed_at_poh: u64,
+}
+
+/// **Phase K5** — Sanitize 进行中状态（spec § 5.26）。
+///
+/// Sanitize Action (sanact)：
+///   1 = Exit Failure mode
+///   2 = Block Erase
+///   3 = Overwrite
+///   4 = Crypto Erase
+/// 我们简化：所有 sanact ≥ 2 触发"擦写"（backing file truncate-then-zero）。
+/// 教学时长压缩到 3 秒；真硬件分钟到小时级。
+#[derive(Debug, Clone)]
+pub(super) struct SanitizeState {
+    pub(super) started_at: std::time::Instant,
+    pub(super) sanact: u8,
+    pub(super) total_seconds: u32,
+    pub(super) percent_complete: u16,
 }
 
 /// **Phase G** — Error Information Log entry（NVMe spec § 5.16.1.1，64 字节）。
@@ -511,6 +549,11 @@ impl NvmeController {
                 s
             },
             fw_next_active_slot: 0,
+            sanitize: None,
+            sanitize_last_status: 0,
+            doorbell_shadow_gpa: 0,
+            doorbell_event_idx_gpa: 0,
+            current_ps: 0,
             vid,
             ssvid,
             msix_count: 4, // admin (vec 0) + IO (vec 1) + 2 spare
@@ -601,6 +644,14 @@ impl NvmeController {
         // 默认 0；我们暂不实现 NVM Subsystem persistent）。
         self.features.clear();
         self.granted_io_queues = IO_QUEUE_CAP;
+        // K5: sanitize 跨 reset 撤回（spec § 5.26 'Sanitize Operation
+        // Aborts on Reset'），last_status 保留作 history
+        self.sanitize = None;
+        // K6: doorbell buffer 跨 reset 清（driver 重新配置）
+        self.doorbell_shadow_gpa = 0;
+        self.doorbell_event_idx_gpa = 0;
+        // K8: power state 重置到 PS0
+        self.current_ps = 0;
         self.state = CtrlState::Disabled;
         self.csts &= !csts::RDY;
     }
@@ -1115,6 +1166,22 @@ impl PcieDevice for NvmeController {
             // info=0x00 reserved/generic，log_id=0x01 Error Information Log
             // 同样：fire 失败不重试（spec § 5.2 允许 drop）。
             let _ = self.fire_aen(ctx, 0x00, 0x00, 0x01);
+        }
+        // **Phase K5** — Sanitize 进度推进 + 完成 transition fire AEN。
+        if let Some(sn) = self.sanitize.as_mut() {
+            let elapsed = sn.started_at.elapsed().as_secs();
+            // SPROG (spec § 5.16.1.18) 是 0..=65535 范围（不是 0..100）
+            let pct = ((elapsed * 65535) / sn.total_seconds.max(1) as u64).min(65535) as u16;
+            sn.percent_complete = pct;
+            if elapsed >= sn.total_seconds as u64 {
+                let sanact = sn.sanact;
+                self.sanitize = None;
+                self.sanitize_last_status = 1; // success
+                tracing::info!(sanact, "Sanitize completed");
+                // AEN Notice (type=0x02) info=0x05 'Sanitize Completed'
+                // log_id=0x81 Sanitize Status Log（spec § 5.2 Figure 174）。
+                let _ = self.fire_aen(ctx, 0x02, 0x05, 0x81);
+            }
         }
     }
 
