@@ -705,20 +705,21 @@ impl NvmeController {
                                 total = accum.num_blocks,
                                 "K4c PI Write partial fail"
                             );
-                            // **Reviewer H-B (9轮)** — partial write 处理：
-                            // written_count 个 LBA 已落盘且不能 rollback（rollback
-                            // 本身也可能 fail）；记 SMART + 推进 ZNS WP by partial
-                            // count 让后续 SWR-aware Write 不 fault。spec 没有
-                            // "partial write success" SC，driver 收 DATA_TRANSFER_ERROR
-                            // 后会重试整条 cmd，重叠区域的写入是幂等的（同 data）。
-                            if written_count > 0 {
+                            // **Reviewer H-B (9轮) + 10轮 regression fix** —
+                            // written_count 个 LBA 已落盘。**关键区分**：
+                            // - 非 ZNS NS：retry 同 cmd 是幂等（重写相同 data
+                            //   到 same LBA），不动 WP 即可。
+                            // - ZNS NS：advance_zns_wp by partial 会让 driver
+                            //   重试时撞 ZONE_INVALID_WRITE（slba 与 WP 不匹配），
+                            //   permanent error。改为**不动 WP**：partial 落盘
+                            //   data 在重试后被 overwrite（NVMe ZNS spec § 4.4
+                            //   允许重试 same LBA in ImplicitOpen zone）。
+                            //   注：partial backing 与 WP 不一致，但 reads
+                            //   from above-WP region 在 ZNS 允许返 zero，
+                            //   驱动语义上 invisible 直到 retry 覆盖。
+                            if written_count > 0 && ns.zns.is_none() {
                                 self.stat_host_writes += 1;
                                 self.stat_lba_written += written_count as u64;
-                                crate::controller::io::advance_zns_wp(
-                                    ns,
-                                    accum.slba,
-                                    written_count,
-                                );
                             }
                             self.stat_num_err_log_entries += 1;
                             self.push_error_log(
@@ -879,9 +880,28 @@ impl NvmeController {
                     self.post_cqe(ctx, p.cq_id, cqe);
                 }
                 PendingOp::AdminFwDownloadChunk { offset_bytes } => {
-                    // **Phase H5** — FW chunk DMA-read 完成，写入累积 buffer
+                    // **Phase H5 + Reviewer M-H1 (10轮)** — FW chunk DMA-read
+                    // 完成，写入累积 buffer。Bound 总尺寸防 driver 恶意发
+                    // offset_bytes = 0xFFFF_FFFF 触发 multi-GB Vec OOM。
+                    // 64 MiB 教学 cap — 真硬件 FW image 通常 1-10 MiB。
+                    const FW_MAX_BYTES: usize = 64 * 1024 * 1024;
                     let off = offset_bytes as usize;
-                    let end = off + data.len();
+                    let end = off.saturating_add(data.len());
+                    if end > FW_MAX_BYTES {
+                        tracing::warn!(
+                            offset_bytes,
+                            chunk_len = data.len(),
+                            end,
+                            cap = FW_MAX_BYTES,
+                            "FW Download exceeds 64 MiB cap → INVALID_FIELD"
+                        );
+                        let cq = self.cqs.get(&p.cq_id);
+                        let phase = cq.map(|c| c.phase).unwrap_or(1);
+                        let cqe =
+                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_FIELD, 0);
+                        self.post_cqe(ctx, p.cq_id, cqe);
+                        return;
+                    }
                     if end > self.fw_download_buf.len() {
                         self.fw_download_buf.resize(end, 0);
                     }

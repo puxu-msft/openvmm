@@ -417,16 +417,35 @@ pub(super) fn persist_ptpl_sidecar(ns: &crate::controller::Namespace) -> std::io
         buf.extend_from_slice(&hi_lo.to_le_bytes());
         buf.extend_from_slice(&hi_hi.to_le_bytes());
     }
-    // **Reviewer M-1 (9轮)** — atomic persist：写 tmp + sync + rename。
-    // 否则 crash mid-write 让 sidecar 截断 → load_ptpl_sidecar 返 None →
-    // driver 认为已 persist 的 reservation 丢失。POSIX rename 是原子的。
+    // **Reviewer M-1 (9轮) + M-1-followup (10轮)** — atomic persist：
+    // tmp + fsync(file) + rename + fsync(parent_dir)。
+    // - rename 在 POSIX / NTFS 同卷下原子（cross-volume 不会 happen 因 tmp
+    //   与 target 同目录）
+    // - parent dir fsync 让 rename 的 directory entry 真落盘（否则 power
+    //   loss 仍可能丢失新 entry）
+    // - rename 失败时 unlink tmp（best-effort，避免遗留）
     let tmp_path = format!("{}.tmp", path);
     {
         let mut f = std::fs::File::create(&tmp_path)?;
         f.write_all(&buf)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp_path, &path)?;
+    if let Err(e) = std::fs::rename(&tmp_path, &path) {
+        let _ = std::fs::remove_file(&tmp_path); // 清残留
+        return Err(e);
+    }
+    // fsync parent dir 保证 rename 的 dirent 也落盘（Unix only；Windows 上
+    // NTFS 的 MoveFileExW 已 metadata-flushed by ourselves rename helpers
+    // — std::fs::rename → MoveFileExW with MOVEFILE_REPLACE_EXISTING +
+    // MOVEFILE_WRITE_THROUGH 不必显式 sync dir）
+    #[cfg(unix)]
+    {
+        if let Some(parent) = std::path::Path::new(&path).parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all(); // best-effort dir fsync
+        }
+    }
     Ok(())
 }
 
@@ -445,11 +464,19 @@ pub(super) const PTPL_MAGIC: u32 = 0x50545054;
 /// 几千 host，256 给教学完全够。
 pub(super) const PTPL_MAX_REGISTRANTS: usize = 256;
 
-/// **Reviewer M-2 (9轮)** — backing path 的 FNV-1a 32-bit hash 用来 sidecar
-/// 与 backing 绑定校验，防 sidecar 错位 reload 别 NS 的 reservation。
+/// **Reviewer M-2 (9轮) + M-2-followup (10轮)** — backing path 的 FNV-1a
+/// 32-bit hash 用来 sidecar 与 backing 绑定校验，防 sidecar 错位 reload。
+///
+/// 用 `std::path::absolute`（不需文件存在，纯路径规范化）解析 ./foo vs
+/// /abs/foo 不一致。比 canonicalize 弱：不解 symlink，也不实际 stat 文件，
+/// 但 workspace lint 禁用 canonicalize（其失败模式与 callers 的预期不同）。
 fn path_hash(path: &str) -> u32 {
+    let normalized = std::path::absolute(path)
+        .ok()
+        .and_then(|p| p.into_os_string().into_string().ok())
+        .unwrap_or_else(|| path.to_string());
     let mut h: u32 = 0x811c_9dc5;
-    for b in path.as_bytes() {
+    for b in normalized.as_bytes() {
         h ^= *b as u32;
         h = h.wrapping_mul(0x0100_0193);
     }
