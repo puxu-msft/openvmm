@@ -2339,6 +2339,14 @@ impl PcieDevice for NvmeController {
                                 // Phase F：dual-PRP Write 完成 → 计数。
                                 self.stat_host_writes += 1;
                                 self.stat_lba_written += accum.num_blocks as u64;
+                                // **Reviewer H-2** — ZNS WP 推进（同 NvmWriteDmaRead）
+                                if let Some(ns) = self.namespaces.get_mut(&p.nsid) {
+                                    crate::controller::io::advance_zns_wp(
+                                        ns,
+                                        accum.lba,
+                                        accum.num_blocks,
+                                    );
+                                }
                                 Cqe::success(accum.cid, accum.sq_id, accum.sq_head, phase)
                             }
                             Err(e) => {
@@ -2465,6 +2473,14 @@ impl PcieDevice for NvmeController {
                                 // Phase F：PRP-list Write 完成 → 计数。
                                 self.stat_host_writes += 1;
                                 self.stat_lba_written += op.num_blocks as u64;
+                                // **Reviewer H-2** — ZNS WP 推进
+                                if let Some(ns) = self.namespaces.get_mut(&op.nsid) {
+                                    crate::controller::io::advance_zns_wp(
+                                        ns,
+                                        op.lba,
+                                        op.num_blocks,
+                                    );
+                                }
                                 Cqe::success(op.cid, op.sq_id, op.sq_head, phase)
                             }
                             Err(e) => {

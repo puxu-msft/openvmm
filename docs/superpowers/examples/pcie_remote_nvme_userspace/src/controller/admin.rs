@@ -1088,9 +1088,15 @@ impl NvmeController {
                 Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0))
             }
             admin_opc::GET_LBA_STATUS => {
-                // **Phase L5** — Get LBA Status (spec § 5.15)。CDW10/11 = SLBA,
-                // CDW12 bits 31:16 = NDR (max ranges)。返 4 KiB 'no error
-                // LBAs' (NLSD=0)。
+                // **Phase L5 + reviewer H-4** — Get LBA Status (spec § 5.15)。
+                // CDW10/11 = SLBA, CDW12 bits 31:16 = MNDW (Max Number of
+                // Dwords)。返 4 KiB buffer with valid LBA Status Header：
+                //   bytes 0..4  NLSD (Number of LBA Status Descriptors) = 0
+                //   bytes 4..7  CMPC (Completion Condition) = 0
+                //   bytes 7..8  reserved
+                //   bytes 8..   per-LBA descriptors (empty since NLSD=0)
+                // 教学：我们的 backing 没 'suspected error LBA' 概念，所以
+                // NLSD 永远 0；header 字段必须真填零（vec![0u8; 4096] 已满足）。
                 let buf = vec![0u8; 4096];
                 self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, 0, sq_head, cq_id);
                 None
