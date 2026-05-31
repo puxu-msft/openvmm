@@ -385,7 +385,7 @@ fn ptpl_path(backing_path: &str) -> String {
 /// magic     u32 = 0x50545054 'PTPT'
 /// version   u32 = 1
 /// gen       u32
-/// reserved  u32
+/// path_hash u32  (FNV-1a of backing path — Reviewer M-2 防 sidecar 错绑)
 /// reservation_present u8（0 or 1）
 /// reservation_key     u64
 /// reservation_type    u8
@@ -397,10 +397,12 @@ pub(super) fn persist_ptpl_sidecar(ns: &crate::controller::Namespace) -> std::io
     use std::io::Write as _;
     let path = ptpl_path(&ns.path);
     let mut buf = Vec::with_capacity(64 + 24 * ns.registrants.len());
-    buf.extend_from_slice(&0x50545054u32.to_le_bytes()); // 'PTPT'
+    buf.extend_from_slice(&PTPL_MAGIC.to_le_bytes()); // 'PTPT'
     buf.extend_from_slice(&1u32.to_le_bytes()); // version
     buf.extend_from_slice(&ns.reservation_gen.to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    // **Reviewer M-2 (9轮)** — backing path hash 用来防 sidecar 错位绑定
+    // （e.g. 两 NS 共享 backing path 或 rename 后误 reload 别人的 state）
+    buf.extend_from_slice(&path_hash(&ns.path).to_le_bytes());
     let (present, rkey, rtype) = match ns.reservation {
         Some((k, t)) => (1u8, k, t),
         None => (0u8, 0u64, 0u8),
@@ -415,9 +417,16 @@ pub(super) fn persist_ptpl_sidecar(ns: &crate::controller::Namespace) -> std::io
         buf.extend_from_slice(&hi_lo.to_le_bytes());
         buf.extend_from_slice(&hi_hi.to_le_bytes());
     }
-    let mut f = std::fs::File::create(&path)?;
-    f.write_all(&buf)?;
-    f.sync_all()?;
+    // **Reviewer M-1 (9轮)** — atomic persist：写 tmp + sync + rename。
+    // 否则 crash mid-write 让 sidecar 截断 → load_ptpl_sidecar 返 None →
+    // driver 认为已 persist 的 reservation 丢失。POSIX rename 是原子的。
+    let tmp_path = format!("{}.tmp", path);
+    {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(&buf)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, &path)?;
     Ok(())
 }
 
@@ -427,27 +436,71 @@ pub(super) fn persist_ptpl_sidecar(ns: &crate::controller::Namespace) -> std::io
 /// 返回元组：(gen, reservation_holder, registrants)。
 pub(super) type PtplSnapshot = (u32, Option<(u64, u8)>, Vec<(u64, u64, u64)>);
 
+/// **Phase P1** — PTPL sidecar 二进制头大小常量（reviewer M-6）。
+pub(super) const PTPL_HEADER_BYTES: usize = 32;
+/// PTPL sidecar magic 'PTPT'（reviewer M-6）。
+pub(super) const PTPL_MAGIC: u32 = 0x50545054;
+/// Max registrant entries we trust on reload（reviewer H-A — bound malicious
+/// sidecar 不会触发 100 GB Vec::with_capacity）。Spec 实际 NVMe 单 NS 最多
+/// 几千 host，256 给教学完全够。
+pub(super) const PTPL_MAX_REGISTRANTS: usize = 256;
+
+/// **Reviewer M-2 (9轮)** — backing path 的 FNV-1a 32-bit hash 用来 sidecar
+/// 与 backing 绑定校验，防 sidecar 错位 reload 别 NS 的 reservation。
+fn path_hash(path: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in path.as_bytes() {
+        h ^= *b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
 pub(super) fn load_ptpl_sidecar(backing_path: &str) -> Option<PtplSnapshot> {
     use std::io::Read as _;
     let path = ptpl_path(backing_path);
     let mut f = std::fs::File::open(&path).ok()?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf).ok()?;
-    if buf.len() < 32 {
+    if buf.len() < PTPL_HEADER_BYTES {
         return None;
     }
     let magic = u32::from_le_bytes(buf[0..4].try_into().ok()?);
     let version = u32::from_le_bytes(buf[4..8].try_into().ok()?);
-    if magic != 0x50545054 || version != 1 {
+    if magic != PTPL_MAGIC || version != 1 {
         return None;
     }
     let gen_ = u32::from_le_bytes(buf[8..12].try_into().ok()?);
+    // **Reviewer M-2 (9轮)** — 比较 path_hash 防 sidecar 错绑
+    let stored_path_hash = u32::from_le_bytes(buf[12..16].try_into().ok()?);
+    let expected_path_hash = path_hash(backing_path);
+    if stored_path_hash != expected_path_hash {
+        tracing::warn!(
+            stored = stored_path_hash,
+            expected = expected_path_hash,
+            backing = backing_path,
+            "PTPL: path_hash mismatch (sidecar from different NS?), ignoring"
+        );
+        return None;
+    }
     let present = buf[16];
     let rkey = u64::from_le_bytes(buf[17..25].try_into().ok()?);
     let rtype = buf[25];
     let reservation = (present == 1).then_some((rkey, rtype));
-    let n_off = 32;
-    let n = u32::from_le_bytes(buf[n_off..n_off + 4].try_into().ok()?) as usize;
+    let n_off = PTPL_HEADER_BYTES;
+    let n_raw = u32::from_le_bytes(buf[n_off..n_off + 4].try_into().ok()?) as usize;
+    // **Reviewer H-A (9轮)** — bound n to defend against corrupted / malicious
+    // sidecar (e.g. 0xFFFFFFFF → 100 GB Vec::with_capacity OOM)。
+    let n_byte_capacity = buf.len().saturating_sub(n_off + 4) / 24;
+    let n = n_raw.min(PTPL_MAX_REGISTRANTS).min(n_byte_capacity);
+    if n < n_raw {
+        tracing::warn!(
+            n_raw,
+            n,
+            cap = PTPL_MAX_REGISTRANTS,
+            "PTPL: clamping n_registrants (corrupted or malicious sidecar)"
+        );
+    }
     let mut regs = Vec::with_capacity(n);
     let mut off = n_off + 4;
     for _ in 0..n {

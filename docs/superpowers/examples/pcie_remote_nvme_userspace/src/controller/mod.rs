@@ -928,9 +928,11 @@ impl NvmeController {
             );
         }
         // **Phase L1** — 把 zns_nsids 列表中的 NS 标记为 ZNS。
-        // 教学短化：zone_size = 1 MiB = 2048 LBA at 512B sector，capacity
-        // 与 size 相同（spec 允许 capacity < size 留 metadata 区域）。
-        const ZNS_ZONE_LBAS: u64 = 2048; // 1 MiB at 512B sector
+        // 教学短化：zone_size = 1 MiB 单位 LBA。**注意单位 = NS LBA**：
+        // 默认 lbads=9 (512B) 时 1 MiB = 2048 LBA；若 Format 切到 lbads=12
+        // (4 KiB) 则 zone 物理大小 = 2048 × 4 KiB = 8 MiB（zone_size 数字
+        // 不变，物理字节 = zone_size × ns.block_bytes()）。
+        const ZNS_ZONE_LBAS: u64 = 2048;
         for &nsid in zns_nsids {
             let Some(ns) = namespaces.get_mut(&nsid) else {
                 tracing::warn!(nsid, "--zns-nsid 指定了不存在的 NSID");

@@ -661,7 +661,7 @@ impl NvmeController {
                         let pi_first = ns.pi_first;
                         let block_bytes = ns.block_bytes() as usize;
                         let data_bytes = ns.data_bytes() as usize;
-                        let mut ok = true;
+                        let mut written_count: u32 = 0;
                         let mut last_err: Option<std::io::Error> = None;
                         for i in 0..accum.num_blocks as usize {
                             let lba = accum.slba + i as u64;
@@ -677,11 +677,12 @@ impl NvmeController {
                                 block[data_bytes..data_bytes + 8].copy_from_slice(&tuple_bytes);
                             }
                             if let Err(e) = ns.write_at(&block, lba * block_bytes as u64) {
-                                ok = false;
                                 last_err = Some(e);
                                 break;
                             }
+                            written_count += 1;
                         }
+                        let ok = written_count == accum.num_blocks;
                         if ok {
                             self.stat_host_writes += 1;
                             self.stat_lba_written += accum.num_blocks as u64;
@@ -696,13 +697,35 @@ impl NvmeController {
                             Cqe::success(accum.cid, accum.sq_id, accum.sq_head, phase)
                         } else {
                             let e = last_err.unwrap();
-                            tracing::warn!(error = %e, nsid, slba = accum.slba, "K4c PI Write fail");
+                            tracing::warn!(
+                                error = %e,
+                                nsid,
+                                slba = accum.slba,
+                                written_count,
+                                total = accum.num_blocks,
+                                "K4c PI Write partial fail"
+                            );
+                            // **Reviewer H-B (9轮)** — partial write 处理：
+                            // written_count 个 LBA 已落盘且不能 rollback（rollback
+                            // 本身也可能 fail）；记 SMART + 推进 ZNS WP by partial
+                            // count 让后续 SWR-aware Write 不 fault。spec 没有
+                            // "partial write success" SC，driver 收 DATA_TRANSFER_ERROR
+                            // 后会重试整条 cmd，重叠区域的写入是幂等的（同 data）。
+                            if written_count > 0 {
+                                self.stat_host_writes += 1;
+                                self.stat_lba_written += written_count as u64;
+                                crate::controller::io::advance_zns_wp(
+                                    ns,
+                                    accum.slba,
+                                    written_count,
+                                );
+                            }
                             self.stat_num_err_log_entries += 1;
                             self.push_error_log(
                                 accum.sq_id,
                                 accum.cid,
                                 (sc::DATA_TRANSFER_ERROR as u16) << 1,
-                                accum.slba,
+                                accum.slba + written_count as u64,
                                 nsid,
                             );
                             Cqe::error(
@@ -1270,7 +1293,16 @@ impl NvmeController {
                     match write_action {
                         Some(()) => {
                             // Compare pass → 真 dispatch Write 走 NvmWriteDmaRead /
-                            // dual-PRP / PRP-list 普通路径
+                            // dual-PRP / PRP-list 普通路径。
+                            //
+                            // **Reviewer M-4 (9轮) atomicity 边界条件**：若
+                            // dispatch_io 同步返 Some(error CQE)（如 bounds
+                            // / SC 校验失败），driver 会看到 Compare=success +
+                            // Write=error。spec § 6.2 要求 fused 两条 individual
+                            // CQE 但 atomic 语义需 driver 解释：Write error 后
+                            // 数据**未**写入，下次 driver 应重试整对 fused。
+                            // 这教学版不做 NS-level "inconsistent" mark；真
+                            // production 可加 NS health 标记。
                             if let Some(cqe) = self.dispatch_io(
                                 ctx,
                                 write_sq_id,
