@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-#![allow(dead_code)]
-// Phase K4 deferred — engine ready for real PI Write/Read IO，
-// 见 K4_DESIGN.md. 当前未在 IO 路径调用；保留供未来接入。
+// Reviewer M7：之前 K4 未接入时全模块 #![allow(dead_code)]，K4a/b/c 已上
+// 路；移除 blanket allow，让未来新加 PI helper 真不用时能被 unused-code
+// lint 抓到。
 
 //! T10 DIF (Data Integrity Field) CRC16 + PI tuple 序列化 / 校验。
 //!

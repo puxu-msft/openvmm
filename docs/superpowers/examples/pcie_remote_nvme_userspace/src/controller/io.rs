@@ -71,17 +71,26 @@ pub(crate) fn check_zsa_transition(state: ZoneState, zsa: u8) -> Option<u8> {
     }
 }
 
-/// **Phase L1** — 构造 ZNS Report Zones 响应 buffer (spec ZNS § 4.5.2)。
+/// **Phase L1 + reviewer M1** — 构造 ZNS Report Zones 响应 buffer
+/// (spec ZNS § 4.5.2)。
 ///
 /// 64-byte header + 64-byte * 每 zone descriptor。
+///
+/// 边界：driver 可能传 bytes < 64 来 size-probe。我们：
+/// - 始终返回 `bytes` 字节（spec 要求 buffer 大小完全等于 driver 请求）
+/// - 即使 bytes < 8 也填进截断后的 NZ 字段（driver 至少能看到部分计数）
+/// - report_n 字段反映实际能装下的 zone 数（容纳 driver 用小 buf 试探）
 fn build_zone_report(zns: &ZnsState, start_zone_idx: usize, bytes: usize) -> Vec<u8> {
     let n_zones = zns.zones.len();
     let max_in_buf = if bytes > 64 { (bytes - 64) / 64 } else { 0 };
     let report_n = max_in_buf.min(n_zones.saturating_sub(start_zone_idx));
-    let total = 64 + report_n * 64;
-    let mut buf = vec![0u8; bytes.max(total)];
+    let mut buf = vec![0u8; bytes];
     // Header: bytes 0..8 = NZ (number of zones in this response)
-    buf[0..8].copy_from_slice(&(report_n as u64).to_le_bytes());
+    // 即使 bytes < 8，也要把能写的字节写进去（driver 看到 partial NZ 仍能
+    // 推断 buffer 太小 → 用更大 buf 重试）
+    let nz_bytes = (report_n as u64).to_le_bytes();
+    let nz_len = nz_bytes.len().min(bytes);
+    buf[..nz_len].copy_from_slice(&nz_bytes[..nz_len]);
     // bytes 8..64 reserved
     // Per-zone descriptor @ 64 + i * 64
     for (i, idx) in (start_zone_idx..start_zone_idx + report_n).enumerate() {
@@ -114,8 +123,17 @@ fn build_zone_report(zns: &ZnsState, start_zone_idx: usize, bytes: usize) -> Vec
         buf[off + 24..off + 32].copy_from_slice(&wp_abs.to_le_bytes());
         // bytes 32..64 reserved / vendor
     }
-    buf.truncate(bytes);
     buf
+}
+
+/// Test-only wrapper：保留 `build_zone_report` 私有，但单元测试需要调它。
+#[cfg(test)]
+pub(crate) fn __test_build_zone_report(
+    zns: &ZnsState,
+    start_zone_idx: usize,
+    bytes: usize,
+) -> Vec<u8> {
+    build_zone_report(zns, start_zone_idx, bytes)
 }
 
 impl NvmeController {
@@ -1203,7 +1221,11 @@ impl NvmeController {
                 // = ZRA：0x00 = Report Zones. PRP1 → response buffer。
                 let nsid = sqe.nsid;
                 let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
-                let numd = sqe.cdw12 + 1;
+                // **Reviewer M2** — checked_add 防 cdw12=0xFFFF_FFFF 时
+                // numd 回绕到 0 → bytes=0 silent。
+                let Some(numd) = sqe.cdw12.checked_add(1) else {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                };
                 let bytes = numd as usize * 4;
                 let zra = (sqe.cdw13 & 0xff) as u8;
                 let Some(ns) = self.ns(nsid) else {
@@ -1490,7 +1512,10 @@ impl NvmeController {
                 // byte HOSTID) 而非 24 byte；目前未实现 EDS=1 layout，
                 // reject INVALID_FIELD 比静默返错 layout 安全。
                 let nsid = sqe.nsid;
-                let numd = sqe.cdw10 + 1;
+                // **Reviewer M2** — checked_add 防 NUMD=0xFFFF_FFFF 时回绕。
+                let Some(numd) = sqe.cdw10.checked_add(1) else {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                };
                 let eds = sqe.cdw11 & 0x1 != 0;
                 if eds {
                     tracing::warn!(nsid, "Reservation Report EDS=1 not yet supported");

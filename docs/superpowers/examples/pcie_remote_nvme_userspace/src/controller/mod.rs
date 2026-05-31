@@ -1209,6 +1209,13 @@ impl NvmeController {
         let Some(ns) = self.namespaces.get_mut(&nsid) else {
             return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_NAMESPACE, 0);
         };
+        // **Reviewer M4** — Compare 路径目前仅对非 PI NS 有效（dispatch
+        // 层已拒绝 PI Compare）。如果未来放宽这条 gate，此 assert 会让
+        // bug 立刻显形而不是静默按 4096 vs 4104 byte 比较全 fail。
+        debug_assert!(
+            !ns.pi_enabled(),
+            "compare_finalize: PI NS not supported (dispatch should reject)"
+        );
         match ns
             .file
             .seek(SeekFrom::Start(lba * SECTOR_SIZE))
@@ -1278,6 +1285,7 @@ impl NvmeController {
     /// **Phase M1b** — Interrupt Coalescing (spec § 5.21.1.8)：
     /// - AGGR_THR (0-based) → 每 (thr+1) 个 CQE 累积 fire 一次
     /// - AGGR_TIME (100 us 单位) → 距 last_fire 超时强制 fire
+    ///
     /// 若 driver Set Features 0x08 时 thr=0 + time=0 → 退化为
     /// "fire-on-every-CQE"（原行为）。Admin CQ (cq_id=0) 不参与
     /// coalescing — spec 要求 admin 延迟最小。
@@ -1641,13 +1649,12 @@ impl PcieDevice for NvmeController {
                     } => {
                         // **Reviewer H1** — Append DMA-fail：回滚预占的 WP/state。
                         // 不回滚 zone 会永久错位（下次 Append 写到 hole 后面）。
-                        if let Some(ns) = self.namespaces.get_mut(&p.nsid) {
-                            if let Some(zns) = ns.zns.as_mut() {
-                                if let Some(zone) = zns.zones.get_mut(zone_idx) {
-                                    zone.write_pointer = prev_wp;
-                                    zone.state = prev_state;
-                                }
-                            }
+                        if let Some(ns) = self.namespaces.get_mut(&p.nsid)
+                            && let Some(zns) = ns.zns.as_mut()
+                            && let Some(zone) = zns.zones.get_mut(zone_idx)
+                        {
+                            zone.write_pointer = prev_wp;
+                            zone.state = prev_state;
                         }
                     }
                     _ => {}
@@ -1889,13 +1896,12 @@ impl PcieDevice for NvmeController {
                             tracing::warn!(error = %e, nsid, zone_idx, assigned_lba,
                                 "Zone Append backing failed; rolling back WP/state");
                             // Rollback WP + state（避免下次 Append 落到错位）
-                            if let Some(ns) = self.namespaces.get_mut(&nsid) {
-                                if let Some(zns) = ns.zns.as_mut() {
-                                    if let Some(zone) = zns.zones.get_mut(zone_idx) {
-                                        zone.write_pointer = prev_wp;
-                                        zone.state = prev_state;
-                                    }
-                                }
+                            if let Some(ns) = self.namespaces.get_mut(&nsid)
+                                && let Some(zns) = ns.zns.as_mut()
+                                && let Some(zone) = zns.zones.get_mut(zone_idx)
+                            {
+                                zone.write_pointer = prev_wp;
+                                zone.state = prev_state;
                             }
                             self.stat_num_err_log_entries += 1;
                             self.push_error_log(
@@ -3010,5 +3016,50 @@ mod tests {
         // Unknown ZSA
         assert_eq!(check_zsa_transition(Empty, 0xAA), Some(sc::INVALID_FIELD));
         assert_eq!(check_zsa_transition(Full, 0x00), Some(sc::INVALID_FIELD));
+    }
+
+    /// **Reviewer M1** — Zone Report 边界 buffer：< 64 byte 不丢 header；
+    /// 中等 buffer 容下若干 zones；大 buffer 反映全部。
+    #[test]
+    fn zone_report_buffer_sizing() {
+        use crate::controller::io::__test_build_zone_report;
+        let zns = ZnsState {
+            zone_size: 1024,
+            zone_capacity: 1024,
+            max_open: 0,
+            max_active: 0,
+            zones: (0..4)
+                .map(|i| Zone {
+                    write_pointer: i as u64 * 64,
+                    state: if i == 0 {
+                        ZoneState::Full
+                    } else {
+                        ZoneState::Empty
+                    },
+                })
+                .collect(),
+        };
+        // 太小：bytes=4 → header NZ 截断到 4 字节，driver 仍能解 partial。
+        let buf = __test_build_zone_report(&zns, 0, 4);
+        assert_eq!(buf.len(), 4);
+        // 正好 64 → header full + 0 zones
+        let buf = __test_build_zone_report(&zns, 0, 64);
+        assert_eq!(buf.len(), 64);
+        assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 0);
+        // 64 + 2*64 = 192 → 2 zones
+        let buf = __test_build_zone_report(&zns, 0, 192);
+        assert_eq!(buf.len(), 192);
+        assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 2);
+        // zone 0 = Full
+        assert_eq!(buf[64], 0x02); // ZT
+        assert_eq!(buf[65], 0xE0); // ZS Full
+        // zone 1 = Empty
+        assert_eq!(buf[128 + 1], 0x10); // ZS Empty
+        // 全装下：64 + 4*64 = 320
+        let buf = __test_build_zone_report(&zns, 0, 320);
+        assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 4);
+        // start_zone_idx > total → 0 zones
+        let buf = __test_build_zone_report(&zns, 99, 320);
+        assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 0);
     }
 }
