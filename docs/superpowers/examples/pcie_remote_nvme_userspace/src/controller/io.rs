@@ -519,12 +519,13 @@ impl NvmeController {
                 Some(Cqe::success(cid, sq_id, sq_head, phase))
             }
             nvm_opc::COMPARE => {
-                // **Phase H3** — NVMe NVM CS Spec § 3.3.2 Compare：读 LBA 与
-                // host 提供数据比较。
+                // **Phase H3 + K2** — NVMe NVM CS Spec § 3.3.2 Compare：
+                // 全 3 档 PRP 路径 (≤4K / ≤8K / PRP list 至 MDTS=128K)。
                 let cdw10 = sqe.cdw10;
                 let cdw11 = sqe.cdw11;
                 let cdw12 = sqe.cdw12;
                 let prp1 = sqe.prp1;
+                let prp2 = sqe.prp2;
                 let nsid = sqe.nsid;
                 let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
                 let nlb = (cdw12 & 0xffff) as u32 + 1;
@@ -560,32 +561,126 @@ impl NvmeController {
                         ));
                     }
                 }
-                if bytes > NVME_PAGE_SIZE {
-                    // **reviewer H3 修复**：之前返 success placeholder ——
-                    // 严重数据完整性 bug：driver 跑数据校验时会拿到假阳性
-                    // 'match'，掩盖真实损坏。改返 INVALID_FIELD 让 driver
-                    // 走 chunked 重试或感知 controller capability 不足。
-                    tracing::warn!(
-                        bytes,
-                        "Compare > 4 KiB not implemented; rejecting (INVALID_FIELD)"
+                if bytes <= NVME_PAGE_SIZE {
+                    let tok = ctx.dma_read(prp1, bytes as u32);
+                    self.pending_ios.insert(
+                        tok,
+                        PendingIo {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            nsid,
+                            op: PendingOp::NvmCompareSinglePrp {
+                                lba: slba,
+                                num_blocks: nlb,
+                            },
+                        },
                     );
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
-                }
-                let tok = ctx.dma_read(prp1, bytes as u32);
-                self.pending_ios.insert(
-                    tok,
-                    PendingIo {
-                        sq_id,
-                        cid,
-                        sq_head,
-                        cq_id,
-                        nsid,
-                        op: PendingOp::NvmCompareSinglePrp {
+                } else if bytes <= 2 * NVME_PAGE_SIZE {
+                    // **Phase K2** — 双 PRP Compare 累积
+                    let op_id = self.alloc_op_id();
+                    self.compare_ops.insert(
+                        op_id,
+                        crate::controller::CompareAccum {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            nsid,
                             lba: slba,
                             num_blocks: nlb,
+                            prp1_data: None,
+                            prp2_data: None,
+                            data_pages: Vec::new(),
+                            total_pages: 0,
+                            pages_done: 0,
+                            list_entries: None,
                         },
-                    },
-                );
+                    );
+                    let prp2_bytes = (bytes - NVME_PAGE_SIZE) as u32;
+                    let tok1 = ctx.dma_read(prp1, NVME_PAGE_SIZE as u32);
+                    let tok2 = ctx.dma_read(prp2, prp2_bytes);
+                    self.pending_ios.insert(
+                        tok1,
+                        PendingIo {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            nsid,
+                            op: PendingOp::NvmCompareDualPrp {
+                                op_id,
+                                is_prp1: true,
+                            },
+                        },
+                    );
+                    self.pending_ios.insert(
+                        tok2,
+                        PendingIo {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            nsid,
+                            op: PendingOp::NvmCompareDualPrp {
+                                op_id,
+                                is_prp1: false,
+                            },
+                        },
+                    );
+                } else {
+                    // **Phase K2** — PRP list Compare
+                    let total_pages = bytes.div_ceil(NVME_PAGE_SIZE) as u32;
+                    let mut data_pages: Vec<Option<Vec<u8>>> =
+                        Vec::with_capacity(total_pages as usize);
+                    for _ in 0..total_pages {
+                        data_pages.push(None);
+                    }
+                    let op_id = self.alloc_op_id();
+                    self.compare_ops.insert(
+                        op_id,
+                        crate::controller::CompareAccum {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            nsid,
+                            lba: slba,
+                            num_blocks: nlb,
+                            prp1_data: None,
+                            prp2_data: None,
+                            data_pages,
+                            total_pages,
+                            pages_done: 0,
+                            list_entries: None,
+                        },
+                    );
+                    let tok_list = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+                    self.pending_ios.insert(
+                        tok_list,
+                        PendingIo {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            nsid,
+                            op: PendingOp::NvmComparePrpListFetch { op_id },
+                        },
+                    );
+                    let tok_prp1 = ctx.dma_read(prp1, NVME_PAGE_SIZE as u32);
+                    self.pending_ios.insert(
+                        tok_prp1,
+                        PendingIo {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            nsid,
+                            op: PendingOp::NvmComparePrpListData { op_id, page_idx: 0 },
+                        },
+                    );
+                }
                 None
             }
             nvm_opc::VERIFY => {

@@ -110,6 +110,13 @@ pub(super) enum PendingOp {
     /// NS Identify 结构（含 NSZE/NCAP/FLBAS/DPS），分配新 NSID + RAM
     /// backing。Create 选 SEL=0，新 NSID 在 CQE.cdw0 返。
     AdminNsCreate,
+    /// **Phase K2** — Compare with dual PRP (≤ 2 page)。两段 DMA-read
+    /// 共用 op_id 累积，全到齐后合并 → byte-compare backing。
+    NvmCompareDualPrp { op_id: u64, is_prp1: bool },
+    /// **Phase K2** — Compare PRP list (> 2 page)：先 fetch list 页本身。
+    NvmComparePrpListFetch { op_id: u64 },
+    /// **Phase K2** — Compare PRP list per-page data DMA-read。
+    NvmComparePrpListData { op_id: u64, page_idx: u32 },
 }
 
 /// 双 PRP Write 累积：两段 DMA-read 任一先到都填到 prp1_data/prp2_data；
@@ -128,6 +135,27 @@ pub(super) struct WriteAccum {
     num_blocks: u32,
     prp1_data: Option<Vec<u8>>,
     prp2_data: Option<Vec<u8>>,
+}
+
+/// **Phase K2** — Compare 双 PRP 或 PRP list 累积（与 WriteAccum 同结构
+/// 但语义不同：累积 host 数据后与 backing 比较，不写盘）。
+pub(super) struct CompareAccum {
+    pub(super) sq_id: u16,
+    pub(super) cid: u16,
+    pub(super) sq_head: u16,
+    pub(super) cq_id: u16,
+    pub(super) nsid: u32,
+    pub(super) lba: u64,
+    pub(super) num_blocks: u32,
+    /// dual-PRP 路径：prp1_data + prp2_data；PRP-list 路径：
+    /// data_pages[0..total_pages] 全填 (None = 未到达)。
+    pub(super) prp1_data: Option<Vec<u8>>,
+    pub(super) prp2_data: Option<Vec<u8>>,
+    /// PRP-list 路径用；single/dual-PRP 路径长度 0 不用。
+    pub(super) data_pages: Vec<Option<Vec<u8>>>,
+    pub(super) total_pages: u32,
+    pub(super) pages_done: u32,
+    pub(super) list_entries: Option<Vec<u64>>,
 }
 
 /// **Phase E** — PRP-list IO 累积（Write 或 Read，> 2 page）。
@@ -271,6 +299,8 @@ pub struct NvmeController {
     next_op_id: u64,
     /// **Phase E** — PRP-list IO 累积（Write/Read > 2 page）。
     pub(super) prp_list_ops: HashMap<u64, PrpListOp>,
+    /// **Phase K2** — Compare > 1 page 累积（dual PRP / PRP list）。
+    pub(super) compare_ops: HashMap<u64, CompareAccum>,
     /// 待 dispatch 的 SQE 队列（按 FIFO 顺序），dispatch 是 sync 逻辑但
     /// 触发 DMA 后异步完成。
     sqe_inbox: Vec<(u16, u16, Sqe)>, // (sq_id, sq_head_after_fetch, sqe)
@@ -533,6 +563,7 @@ impl NvmeController {
             dual_prp_writes: HashMap::new(),
             next_op_id: 1,
             prp_list_ops: HashMap::new(),
+            compare_ops: HashMap::new(),
             sqe_inbox: Vec::new(),
             stat_host_reads: 0,
             stat_host_writes: 0,
@@ -636,10 +667,12 @@ impl NvmeController {
         self.pending_ios.clear();
         self.dual_prp_writes.clear();
         self.prp_list_ops.clear();
+        self.compare_ops.clear();
         self.sqe_inbox.clear();
         debug_assert!(self.pending_ios.is_empty());
         debug_assert!(self.dual_prp_writes.is_empty());
         debug_assert!(self.prp_list_ops.is_empty());
+        debug_assert!(self.compare_ops.is_empty());
         // AEN queue 跨 reset 不保留 (NVMe spec § 5.2 "Implicit Aborts on Reset")
         self.aen_pending.clear();
         self.aen_last_err_count = self.stat_num_err_log_entries;
@@ -918,6 +951,72 @@ impl NvmeController {
         });
         while self.error_log.len() > ELPE_MAX {
             self.error_log.pop_front();
+        }
+    }
+
+    /// **Phase K2** — Compare finalize：把 host 数据（prp1 + 可选 prp2）
+    /// 拼起来，读 backing 对比，构造 success / COMPARE_FAILURE CQE。
+    /// dual-PRP 路径 host_prp2 = Some；PRP-list 路径 host_prp1 = 完整
+    /// data，host_prp2 = None。
+    #[allow(clippy::too_many_arguments)]
+    fn compare_finalize(
+        &mut self,
+        nsid: u32,
+        lba: u64,
+        num_blocks: u32,
+        host_prp1: Vec<u8>,
+        host_prp2: Option<Vec<u8>>,
+        cid: u16,
+        sq_id: u16,
+        sq_head: u16,
+        cq_id: u16,
+    ) -> Cqe {
+        let bytes = num_blocks as u64 * SECTOR_SIZE;
+        let mut host_data = host_prp1;
+        if let Some(extra) = host_prp2 {
+            host_data.extend_from_slice(&extra);
+        }
+        host_data.truncate(bytes as usize);
+        let mut backing_buf = vec![0u8; bytes as usize];
+        let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+        let Some(ns) = self.namespaces.get_mut(&nsid) else {
+            return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_NAMESPACE, 0);
+        };
+        match ns
+            .file
+            .seek(SeekFrom::Start(lba * SECTOR_SIZE))
+            .and_then(|_| std::io::Read::read_exact(&mut ns.file, &mut backing_buf))
+        {
+            Ok(()) => {
+                if host_data == backing_buf {
+                    self.stat_host_reads += 1;
+                    self.stat_lba_read += num_blocks as u64;
+                    tracing::debug!(nsid, lba, num_blocks, "Compare multi-PRP OK");
+                    Cqe::success(cid, sq_id, sq_head, phase)
+                } else {
+                    let mismatch_at = host_data
+                        .iter()
+                        .zip(backing_buf.iter())
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(0);
+                    tracing::warn!(
+                        nsid,
+                        lba,
+                        num_blocks,
+                        mismatch_at,
+                        "Compare multi-PRP FAILURE"
+                    );
+                    self.stat_num_err_log_entries += 1;
+                    self.push_error_log(sq_id, cid, (sc::COMPARE_FAILURE as u16) << 1, lba, nsid);
+                    Cqe::error(cid, sq_id, sq_head, phase, sc::COMPARE_FAILURE, 0)
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, nsid, lba, "Compare: backing read failed");
+                self.stat_num_err_log_entries += 1;
+                self.push_error_log(sq_id, cid, (sc::DATA_TRANSFER_ERROR as u16) << 1, lba, nsid);
+                Cqe::error(cid, sq_id, sq_head, phase, sc::DATA_TRANSFER_ERROR, 0)
+            }
         }
     }
 
@@ -1228,6 +1327,18 @@ impl PcieDevice for NvmeController {
                         });
                         self.prp_list_ops.remove(&op_id);
                     }
+                    PendingOp::NvmCompareDualPrp { op_id, .. }
+                    | PendingOp::NvmComparePrpListFetch { op_id }
+                    | PendingOp::NvmComparePrpListData { op_id, .. } => {
+                        // **Phase K2** — Compare 多段 sibling cleanup (同 C1 修复)
+                        self.pending_ios.retain(|_, q| match q.op {
+                            PendingOp::NvmCompareDualPrp { op_id: o, .. }
+                            | PendingOp::NvmComparePrpListFetch { op_id: o }
+                            | PendingOp::NvmComparePrpListData { op_id: o, .. } => o != op_id,
+                            _ => true,
+                        });
+                        self.compare_ops.remove(&op_id);
+                    }
                     PendingOp::NvmReadDualPrpSiblingHalf => {
                         // sibling tok2 (NvmReadDmaWrite) 还在 pending_ios 中；
                         // 移除避免它后续到达时给 driver post success CQE
@@ -1461,6 +1572,111 @@ impl PcieDevice for NvmeController {
                     };
                     let _ = &mut cqe; // suppress unused_mut if no future mutation
                     self.post_cqe(ctx, p.cq_id, cqe);
+                }
+                PendingOp::NvmCompareDualPrp { op_id, is_prp1 } => {
+                    // **Phase K2** — 双 PRP Compare：两段 DMA-read 累积 →
+                    // 合并 → byte-compare backing。
+                    let ready = if let Some(accum) = self.compare_ops.get_mut(&op_id) {
+                        if is_prp1 {
+                            accum.prp1_data = Some(data);
+                        } else {
+                            accum.prp2_data = Some(data);
+                        }
+                        accum.prp1_data.is_some() && accum.prp2_data.is_some()
+                    } else {
+                        tracing::warn!(op_id, "Compare dual-PRP unknown op_id");
+                        false
+                    };
+                    if ready {
+                        let accum = self.compare_ops.remove(&op_id).unwrap();
+                        let cqe = self.compare_finalize(
+                            accum.nsid,
+                            accum.lba,
+                            accum.num_blocks,
+                            accum.prp1_data.unwrap(),
+                            Some(accum.prp2_data.unwrap()),
+                            accum.cid,
+                            accum.sq_id,
+                            accum.sq_head,
+                            accum.cq_id,
+                        );
+                        self.post_cqe(ctx, accum.cq_id, cqe);
+                    }
+                }
+                PendingOp::NvmComparePrpListFetch { op_id } => {
+                    // **Phase K2** — PRP list 页到达，parse + issue per-page
+                    // DMA-read。
+                    let entries = parse_prp_list(&data);
+                    let info: Option<(u32, u32, Vec<u64>)> =
+                        self.compare_ops.get_mut(&op_id).map(|op| {
+                            let take = (op.total_pages - 1) as usize;
+                            let list: Vec<u64> = entries.into_iter().take(take).collect();
+                            op.list_entries = Some(list.clone());
+                            (op.total_pages, op.num_blocks, list)
+                        });
+                    let Some((total_pages, num_blocks, list)) = info else {
+                        tracing::warn!(op_id, "Compare PRP list fetch unknown op_id");
+                        return;
+                    };
+                    let (sq_id, cid, sq_head, cq_id, nsid) = {
+                        let op = &self.compare_ops[&op_id];
+                        (op.sq_id, op.cid, op.sq_head, op.cq_id, op.nsid)
+                    };
+                    let total_bytes = num_blocks as u64 * SECTOR_SIZE;
+                    for (i, gpa) in list.iter().enumerate() {
+                        let page_idx = (i + 1) as u32;
+                        let want_bytes = if page_idx == total_pages - 1 {
+                            let last = total_bytes - (page_idx as u64) * NVME_PAGE_SIZE;
+                            last as u32
+                        } else {
+                            NVME_PAGE_SIZE as u32
+                        };
+                        let tok = ctx.dma_read(*gpa, want_bytes);
+                        self.pending_ios.insert(
+                            tok,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmComparePrpListData { op_id, page_idx },
+                            },
+                        );
+                    }
+                }
+                PendingOp::NvmComparePrpListData { op_id, page_idx } => {
+                    // **Phase K2** — 单页数据到达 → 填 data_pages[page_idx]，
+                    // 全到齐合并 + compare。
+                    let done_all = if let Some(op) = self.compare_ops.get_mut(&op_id) {
+                        op.data_pages[page_idx as usize] = Some(data);
+                        op.pages_done += 1;
+                        op.pages_done == op.total_pages
+                    } else {
+                        tracing::warn!(op_id, page_idx, "Compare PRP list data unknown");
+                        false
+                    };
+                    if done_all {
+                        let op = self.compare_ops.remove(&op_id).unwrap();
+                        let total_bytes = op.num_blocks as u64 * SECTOR_SIZE;
+                        let mut full = Vec::with_capacity(total_bytes as usize);
+                        for b in op.data_pages.iter().flatten() {
+                            full.extend_from_slice(b);
+                        }
+                        full.truncate(total_bytes as usize);
+                        let cqe = self.compare_finalize(
+                            op.nsid,
+                            op.lba,
+                            op.num_blocks,
+                            full,
+                            None,
+                            op.cid,
+                            op.sq_id,
+                            op.sq_head,
+                            op.cq_id,
+                        );
+                        self.post_cqe(ctx, op.cq_id, cqe);
+                    }
                 }
                 PendingOp::NvmReservationCmd {
                     op_kind,
