@@ -647,15 +647,25 @@ impl NvmeController {
                 }
                 let new_pi_type = pi;
                 let new_pi_first = pil == 0; // PIL=0 → first 8, PIL=1 → last 8
-                // **C1 修复**：FORMAT 不能在有 in-flight IO 时执行。否则
-                // outstanding dma_read 完成后 write_all 到已被 truncate 后
-                // 重新分配的 sparse hole，导致 driver 视角"擦除前的写已
-                // 完成"但盘上随机残留 in-flight 写。返 sc=0x84 (Format
-                // In Progress) 让 driver 重试。
-                if !self.pending_ios.is_empty() || !self.dual_prp_writes.is_empty() {
+                // **C1 修复 + Reviewer H-1 (7轮)**：FORMAT 不能在任何 in-flight
+                // IO 时执行。除 pending_ios / dual_prp_writes 外，K2/K4c/O2
+                // 引入的 prp_list_ops / compare_ops / pi_writes / pending_fused
+                // 累积器也都得空 — 否则它们后续完成时会写已被 truncate 的
+                // 文件。
+                let inflight = !self.pending_ios.is_empty()
+                    || !self.dual_prp_writes.is_empty()
+                    || !self.prp_list_ops.is_empty()
+                    || !self.compare_ops.is_empty()
+                    || !self.pi_writes.is_empty()
+                    || !self.pending_fused.is_empty();
+                if inflight {
                     tracing::warn!(
                         pending_ios = self.pending_ios.len(),
                         pending_dual = self.dual_prp_writes.len(),
+                        pending_prp_list = self.prp_list_ops.len(),
+                        pending_compare = self.compare_ops.len(),
+                        pending_pi_writes = self.pi_writes.len(),
+                        pending_fused = self.pending_fused.len(),
                         "Format NVM rejected: IO in flight"
                     );
                     // SC 0x84 Format In Progress (NVMe 1.4 § 4.6.1.2.1)。
@@ -704,15 +714,25 @@ impl NvmeController {
                                 ));
                             }
                         };
+                        // **Reviewer C-2 修正** — set_len(0) 会让 live mmap
+                        // 的 page mapping 越界 → 后续 mmap 访问 SIGBUS。
+                        // 先 drop mmap，truncate 完成后再 rebuild。
+                        ns.mmap = None;
                         if let Err(e) = ns.file.set_len(0).and_then(|_| ns.file.set_len(size)) {
                             tracing::warn!(error = %e, nsid = target_nsid, "Format NVM: truncate failed");
+                            // 失败也尝试 rebuild mmap 以维持一致性
+                            ns.mmap = crate::controller::try_mmap_file(&ns.file);
                             return Some(Cqe::error(cid, 0, sq_head, phase, sc::INTERNAL_ERROR, 0));
                         }
                         use std::io::Write as _;
                         if let Err(e) = ns.file.flush() {
                             tracing::warn!(error = %e, nsid = target_nsid, "Format NVM: flush failed");
+                            ns.mmap = crate::controller::try_mmap_file(&ns.file);
                             return Some(Cqe::error(cid, 0, sq_head, phase, sc::INTERNAL_ERROR, 0));
                         }
+                        // **Reviewer C-2** — rebuild mmap，让后续 read_at/write_at
+                        // 重走零拷贝 fast path。
+                        ns.mmap = crate::controller::try_mmap_file(&ns.file);
                         // **Phase K1** — 应用新 LBAF + PI 配置
                         ns.lbads = new_lbads;
                         ns.meta_size = new_meta_size;

@@ -775,6 +775,20 @@ impl NvmeController {
                             0,
                         ));
                     }
+                    // **Reviewer H-4 (7轮)** — PI 与 ZNS 组合未实现（同 ZONE_APPEND
+                    // 路径的 H8 决定）。这里 NVM WRITE 落到 PI-ZNS NS 上同样拒绝，
+                    // 避免 NvmWritePi / NvmWritePiMulti 完成路径漏 advance_zns_wp。
+                    if ns.zns.is_some() {
+                        tracing::warn!(nsid, "WRITE PI on ZNS NS rejected (K4c+ZNS unimplemented)");
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::INVALID_PROTECTION_INFO,
+                            0,
+                        ));
+                    }
                     if nlb != 1 {
                         // **Phase K4c** — 多 LBA PI Write：data 体积
                         // nlb * 4096，可能跨多个 PRP 页。简化教学路径：

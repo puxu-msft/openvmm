@@ -287,10 +287,13 @@ pub(super) struct Namespace {
     /// 首次 `read_at` / `write_at` 时建立；之后 hot-path 跳过 syscall，
     /// 直接 memcpy from/to mmap slice。失败回退 file IO。
     ///
-    /// 何时 invalidate：Format NVM SES=1 (User Data Erase) 把 file 重写但
-    /// 大小不变 — mmap 仍 valid。Format SES=0 +换 lbads 但不改大小 — 同样
-    /// valid。NS Management Delete 直接 drop Namespace → drop mmap → munmap。
-    /// 若未来支持 NS Resize，必须 drop 并重建 mmap。
+    /// 何时 invalidate (重要)：**任何 in-process file size 变化都必须先
+    /// drop 这个 mmap**，否则 Linux mmap 越界访问 = SIGBUS。具体：
+    /// - Format NVM SES=1/2：admin.rs set_len(0) 前先 `ns.mmap = None`，
+    ///   完成后 try_mmap_file 重建（Reviewer C-2 修复）
+    /// - NS Management Delete：drop Namespace 自动 drop mmap
+    /// - 未来 NS Resize：必须 drop+rebuild
+    /// Format SES=0 不改 size，mmap 仍 valid。
     pub(super) mmap: Option<memmap2::MmapMut>,
     /// LBA 数（按当前 lbads + meta_size 计算 = file_size / block_bytes）。
     pub(super) total_lba: u64,
@@ -503,11 +506,16 @@ impl Namespace {
 /// # Safety
 ///
 /// `MmapMut::map_mut(file)` 是 `unsafe`：要求 file 在 mmap 生命周期内不能
-/// 被其他进程同步 write（page contents 可能不一致）。教学示例的 backing
-/// file 只由本 controller 自己持有 + 单线程访问，前置条件满足。
+/// 被任何路径同步 write 或 truncate（page contents 可能不一致 / SIGBUS）。
+/// 教学示例：
+/// - **外部进程** — backing file 只由本 controller 进程持有；
+/// - **内部** — NvmeController 单线程访问；任何**改变 file size** 的路径
+///   (Format SES=1/2 set_len) **必须先 `ns.mmap = None`** 释放映射，
+///   完成 truncate 后再 try_mmap_file 重建。Reviewer C-2 修复后此契约
+///   在 admin.rs::Format NVM 路径已 enforce。
 pub(super) fn try_mmap_file(file: &File) -> Option<memmap2::MmapMut> {
     // SAFETY: backing file 仅由本进程持有；NvmeController 单线程访问；
-    // 没有其他 writer / mmap，符合 memmap2::MmapMut::map_mut 安全前置条件。
+    // 改 size 的路径已先 drop mmap。符合 memmap2::MmapMut::map_mut 安全前置。
     let mmap = unsafe { memmap2::MmapMut::map_mut(file) };
     match mmap {
         Ok(m) => Some(m),
@@ -1174,7 +1182,15 @@ impl NvmeController {
 
         // **Phase O2** — Fused operation handling (spec § 6.2)。
         // Admin SQ 不支持 fused（spec §6.2 "fused operations are not supported
-        // on Admin Submission Queue"）—— 静默忽略 fuse bits 让普通 dispatch 处理。
+        // on Admin Submission Queue"）—— Reviewer H-5 (7轮)：admin SQ 上 fuse
+        // != 0 必须直接 INVALID_FIELD，不能 silently 走 normal admin dispatch。
+        if is_admin && fuse != 0 {
+            tracing::warn!(fuse, "Fused operation on Admin SQ → INVALID_FIELD");
+            let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+            let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+            self.post_cqe(ctx, cq_id, cqe);
+            return;
+        }
         if !is_admin {
             match fuse {
                 0 => {
@@ -1279,13 +1295,21 @@ impl NvmeController {
                     // 真正 atomic chain 需 PendingOp::NvmFusedCompareThenWrite
                     // 跟踪 pair；留作后续扩展。当前：dispatch 两条独立但顺序
                     // 保证（FIRST 先 dispatch + post CQE，然后 SECOND）。
-                    tracing::info!(
+                    // **Reviewer C-1 修正** — 当前 dispatch 不真做 atomic chain
+                    // （Compare 的 single-PRP 路径返 None async；Write 在 Compare
+                    // 完成前已 dispatch）。所以 IdentifyController.fuses=0 不
+                    // advertise，但保留 dispatcher 路径让 driver / 测试能识别
+                    // fused-pair 协议是 understood。真 atomic chain 需新
+                    // PendingOp::NvmFusedCompareThenWrite 在 Compare 完成时
+                    // 决定是否 dispatch Write（pass=dispatch，fail=COMPARE_FAILURE
+                    // 给 Write 而非真 write）。Tracked as Phase O3 TODO。
+                    tracing::warn!(
                         sq_id,
                         first_cid = first.cid(),
                         second_cid = cid,
                         slba = first_slba,
                         nlb = first_nlb,
-                        "Fused Compare+Write — dispatching sequentially"
+                        "Fused C+W dispatched sequentially (NOT atomic; fuses=0 advertise)"
                     );
                     if let Some(cqe) =
                         self.dispatch_io(ctx, sq_id, first, first.cid(), first_head, cq_id)
@@ -2216,16 +2240,44 @@ impl PcieDevice for NvmeController {
                     self.post_cqe(ctx, p.cq_id, cqe);
                 }
                 PendingOp::NvmWritePiMulti { op_id, page_idx } => {
-                    // **Phase K4c** — 多 LBA PI Write 数据段到达。把数据
-                    // copy 到 accumulator.received 中对应 page；所有 page
-                    // 到齐时按 LBA 切 4096 + compute PI + interleave 写文件。
+                    // **Phase K4c + Reviewer H-3 (7轮)** — 多 LBA PI Write
+                    // 数据段到达。把数据 copy 到 accumulator.received 中
+                    // 对应 page；所有 page 到齐时按 LBA 切 4096 + compute
+                    // PI + interleave 写文件。
                     let Some(accum) = self.pi_writes.get_mut(&op_id) else {
                         tracing::warn!(op_id, "NvmWritePiMulti: unknown op_id");
                         return;
                     };
                     let off = page_idx as usize * NVME_PAGE_SIZE as usize;
-                    let end = (off + data.len()).min(accum.received.len());
-                    accum.received[off..end].copy_from_slice(&data[..end - off]);
+                    // Bounds-check defensively：page_idx 越界 / data 长度异常
+                    // 都立即 abort 整个 op，避免 silent corruption
+                    if off >= accum.received.len() || off + data.len() > accum.received.len() {
+                        tracing::error!(
+                            op_id,
+                            page_idx,
+                            data_len = data.len(),
+                            cap = accum.received.len(),
+                            "K4c PI Write: page out of bounds; aborting op"
+                        );
+                        let accum = self.pi_writes.remove(&op_id).unwrap();
+                        let phase = self.cqs.get(&accum.cq_id).map(|c| c.phase).unwrap_or(1);
+                        let cqe = Cqe::error(
+                            accum.cid,
+                            accum.sq_id,
+                            accum.sq_head,
+                            phase,
+                            sc::DATA_TRANSFER_ERROR,
+                            0,
+                        );
+                        self.post_cqe(ctx, accum.cq_id, cqe);
+                        // 顺便清 sibling tokens（防止 silently 完成）
+                        self.pending_ios.retain(|_, q| {
+                            !matches!(q.op,
+                                PendingOp::NvmWritePiMulti { op_id: o, .. } if o == op_id)
+                        });
+                        return;
+                    }
+                    accum.received[off..off + data.len()].copy_from_slice(&data);
                     accum.pages_done += 1;
                     if accum.pages_done < accum.pages_total {
                         return; // 还有 page 未到，等下一次完成
@@ -2343,14 +2395,15 @@ impl PcieDevice for NvmeController {
                     }
                     let cqe = if let Some(ns) = self.namespaces.get_mut(&nsid) {
                         let sector = SECTOR_SIZE;
-                        // 边界：所有 ranges + 目标都得在 total_lba 内
-                        let mut ok_bounds = sdlba + dst_total <= ns.total_lba;
-                        for &(slba, nlb) in &ranges {
-                            if slba + nlb as u64 > ns.total_lba {
-                                ok_bounds = false;
-                                break;
-                            }
-                        }
+                        // **Reviewer H-2** — checked_add 防 sdlba/slba 来自
+                        // driver / 恶意输入溢出 u64 后绕过 bounds 检查。
+                        let ok_bounds = sdlba
+                            .checked_add(dst_total)
+                            .is_some_and(|e| e <= ns.total_lba)
+                            && ranges.iter().all(|&(slba, nlb)| {
+                                slba.checked_add(nlb as u64)
+                                    .is_some_and(|e| e <= ns.total_lba)
+                            });
                         if !ok_bounds {
                             Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::LBA_OUT_OF_RANGE, 0)
                         } else {
