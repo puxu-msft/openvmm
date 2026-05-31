@@ -173,6 +173,131 @@ pub(crate) fn apply_zsa(zone: &mut crate::controller::Zone, zsa: u8, zone_capaci
     true
 }
 
+/// **Reviewer H-1 + M-2** — 共享 ZNS Write-path guard。NVM_WRITE /
+/// WRITE_ZEROES / WRITE_UNCORRECTABLE 在 ZNS NS 上落到 zone 前都要 enforce
+/// SWR + state + boundary。返回 `Some(cqe)` 表示拒绝，`None` 表示通过。
+///
+/// 通过后调用方应在完成路径（成功 IO 完成后）推进 WP — 见
+/// `mod.rs::on_dma_complete::NvmWriteDmaRead`。
+pub(crate) fn check_zns_write(
+    ns: &crate::controller::Namespace,
+    slba: u64,
+    nlb: u32,
+    cid: u16,
+    sq_id: u16,
+    sq_head: u16,
+    phase: u8,
+) -> Option<Cqe> {
+    let zns = ns.zns.as_ref()?;
+    let zone_idx = (slba / zns.zone_size) as usize;
+    let zone = zns.zones.get(zone_idx)?;
+    let zone_end = (zone_idx as u64 + 1) * zns.zone_size;
+    if slba + nlb as u64 > zone_end {
+        return Some(Cqe::error(
+            cid,
+            sq_id,
+            sq_head,
+            phase,
+            sc::ZONE_BOUNDARY_ERR,
+            sc::SCT_COMMAND_SPECIFIC,
+        ));
+    }
+    match zone.state {
+        ZoneState::ReadOnly => {
+            return Some(Cqe::error(
+                cid,
+                sq_id,
+                sq_head,
+                phase,
+                sc::ZONE_IS_READ_ONLY,
+                sc::SCT_COMMAND_SPECIFIC,
+            ));
+        }
+        ZoneState::Offline => {
+            return Some(Cqe::error(
+                cid,
+                sq_id,
+                sq_head,
+                phase,
+                sc::ZONE_IS_OFFLINE,
+                sc::SCT_COMMAND_SPECIFIC,
+            ));
+        }
+        ZoneState::Full => {
+            return Some(Cqe::error(
+                cid,
+                sq_id,
+                sq_head,
+                phase,
+                sc::ZONE_IS_FULL,
+                sc::SCT_COMMAND_SPECIFIC,
+            ));
+        }
+        _ => {}
+    }
+    let zone_start = zone_idx as u64 * zns.zone_size;
+    let expected_lba = zone_start + zone.write_pointer;
+    if slba != expected_lba {
+        return Some(Cqe::error(
+            cid,
+            sq_id,
+            sq_head,
+            phase,
+            sc::ZONE_INVALID_WRITE,
+            sc::SCT_COMMAND_SPECIFIC,
+        ));
+    }
+    None
+}
+
+/// **Reviewer H-1** — ZNS Read-path guard：Offline zone 拒读
+/// (spec § 2.3.4)。其他 state 允许读（包括 ReadOnly）。
+pub(crate) fn check_zns_read(
+    ns: &crate::controller::Namespace,
+    slba: u64,
+    cid: u16,
+    sq_id: u16,
+    sq_head: u16,
+    phase: u8,
+) -> Option<Cqe> {
+    let zns = ns.zns.as_ref()?;
+    let zone_idx = (slba / zns.zone_size) as usize;
+    let zone = zns.zones.get(zone_idx)?;
+    if matches!(zone.state, ZoneState::Offline) {
+        return Some(Cqe::error(
+            cid,
+            sq_id,
+            sq_head,
+            phase,
+            sc::ZONE_IS_OFFLINE,
+            sc::SCT_COMMAND_SPECIFIC,
+        ));
+    }
+    None
+}
+
+/// **Reviewer H-1** — ZNS Write 成功后推进 WP + Empty/Closed→ImplicitOpen
+/// + WP=capacity→Full。
+///
+/// 在 dispatch 同步成功路径 (WRITE_ZEROES) 与 completion 异步路径
+/// (NvmWriteDmaRead) 共享。
+pub(crate) fn advance_zns_wp(ns: &mut crate::controller::Namespace, lba: u64, nlb: u32) {
+    let Some(zns) = ns.zns.as_mut() else {
+        return;
+    };
+    let zone_size = zns.zone_size;
+    let capacity = zns.zone_capacity;
+    let zone_idx = (lba / zone_size) as usize;
+    if let Some(zone) = zns.zones.get_mut(zone_idx) {
+        zone.write_pointer += nlb as u64;
+        if zone.write_pointer >= capacity {
+            zone.state = ZoneState::Full;
+        } else if matches!(zone.state, ZoneState::Empty | ZoneState::Closed) {
+            zone.state = ZoneState::ImplicitOpen;
+        }
+    }
+}
+
 impl NvmeController {
     /// IO command dispatch。Read/Write 走 DMA。
     pub(super) fn dispatch_io(
@@ -300,6 +425,10 @@ impl NvmeController {
                             0,
                         ));
                     }
+                }
+                // **Reviewer H-1** — ZNS Read：Offline zone 拒绝（其他 state 允许读）
+                if let Some(cqe) = check_zns_read(ns, slba, cid, sq_id, sq_head, phase) {
+                    return Some(cqe);
                 }
                 // 从文件读到 buf（per-NSID）
                 // **Phase K4b** — PI 路径单 LBA：file size = 4096 + 8 = 4104；
@@ -582,73 +711,10 @@ impl NvmeController {
                         ));
                     }
                 }
-                // **Reviewer M-2** — 普通 NVM WRITE 落到 ZNS NS 时必须强制
-                // SWR (Sequential Write Required) + 状态 / 边界检查。
-                // 否则 driver 能用 plain WRITE 绕过 ZONE_APPEND，向 Full/
-                // ReadOnly/Offline zone 写、或乱序写破坏 SWR 语义。
-                if let Some(zns) = ns.zns.as_ref() {
-                    let zone_idx = (slba / zns.zone_size) as usize;
-                    if let Some(zone) = zns.zones.get(zone_idx) {
-                        // 边界：write 不能跨 zone（SWR 要求 single-zone）
-                        let zone_end = (zone_idx as u64 + 1) * zns.zone_size;
-                        if slba + nlb as u64 > zone_end {
-                            return Some(Cqe::error(
-                                cid,
-                                sq_id,
-                                sq_head,
-                                phase,
-                                sc::ZONE_BOUNDARY_ERR,
-                                sc::SCT_COMMAND_SPECIFIC,
-                            ));
-                        }
-                        // 状态：ReadOnly/Offline/Full 拒绝
-                        match zone.state {
-                            ZoneState::ReadOnly => {
-                                return Some(Cqe::error(
-                                    cid,
-                                    sq_id,
-                                    sq_head,
-                                    phase,
-                                    sc::ZONE_IS_READ_ONLY,
-                                    sc::SCT_COMMAND_SPECIFIC,
-                                ));
-                            }
-                            ZoneState::Offline => {
-                                return Some(Cqe::error(
-                                    cid,
-                                    sq_id,
-                                    sq_head,
-                                    phase,
-                                    sc::ZONE_IS_OFFLINE,
-                                    sc::SCT_COMMAND_SPECIFIC,
-                                ));
-                            }
-                            ZoneState::Full => {
-                                return Some(Cqe::error(
-                                    cid,
-                                    sq_id,
-                                    sq_head,
-                                    phase,
-                                    sc::ZONE_IS_FULL,
-                                    sc::SCT_COMMAND_SPECIFIC,
-                                ));
-                            }
-                            _ => {}
-                        }
-                        // SWR：SLBA 必须 = zone_start + WP（顺序写）
-                        let zone_start = zone_idx as u64 * zns.zone_size;
-                        let expected_lba = zone_start + zone.write_pointer;
-                        if slba != expected_lba {
-                            return Some(Cqe::error(
-                                cid,
-                                sq_id,
-                                sq_head,
-                                phase,
-                                sc::ZONE_INVALID_WRITE,
-                                sc::SCT_COMMAND_SPECIFIC,
-                            ));
-                        }
-                    }
+                // **Reviewer M-2 + H-1** — 普通 NVM WRITE 落到 ZNS NS 时必须
+                // 强制 SWR + 状态 + 边界检查（共享 check_zns_write helper）。
+                if let Some(cqe) = check_zns_write(ns, slba, nlb, cid, sq_id, sq_head, phase) {
+                    return Some(cqe);
                 }
                 // 三档 PRP 分流（同 READ 路径）：≤1page / ≤2page / PRP list。
                 if bytes <= NVME_PAGE_SIZE {
@@ -861,6 +927,10 @@ impl NvmeController {
                         ));
                     }
                 }
+                // **Reviewer H-1** — WRITE_ZEROES 在 ZNS NS 上同样守 SWR
+                if let Some(cqe) = check_zns_write(ns, slba, nlb, cid, sq_id, sq_head, phase) {
+                    return Some(cqe);
+                }
                 if is_pi_path {
                     // **Phase K4c + reviewer H3** — PI Write Zeroes：每 LBA 写
                     // zero data + 自 compute PI tuple (Guard=CRC16(zeros)=0,
@@ -932,6 +1002,8 @@ impl NvmeController {
                     remaining -= n;
                     off += n as u64;
                 }
+                // **Reviewer H-1** — 同 plain WRITE：ZNS NS 上 WZ 成功后推进 WP。
+                advance_zns_wp(self.ns_mut(nsid).unwrap(), slba, nlb);
                 Some(Cqe::success(cid, sq_id, sq_head, phase))
             }
             nvm_opc::DSM => {

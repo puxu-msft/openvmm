@@ -1751,26 +1751,10 @@ impl PcieDevice for NvmeController {
                             // Phase F：真 IO 写完成 → 计数。
                             self.stat_host_writes += 1;
                             self.stat_lba_written += num_blocks as u64;
-                            // **Reviewer M-2** — 落到 ZNS NS 时推进 WP +
-                            // 状态 transition（Empty/Closed → ImplicitOpen；
-                            // 到达 capacity → Full）。
-                            if let Some(ns) = self.namespaces.get_mut(&p.nsid)
-                                && let Some(zns) = ns.zns.as_mut()
-                            {
-                                let zone_size = zns.zone_size;
-                                let capacity = zns.zone_capacity;
-                                let zone_idx = (lba / zone_size) as usize;
-                                if let Some(zone) = zns.zones.get_mut(zone_idx) {
-                                    zone.write_pointer += num_blocks as u64;
-                                    if zone.write_pointer >= capacity {
-                                        zone.state = ZoneState::Full;
-                                    } else if matches!(
-                                        zone.state,
-                                        ZoneState::Empty | ZoneState::Closed
-                                    ) {
-                                        zone.state = ZoneState::ImplicitOpen;
-                                    }
-                                }
+                            // **Reviewer M-2 + H-1** — 落到 ZNS NS 时推进 WP
+                            // + 状态 transition（共享 io::advance_zns_wp）。
+                            if let Some(ns) = self.namespaces.get_mut(&p.nsid) {
+                                crate::controller::io::advance_zns_wp(ns, lba, num_blocks);
                             }
                             Cqe::success(p.cid, p.sq_id, p.sq_head, phase)
                         }

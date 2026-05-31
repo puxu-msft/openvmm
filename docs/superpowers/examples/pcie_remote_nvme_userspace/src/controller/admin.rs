@@ -66,9 +66,15 @@ fn build_zns_ns_identify(zns: &ZnsState) -> Vec<u8> {
     buf
 }
 
-/// **Phase L1d** — 构造 CNS 0x06 (I/O Command Set Independent Identify NS)。
+/// **Phase L1d (修正后)** — 构造 CNS 0x08 (I/O Command Set Independent
+/// Identify Namespace) 4 KiB 数据。**之前 commit 误用 CNS 0x06 (Reviewer
+/// C-1 修正)** — CNS 0x06 实际是 "specific Controller for I/O CS"，与 NS
+/// 无关；NS-level command-set-agnostic descriptor 在 NVMe 2.0 spec 是
+/// CNS 0x08。
+///
 /// 抽成纯函数便于 unit test 字段 offset 和 RESCAP 与 CNS 0x00 的 spec
-/// 一致性约束。spec 见 NVMe 2.0 § 5.17.2.6 Figure 281。
+/// 一致性约束。spec 见 NVMe 2.0 § 5.17.2 (Identify Namespace - CSI
+/// Independent)。
 pub(crate) fn build_cs_indep_ns_identify() -> Vec<u8> {
     let mut buf = vec![0u8; 4096];
     buf[0] = 0x00; // NSFEAT
@@ -191,10 +197,24 @@ impl NvmeController {
                         }
                     }
                     0x06 => {
-                        // **Phase L1d + reviewer H-L1d-1/2** — Identify Namespace
-                        // I/O Command Set Independent (spec NVMe 2.0 § 5.17.2.6
-                        // Figure 281)。委托 build_cs_indep_ns_identify 纯函数
-                        // (单测覆盖字段 offset + RESCAP cross-CNS 一致性)。
+                        // **Reviewer C-1 修正** — CNS 0x06 是 "Identify
+                        // Controller for the specific I/O Command Set"
+                        // (spec NVMe 2.0 § 5.17.2.7 + in-tree nvme_spec::Cns
+                        // SPECIFIC_CONTROLLER_IO_COMMAND_SET = 0x6)，**不是**
+                        // NS Identify。CDW11 bits 31:24 = CSI。
+                        //
+                        // 我们的 ZNS controller 与 NVM controller 行为一样
+                        // （同一 SQ/CQ stack），CSI-specific controller 字段
+                        // (ZASL 等) 留 0 让 driver 走默认 MDTS。
+                        // 非 ZNS CSI 也返零 buffer。
+                        vec![0u8; 4096]
+                    }
+                    0x08 => {
+                        // **Phase L1d 修正后** — CNS 0x08 = I/O Command Set
+                        // Independent Identify Namespace (spec NVMe 2.0
+                        // § 5.17.2.8)。这才是 NS-level command-set-agnostic
+                        // descriptor，含 NSFEAT/NMIC/RESCAP/FPI/NSTAT。
+                        // （之前 commit 误用 CNS 0x06。）
                         if self.ns(nsid).is_none() {
                             return Some(Cqe::error(
                                 cid,
@@ -1131,14 +1151,14 @@ impl NvmeController {
                 Some(Cqe::success(cid, 0, sq_head, phase))
             }
             opc => {
-                tracing::warn!(
-                    opc,
-                    "unsupported admin opcode; returning success to keep driver alive"
-                );
-                // 返 success 而非 INVALID_OPCODE：很多 driver 在
-                // boot 期会探测可选 opcode，遇 INVALID_OPCODE 会进入 fallback
-                // 路径或直接 fail device。返 success（CQE cdw0=0）通常更安全。
-                Some(Cqe::success(cid, 0, sq_head, phase))
+                // **Reviewer C-2 修正** — spec § 3.3.3.2.1：未识别 opcode
+                // 必须返 INVALID_OPCODE (0x01)，否则 driver 在探测 opcode
+                // 时会被 'success+cdw0=0' 误导，可能基于幻觉的副作用继续
+                // 操作。INVALID_OPCODE 是 NVMe driver 的正常路径，不会
+                // fail device — Linux nvme_set_features / Windows
+                // nvme_query_directive 都把它视为 'feature 不支持'。
+                tracing::warn!(opc, "unsupported admin opcode → INVALID_OPCODE");
+                Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_OPCODE, 0))
             }
         }
     }
