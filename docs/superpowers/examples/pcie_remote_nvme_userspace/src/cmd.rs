@@ -89,6 +89,16 @@ pub mod admin_opc {
     /// 真做 polling（vsock 模型用 MMIO 已 OK），返 success 让 driver
     /// 满意。
     pub const DOORBELL_BUFFER_CONFIG: u8 = 0x7c;
+    /// **Phase L4** — Directive Send (NVMe 1.3+，spec § 5.10)。Driver
+    /// 控制 controller 特定行为（如 Stream Identifier）。
+    pub const DIRECTIVE_SEND: u8 = 0x19;
+    /// **Phase L4** — Directive Receive (spec § 5.9)。读 controller
+    /// directives 状态。
+    pub const DIRECTIVE_RECEIVE: u8 = 0x1a;
+    /// **Phase L5** — Virtualization Management (NVMe 1.3+，spec § 5.24)。
+    pub const VIRTUALIZATION_MGMT: u8 = 0x1c;
+    /// **Phase L5** — Get LBA Status (NVMe 1.4+，spec § 5.15)。
+    pub const GET_LBA_STATUS: u8 = 0x1e;
 }
 
 /// **Phase H1** — Feature Identifier (NVMe spec § 5.21.1 Table 134)。
@@ -384,7 +394,10 @@ impl IdentifyController {
             .with_firmware_activate_firmware_download(true)
             .with_self_test(true)
             .with_ns_management(true) // Phase K3
-            .with_doorbell_buffer_config(true); // Phase K6
+            .with_doorbell_buffer_config(true) // Phase K6
+            .with_directives(true) // Phase L4
+            .with_get_lba_status(true) // Phase L5
+            .with_security_send_security_receive(true); // Phase L5
         // **Phase K5** — SANICAP：bit 0 CES Crypto Erase / bit 1 BES Block
         // Erase / bit 2 OWS Overwrite (spec § 5.17.2.2)。NDI / NODMMAS 留 0。
         id.sanicap = 0b0000_0111u32;

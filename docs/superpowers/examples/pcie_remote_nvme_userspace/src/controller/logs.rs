@@ -126,6 +126,77 @@ pub(super) fn build_reservation_notification(_c: &NvmeController, bytes: usize) 
     buf
 }
 
+/// **Phase L2** — Log Page 0x09 Endurance Group Information (spec § 5.16.1.9)。
+///
+/// 512 字节，per endurance group。我们只有 1 个 endurance group (id=1)，
+/// 字段大多为 0：no critical warnings, no data tracked。
+pub(super) fn build_endurance_group(_c: &NvmeController, bytes: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; bytes.max(512)];
+    buf[2] = 100; // available_spare = 100%
+    buf[3] = 10; // available_spare_threshold
+    buf.truncate(bytes);
+    buf
+}
+
+/// **Phase L2** — Log Page 0x0A Predictable Latency Per NVM Set (spec § 5.16.1.10)。
+pub(super) fn build_predictable_latency_nvmset(_c: &NvmeController, bytes: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; bytes.max(512)];
+    buf.truncate(bytes);
+    buf
+}
+
+/// **Phase L2** — Log Page 0x0B Predictable Latency Event Aggregate (spec § 5.16.1.11)。
+pub(super) fn build_predictable_latency_event(_c: &NvmeController, bytes: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; bytes.max(8)];
+    buf.truncate(bytes);
+    buf
+}
+
+/// **Phase L2** — Log Page 0x0C Asymmetric Namespace Access (spec § 5.16.1.13)。
+///
+/// 16 byte header + per-ANA group descriptor。我们 1 controller，1 ANA group
+/// containing 所有 NS，state = Optimized (0x01)。
+pub(super) fn build_ana_log(c: &NvmeController, bytes: usize) -> Vec<u8> {
+    let mut nsids: Vec<u32> = c.namespaces.keys().copied().collect();
+    nsids.sort();
+    let n_nsid = nsids.len() as u32;
+    let total = 16 + 32 + 4 * (n_nsid as usize);
+    let mut buf = vec![0u8; bytes.max(total)];
+    // Header
+    // bytes 0..8 = change count (incrementing). 用 1 (stable)
+    buf[0..8].copy_from_slice(&1u64.to_le_bytes());
+    // bytes 8..12 = number of ANA Group Descriptors = 1
+    buf[8..12].copy_from_slice(&1u32.to_le_bytes());
+    // ANA Group Descriptor @ offset 16
+    let off = 16;
+    // bytes 0..4 of descriptor = ANA Group ID = 1
+    buf[off..off + 4].copy_from_slice(&1u32.to_le_bytes());
+    // bytes 4..8 = NumNSID
+    buf[off + 4..off + 8].copy_from_slice(&n_nsid.to_le_bytes());
+    // bytes 8..16 = Change Count = 1
+    buf[off + 8..off + 16].copy_from_slice(&1u64.to_le_bytes());
+    // byte 16 = ANA State = 1 (Optimized)
+    buf[off + 16] = 0x01;
+    // bytes 17..32 reserved
+    // NSID list @ offset 16+32
+    for (i, n) in nsids.iter().enumerate() {
+        let no = 16 + 32 + i * 4;
+        if no + 4 > buf.len() {
+            break;
+        }
+        buf[no..no + 4].copy_from_slice(&n.to_le_bytes());
+    }
+    buf.truncate(bytes);
+    buf
+}
+
+/// **Phase L2** — Log Page 0x0F Endurance Group Event Aggregate (spec § 5.16.1.12)。
+pub(super) fn build_endurance_group_event(_c: &NvmeController, bytes: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; bytes.max(8)];
+    buf.truncate(bytes);
+    buf
+}
+
 /// **Phase K7** — Log Page 0x07 Telemetry Host-Initiated (spec § 5.16.1.10)。
 ///
 /// 512 字节 header + per-area data blocks。Telemetry 是 controller 内部

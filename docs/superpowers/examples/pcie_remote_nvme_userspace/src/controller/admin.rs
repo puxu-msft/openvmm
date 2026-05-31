@@ -221,6 +221,25 @@ impl NvmeController {
                         self.features.insert(fid, cdw11);
                         tracing::info!(ps, "Set Features Power Management");
                     }
+                    cmd::fid::INTERRUPT_COALESCING => {
+                        // **Phase M1** — spec § 5.21.1.8。cdw11 bits 7:0 =
+                        // AGGR_THR (0-based)，bits 15:8 = AGGR_TIME (100 us)。
+                        self.irq_aggr_threshold = (cdw11 & 0xff) as u8;
+                        self.irq_aggr_time = ((cdw11 >> 8) & 0xff) as u8;
+                        self.features.insert(fid, cdw11);
+                        tracing::info!(
+                            thr = self.irq_aggr_threshold,
+                            time_100us = self.irq_aggr_time,
+                            "Set Features Interrupt Coalescing"
+                        );
+                    }
+                    cmd::fid::INTERRUPT_VECTOR_CONFIG => {
+                        // spec § 5.21.1.9。cdw11 bits 15:0 = IV, bit 16 = CD
+                        // (Coalescing Disable for this vector)。存进 features
+                        // map，driver 真要 per-vector control 时再实现。
+                        self.features.insert(fid, cdw11);
+                        tracing::debug!(cdw11, "Set Features Interrupt Vector Config");
+                    }
                     cmd::fid::VOLATILE_WRITE_CACHE => {
                         // VWC bit 0 = WCE (Write Cache Enable)。我们 backing
                         // file 始终有 host page cache → WCE 实际不可关；
@@ -356,8 +375,13 @@ impl NvmeController {
                     0x06 => super::logs::build_self_test(self, bytes),
                     0x07 => super::logs::build_telemetry_host(self, bytes),
                     0x08 => super::logs::build_telemetry_ctrl(self, bytes),
+                    0x09 => super::logs::build_endurance_group(self, bytes),
+                    0x0a => super::logs::build_predictable_latency_nvmset(self, bytes),
+                    0x0b => super::logs::build_predictable_latency_event(self, bytes),
+                    0x0c => super::logs::build_ana_log(self, bytes),
                     0x0d => super::logs::build_persistent_event(self, bytes),
                     0x0e => super::logs::build_lba_status_info(self, bytes),
+                    0x0f => super::logs::build_endurance_group_event(self, bytes),
                     0x80 => super::logs::build_reservation_notification(self, bytes),
                     0x81 => super::logs::build_sanitize_status(self, bytes),
                     _ => {
@@ -773,12 +797,78 @@ impl NvmeController {
                 tracing::debug!(cid, "Namespace Attachment (no-op success)");
                 Some(Cqe::success(cid, 0, sq_head, phase))
             }
-            admin_opc::SECURITY_SEND | admin_opc::SECURITY_RECEIVE => {
-                // NVMe spec § 5.27/5.28 Security Send/Receive。我们没 TCG
-                // OPAL / Sanitize 安全协议；返 INVALID_OPCODE 让 driver
-                // 直接放弃（比 success 更安全：避免 driver 误以为命令完成）。
-                tracing::debug!(cid, opc = sqe.opcode(), "Security cmd (INVALID_OPCODE)");
-                Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_OPCODE, 0))
+            admin_opc::SECURITY_SEND => {
+                // **Phase L5** — NVMe spec § 5.27 Security Send。TCG OPAL /
+                // NVMe Security Protocols 通过此命令传 SP-specific 命令。
+                // 我们不实现 TCG 状态机：CDW10 bits 23:16 = SECP (security
+                // protocol)；对 SECP=0x00 (Information) accept；其他返
+                // INVALID_FIELD。
+                let secp = ((sqe.cdw10 >> 16) & 0xff) as u8;
+                tracing::debug!(secp, "Security Send (educational stub)");
+                if secp == 0 {
+                    Some(Cqe::success(cid, 0, sq_head, phase))
+                } else {
+                    Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0))
+                }
+            }
+            admin_opc::SECURITY_RECEIVE => {
+                // **Phase L5** — spec § 5.28 Security Receive。SECP=0x00 时
+                // 返 Security Protocol List：3 byte header + N byte protocol
+                // IDs。我们仅声明 0x00 (Info) + 0xEF (TCG 占位 / 实际不实现)。
+                let secp = ((sqe.cdw10 >> 16) & 0xff) as u8;
+                let alloc = (sqe.cdw11 & 0xffff) as usize;
+                let bytes = alloc.max(8);
+                if secp == 0 {
+                    let mut buf = vec![0u8; bytes];
+                    // bytes 0..6 reserved
+                    // bytes 6..8 = LIST LENGTH (big endian) = 2 (number of bytes following)
+                    buf[6] = 0;
+                    buf[7] = 2;
+                    // bytes 8..N = supported protocol IDs
+                    if bytes > 9 {
+                        buf[8] = 0x00; // Info
+                        buf[9] = 0xEF; // TCG OPAL (declared, not really impl)
+                    }
+                    self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, 0, sq_head, cq_id);
+                    None
+                } else {
+                    Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0))
+                }
+            }
+            admin_opc::DIRECTIVE_SEND => {
+                // **Phase L4** — Directive Send (spec § 5.10)。CDW10 = numd-1,
+                // CDW11 = doper (Directive Operation) + dtype, CDW12 = dspec。
+                // Stream Identifier directive (dtype=1) doper:
+                //   1 = Enable Directive
+                //   2 = Release Identifier
+                //   3 = Release Resources
+                // 教学：返 success 接受 driver 配置；我们不真分流 Stream。
+                let doper = (sqe.cdw11 & 0xff) as u8;
+                let dtype = ((sqe.cdw11 >> 8) & 0xff) as u8;
+                tracing::debug!(doper, dtype, "Directive Send (no-op success)");
+                Some(Cqe::success(cid, 0, sq_head, phase))
+            }
+            admin_opc::DIRECTIVE_RECEIVE => {
+                // **Phase L4** — Directive Receive (spec § 5.9)。返 PRP1 4 KiB
+                // 全 0 = "no directives currently enabled"。
+                let buf = vec![0u8; 4096];
+                self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, 0, sq_head, cq_id);
+                None
+            }
+            admin_opc::VIRTUALIZATION_MGMT => {
+                // **Phase L5** — Virtualization Management (spec § 5.24)。
+                // 我们不实现 SR-IOV / VF resource alloc；返 INVALID_FIELD
+                // 让 driver fallback。
+                tracing::debug!(cid, "Virtualization Mgmt (INVALID_FIELD)");
+                Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0))
+            }
+            admin_opc::GET_LBA_STATUS => {
+                // **Phase L5** — Get LBA Status (spec § 5.15)。CDW10/11 = SLBA,
+                // CDW12 bits 31:16 = NDR (max ranges)。返 4 KiB 'no error
+                // LBAs' (NLSD=0)。
+                let buf = vec![0u8; 4096];
+                self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, 0, sq_head, cq_id);
+                None
             }
             admin_opc::SANITIZE => {
                 // **Phase K5** — NVMe spec § 5.26 Sanitize。CDW10 字段：

@@ -359,6 +359,12 @@ pub struct NvmeController {
     /// 修改；Identify Controller .psd[N] 描述每个 state（spec § 5.17.2.2）。
     pub(super) current_ps: u8,
 
+    // ----- Phase M1: Interrupt Coalescing (spec § 5.21.1.8) -----
+    /// AGGR_TIME (8 bit, 100 us units) — 中断聚合最大延迟。0 = no coalesce。
+    pub(super) irq_aggr_time: u8,
+    /// AGGR_THR (8 bit) — Aggregation Threshold (0-based, 实际 = 值 + 1)。
+    pub(super) irq_aggr_threshold: u8,
+
     // ----- 配置 -----
     vid: u16,
     ssvid: u16,
@@ -554,6 +560,8 @@ impl NvmeController {
             doorbell_shadow_gpa: 0,
             doorbell_event_idx_gpa: 0,
             current_ps: 0,
+            irq_aggr_time: 0,
+            irq_aggr_threshold: 0,
             vid,
             ssvid,
             msix_count: 4, // admin (vec 0) + IO (vec 1) + 2 spare
@@ -652,6 +660,9 @@ impl NvmeController {
         self.doorbell_event_idx_gpa = 0;
         // K8: power state 重置到 PS0
         self.current_ps = 0;
+        // M1: interrupt coalescing 重置默认（无 coalesce）
+        self.irq_aggr_time = 0;
+        self.irq_aggr_threshold = 0;
         self.state = CtrlState::Disabled;
         self.csts &= !csts::RDY;
     }
