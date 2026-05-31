@@ -1320,3 +1320,36 @@ reviewer 发现：
   release：每 commit 全清
 - Hyper-V e2e：deploy 后 controller 成功 vsock-connect VTL2 → guest
   Windows 真 IO（每 commit 都跑过 run_nvme_e2e_phase_ef.ps1）
+
+### Phase G rust-reviewer 第二轮修复 (commit 079aabab)
+
+第一轮 Phase G commit (97a59465) 后 reviewer 发现两条 **CRITICAL**：
+- C1：tick 完成后 `self_test=Some{stc:0,pct:100}` 每秒重 fire AEN，4 秒消
+  耗掉 driver 所有预投 AER
+- C2：admin abort 把 `last_result=0x09`，下次 tick 走完成分支强制覆写=0，
+  抹掉 abort 标记 + 发 spurious 'Self-Test Completed' AEN
+
+重构方案：`SelfTestState` 拆成 `SelfTestInProgress`（仅 in-progress 时
+Some）+ `SelfTestCompleted`（最近一次结果快照）。tick 用 `.take()` 把
+状态从 in_progress 移走 → 下次 tick 整个分支不再进；abort 路径也走
+take() + 把 result 写进 last。
+
+附带修：H1 Self-Test Log STC 不再硬编码 short（用 last.stc）+ test 加
+extended/aborted case；H2 删 `#[allow(dead_code)]`；H3 Reservation log
+返 64-byte 固定占位；H4 Self-Test Log 字段 offset 错位（POH/NSID/Failing
+LBA 偏移 1 字节被改对）；M3 push_error_log admin 失败 nsid=0xFFFF_FFFF；
+LOW tick f64→整数 + aen_pending tuple 减字段。
+
+### Hyper-V e2e 部分验证
+
+deploy commit 079aabab 后 PSDirect IO 测试未跑通（"credential invalid"，
+guest 用户密码不匹配 — 与 Phase G 代码无关的环境问题）。但 controller
+本身：
+- vsock 成功 connect VTL2 (Hello/HelloAck 交换)
+- 之前 Phase F 之前的 commit 在同 VM 上已多次跑通完整 partition + format
+  + 文件读写 + FLUSH（见 commit 4fe6bec1）
+
+Phase E/F/G 的正确性由单测充分覆盖（7/7 pass + clippy --tests -D warnings
+干净 + MSVC cross-build release 干净）。e2e 中验证 PRP list 路径需要 guest
+issue > 8 KiB 单次 IO（NTFS large file copy），SMART 验证需要 Get-
+StorageReliabilityCounter；这两条留 USER_TODO（需先解决 guest 凭据）。
