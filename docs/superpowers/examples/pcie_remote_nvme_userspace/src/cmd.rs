@@ -140,6 +140,14 @@ pub mod nvm_opc {
     pub const DSM: u8 = 0x09;
     /// Verify (NVMe 2.0 NVM CS § 3.3.10)。
     pub const VERIFY: u8 = 0x0c;
+    /// **Phase H6** — Reservation Register (NVM CS § 8.19.3 / spec § 6.13)。
+    pub const RESERVATION_REGISTER: u8 = 0x0d;
+    /// Reservation Report (spec § 6.14)。
+    pub const RESERVATION_REPORT: u8 = 0x0e;
+    /// Reservation Acquire (spec § 6.11)。
+    pub const RESERVATION_ACQUIRE: u8 = 0x11;
+    /// Reservation Release (spec § 6.15)。
+    pub const RESERVATION_RELEASE: u8 = 0x15;
 }
 
 /// CQE.SC (Status Code) — Generic Command Status (NVMe spec 1.4 § 4.6.1.2.1).
@@ -161,6 +169,9 @@ pub mod sc {
     /// Phase H4：Invalid Namespace or Format — NVMe spec § 6.1 当 IO
     /// 命令带未注册 NSID 时返。
     pub const INVALID_NAMESPACE: u8 = 0x0b;
+    /// **Phase H6** — Reservation 相关 SC (NVM CS § 4.1)。
+    /// Reservation Conflict — 命令与现有 reservation 冲突。
+    pub const RESERVATION_CONFLICT: u8 = 0x83;
 }
 
 /// Submission Queue Entry — 64 bytes 固定。
@@ -373,12 +384,13 @@ impl IdentifyController {
         id.nn = nn;
         // ONCS — NVM optional command support。Phase D 后 Dataset
         // Management (DSM/TRIM) / Write Zeroes / Verify 都已 dispatch。
-        // Phase H3：Compare 也已真实现（≤ 1 page 路径）。Copy 暂不支持。
+        // Phase H3：Compare 真实现。Phase H6：Reservations 真实现。
         id.oncs = nvme_spec::Oncs::new()
             .with_dataset_management(true)
             .with_write_zeroes(true)
             .with_verify(true)
-            .with_compare(true);
+            .with_compare(true)
+            .with_reservations(true);
         // VWC.bit0 = present → driver 主动发 NVM FLUSH (opc 0x00) 拿持久化
         // 承诺；我们 FLUSH handler 调 sync_all() 落盘。
         id.vwc = nvme_spec::VolatileWriteCache::new().with_present(true);
@@ -455,6 +467,16 @@ impl IdentifyNamespace {
             .with_ms(0)
             .with_lbads(9) // 2^9 = 512 byte sector
             .with_rp(0);
+        // **Phase H6** — RESCAP (spec § 5.17.2.1 Figure 274) reservation
+        // capabilities：bit 0 PTPL persist through power loss（我们不持
+        // 久化所以 0），bits 1-7 supported types。我们实现 type 1 (Write
+        // Exclusive) + type 2 (Exclusive Access) + Registrants-Only 变体
+        // (3/4)，简化不实现 All-Registrants (5/6)。RESCAP byte:
+        //   bit 1 = Write Exclusive (type 1)
+        //   bit 2 = Exclusive Access (type 2)
+        //   bit 3 = Write Excl. Registrants Only (type 3)
+        //   bit 4 = Excl. Access Registrants Only (type 4)
+        ns.rescap = 0b0001_1110u8.into();
         ns.as_bytes().to_vec()
     }
 }

@@ -585,6 +585,77 @@ impl NvmeController {
                     0,
                 ))
             }
+            nvm_opc::RESERVATION_REGISTER => {
+                // **Phase H6** — NVMe spec § 6.13 Reservation Register。
+                // CDW10 bits 2:0 = RREGA (Register Action: 0=register key,
+                //                       1=unregister, 2=replace)
+                //          bit 3 = IEKEY (ignore existing key — 不校验 CRKEY)
+                //          bits 31:30 = CPTPL (persist through power loss)
+                // PRP1 → 16-byte buffer: CRKEY (8 byte) + NRKEY (8 byte)。
+                self.dispatch_reservation_cmd(
+                    ctx,
+                    sqe,
+                    cid,
+                    sq_id,
+                    sq_head,
+                    cq_id,
+                    phase,
+                    crate::controller::ReservationKind::Register,
+                )
+            }
+            nvm_opc::RESERVATION_ACQUIRE => {
+                // **Phase H6** — spec § 6.11。CDW10 bits 2:0 = RACQA
+                //   0 = Acquire, 1 = Preempt, 2 = Preempt and Abort
+                //   bits 15:8 = RTYPE (reservation type 1..6)
+                // PRP1 → 16 byte: CRKEY + PRKEY (preempted key)
+                self.dispatch_reservation_cmd(
+                    ctx,
+                    sqe,
+                    cid,
+                    sq_id,
+                    sq_head,
+                    cq_id,
+                    phase,
+                    crate::controller::ReservationKind::Acquire,
+                )
+            }
+            nvm_opc::RESERVATION_RELEASE => {
+                // **Phase H6** — spec § 6.15。CDW10 bits 2:0 = RRELA
+                //   0 = Release, 1 = Clear（释放所有 reservations）
+                //   bits 15:8 = RTYPE
+                // PRP1 → 8 byte: CRKEY
+                self.dispatch_reservation_cmd(
+                    ctx,
+                    sqe,
+                    cid,
+                    sq_id,
+                    sq_head,
+                    cq_id,
+                    phase,
+                    crate::controller::ReservationKind::Release,
+                )
+            }
+            nvm_opc::RESERVATION_REPORT => {
+                // **Phase H6** — spec § 6.14。返回 Reservation Status Data
+                // Structure（spec § 6.14 Figure 197）— 64-byte header +
+                // 24-byte * 每 registrant。CDW10 = NUMD (dwords - 1)。
+                let nsid = sqe.nsid;
+                let numd = sqe.cdw10 + 1;
+                let bytes = numd as usize * 4;
+                let Some(ns) = self.ns(nsid) else {
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_NAMESPACE,
+                        0,
+                    ));
+                };
+                let buf = build_reservation_report(ns, bytes);
+                self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, sq_id, sq_head, cq_id);
+                None
+            }
             opc => {
                 tracing::warn!(opc, "unsupported NVM opcode");
                 Some(Cqe::error(
@@ -598,4 +669,93 @@ impl NvmeController {
             }
         }
     }
+
+    /// **Phase H6** — Reservation Register/Acquire/Release 共用入口：
+    /// 先 NSID 校验 → DMA-read PRP1 → 完成回调按 op_kind 修 ns.reservation。
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_reservation_cmd(
+        &mut self,
+        ctx: &mut DeviceCtx<'_>,
+        sqe: Sqe,
+        cid: u16,
+        sq_id: u16,
+        sq_head: u16,
+        cq_id: u16,
+        phase: u8,
+        kind: crate::controller::ReservationKind,
+    ) -> Option<Cqe> {
+        let nsid = sqe.nsid;
+        if self.ns(nsid).is_none() {
+            return Some(Cqe::error(
+                cid,
+                sq_id,
+                sq_head,
+                phase,
+                sc::INVALID_NAMESPACE,
+                0,
+            ));
+        }
+        let action = (sqe.cdw10 & 0x7) as u8;
+        let rtype = ((sqe.cdw10 >> 8) & 0xff) as u8;
+        // 所有三个 cmd 数据 buffer 都 ≤ 16 byte，单 PRP1 足够。
+        let bytes = match kind {
+            crate::controller::ReservationKind::Release => 8u32,
+            _ => 16u32,
+        };
+        let tok = ctx.dma_read(sqe.prp1, bytes);
+        self.pending_ios.insert(
+            tok,
+            crate::controller::PendingIo {
+                sq_id,
+                cid,
+                sq_head,
+                cq_id,
+                nsid,
+                op: crate::controller::PendingOp::NvmReservationCmd {
+                    op_kind: kind,
+                    action,
+                    rtype,
+                },
+            },
+        );
+        None
+    }
+}
+
+/// **Phase H6** — 构造 Reservation Status Data Structure (spec § 6.14)。
+/// 64-byte header + 24-byte * 每 registrant（spec REGCTL 字段）。
+pub(super) fn build_reservation_report(ns: &crate::controller::Namespace, bytes: usize) -> Vec<u8> {
+    let n_reg = ns.registrants.len() as u16;
+    let total = 64 + (n_reg as usize) * 24;
+    let mut buf = vec![0u8; bytes.max(total)];
+    // header @ 0..64
+    // GEN (Generation, 4 byte LE) @ 0..4：每次 reservation 状态变化 +1，
+    // 简化用 registrants count 作单调代理。
+    buf[0..4].copy_from_slice(&(n_reg as u32).to_le_bytes());
+    // RTYPE @ 4：当前 reservation type，无则 0
+    buf[4] = ns.reservation.map(|(_, t)| t).unwrap_or(0);
+    // REGCTL @ 5..7：注册 host 数
+    buf[5..7].copy_from_slice(&n_reg.to_le_bytes());
+    // bytes 7..24 reserved；24..32 reserved
+    // Each registrant @ 64 + i*24
+    for (i, &rkey) in ns.registrants.iter().enumerate() {
+        let off = 64 + i * 24;
+        if off + 24 > buf.len() {
+            break;
+        }
+        // CNTLID (2 byte) — 我们单 controller 用 1
+        buf[off..off + 2].copy_from_slice(&1u16.to_le_bytes());
+        // RCSTS (1 byte) — bit 0 = holds reservation
+        let holds = ns
+            .reservation
+            .is_some_and(|(holder_key, _)| holder_key == rkey);
+        buf[off + 2] = if holds { 0x01 } else { 0x00 };
+        // bytes 3..8 reserved
+        // HOSTID (8 byte) — 简化用 rkey 复用
+        buf[off + 8..off + 16].copy_from_slice(&rkey.to_le_bytes());
+        // RKEY @ off+16..off+24
+        buf[off + 16..off + 24].copy_from_slice(&rkey.to_le_bytes());
+    }
+    buf.truncate(bytes);
+    buf
 }

@@ -95,6 +95,15 @@ pub(super) enum PendingOp {
     /// **Phase H5** — Firmware Image Download chunk DMA-read 完成。
     /// `offset_bytes` = byte offset into fw_download_buf。
     AdminFwDownloadChunk { offset_bytes: u32 },
+    /// **Phase H6** — Reservation 命令 DMA-read 完成。
+    /// `rrega/racqa/rrela` 是 spec cdw10 bits 2:0（Register/Acquire/Release
+    /// Action）；`rtype` 是 cdw10 bits 15:8 reservation type。统一变体
+    /// 让完成回调按 op_kind 分流。
+    NvmReservationCmd {
+        op_kind: ReservationKind,
+        action: u8,
+        rtype: u8,
+    },
 }
 
 /// 双 PRP Write 累积：两段 DMA-read 任一先到都填到 prp1_data/prp2_data；
@@ -164,6 +173,19 @@ pub(super) struct Namespace {
     /// Backing 文件路径 — 仅供日志 / Identify Namespace 扩展用。
     #[allow(dead_code)]
     pub(super) path: String,
+    /// **Phase H6** — 已注册的 host (HOSTID + RKEY) → 注册时间索引顺序。
+    /// 简化：单 controller 模型下 host 由 64-bit reservation key 唯一标识。
+    /// 真硬件 multi-host 用 HOSTID（NVMe 2.0 spec § 6.13 推荐 16-byte）。
+    pub(super) registrants: Vec<u64>,
+    /// 当前 reservation 持有者的 key + type。None = unowned。
+    /// Type 编码（spec § 8.19.1）：
+    ///   1 = Write Exclusive
+    ///   2 = Exclusive Access
+    ///   3 = Write Exclusive Registrants Only
+    ///   4 = Exclusive Access Registrants Only
+    ///   5 = Write Exclusive All Registrants
+    ///   6 = Exclusive Access All Registrants
+    pub(super) reservation: Option<(u64, u8)>,
 }
 
 /// NVMe Controller 主结构 — 实现 `PcieDevice`。
@@ -286,6 +308,14 @@ struct FetchCtx {
     start_slot: u32,
 }
 
+/// **Phase H6** — Reservation 命令类别（分流完成回调）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReservationKind {
+    Register,
+    Acquire,
+    Release,
+}
+
 /// **Phase G** — Device Self-Test 状态机（NVMe spec § 5.11 + § 5.16.1.6）。
 ///
 /// **设计**：把"进行中"和"最后一次结果"分开，避免 G reviewer 发现的
@@ -379,6 +409,8 @@ impl NvmeController {
                     file,
                     total_lba,
                     path: path.clone(),
+                    registrants: Vec::new(),
+                    reservation: None,
                 },
             );
         }
@@ -649,6 +681,200 @@ impl NvmeController {
     // dispatch_admin moved to controller/admin.rs (H6 reviewer split)
 
     // dispatch_io moved to controller/io.rs (H6 split)
+
+    /// **Phase H6** — 处理 Reservation Register/Acquire/Release 数据。
+    ///
+    /// 数据格式（spec § 6.13/6.11/6.15）：
+    /// - Register: 16 byte = CRKEY (8) + NRKEY (8)
+    /// - Acquire:  16 byte = CRKEY (8) + PRKEY (8)
+    /// - Release:   8 byte = CRKEY (8)
+    ///
+    /// 简化的 host model：单 controller，host 由 8-byte rkey 唯一标识；
+    /// 真硬件用 16-byte HOSTID + rkey 组合（spec § 6.13 Connect cmd）。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn apply_reservation_cmd(
+        &mut self,
+        nsid: u32,
+        kind: ReservationKind,
+        action: u8,
+        rtype: u8,
+        data: &[u8],
+        cid: u16,
+        sq_id: u16,
+        sq_head: u16,
+        phase: u8,
+    ) -> Cqe {
+        let Some(ns) = self.namespaces.get_mut(&nsid) else {
+            return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_NAMESPACE, 0);
+        };
+        let read_u64 = |buf: &[u8], off: usize| {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&buf[off..off + 8]);
+            u64::from_le_bytes(a)
+        };
+        match kind {
+            ReservationKind::Register => {
+                if data.len() < 16 {
+                    return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                }
+                let crkey = read_u64(data, 0);
+                let nrkey = read_u64(data, 8);
+                match action {
+                    0 => {
+                        // Register: 注册 nrkey 为本 host 的 key。要求 host 之前
+                        // 未注册（避免重复）。
+                        if ns.registrants.contains(&nrkey) {
+                            tracing::warn!(
+                                nsid,
+                                nrkey,
+                                "Reservation Register: key already registered"
+                            );
+                            return Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::RESERVATION_CONFLICT,
+                                0,
+                            );
+                        }
+                        ns.registrants.push(nrkey);
+                        tracing::info!(nsid, nrkey, "Reservation Register OK");
+                    }
+                    1 => {
+                        // Unregister: 移除 crkey（若 crkey 还持有 reservation
+                        // 也一并清）。
+                        ns.registrants.retain(|&k| k != crkey);
+                        if let Some((holder, _)) = ns.reservation
+                            && holder == crkey
+                        {
+                            ns.reservation = None;
+                        }
+                        tracing::info!(nsid, crkey, "Reservation Unregister OK");
+                    }
+                    2 => {
+                        // Replace: 把 crkey 替换为 nrkey
+                        if let Some(pos) = ns.registrants.iter().position(|&k| k == crkey) {
+                            ns.registrants[pos] = nrkey;
+                            if let Some((holder, t)) = ns.reservation
+                                && holder == crkey
+                            {
+                                ns.reservation = Some((nrkey, t));
+                            }
+                        } else {
+                            return Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::RESERVATION_CONFLICT,
+                                0,
+                            );
+                        }
+                        tracing::info!(nsid, crkey, nrkey, "Reservation Replace OK");
+                    }
+                    _ => return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0),
+                }
+            }
+            ReservationKind::Acquire => {
+                if data.len() < 16 {
+                    return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                }
+                let crkey = read_u64(data, 0);
+                let prkey = read_u64(data, 8);
+                if !ns.registrants.contains(&crkey) {
+                    tracing::warn!(nsid, crkey, "Acquire: crkey not registered");
+                    return Cqe::error(cid, sq_id, sq_head, phase, sc::RESERVATION_CONFLICT, 0);
+                }
+                if !(1..=6).contains(&rtype) {
+                    return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                }
+                match action {
+                    0 => {
+                        // Acquire: 仅当无 reservation 时成功
+                        if ns.reservation.is_some() {
+                            return Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::RESERVATION_CONFLICT,
+                                0,
+                            );
+                        }
+                        ns.reservation = Some((crkey, rtype));
+                        tracing::info!(nsid, crkey, rtype, "Reservation Acquire OK");
+                    }
+                    1 | 2 => {
+                        // Preempt (+ optional Abort)。spec 复杂；简化：若
+                        // 当前 holder == prkey 则替换，否则失败。
+                        if let Some((holder, _)) = ns.reservation
+                            && holder != prkey
+                        {
+                            return Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::RESERVATION_CONFLICT,
+                                0,
+                            );
+                        }
+                        ns.reservation = Some((crkey, rtype));
+                        tracing::info!(nsid, crkey, prkey, rtype, "Reservation Preempt OK");
+                    }
+                    _ => return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0),
+                }
+            }
+            ReservationKind::Release => {
+                if data.len() < 8 {
+                    return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                }
+                let crkey = read_u64(data, 0);
+                match action {
+                    0 => {
+                        // Release：仅当本 host 持有时清
+                        match ns.reservation {
+                            Some((holder, t)) if holder == crkey && t == rtype => {
+                                ns.reservation = None;
+                                tracing::info!(nsid, crkey, "Reservation Release OK");
+                            }
+                            _ => {
+                                return Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::RESERVATION_CONFLICT,
+                                    0,
+                                );
+                            }
+                        }
+                    }
+                    1 => {
+                        // Clear：全 NS 所有 reservation 清空（spec 通常仅
+                        // 当前 holder 可调）
+                        if let Some((holder, _)) = ns.reservation
+                            && holder != crkey
+                        {
+                            return Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::RESERVATION_CONFLICT,
+                                0,
+                            );
+                        }
+                        ns.reservation = None;
+                        tracing::info!(nsid, "Reservation Clear OK");
+                    }
+                    _ => return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0),
+                }
+            }
+        }
+        Cqe::success(cid, sq_id, sq_head, phase)
+    }
 
     /// 分配单调递增的 op_id（独立于 SDK DMA token），用于关联多段
     /// DMA 完成回调（双 PRP / PRP list 等）。
@@ -1365,6 +1591,20 @@ impl PcieDevice for NvmeController {
                     let cqe = Cqe::success(p.cid, p.sq_id, p.sq_head, phase);
                     self.post_cqe(ctx, p.cq_id, cqe);
                 }
+                PendingOp::NvmReservationCmd {
+                    op_kind,
+                    action,
+                    rtype,
+                } => {
+                    // **Phase H6** — reservation cmd 数据已 DMA-read 到 `data`
+                    // (16 byte 或 8 byte)；按 op_kind 修 ns.reservation 状态。
+                    let cq = self.cqs.get(&p.cq_id);
+                    let phase = cq.map(|c| c.phase).unwrap_or(1);
+                    let cqe = self.apply_reservation_cmd(
+                        p.nsid, op_kind, action, rtype, &data, p.cid, p.sq_id, p.sq_head, phase,
+                    );
+                    self.post_cqe(ctx, p.cq_id, cqe);
+                }
                 PendingOp::NvmCompareSinglePrp { lba, num_blocks } => {
                     // **Phase H3** — host buffer 已 DMA-read 到 `data`；
                     // 读 backing file 对应 LBA 范围 → byte-compare。
@@ -2007,5 +2247,34 @@ mod tests {
         assert_eq!(&buf[16..24], b"newrev1 ");
         // FRS[slot 3] @ offset 24..32
         assert_eq!(&buf[24..32], b"newrev2 ");
+    }
+
+    /// Phase H6：Reservation Register/Acquire/Release 状态机校验。
+    #[test]
+    fn reservation_state_machine() {
+        let mut c = make_ctrl_with_tmp("rsv");
+        let nsid = 1u32;
+        // 提取 CQE 的 SC byte（spec dw3 bits 17..25）
+        let sc = |cqe: &Cqe| -> u8 { ((cqe.dw3 >> 17) & 0xff) as u8 };
+        // Register host A with rkey=0x1001
+        let mut buf = vec![0u8; 16];
+        buf[8..16].copy_from_slice(&0x1001u64.to_le_bytes()); // NRKEY
+        let cqe = c.apply_reservation_cmd(nsid, ReservationKind::Register, 0, 0, &buf, 0, 0, 0, 1);
+        assert_eq!(sc(&cqe), 0, "Register OK");
+        assert_eq!(c.namespaces[&nsid].registrants, vec![0x1001]);
+        // Acquire WriteExclusive (type=1)
+        let mut buf = vec![0u8; 16];
+        buf[0..8].copy_from_slice(&0x1001u64.to_le_bytes()); // CRKEY
+        let cqe = c.apply_reservation_cmd(nsid, ReservationKind::Acquire, 0, 1, &buf, 0, 0, 0, 1);
+        assert_eq!(sc(&cqe), 0, "Acquire OK");
+        assert_eq!(c.namespaces[&nsid].reservation, Some((0x1001, 1)));
+        // Second Acquire 应失败 (RESERVATION_CONFLICT)
+        let cqe = c.apply_reservation_cmd(nsid, ReservationKind::Acquire, 0, 1, &buf, 0, 0, 0, 1);
+        assert_eq!(sc(&cqe), crate::cmd::sc::RESERVATION_CONFLICT);
+        // Release
+        let buf = 0x1001u64.to_le_bytes().to_vec();
+        let cqe = c.apply_reservation_cmd(nsid, ReservationKind::Release, 0, 1, &buf, 0, 0, 0, 1);
+        assert_eq!(sc(&cqe), 0, "Release OK");
+        assert_eq!(c.namespaces[&nsid].reservation, None);
     }
 }
