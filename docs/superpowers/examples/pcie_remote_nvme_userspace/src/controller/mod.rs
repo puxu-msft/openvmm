@@ -269,6 +269,53 @@ pub(super) struct Namespace {
     /// 单调递增（即使 unregister 也 +1），driver 用此感知 state 变化。
     /// spec § 6.14。
     pub(super) reservation_gen: u32,
+    /// **Phase L1** — Zoned Namespace 状态（None = 普通 NVM NS，Some = ZNS）。
+    /// ZNS NS 的 CSI=0x02，Identify NS CNS=0x05 返 ZNS-specific 字段；
+    /// Read/Write 必须遵循 SWR（Sequential Write Required）。
+    pub(super) zns: Option<ZnsState>,
+}
+
+/// **Phase L1** — ZNS (Zoned Namespace) 状态（spec ZNS CS § 4）。
+pub(super) struct ZnsState {
+    /// 单 zone 容纳 LBA 数（典型 256 MiB / 512 = 524288 LBA，本教学小
+    /// 化为 256 LBA = 128 KiB）。
+    pub(super) zone_size: u64,
+    /// 单 zone 可写 LBA 数（≤ zone_size；spec 留 capacity 给 metadata）。
+    pub(super) zone_capacity: u64,
+    /// Max Active Zones / Max Open Zones 限制（0 = 无限）。
+    /// 未来 ZoneAppend 真 enforce 这些限制（spec ZNS § 2.2）。
+    #[allow(dead_code)]
+    pub(super) max_open: u32,
+    #[allow(dead_code)]
+    pub(super) max_active: u32,
+    /// per-zone 状态。zones[i] 对应 LBA 范围 [i*zone_size, (i+1)*zone_size)。
+    pub(super) zones: Vec<Zone>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ZoneState {
+    /// Empty — WP = start, never written
+    Empty,
+    /// Implicit Open — 写后未 explicit close/finish
+    ImplicitOpen,
+    /// Explicit Open — 通过 Zone Mgmt Send Open 转入
+    ExplicitOpen,
+    /// Closed — 写后被 close，但未 finish；后续可重新 open
+    Closed,
+    /// Full — WP == zone_capacity，不可再 Write
+    Full,
+    /// Read Only / Offline — Zone Mgmt Send Reset/Offline 触发
+    /// (ReadOnly 留 future faulted-media simulation 路径)
+    #[allow(dead_code)]
+    ReadOnly,
+    Offline,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Zone {
+    /// Write Pointer，相对 zone 起点 (0..=zone_capacity)。Full 时 = capacity。
+    pub(super) write_pointer: u64,
+    pub(super) state: ZoneState,
 }
 
 impl Namespace {
@@ -540,7 +587,12 @@ impl NvmeController {
     /// `backing_files`：每个文件成为一个 namespace（NSID 1, 2, ...）。
     /// 文件大小决定该 NS 容量（÷ 512 round down 到 LBA 数）。
     /// Phase H4：之前接受单 path string；现在 slice，至少 1 个。
-    pub fn open(backing_files: &[String], vid: u16, ssvid: u16) -> anyhow::Result<Self> {
+    pub fn open(
+        backing_files: &[String],
+        vid: u16,
+        ssvid: u16,
+        zns_nsids: &[u32],
+    ) -> anyhow::Result<Self> {
         if backing_files.is_empty() {
             return Err(anyhow::anyhow!("at least one --backing-file required"));
         }
@@ -585,8 +637,36 @@ impl NvmeController {
                     registrants: Vec::new(),
                     reservation: None,
                     reservation_gen: 0,
+                    zns: None,
                 },
             );
+        }
+        // **Phase L1** — 把 zns_nsids 列表中的 NS 标记为 ZNS。
+        // 教学短化：zone_size = 1 MiB = 2048 LBA at 512B sector，capacity
+        // 与 size 相同（spec 允许 capacity < size 留 metadata 区域）。
+        const ZNS_ZONE_LBAS: u64 = 2048; // 1 MiB at 512B sector
+        for &nsid in zns_nsids {
+            let Some(ns) = namespaces.get_mut(&nsid) else {
+                tracing::warn!(nsid, "--zns-nsid 指定了不存在的 NSID");
+                continue;
+            };
+            let total = ns.total_lba;
+            let zone_size = ZNS_ZONE_LBAS.min(total.max(1));
+            let n_zones = total.div_ceil(zone_size);
+            let zones: Vec<Zone> = (0..n_zones)
+                .map(|_| Zone {
+                    write_pointer: 0,
+                    state: ZoneState::Empty,
+                })
+                .collect();
+            ns.zns = Some(ZnsState {
+                zone_size,
+                zone_capacity: zone_size,
+                max_open: 0,
+                max_active: 0,
+                zones,
+            });
+            tracing::info!(nsid, zone_size, n_zones, "ZNS NS enabled");
         }
         Ok(Self {
             namespaces,
@@ -1710,6 +1790,7 @@ impl PcieDevice for NvmeController {
                                                 registrants: Vec::new(),
                                                 reservation: None,
                                                 reservation_gen: 0,
+                                                zns: None,
                                             },
                                         );
                                         let mut c = Cqe::success(p.cid, p.sq_id, p.sq_head, phase);
@@ -2272,7 +2353,8 @@ mod tests {
         let f = std::fs::File::create(&path).unwrap();
         f.set_len(1024 * 1024).unwrap(); // 1 MiB → 2048 LBA
         drop(f);
-        let c = NvmeController::open(&[path.to_str().unwrap().to_string()], 0x1414, 0).unwrap();
+        let c =
+            NvmeController::open(&[path.to_str().unwrap().to_string()], 0x1414, 0, &[]).unwrap();
         // 不能立即 remove —— Windows 上仍持有的 File 句柄被删后导致后续操作
         // 失败；Unix 下 unlink-while-open 没问题但为可移植性也 keep。测试
         // 结束 OS tempdir 清理（best-effort）。
@@ -2464,7 +2546,7 @@ mod tests {
             p1.to_str().unwrap().to_string(),
             p2.to_str().unwrap().to_string(),
         ];
-        let c = NvmeController::open(&paths, 0x1414, 0).unwrap();
+        let c = NvmeController::open(&paths, 0x1414, 0, &[]).unwrap();
         assert_eq!(c.namespaces.len(), 2);
         assert!(c.namespaces.contains_key(&1));
         assert!(c.namespaces.contains_key(&2));
@@ -2577,5 +2659,28 @@ mod tests {
             bad_pi.verify(bad_data, lba, 1),
             crate::pi::PiCheck::GuardFail
         );
+    }
+
+    /// Phase L1：ZNS NS 初始化 + zone state 默认值。
+    #[test]
+    fn zns_namespace_init() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "nvme_test_zns_{}_{:?}.img",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(8 * 1024 * 1024).unwrap(); // 8 MiB = 16384 LBA at 512B
+        drop(f);
+        let paths = vec![path.to_str().unwrap().to_string()];
+        let c = NvmeController::open(&paths, 0x1414, 0, &[1]).unwrap();
+        let zns = c.namespaces[&1].zns.as_ref().unwrap();
+        // 8 MiB / 1 MiB per zone = 8 zones
+        assert_eq!(zns.zones.len(), 8);
+        assert_eq!(zns.zone_size, 2048);
+        assert_eq!(zns.zone_capacity, 2048);
+        assert!(zns.zones.iter().all(|z| z.state == ZoneState::Empty));
+        assert!(zns.zones.iter().all(|z| z.write_pointer == 0));
     }
 }

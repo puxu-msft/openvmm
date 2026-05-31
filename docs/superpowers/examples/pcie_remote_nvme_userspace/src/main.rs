@@ -58,6 +58,13 @@ struct Args {
     /// 文件大小决定 NS 容量（÷ 512 round down 到 LBA 数）。
     #[arg(long = "backing-file", value_delimiter = ',', num_args = 1..)]
     backing_files: Vec<String>,
+    /// **Phase L1** — 把指定 NSID 列表标记为 ZNS namespace (Zoned)。
+    /// 例：`--zns-nsid 2 --zns-nsid 3` 让 NS 2/3 走 ZNS Command Set，
+    /// 受 Sequential Write Required 约束。每 zone 1 MiB (= 2048 LBA at
+    /// 512B sector / 256 LBA at 4 KiB sector)，教学短化。NSID 1 默认
+    /// 保留为普通 NVM 让 driver 可走 enumerate flow。
+    #[arg(long = "zns-nsid", value_delimiter = ',', num_args = 0..)]
+    zns_nsids: Vec<u32>,
     /// PCI Vendor ID（默认 0x1414 = Microsoft，配合 OpenHCL 的 default 路由）。
     #[arg(long, default_value_t = 0x1414)]
     vid: u16,
@@ -122,7 +129,8 @@ fn run_main(args: Args) -> Result<()> {
             tracing::info!("connected; spawning NvmeController");
 
             // 每次重连重新 open file（让 hot-reconnect 也能切换 backing）
-            let device = NvmeController::open(&args.backing_files, args.vid, args.ssvid)?;
+            let device =
+                NvmeController::open(&args.backing_files, args.vid, args.ssvid, &args.zns_nsids)?;
             let opts = RunOptions {
                 tick_interval: Duration::from_secs(60),
                 read_timeout: Duration::from_secs(60),

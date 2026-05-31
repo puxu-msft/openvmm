@@ -187,6 +187,15 @@ pub mod sc {
     pub const SANITIZE_IN_PROGRESS: u8 = 0x12;
     pub const SELF_TEST_IN_PROGRESS: u8 = 0x1d;
     pub const FORMAT_IN_PROGRESS: u8 = 0x84;
+    /// **Phase L1** — ZNS Command Set Specific status codes (spec ZNS § 5)。
+    /// SC bytes appear in CQE.dw3 SF.SC，SCT=0x02 Command Specific：
+    pub const ZONE_BOUNDARY_ERR: u8 = 0xB8;
+    pub const ZONE_IS_FULL: u8 = 0xB9;
+    pub const ZONE_IS_READ_ONLY: u8 = 0xBA;
+    pub const ZONE_IS_OFFLINE: u8 = 0xBB;
+    pub const ZONE_INVALID_WRITE: u8 = 0xBC;
+    pub const TOO_MANY_ACTIVE_ZONES: u8 = 0xBD;
+    pub const TOO_MANY_OPEN_ZONES: u8 = 0xBE;
     /// Phase H3：Compare Failure — Media/Data Integrity 类 (SCT=0x02)。
     /// NVM CS spec § 4.1。CQE 的 Status Field 编码：bits 15:1 包括
     /// `SCT(11:9) | SC(8:1)`；本常量是 SC byte，SCT 在 Cqe::error 还需

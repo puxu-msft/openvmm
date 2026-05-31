@@ -13,11 +13,60 @@ use crate::controller::PendingIo;
 use crate::controller::PendingOp;
 use crate::controller::SECTOR_SIZE;
 use crate::controller::WriteAccum;
+use crate::controller::ZnsState;
+use crate::controller::ZoneState;
 use crate::regs::*;
 use pcie_remote_userspace_sdk::*;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
+
+/// **Phase L1** — 构造 ZNS Report Zones 响应 buffer (spec ZNS § 4.5.2)。
+///
+/// 64-byte header + 64-byte * 每 zone descriptor。
+fn build_zone_report(zns: &ZnsState, start_zone_idx: usize, bytes: usize) -> Vec<u8> {
+    let n_zones = zns.zones.len();
+    let max_in_buf = if bytes > 64 { (bytes - 64) / 64 } else { 0 };
+    let report_n = max_in_buf.min(n_zones.saturating_sub(start_zone_idx));
+    let total = 64 + report_n * 64;
+    let mut buf = vec![0u8; bytes.max(total)];
+    // Header: bytes 0..8 = NZ (number of zones in this response)
+    buf[0..8].copy_from_slice(&(report_n as u64).to_le_bytes());
+    // bytes 8..64 reserved
+    // Per-zone descriptor @ 64 + i * 64
+    for (i, idx) in (start_zone_idx..start_zone_idx + report_n).enumerate() {
+        let zone = &zns.zones[idx];
+        let off = 64 + i * 64;
+        if off + 64 > buf.len() {
+            break;
+        }
+        // byte 0: ZT (Zone Type) — 2 = Sequential Write Required
+        buf[off] = 0x02;
+        // byte 1: ZS (Zone State) bits 7:4
+        buf[off + 1] = match zone.state {
+            ZoneState::Empty => 0x10,
+            ZoneState::ImplicitOpen => 0x20,
+            ZoneState::ExplicitOpen => 0x30,
+            ZoneState::Closed => 0x40,
+            ZoneState::ReadOnly => 0xD0,
+            ZoneState::Full => 0xE0,
+            ZoneState::Offline => 0xF0,
+        };
+        // byte 2: ZA (Zone Attributes) — 0
+        // byte 3 reserved
+        // bytes 8..16: ZCAP (Zone Capacity)
+        buf[off + 8..off + 16].copy_from_slice(&zns.zone_capacity.to_le_bytes());
+        // bytes 16..24: ZSLBA (Zone Start LBA)
+        let zslba = (idx as u64) * zns.zone_size;
+        buf[off + 16..off + 24].copy_from_slice(&zslba.to_le_bytes());
+        // bytes 24..32: WP (Write Pointer，绝对 LBA)
+        let wp_abs = zslba + zone.write_pointer;
+        buf[off + 24..off + 32].copy_from_slice(&wp_abs.to_le_bytes());
+        // bytes 32..64 reserved / vendor
+    }
+    buf.truncate(bytes);
+    buf
+}
 
 impl NvmeController {
     /// IO command dispatch。Read/Write 走 DMA。
@@ -103,7 +152,11 @@ impl NvmeController {
                     // 单 4 KiB 只能装 1 个 LBA，driver 用多 LBA 必发 ≥ 2 page
                     // = dual-PRP / PRP-list 路径才能传完整 data；这里
                     // single-PRP entry 已最大 1 LBA。
-                    tracing::warn!(nsid, nlb, "PI multi-LBA path requires dual-PRP/PRP-list, not yet impl");
+                    tracing::warn!(
+                        nsid,
+                        nlb,
+                        "PI multi-LBA path requires dual-PRP/PRP-list, not yet impl"
+                    );
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
                 let total_lba = ns.total_lba;
@@ -612,7 +665,12 @@ impl NvmeController {
                         {
                             tracing::warn!(error = %e, nsid, lba, "WZ PI write fail");
                             return Some(Cqe::error(
-                                cid, sq_id, sq_head, phase, sc::DATA_TRANSFER_ERROR, 0,
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::DATA_TRANSFER_ERROR,
+                                0,
                             ));
                         }
                     }
@@ -898,10 +956,7 @@ impl NvmeController {
                         let (data_slice, tuple_slice) = if pi_first {
                             (&block[8..8 + data_bytes], &block[0..8])
                         } else {
-                            (
-                                &block[0..data_bytes],
-                                &block[data_bytes..data_bytes + 8],
-                            )
+                            (&block[0..data_bytes], &block[data_bytes..data_bytes + 8])
                         };
                         let tuple_arr: [u8; 8] = tuple_slice.try_into().unwrap();
                         let pi = crate::pi::PiTuple::from_bytes(&tuple_arr);
@@ -909,13 +964,7 @@ impl NvmeController {
                         if let Some(sc_code) = check.to_sc() {
                             tracing::warn!(nsid, lba, ?check, "Verify PI FAIL");
                             self.stat_num_err_log_entries += 1;
-                            self.push_error_log(
-                                sq_id,
-                                cid,
-                                (sc_code as u16) << 1,
-                                lba,
-                                nsid,
-                            );
+                            self.push_error_log(sq_id, cid, (sc_code as u16) << 1, lba, nsid);
                             return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_code, 0));
                         }
                     }
@@ -923,23 +972,214 @@ impl NvmeController {
                 }
                 Some(Cqe::success(cid, sq_id, sq_head, phase))
             }
-            nvm_opc::ZONE_MGMT_SEND | nvm_opc::ZONE_MGMT_RECEIVE | nvm_opc::ZONE_APPEND => {
-                // **Phase L1** — ZNS opcodes 已识别。我们 NS 全是 NVM 命名
-                // 空间（CSI=0），无 ZNS NS → 返 SC=0x2A 'Zone Boundary Error'
-                // 简化版（spec 真应该返 SC=0xBE 'I/O Command Set Not Supported'
-                // for non-ZNS NS）。完整 ZNS 实现见 ZNS_DESIGN.md，需独立
-                // example 或大重构。
-                let opc = sqe.opcode();
+            nvm_opc::ZONE_MGMT_SEND => {
+                // **Phase L1** — Zone Management Send (ZNS CS § 4.4)。
+                // CDW10/11 = SLBA (zone 起点)；CDW13 bits 7:0 = ZSA
+                // (Zone Send Action)：
+                //   0x01 Close, 0x02 Finish, 0x03 Open, 0x04 Reset, 0x05 Offline
                 let nsid = sqe.nsid;
-                tracing::debug!(opc, nsid, "ZNS opcode (no ZNS NS)");
-                Some(Cqe::error(
-                    cid,
-                    sq_id,
-                    sq_head,
-                    phase,
-                    sc::INVALID_OPCODE,
-                    0,
-                ))
+                let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
+                let zsa = (sqe.cdw13 & 0xff) as u8;
+                let Some(ns) = self.ns_mut(nsid) else {
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_NAMESPACE,
+                        0,
+                    ));
+                };
+                let Some(zns) = ns.zns.as_mut() else {
+                    tracing::warn!(nsid, "Zone Mgmt Send: not a ZNS NS");
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_OPCODE,
+                        0,
+                    ));
+                };
+                let zone_idx = (slba / zns.zone_size) as usize;
+                if zone_idx >= zns.zones.len() {
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::LBA_OUT_OF_RANGE,
+                        0,
+                    ));
+                }
+                let zone = &mut zns.zones[zone_idx];
+                match zsa {
+                    0x01 => {
+                        // Close: ImplicitOpen/ExplicitOpen → Closed
+                        if matches!(
+                            zone.state,
+                            ZoneState::ImplicitOpen | ZoneState::ExplicitOpen
+                        ) {
+                            zone.state = ZoneState::Closed;
+                        }
+                    }
+                    0x02 => {
+                        // Finish: state → Full, WP = capacity
+                        zone.state = ZoneState::Full;
+                        zone.write_pointer = zns.zone_capacity;
+                    }
+                    0x03 => {
+                        // Open: → ExplicitOpen (Empty/Closed/Implicit allowed)
+                        zone.state = ZoneState::ExplicitOpen;
+                    }
+                    0x04 => {
+                        // Reset: → Empty, WP = 0
+                        zone.state = ZoneState::Empty;
+                        zone.write_pointer = 0;
+                    }
+                    0x05 => {
+                        zone.state = ZoneState::Offline;
+                    }
+                    _ => {
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    }
+                }
+                tracing::info!(nsid, zone_idx, zsa, ?zone.state, "Zone Mgmt Send OK");
+                Some(Cqe::success(cid, sq_id, sq_head, phase))
+            }
+            nvm_opc::ZONE_MGMT_RECEIVE => {
+                // **Phase L1** — Zone Management Receive (ZNS CS § 4.5)。
+                // CDW10/11 = SLBA, CDW12 = NUMD (dwords - 1)，CDW13 bits 7:0
+                // = ZRA：0x00 = Report Zones. PRP1 → response buffer。
+                let nsid = sqe.nsid;
+                let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
+                let numd = sqe.cdw12 + 1;
+                let bytes = numd as usize * 4;
+                let zra = (sqe.cdw13 & 0xff) as u8;
+                let Some(ns) = self.ns(nsid) else {
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_NAMESPACE,
+                        0,
+                    ));
+                };
+                let Some(zns) = ns.zns.as_ref() else {
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_OPCODE,
+                        0,
+                    ));
+                };
+                if zra != 0 {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
+                let start_zone_idx = (slba / zns.zone_size) as usize;
+                let buf = build_zone_report(zns, start_zone_idx, bytes);
+                self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, sq_id, sq_head, cq_id);
+                None
+            }
+            nvm_opc::ZONE_APPEND => {
+                // **Phase L1** — Zone Append (ZNS CS § 4.3)。
+                // CDW10/11 = ZSLBA (zone 起点)；driver 不知 WP，controller
+                // 把数据写在当前 WP 处，把实际 LBA 写回 CQE.dw0/dw1。
+                // CDW12 bits 15:0 = NLB - 1。
+                let nsid = sqe.nsid;
+                let prp1 = sqe.prp1;
+                let zslba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
+                let nlb = (sqe.cdw12 & 0xffff) as u32 + 1;
+                let bytes = nlb as u64 * SECTOR_SIZE;
+                let Some(ns) = self.ns(nsid) else {
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_NAMESPACE,
+                        0,
+                    ));
+                };
+                let Some(zns) = ns.zns.as_ref() else {
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_OPCODE,
+                        0,
+                    ));
+                };
+                if bytes > NVME_PAGE_SIZE {
+                    // 单 PRP only for ZNS Append (教学简化)
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
+                let zone_idx = (zslba / zns.zone_size) as usize;
+                if zone_idx >= zns.zones.len() {
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::LBA_OUT_OF_RANGE,
+                        0,
+                    ));
+                }
+                let zone = zns.zones[zone_idx];
+                if matches!(
+                    zone.state,
+                    ZoneState::Full | ZoneState::ReadOnly | ZoneState::Offline
+                ) {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::ZONE_IS_FULL, 0));
+                }
+                if zone.write_pointer + nlb as u64 > zns.zone_capacity {
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::ZONE_BOUNDARY_ERR,
+                        0,
+                    ));
+                }
+                let assigned_lba = zslba + zone.write_pointer;
+                // DMA-read data → 完成回调通用 NvmWriteDmaRead；assigned_lba
+                // 通过 cdw0/cdw1 在 success CQE 返。我们简化：append 借
+                // NvmWriteDmaRead 路径写文件，append 完成时 driver 仍读
+                // CQE.dw0/dw1 — 这里我们 success CQE 默认 dw0=0/dw1=0；
+                // **教学限制**：assigned LBA 不真返给 driver；真硬件应
+                // post 携 lba 的 CQE。
+                let tok = ctx.dma_read(prp1, bytes as u32);
+                self.pending_ios.insert(
+                    tok,
+                    PendingIo {
+                        sq_id,
+                        cid,
+                        sq_head,
+                        cq_id,
+                        nsid,
+                        op: PendingOp::NvmWriteDmaRead {
+                            lba: assigned_lba,
+                            num_blocks: nlb,
+                        },
+                    },
+                );
+                // 更新 WP + state
+                let ns_mut = self.ns_mut(nsid).unwrap();
+                let zns_mut = ns_mut.zns.as_mut().unwrap();
+                let zone = &mut zns_mut.zones[zone_idx];
+                zone.write_pointer += nlb as u64;
+                if zone.write_pointer >= zns_mut.zone_capacity {
+                    zone.state = ZoneState::Full;
+                } else if matches!(zone.state, ZoneState::Empty | ZoneState::Closed) {
+                    zone.state = ZoneState::ImplicitOpen;
+                }
+                tracing::info!(nsid, zone_idx, assigned_lba, nlb, "Zone Append at WP");
+                None
             }
             nvm_opc::WRITE_UNCORRECTABLE => {
                 // NVMe NVM CS Spec § 3.3.6 Write Uncorrectable — 在指定
