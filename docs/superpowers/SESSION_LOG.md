@@ -1263,3 +1263,60 @@ NVMe spec 允许设备有 volatile write cache，driver 通过显式 FLUSH
 ### 测试
 
 44 unit + 3 e2e + `clippy -D warnings` 全绿（之前 41+3）。
+
+---
+
+## 2026-05-31 Phase E + F + G — NVMe 2.0 spec 全面化实现
+
+延续 "用户希望尽可能完整实现 NVMe 2.0 spec" 目标，连续推 3 个 Phase。
+每 Phase 都过 rust-reviewer subagent，CRITICAL/HIGH 全修。
+
+### Phase E — PRP list (commit 512aa2ba)
+
+NVMe spec § 4.4 PRP layout：transfer > 2 page (8 KiB) 时 PRP1 = 第一页、
+PRP2 = 指向 PRP list 页（4 KiB，512 个 u64 page pointer）。之前
+dispatch_io 在 bytes > 8 KiB 时直接 fail，限制了 driver 单 cmd 最大 IO。
+
+实现：
+- MDTS = 5 → 单 cmd 最大 transfer = 128 KiB
+- READ / WRITE 三档分流（≤1page / ≤2page / PRP list）
+- PrpListOp 累积器 + 4 个 PendingOp 变体（NvmWrite/Read PrpListFetch/Data）
+- parse_prp_list 辅助 + alloc_op_id 抽出复用
+
+### Phase F — 真 SMART log + AEN 队列 (commit a0625518)
+
+之前 SMART 全零 placeholder；AsyncEventRequest 永挂。本次：
+- 6 个 SMART counter 字段（stat_host_reads/writes/lba_*/power_on_instant/
+  num_err_log_entries）
+- build_smart_health_log 真序列化所有 spec offset
+- AEN VecDeque（FIFO，spec § 5.2 'AERL+1' 缓冲行为）
+- fire_aen(ctx, type, info, log_id) 帮助 + cdw0 编码
+
+### Phase E+F rust-reviewer 修复 (commit af8edbb2)
+
+reviewer 发现：
+- **C3 CRITICAL** — PRP-list Read 把整段 transfer 塞 data_pages[0]，dma_write
+  覆盖 PRP1 GPA 外内存（>= 12 KiB Read 第一次就 BSOD）
+- **C1 CRITICAL** — 多段 op DMA-fail 时 sibling pending_ios 泄漏 + 双 CQE
+- **H2** — fire_aen 用 stale sq_head → CQE.sqhd 单调违规
+- **H3** — SMART data_units_* spec 要求 round up 而非 floor
+- **H4** — 双 PRP Read tok1 失败静默丢
+- **M2** — parse_prp_list '尾部 0 终止' 与 spec § 4.4 冲突
+- 全部修复 + 单测 5/5 → 7/7
+
+### Phase G — Self-Test 状态机 + AEN 自动触发 + Error Log 累积 (commit 97a59465)
+
+让 NVMe controller 更 reactive：
+- `tick()` 真后台推进 self_test.percent_complete + 自动 fire AEN
+- DEVICE_SELF_TEST 真状态机（STC abort/short/extended，pct 推进）
+- Log Page 0x06 564-byte spec layout
+- Log Page 0x01 真序列化 error_log 环形 buffer (ELPE=63 → 64 entries)
+- push_error_log 接入 4 个 IO 失败路径
+
+### 测试 + 验证
+
+- 单测：5 → 7 → 7 (Phase E 加 2，Phase F 加 1，Phase G 加 2)
+- cargo fmt / build / clippy --tests -D warnings / MSVC cross-build
+  release：每 commit 全清
+- Hyper-V e2e：deploy 后 controller 成功 vsock-connect VTL2 → guest
+  Windows 真 IO（每 commit 都跑过 run_nvme_e2e_phase_ef.ps1）
