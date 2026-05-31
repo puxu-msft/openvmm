@@ -305,6 +305,8 @@ bash docs/superpowers/scripts/build-windows-cross.sh
   block_bytes=4104 interleave，positional IO 防 cursor race）
 - **Phase K4c** — 多 LBA PI Write/Read 真实现（dual-PRP ≤ 2 page，
   PiWriteAccum 累积器 + per-LBA verify）
+- **Phase K4c-list** — PI Write/Read PRP-list 路径（> 2 page，list fetch
+  + per-entry data DMA）
 - **Phase K5** — Sanitize 5 action state machine + IO quiesce
 - **Phase K6** — Doorbell Buffer Config（fast doorbell skip vsock round-trip）
 - **Phase K9** — Reservation full HOSTID 16-byte + monotonic GEN
@@ -315,6 +317,8 @@ bash docs/superpowers/scripts/build-windows-cross.sh
 - **Phase L1d** — Identify CNS 0x06 (Specific Controller-for-CSI) +
   CNS 0x08 (I/O CS Independent NS Identify) + CNS 0x1c (I/O Command Sets
   bitmap = NVM|ZNS)
+- **Phase L1f** — PI + ZNS 组合（plain WRITE PI 完成路径加 advance_zns_wp，
+  ZONE_APPEND 因 SECTOR_SIZE 常量限制仍 reject）
 - **Phase L2** — Reservation Notification Log (0x80)
 - **Phase L4** — Directive Send/Receive (Streams)
 - **Phase L5** — Security Send/Receive + Virtualization Mgmt + Get LBA Status
@@ -325,16 +329,25 @@ bash docs/superpowers/scripts/build-windows-cross.sh
   SWR + zone state + 边界 + WP 推进（reviewer 修复）
 - **Phase M2** — mmap zero-copy backing（Namespace.mmap +
   Unix mmap/Windows CreateFileMapping，hot-path 抹掉 kernel buf 拷贝）
+- **Phase M3** — per-queue parallel dispatch（架构决策记录 M3_PARALLEL_DESIGN.md：
+  当前 single-thread async 是 SDK 一次 &mut PcieDevice 的结果；真多线程
+  需 SDK + per-queue actor 重写。教学版保留 single-thread 换 0 race/lock
+  风险）
 - **Phase N1** — SDK DeviceCtx outbound 单测
 - **Phase N1b** — SDK dispatch_inbound 路由测试 + CaptureDevice fixture
-  （让 CI 不需要 live vsock 就能验证 protocol 路径）
 - **Phase N2** — NVMe 12-step 生命周期教学文档（docs/NVME_LIFECYCLE.md）
 - **Phase O1** — Simple Copy (0x19) — controller-side data movement
-  （driver 提供 source range list，controller 自己读 backing + 写 sdlba）
-- **Phase O2** — Fused Compare-and-Write dispatcher 检测（fuse=01/10 协议
-  pair 识别）；spec atomicity 真实现留 O3，所以 IdentifyController.fuses=0
-  暂不 advertise，避免 driver 误用做 distributed CAS。
+- **Phase O2** — Fused Compare-and-Write dispatcher 检测
+- **Phase O3** — Fused C+W 真 atomic chain（NvmCompareSinglePrpFused：
+  Compare pass → 真 dispatch Write；Compare fail → Write 也收 COMPARE_FAILURE
+  不写盘。IdentifyController.fuses bit 0 = 1 真 advertise）
+- **Phase P1** — Endurance Group (CNS 0x19) + NVM Set (CNS 0x04) +
+  Log Page 0x09 真字段填充 + PTPL (Persist Through Power Loss) sidecar
+  让 Reservation 跨重启存活
+- **H-3** — on_dma_complete 1614 行单方法拆到 controller/completion.rs，
+  mod.rs 从 3272 → ~2050 行
 
-每 Phase 都过 rust-reviewer + 多数有 CRITICAL/HIGH 修复。**8 轮 reviewer
-后 0 CRITICAL / 0 HIGH / 0 MEDIUM**：当前总单测 **NVMe controller 36 +
-SDK 13 = 49**。Production-ready as teaching example。
+每 Phase 都过 rust-reviewer + 多数有 CRITICAL/HIGH 修复。**11 轮 reviewer
+后 0 CRITICAL / 0 HIGH / 0 MEDIUM**：当前总单测 **NVMe controller 44 +
+SDK 13 = 57**。`cargo clippy --all-targets -- -D warnings` 全绿。
+Production-ready as teaching example。
