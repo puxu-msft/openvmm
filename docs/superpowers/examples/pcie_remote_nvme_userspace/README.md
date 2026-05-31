@@ -297,5 +297,33 @@ bash docs/superpowers/scripts/build-windows-cross.sh
 - **Phase H5** — Firmware download/commit/activate 状态机
 - **Phase H6** — Reservation Register/Acquire/Release/Report
 - **Phase H7** — Protection Information capability + LBAF[1]
+- **Phase J** — Reservation 多 host model (HOSTID 16B + RKEY 8B)
+- **Phase K1** — T10 DIF CRC16 engine（spec § 8.3，table-free 教学版）
+- **Phase K2** — Compare dual-PRP + PRP list 路径（与 Write 三档分流对齐）
+- **Phase K3** — NS Management Create/Delete + 临时 backing
+- **Phase K4a/b/c** — 真 PI Write/Read/Verify/WriteZeroes（单 LBA，
+  block_bytes=4104 interleave，positional IO 防 cursor race）
+- **Phase K5** — Sanitize 5 action state machine + IO quiesce
+- **Phase K6** — Doorbell Buffer Config（fast doorbell skip vsock round-trip）
+- **Phase K9** — Reservation full HOSTID 16-byte + monotonic GEN
+- **Phase L1** — Zoned Namespace 基础（per-NS opt-in via `--zns-nsid`，
+  Zone Mgmt Send/Receive/Append + 完整 state machine）
+- **Phase L1c** — Identify NS CNS 0x05 (ZNS) 上报 MAR/MOR/ZSZE
+  （0-based + 0xFFFFFFFF=unlimited 翻译正确）
+- **Phase L1d** — Identify NS CNS 0x06 (I/O CS Indep) + CNS 0x1c
+  (I/O Command Sets bitmap) 让 driver 看到 NVM|ZNS 支持
+- **Phase L2** — Reservation Notification Log (0x80)
+- **Phase L4** — Directive Send/Receive (Streams)
+- **Phase L5** — Security Send/Receive + Virtualization Mgmt + Get LBA Status
+- **Phase M1** — Set Features Interrupt Coalescing（cdw11 解析）
+- **Phase M1b** — 真 Interrupt Coalescing batch + tick-driven time flush
+  （spec § 5.21.1.8，should_fire_irq 纯函数 + 单测）
+- **Phase M-2 (reviewer)** — plain NVM_WRITE 落到 ZNS NS 也强制 SWR +
+  zone state + 边界 + WP 推进
+- **Phase N1** — SDK DeviceCtx outbound 单测
+- **Phase N1b** — SDK dispatch_inbound 路由测试 + CaptureDevice fixture
+  （让 CI 不需要 live vsock 就能验证 protocol 路径）
+- **Phase N2** — NVMe 12-step 生命周期教学文档（docs/NVME_LIFECYCLE.md）
 
-每 Phase 都过 rust-reviewer + 多数有 CRITICAL/HIGH 修复。
+每 Phase 都过 rust-reviewer + 多数有 CRITICAL/HIGH 修复。当前总单测：
+NVMe controller 25 + SDK 13 = 38。
