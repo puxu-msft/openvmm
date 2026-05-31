@@ -14,9 +14,52 @@
 use crate::cmd;
 use crate::cmd::*;
 use crate::controller::NvmeController;
+use crate::controller::ZnsState;
 use crate::regs::*;
 use pcie_remote_userspace_sdk::*;
 use zerocopy::IntoBytes;
+
+/// **Phase L1c** — 构造 4 KiB ZNS NS Identify (spec ZNS § 3.1.6 / Figure
+/// "I/O Command Set Specific Identify Namespace Data Structure")。
+///
+/// 教学填最关键字段让 Linux/Windows 驱动能正确驱动 ZNS NS：
+///
+/// | offset | name | val |
+/// |--------|------|-----|
+/// | 0..2   | ZOC (Zone Operation Characteristics) | 0 = 无特殊 |
+/// | 2..4   | OZCS (Optional Zoned CS support) | 0 |
+/// | 4..8   | MAR (Max Active Resources) | zns.max_active 或 0xFFFFFFFF=unlimited |
+/// | 8..12  | MOR (Max Open Resources) | zns.max_open 或 0xFFFFFFFF |
+/// | 12..16 | RRL (Reset Recommended Limit) | 0 = 无 |
+/// | 16..20 | FRL (Finish Recommended Limit) | 0 |
+/// | 20..768 | reserved | |
+/// | 2816..2832 | LBAFE[0] (LBA Format Extension) | ZSZE=zone_size, ZDES=0 |
+///
+/// Linux nvme-cli `zns id-ns` 会读这些值；MAR/MOR 让 driver 自约束不超 cap。
+fn build_zns_ns_identify(zns: &ZnsState) -> Vec<u8> {
+    let mut buf = vec![0u8; 4096];
+    // ZOC = 0
+    // OZCS = 0
+    // MAR / MOR：spec 0 表示 unlimited（与我们 max_open=0 语义一致），
+    // 非零值上报 driver 实际限制。
+    buf[4..8].copy_from_slice(&zns.max_active.to_le_bytes());
+    buf[8..12].copy_from_slice(&zns.max_open.to_le_bytes());
+    // RRL/FRL = 0
+    // LBAFE[0] @ offset 2816 (spec § 3.1.6 Figure)：
+    //   bytes 0..8  ZSZE (Zone Size in LBA)
+    //   byte  8     ZDES (Zone Descriptor Extension Size in 64-byte units) = 0
+    //   bytes 9..16 reserved
+    let zsze_off = 2816;
+    buf[zsze_off..zsze_off + 8].copy_from_slice(&zns.zone_size.to_le_bytes());
+    // ZDES = 0 已是默认零
+    buf
+}
+
+/// Test-only wrapper for `build_zns_ns_identify`。
+#[cfg(test)]
+pub(crate) fn __test_build_zns_ns_identify(zns: &ZnsState) -> Vec<u8> {
+    build_zns_ns_identify(zns)
+}
 
 impl NvmeController {
     /// Admin command dispatch。多数即时完成 → 返回 Some(CQE)；Identify 需
@@ -91,6 +134,33 @@ impl NvmeController {
                         // indicates the controller does not support NGUID"
                         // → 不应作为 descriptor 返回）。
                         vec![0u8; 4096]
+                    }
+                    0x05 => {
+                        // **Phase L1c** — Identify Namespace (I/O Command Set
+                        // specific)。CDW11 bits 7:0 = CSI；CSI=0x02 (ZNS) 时
+                        // 返 4 KiB ZNS NS Identify (spec ZNS § 3.1.6)。其他
+                        // CSI → zeros 让 driver 走 fallback。
+                        let csi = (sqe.cdw11 & 0xff) as u8;
+                        let Some(ns) = self.ns(nsid) else {
+                            return Some(Cqe::error(
+                                cid,
+                                0,
+                                sq_head,
+                                phase,
+                                sc::INVALID_NAMESPACE,
+                                0,
+                            ));
+                        };
+                        if csi == 0x02 {
+                            if let Some(zns) = ns.zns.as_ref() {
+                                build_zns_ns_identify(zns)
+                            } else {
+                                // 不是 ZNS NS → spec 说 return zeros
+                                vec![0u8; 4096]
+                            }
+                        } else {
+                            vec![0u8; 4096]
+                        }
                     }
                     0x06 => {
                         // CNS 0x06 = Identify Controller for the controller list /

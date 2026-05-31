@@ -3176,4 +3176,30 @@ mod tests {
         let buf = __test_build_zone_report(&zns, 99, 320);
         assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 0);
     }
+
+    /// **Phase L1c** — ZNS NS Identify byte layout：MAR/MOR/ZSZE 正确 offset。
+    #[test]
+    fn zns_ns_identify_byte_layout() {
+        use crate::controller::admin::__test_build_zns_ns_identify;
+        let zns = ZnsState {
+            zone_size: 2048,
+            zone_capacity: 2048,
+            max_open: 7,
+            max_active: 14,
+            zones: vec![],
+        };
+        let buf = __test_build_zns_ns_identify(&zns);
+        assert_eq!(buf.len(), 4096);
+        // MAR @ 4..8
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 14);
+        // MOR @ 8..12
+        assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()), 7);
+        // ZSZE @ 2816..2824
+        assert_eq!(
+            u64::from_le_bytes(buf[2816..2824].try_into().unwrap()),
+            2048
+        );
+        // ZDES @ 2824 = 0
+        assert_eq!(buf[2824], 0);
+    }
 }
