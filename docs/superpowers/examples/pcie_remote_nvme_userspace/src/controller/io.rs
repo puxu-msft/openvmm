@@ -687,7 +687,7 @@ impl NvmeController {
                         0,
                     ));
                 };
-                let buf = build_reservation_report(ns, bytes);
+                let buf = super::reservation::build_reservation_report(ns, bytes);
                 self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, sq_id, sq_head, cq_id);
                 None
             }
@@ -755,42 +755,4 @@ impl NvmeController {
         );
         None
     }
-}
-
-/// **Phase H6** — 构造 Reservation Status Data Structure (spec § 6.14)。
-/// 64-byte header + 24-byte * 每 registrant（spec REGCTL 字段）。
-pub(super) fn build_reservation_report(ns: &crate::controller::Namespace, bytes: usize) -> Vec<u8> {
-    let n_reg = ns.registrants.len() as u16;
-    let total = 64 + (n_reg as usize) * 24;
-    let mut buf = vec![0u8; bytes.max(total)];
-    // header @ 0..64
-    // GEN (Generation, 4 byte LE) @ 0..4：每次 reservation 状态变化 +1，
-    // 简化用 registrants count 作单调代理。
-    buf[0..4].copy_from_slice(&(n_reg as u32).to_le_bytes());
-    // RTYPE @ 4：当前 reservation type，无则 0
-    buf[4] = ns.reservation.map(|(_, t)| t).unwrap_or(0);
-    // REGCTL @ 5..7：注册 host 数
-    buf[5..7].copy_from_slice(&n_reg.to_le_bytes());
-    // bytes 7..24 reserved；24..32 reserved
-    // Each registrant @ 64 + i*24
-    for (i, &rkey) in ns.registrants.iter().enumerate() {
-        let off = 64 + i * 24;
-        if off + 24 > buf.len() {
-            break;
-        }
-        // CNTLID (2 byte) — 我们单 controller 用 1
-        buf[off..off + 2].copy_from_slice(&1u16.to_le_bytes());
-        // RCSTS (1 byte) — bit 0 = holds reservation
-        let holds = ns
-            .reservation
-            .is_some_and(|(holder_key, _)| holder_key == rkey);
-        buf[off + 2] = if holds { 0x01 } else { 0x00 };
-        // bytes 3..8 reserved
-        // HOSTID (8 byte) — 简化用 rkey 复用
-        buf[off + 8..off + 16].copy_from_slice(&rkey.to_le_bytes());
-        // RKEY @ off+16..off+24
-        buf[off + 16..off + 24].copy_from_slice(&rkey.to_le_bytes());
-    }
-    buf.truncate(bytes);
-    buf
 }

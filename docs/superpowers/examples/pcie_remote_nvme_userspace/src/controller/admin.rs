@@ -326,11 +326,11 @@ impl NvmeController {
                     // 0x0f Endurance Group Event Aggregate
                     // 0x80 Reservation Notification
                     // 0x81 Sanitize Status
-                    0x01 => self.build_error_info_log(bytes),
-                    0x02 => self.build_smart_health_log(bytes),
-                    0x03 => self.build_fw_slot_info_log(bytes),
-                    0x06 => self.build_self_test_log(bytes),
-                    0x80 => self.build_reservation_log(bytes),
+                    0x01 => super::logs::build_error_info(self, bytes),
+                    0x02 => super::logs::build_smart_health(self, bytes),
+                    0x03 => super::logs::build_fw_slot_info(self, bytes),
+                    0x06 => super::logs::build_self_test(self, bytes),
+                    0x80 => super::logs::build_reservation_notification(self, bytes),
                     _ => {
                         tracing::debug!(
                             lid = format_args!("{:#x}", lid),

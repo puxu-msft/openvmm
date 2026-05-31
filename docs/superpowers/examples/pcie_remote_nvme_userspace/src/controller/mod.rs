@@ -18,6 +18,8 @@
 
 mod admin;
 mod io;
+mod logs;
+mod reservation;
 
 use crate::cmd::*;
 use crate::regs::*;
@@ -186,6 +188,10 @@ pub(super) struct Namespace {
     ///   5 = Write Exclusive All Registrants
     ///   6 = Exclusive Access All Registrants
     pub(super) reservation: Option<(u64, u8)>,
+    /// **Phase J reviewer M3 修复** — Reservation Status 'GEN' 字段，
+    /// 单调递增（即使 unregister 也 +1），driver 用此感知 state 变化。
+    /// spec § 6.14。
+    pub(super) reservation_gen: u32,
 }
 
 /// NVMe Controller 主结构 — 实现 `PcieDevice`。
@@ -411,6 +417,7 @@ impl NvmeController {
                     path: path.clone(),
                     registrants: Vec::new(),
                     reservation: None,
+                    reservation_gen: 0,
                 },
             );
         }
@@ -691,238 +698,6 @@ impl NvmeController {
 
     // dispatch_io moved to controller/io.rs (H6 split)
 
-    /// **Phase H6** — 处理 Reservation Register/Acquire/Release 数据。
-    ///
-    /// 数据格式（spec § 6.13/6.11/6.15）：
-    /// - Register: 16 byte = CRKEY (8) + NRKEY (8)
-    /// - Acquire:  16 byte = CRKEY (8) + PRKEY (8)
-    /// - Release:   8 byte = CRKEY (8)
-    ///
-    /// 简化的 host model：单 controller，host 由 8-byte rkey 唯一标识；
-    /// 真硬件用 16-byte HOSTID + rkey 组合（spec § 6.13 Connect cmd）。
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn apply_reservation_cmd(
-        &mut self,
-        nsid: u32,
-        kind: ReservationKind,
-        action: u8,
-        rtype: u8,
-        data: &[u8],
-        cid: u16,
-        sq_id: u16,
-        sq_head: u16,
-        phase: u8,
-    ) -> Cqe {
-        let Some(ns) = self.namespaces.get_mut(&nsid) else {
-            return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_NAMESPACE, 0);
-        };
-        let read_u64 = |buf: &[u8], off: usize| {
-            let mut a = [0u8; 8];
-            a.copy_from_slice(&buf[off..off + 8]);
-            u64::from_le_bytes(a)
-        };
-        match kind {
-            ReservationKind::Register => {
-                if data.len() < 16 {
-                    return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
-                }
-                let crkey = read_u64(data, 0);
-                let nrkey = read_u64(data, 8);
-                match action {
-                    0 => {
-                        // Register: 注册 nrkey 为本 host 的 key。要求 host 之前
-                        // 未注册（避免重复）。
-                        if ns.registrants.contains(&nrkey) {
-                            tracing::warn!(
-                                nsid,
-                                nrkey,
-                                "Reservation Register: key already registered"
-                            );
-                            return Cqe::error(
-                                cid,
-                                sq_id,
-                                sq_head,
-                                phase,
-                                sc::RESERVATION_CONFLICT,
-                                0,
-                            );
-                        }
-                        ns.registrants.push(nrkey);
-                        tracing::info!(nsid, nrkey, "Reservation Register OK");
-                    }
-                    1 => {
-                        // Unregister: 移除 crkey（若 crkey 还持有 reservation
-                        // 也一并清）。
-                        ns.registrants.retain(|&k| k != crkey);
-                        if let Some((holder, _)) = ns.reservation
-                            && holder == crkey
-                        {
-                            ns.reservation = None;
-                        }
-                        tracing::info!(nsid, crkey, "Reservation Unregister OK");
-                    }
-                    2 => {
-                        // Replace: 把 crkey 替换为 nrkey
-                        // **reviewer H1 修复**：nrkey 不能与现有 registrant
-                        // 冲突，否则 Vec 中出现重复 → Register 后续 contains
-                        // check 失真。spec § 6.13: "If the New Reservation Key
-                        // equals an existing key, the action shall fail."
-                        if ns.registrants.contains(&nrkey) && nrkey != crkey {
-                            tracing::warn!(
-                                nsid,
-                                nrkey,
-                                "Reservation Replace: nrkey conflicts existing registrant"
-                            );
-                            return Cqe::error(
-                                cid,
-                                sq_id,
-                                sq_head,
-                                phase,
-                                sc::RESERVATION_CONFLICT,
-                                0,
-                            );
-                        }
-                        if let Some(pos) = ns.registrants.iter().position(|&k| k == crkey) {
-                            ns.registrants[pos] = nrkey;
-                            if let Some((holder, t)) = ns.reservation
-                                && holder == crkey
-                            {
-                                ns.reservation = Some((nrkey, t));
-                            }
-                        } else {
-                            return Cqe::error(
-                                cid,
-                                sq_id,
-                                sq_head,
-                                phase,
-                                sc::RESERVATION_CONFLICT,
-                                0,
-                            );
-                        }
-                        tracing::info!(nsid, crkey, nrkey, "Reservation Replace OK");
-                    }
-                    _ => return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0),
-                }
-            }
-            ReservationKind::Acquire => {
-                if data.len() < 16 {
-                    return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
-                }
-                let crkey = read_u64(data, 0);
-                let prkey = read_u64(data, 8);
-                if !ns.registrants.contains(&crkey) {
-                    tracing::warn!(nsid, crkey, "Acquire: crkey not registered");
-                    return Cqe::error(cid, sq_id, sq_head, phase, sc::RESERVATION_CONFLICT, 0);
-                }
-                if !(1..=6).contains(&rtype) {
-                    return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
-                }
-                match action {
-                    0 => {
-                        // Acquire: 仅当无 reservation 时成功
-                        if ns.reservation.is_some() {
-                            return Cqe::error(
-                                cid,
-                                sq_id,
-                                sq_head,
-                                phase,
-                                sc::RESERVATION_CONFLICT,
-                                0,
-                            );
-                        }
-                        ns.reservation = Some((crkey, rtype));
-                        tracing::info!(nsid, crkey, rtype, "Reservation Acquire OK");
-                    }
-                    1 | 2 => {
-                        // Preempt (+ optional Abort)。spec 复杂；简化：若
-                        // 当前 holder == prkey 则替换，否则失败。
-                        if let Some((holder, _)) = ns.reservation
-                            && holder != prkey
-                        {
-                            return Cqe::error(
-                                cid,
-                                sq_id,
-                                sq_head,
-                                phase,
-                                sc::RESERVATION_CONFLICT,
-                                0,
-                            );
-                        }
-                        ns.reservation = Some((crkey, rtype));
-                        tracing::info!(nsid, crkey, prkey, rtype, "Reservation Preempt OK");
-                    }
-                    _ => return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0),
-                }
-            }
-            ReservationKind::Release => {
-                if data.len() < 8 {
-                    return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
-                }
-                let crkey = read_u64(data, 0);
-                match action {
-                    0 => {
-                        // Release：仅当本 host 持有时清。
-                        // **reviewer H2 修复**：区分 holder 不匹配（CONFLICT）
-                        // vs rtype 不匹配（INVALID_FIELD）。spec § 6.15。
-                        match ns.reservation {
-                            Some((holder, t)) if holder == crkey && t == rtype => {
-                                ns.reservation = None;
-                                tracing::info!(nsid, crkey, "Reservation Release OK");
-                            }
-                            Some((holder, t)) if holder == crkey && t != rtype => {
-                                tracing::warn!(
-                                    nsid,
-                                    crkey,
-                                    holder_type = t,
-                                    requested = rtype,
-                                    "Release rtype mismatch (INVALID_FIELD)"
-                                );
-                                return Cqe::error(
-                                    cid,
-                                    sq_id,
-                                    sq_head,
-                                    phase,
-                                    sc::INVALID_FIELD,
-                                    0,
-                                );
-                            }
-                            _ => {
-                                return Cqe::error(
-                                    cid,
-                                    sq_id,
-                                    sq_head,
-                                    phase,
-                                    sc::RESERVATION_CONFLICT,
-                                    0,
-                                );
-                            }
-                        }
-                    }
-                    1 => {
-                        // Clear：全 NS 所有 reservation 清空（spec 通常仅
-                        // 当前 holder 可调）
-                        if let Some((holder, _)) = ns.reservation
-                            && holder != crkey
-                        {
-                            return Cqe::error(
-                                cid,
-                                sq_id,
-                                sq_head,
-                                phase,
-                                sc::RESERVATION_CONFLICT,
-                                0,
-                            );
-                        }
-                        ns.reservation = None;
-                        tracing::info!(nsid, "Reservation Clear OK");
-                    }
-                    _ => return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0),
-                }
-            }
-        }
-        Cqe::success(cid, sq_id, sq_head, phase)
-    }
-
     /// 分配单调递增的 op_id（独立于 SDK DMA token），用于关联多段
     /// DMA 完成回调（双 PRP / PRP list 等）。
     pub(super) fn alloc_op_id(&mut self) -> u64 {
@@ -1006,93 +781,11 @@ impl NvmeController {
         true
     }
 
-    /// **Phase C** — Log Page 0x01 Error Information Log。
-    ///
-    /// NVMe spec § 5.16.1.1。每个 entry 64 字节，含 Error Count / SQID /
-    /// CMDID / Status Field / Param Error Loc / LBA / NSID / Vendor /
-    /// Cmd Specific Info。我们当前不追踪 per-cmd error history，返单条
-    /// 全零 entry 作 "no errors" 占位。
-    /// **Phase C/G** — Log Page 0x01 Error Information Log。
-    ///
-    /// NVMe spec § 5.16.1.1。每 entry 64 字节。Phase G 之前返全零；现在
-    /// 真序列化 `self.error_log` 环形 buffer。Driver 顺序读到 error_count
-    /// 单调递增的 entry 列表（最旧→最新）。entry 0 是 "最近一次" — 我们
-    /// 按 spec 反序：buf[0..64] = 最新，buf[64..128] = 次新，…。
-    fn build_error_info_log(&self, bytes: usize) -> Vec<u8> {
-        let mut buf = vec![0u8; bytes];
-        // 最多塞 bytes/64 个；error_log 按 push 顺序（旧→新），spec 要求
-        // entry 0 = most recent，所以 rev()。
-        for (i, e) in self.error_log.iter().rev().enumerate() {
-            let off = i * 64;
-            if off + 64 > bytes {
-                break;
-            }
-            buf[off..off + 8].copy_from_slice(&e.error_count.to_le_bytes());
-            buf[off + 8..off + 10].copy_from_slice(&e.sq_id.to_le_bytes());
-            buf[off + 10..off + 12].copy_from_slice(&e.cid.to_le_bytes());
-            buf[off + 12..off + 14].copy_from_slice(&e.status_field.to_le_bytes());
-            buf[off + 14..off + 16].copy_from_slice(&e.param_loc.to_le_bytes());
-            buf[off + 16..off + 24].copy_from_slice(&e.lba.to_le_bytes());
-            buf[off + 24..off + 28].copy_from_slice(&e.nsid.to_le_bytes());
-            // offset 28..64 = vendor info / log page ver / cmd-specific = 0
-        }
-        buf
-    }
-
-    /// **Phase G** — Log Page 0x06 Device Self-Test (NVMe spec § 5.16.1.6)。
-    ///
-    /// 564 字节布局（修正 reviewer H + M offset 错位）：
-    /// - offset 0 (1 byte): Current Self-Test Operation
-    ///   bits 3:0 = 0x0 (none), 0x1 short, 0x2 extended
-    /// - offset 1 (1 byte): Current Self-Test Completion (bits 6:0 = pct)
-    /// - offset 2-3: Reserved
-    /// - offset 4..32: Self-Test Result Data Structure[0] (most recent)
-    ///   - byte 0 bits 7:4 = Self-Test Code (STC: 1=short, 2=extended)
-    ///   - byte 0 bits 3:0 = Self-Test Result (0=ok, 0x09=aborted, 0xf=未运行)
-    ///   - byte 1 = Segment Number (我们单段)
-    ///   - byte 2 = Valid Diagnostic Information bits (POH/NSID/LBA/SC/SCT)
-    ///   - byte 3 = Reserved
-    ///   - byte 4..12 = Power On Hours (u64 LE, run-time 快照)
-    ///   - byte 12 = NSID Valid (1 byte) — spec 实际 bit 0
-    ///   - byte 13..17 = NSID (u32 LE)
-    ///   - byte 17..25 = Failing LBA (u64 LE) — 注：跨 byte 边界但 spec
-    ///     就是这样 (offset 17 起 8 byte)
-    ///   - byte 25 = Status Code Type / Status Code
-    ///   - byte 27 = Vendor Specific
-    /// - offset 32..560: Result[1..19] (older entries) — 我们只追踪最新一条
-    fn build_self_test_log(&self, bytes: usize) -> Vec<u8> {
-        let mut buf = vec![0u8; bytes.max(564)];
-        // 当前进行中：byte 0/1
-        if let Some(ip) = &self.self_test_in_progress {
-            buf[0] = ip.stc & 0x0f;
-            buf[1] = ip.percent_complete & 0x7f;
-        }
-        // 最近完成结果（包括 abort）：result data structure @ offset 4
-        if let Some(last) = self.self_test_last {
-            buf[4] = ((last.stc & 0x0f) << 4) | (last.result & 0x0f);
-            // POH @ offset 4..12 的 byte 4..12 == buf[8..16]
-            buf[8..16].copy_from_slice(&last.completed_at_poh.to_le_bytes());
-            // NSID Valid bit @ buf[16] — 我们不指定具体 NS 失败 → 0
-            // 不写 NSID / Failing LBA / SC / SCT（保持 0 = "无该字段"）
-        }
-        buf.truncate(bytes);
-        buf
-    }
-
-    /// **Phase G (rev. H 修复)** — Log Page 0x80 Reservation Notification
-    /// (NVMe spec § 5.16.1.15)。
-    ///
-    /// 我们 ONCS.reservations=0 → spec 允许 controller 返 INVALID_FIELD。
-    /// 但为兼容老 driver 误发，返 spec 规定的 64 字节 'no notifications'
-    /// 占位（全零 = 没新通知 + count=0），并 truncate 到 driver 请求大小。
-    fn build_reservation_log(&self, bytes: usize) -> Vec<u8> {
-        let mut buf = vec![0u8; bytes.max(64)];
-        buf.truncate(bytes);
-        buf
-    }
-
     /// **Phase G** — push error log entry（CQE 携 non-zero status 时调）。
     /// 环形 buffer，最多 64 entry（spec ELPE=63）。
+    ///
+    /// Phase J 重构后唯一保留在 mod.rs 的 log 相关方法（需 `&mut self`，
+    /// 5 个纯读 builder 已搬到 controller/logs.rs）。
     pub(super) fn push_error_log(
         &mut self,
         sq_id: u16,
@@ -1115,97 +808,6 @@ impl NvmeController {
         while self.error_log.len() > ELPE_MAX {
             self.error_log.pop_front();
         }
-    }
-
-    /// **Phase C/F** — Log Page 0x02 SMART / Health Information。
-    ///
-    /// NVMe spec § 5.16.1.2，512 字节固定。Phase F：填入真追踪的
-    /// counters（host_read_commands / host_write_commands / data_units_*
-    /// / power_on_hours / num_err_log_entries），其余字段保持合理常量。
-    ///
-    /// data_units_read/written 单位：spec 定义为 "1000 × 512B sectors"
-    /// 的累计数，即 `lba_count / 1000`，向下取整。当 lba_count < 1000
-    /// 时回报 0（spec 允许，driver 不会因此告警）。
-    fn build_smart_health_log(&self, bytes: usize) -> Vec<u8> {
-        let mut buf = vec![0u8; bytes.max(512)];
-        // Offset 0: critical_warning (1 byte) = 0
-        // Offset 1-2: composite_temperature (2 byte LE, in Kelvin)
-        let temp_kelvin: u16 = 313;
-        buf[1..3].copy_from_slice(&temp_kelvin.to_le_bytes());
-        // Offset 3: available_spare (%) — set 100 = full spare available
-        buf[3] = 100;
-        // Offset 4: available_spare_threshold (%)
-        buf[4] = 10;
-        // Offset 5: percentage_used (%) — controller wear indicator
-        buf[5] = 0;
-        // Offset 6: endurance_group_critical_warning_summary
-        // Offset 7-31: reserved
-        // H3 修复：spec § 5.16.1.2 Figure 196 — data_units_*
-        // 以 1000 × 512B sector 为单位，**round up**（"a value of 1
-        // corresponds to 1000 units of 512 bytes read, rounded up"）。
-        let units_read = self.stat_lba_read.div_ceil(1000) as u128;
-        let units_written = self.stat_lba_written.div_ceil(1000) as u128;
-        let host_reads = self.stat_host_reads as u128;
-        let host_writes = self.stat_host_writes as u128;
-        // Offset 32-47: data_units_read (128-bit LE)
-        buf[32..48].copy_from_slice(&units_read.to_le_bytes());
-        // Offset 48-63: data_units_written
-        buf[48..64].copy_from_slice(&units_written.to_le_bytes());
-        // Offset 64-79: host_read_commands
-        buf[64..80].copy_from_slice(&host_reads.to_le_bytes());
-        // Offset 80-95: host_write_commands
-        buf[80..96].copy_from_slice(&host_writes.to_le_bytes());
-        // Offset 96-111: controller_busy_time (minutes) — 简化 = power_on_hours * 60
-        // 真实现需追踪 IO 累计时间；这里近似当作 always busy。
-        // 留 0 避免对 driver 误导。
-        // Offset 112-127: power_cycles — 1 (本进程启动算一次)
-        let one: u128 = 1;
-        buf[112..128].copy_from_slice(&one.to_le_bytes());
-        // Offset 128-143: power_on_hours
-        let hours = (self.power_on_instant.elapsed().as_secs() / 3600) as u128;
-        buf[128..144].copy_from_slice(&hours.to_le_bytes());
-        // Offset 144-159: unsafe_shutdowns — 0
-        // Offset 160-175: media_errors — 0
-        // Offset 176-191: num_err_log_entries
-        let nerr = self.stat_num_err_log_entries as u128;
-        buf[176..192].copy_from_slice(&nerr.to_le_bytes());
-        // Offset 192-195: warning_composite_temp_time (minutes above WCTEMP)
-        // Offset 196-199: critical_composite_temp_time
-        // Offset 200..: thermal sensors / endurance group stats — 0 占位
-        buf.truncate(bytes); // 缩到 driver 请求的字节数
-        buf
-    }
-
-    /// **Phase C/H5** — Log Page 0x03 Firmware Slot Information。
-    ///
-    /// NVMe spec § 5.16.1.3，512 字节固定。AFI bit 2:0 = 当前激活槽
-    /// (1..7)，bits 6:4 = 下次启动激活槽（0 表示无 pending activation）。
-    /// FRS[1..7] = 8 字节 ASCII FW revision；FRS[0] 不存在（spec FRS 索引
-    /// 1-based）。Phase H5：从 self.fw_active_slot / fw_next_active_slot /
-    /// fw_slot_revisions 真序列化。
-    fn build_fw_slot_info_log(&self, bytes: usize) -> Vec<u8> {
-        let mut buf = vec![0u8; bytes.max(512)];
-        // AFI = (next << 4) | active
-        let afi = (self.fw_next_active_slot & 0x7) << 4 | (self.fw_active_slot & 0x7);
-        buf[0] = afi;
-        // FRS[1..7] @ offset 8..64（每槽 8 byte），index 1-based 但
-        // spec layout 是 offset 8 = FRS for slot 1
-        for slot in 1..=7usize {
-            let rev = &self.fw_slot_revisions[slot];
-            if rev.is_empty() {
-                continue;
-            }
-            let off = (slot - 1) * 8 + 8;
-            let rev_bytes = rev.as_bytes();
-            let n = rev_bytes.len().min(8);
-            buf[off..off + n].copy_from_slice(&rev_bytes[..n]);
-            // pad 不足 8 字节为 ASCII space
-            for b in buf[off + n..off + 8].iter_mut() {
-                *b = b' ';
-            }
-        }
-        buf.truncate(bytes);
-        buf
     }
 
     /// 帮助函数：DMA-write `data` 到 `gpa`，完成后构造 success CQE 提交。
@@ -2087,7 +1689,7 @@ mod tests {
         c.stat_lba_read = 12_345;
         c.stat_lba_written = 67_890;
         c.stat_num_err_log_entries = 3;
-        let buf = c.build_smart_health_log(512);
+        let buf = super::logs::build_smart_health(&c, 512);
         assert_eq!(buf.len(), 512);
         // composite_temp @ 1..3 (KiB)
         assert_eq!(u16::from_le_bytes([buf[1], buf[2]]), 313);
@@ -2162,7 +1764,7 @@ mod tests {
         // 最旧保留的 error_count = 7 (70 个推入 - 64 保留 = 6 个丢弃)
         assert_eq!(c.error_log.front().unwrap().error_count, 7);
         // 序列化：entry 0 应是最新的 (cid=69)
-        let buf = c.build_error_info_log(4096);
+        let buf = super::logs::build_error_info(&c, 4096);
         let cid_at_entry0 = u16::from_le_bytes([buf[10], buf[11]]);
         assert_eq!(cid_at_entry0, 69, "entry 0 must be most recent");
         // entry 1 = 次新 cid=68
@@ -2177,7 +1779,7 @@ mod tests {
     fn self_test_log_layout_in_progress_done_and_abort() {
         let mut c = make_ctrl_with_tmp("st");
         // idle → 全 0
-        let buf = c.build_self_test_log(564);
+        let buf = super::logs::build_self_test(&c, 564);
         assert_eq!(buf[0], 0);
         assert_eq!(buf[1], 0);
         assert_eq!(buf[4], 0);
@@ -2188,7 +1790,7 @@ mod tests {
             total_seconds: 20,
             percent_complete: 42,
         });
-        let buf = c.build_self_test_log(564);
+        let buf = super::logs::build_self_test(&c, 564);
         assert_eq!(buf[0], 2);
         assert_eq!(buf[1], 42);
         // 完成 extended：in_progress=None, last=Some(stc=2, result=0)
@@ -2198,7 +1800,7 @@ mod tests {
             result: 0,
             completed_at_poh: 7,
         });
-        let buf = c.build_self_test_log(564);
+        let buf = super::logs::build_self_test(&c, 564);
         assert_eq!(buf[0], 0);
         assert_eq!(buf[1], 0);
         // byte 4：上半 nibble = STC=2 (extended), 下半 = result=0
@@ -2213,7 +1815,7 @@ mod tests {
             result: 0x09,
             completed_at_poh: 3,
         });
-        let buf = c.build_self_test_log(564);
+        let buf = super::logs::build_self_test(&c, 564);
         assert_eq!(buf[4] & 0xf0, 0x10);
         assert_eq!(buf[4] & 0x0f, 0x09);
     }
@@ -2285,7 +1887,7 @@ mod tests {
         c.fw_next_active_slot = 3;
         c.fw_slot_revisions[2] = "newrev1 ".to_string();
         c.fw_slot_revisions[3] = "newrev2 ".to_string();
-        let buf = c.build_fw_slot_info_log(512);
+        let buf = super::logs::build_fw_slot_info(&c, 512);
         // AFI = (3 << 4) | 2 = 0x32
         assert_eq!(buf[0], 0x32);
         // FRS[slot 1] @ offset 8..16（默认 v2.0    ，保留自 init）
