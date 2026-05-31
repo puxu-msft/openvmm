@@ -2367,6 +2367,9 @@ impl PcieDevice for NvmeController {
                                 Ok(()) => {
                                     self.stat_host_writes += 1;
                                     self.stat_lba_written += num_blocks as u64;
+                                    // **Phase L1f** — ZNS + PI 组合：WP 推进
+                                    // 与 plain Write 完成路径对称（io::advance_zns_wp）。
+                                    crate::controller::io::advance_zns_wp(ns, lba, num_blocks);
                                     tracing::debug!(
                                         nsid,
                                         lba,
@@ -2657,6 +2660,8 @@ impl PcieDevice for NvmeController {
                         if ok {
                             self.stat_host_writes += 1;
                             self.stat_lba_written += accum.num_blocks as u64;
+                            // **Phase L1f** — ZNS + PI 组合 WP 推进
+                            crate::controller::io::advance_zns_wp(ns, accum.slba, accum.num_blocks);
                             tracing::debug!(
                                 nsid,
                                 slba = accum.slba,

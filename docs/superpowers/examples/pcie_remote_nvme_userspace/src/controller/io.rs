@@ -813,19 +813,15 @@ impl NvmeController {
                             0,
                         ));
                     }
-                    // **Reviewer H-4 (7轮)** — PI 与 ZNS 组合未实现（同 ZONE_APPEND
-                    // 路径的 H8 决定）。这里 NVM WRITE 落到 PI-ZNS NS 上同样拒绝，
-                    // 避免 NvmWritePi / NvmWritePiMulti 完成路径漏 advance_zns_wp。
-                    if ns.zns.is_some() {
-                        tracing::warn!(nsid, "WRITE PI on ZNS NS rejected (K4c+ZNS unimplemented)");
-                        return Some(Cqe::error(
-                            cid,
-                            sq_id,
-                            sq_head,
-                            phase,
-                            sc::INVALID_PROTECTION_INFO,
-                            0,
-                        ));
+                    // **Phase L1f** — PI + ZNS 组合。WRITE PI 在 ZNS NS 上
+                    // 需走 check_zns_write 校验 SWR + state + 边界（与 plain
+                    // WRITE 一致）；完成路径在 advance_zns_wp 推进 WP。
+                    // 之前 7th-round H-4 暂拒，K4c-list 完成后这条解禁。
+                    if ns.zns.is_some()
+                        && let Some(cqe) =
+                            check_zns_write(ns, slba, nlb, cid, sq_id, sq_head, phase)
+                    {
+                        return Some(cqe);
                     }
                     if nlb != 1 {
                         // **Phase K4c** — 多 LBA PI Write：data 体积
@@ -1836,9 +1832,14 @@ impl NvmeController {
                 // 拒绝避免静默落 4 KiB 到本应 4104 块对齐的位置导致后续
                 // PI Read 全 GuardFail。
                 if ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled() {
+                    // **Phase L1f** — ZNS + PI 组合：plain WRITE 已支持
+                    // (走 check_zns_write + advance_zns_wp + PI tuple)。
+                    // ZONE_APPEND 路径仍用 hardcoded SECTOR_SIZE=512 算 offset，
+                    // 不适配 PI block_bytes=4104。教学限制：driver 想在 PI-ZNS
+                    // NS 上用 ZONE_APPEND 仍需 fallback 到 plain WRITE+WP 跟踪。
                     tracing::warn!(
                         nsid,
-                        "ZONE_APPEND on PI NS rejected (K4c-ZNS unimplemented)"
+                        "ZONE_APPEND on PI NS rejected (use plain WRITE for PI+ZNS)"
                     );
                     return Some(Cqe::error(
                         cid,
