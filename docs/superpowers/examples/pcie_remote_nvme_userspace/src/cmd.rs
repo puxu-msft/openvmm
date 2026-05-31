@@ -477,6 +477,27 @@ impl IdentifyNamespace {
         //   bit 3 = Write Excl. Registrants Only (type 3)
         //   bit 4 = Excl. Access Registrants Only (type 4)
         ns.rescap = 0b0001_1110u8.into();
+        // **Phase H7** — Protection Information (spec § 8.3 PI)：
+        //   DPC (Data Protection Capabilities) byte：声明硬件能力
+        //     bit 0 = PI Type 1 supported (T10 DIF Guard+RefTag)
+        //     bit 1 = Type 2 (deferred RefTag check)
+        //     bit 2 = Type 3 (no RefTag)
+        //     bit 3 = first 8 bytes of metadata are PI
+        //     bit 4 = last 8 bytes of metadata are PI
+        //   DPS (Data Protection Settings) byte：per-NS 当前启用的 type
+        //     bits 2:0 = 0 (none), 1 (T1), 2 (T2), 3 (T3)
+        //     bit 3 = PI in first 8 bytes
+        // 教学声明：DPC 暴露 Type 1 + first-8 能力；DPS=0 默认不启用
+        // （Format 才切换）。LBAF[1] = 4096B data + 8B metadata（PI tuple
+        // 占整个 8 byte metadata）；driver 选 LBAF[1] 才走 PI 路径，目前
+        // 我们 IO 路径不真做 CRC 计算（见 H7 注释）。
+        ns.dpc = 0b0000_1001; // T1 + first-8 metadata
+        ns.dps = 0; // 默认禁用
+        ns.nlbaf = 1; // 1+1 = 2 LBAF
+        ns.lbaf[1] = nvme_spec::nvm::Lbaf::new()
+            .with_ms(8) // 8 byte metadata
+            .with_lbads(12) // 4096 byte data
+            .with_rp(0);
         ns.as_bytes().to_vec()
     }
 }

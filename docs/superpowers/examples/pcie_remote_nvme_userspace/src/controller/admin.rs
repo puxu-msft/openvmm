@@ -376,9 +376,11 @@ impl NvmeController {
                 let pil = ((sqe.cdw10 >> 8) & 0x1) as u8;
                 let ses = ((sqe.cdw10 >> 9) & 0x7) as u8;
                 tracing::info!(lbafl, mset, pi, pil, ses, "Format NVM");
-                if lbafl != 0 || pi != 0 || mset != 0 {
-                    // 只支持 LBAF[0] (512B, no metadata, no PI)；PIL 我们
-                    // 不关心（无 PI 时 PIL 无意义）。
+                if !(lbafl == 0 || lbafl == 1) || pi > 1 || mset != 0 {
+                    // **Phase H7** — 接受 LBAF[0] (512B no-meta) 或 LBAF[1]
+                    // (4096B+8B meta)；PI Type 0 (none) 或 1 (T10 DIF)。
+                    // 其余拒绝。注：我们当前不真做 CRC/RefTag 校验 (见
+                    // io.rs PRACT 处理)，但接受 Format 让 driver 完成探测。
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
                 // **C1 修复**：FORMAT 不能在有 in-flight IO 时执行。否则

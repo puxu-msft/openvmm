@@ -41,6 +41,16 @@ impl NvmeController {
                 let nsid = sqe.nsid;
                 let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
                 let nlb = (cdw12 & 0xffff) as u32 + 1;
+                // **Phase H7** — PRACT (Protection Information Action) bit 29
+                // 表示 driver 期望 controller 自动校验/生成 PI tuple。我们
+                // 没真实现 CRC/RefTag 引擎；driver 若发 PRACT=1 我们 reject
+                // 让其 fallback 到 PI=0 path（spec § 8.3：controller 可返
+                // INVALID_PROTECTION_INFO = SC 0x81，但 INVALID_FIELD 也
+                // 让 driver 知道）。
+                if (cdw12 >> 29) & 0x1 != 0 {
+                    tracing::warn!(nsid, "NVM READ with PRACT=1 not supported");
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
                 let bytes = nlb as u64 * SECTOR_SIZE;
                 tracing::debug!(
                     nsid,
@@ -196,6 +206,11 @@ impl NvmeController {
                 let nsid = sqe.nsid;
                 let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
                 let nlb = (cdw12 & 0xffff) as u32 + 1;
+                // Phase H7：PRACT bit 29，参 READ 注释
+                if (cdw12 >> 29) & 0x1 != 0 {
+                    tracing::warn!(nsid, "NVM WRITE with PRACT=1 not supported");
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
                 let bytes = nlb as u64 * SECTOR_SIZE;
                 tracing::debug!(
                     nsid,
