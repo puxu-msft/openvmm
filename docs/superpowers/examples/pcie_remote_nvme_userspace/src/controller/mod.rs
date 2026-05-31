@@ -256,6 +256,15 @@ pub(super) struct PrpListOp {
 /// 配置。spec § 1.6 "An NSID maps to one namespace"。
 pub(super) struct Namespace {
     pub(super) file: File,
+    /// **Phase M2** — Lazy mmap of `file`（整文件映射，长度 = file_size）。
+    /// 首次 `read_at` / `write_at` 时建立；之后 hot-path 跳过 syscall，
+    /// 直接 memcpy from/to mmap slice。失败回退 file IO。
+    ///
+    /// 何时 invalidate：Format NVM SES=1 (User Data Erase) 把 file 重写但
+    /// 大小不变 — mmap 仍 valid。Format SES=0 +换 lbads 但不改大小 — 同样
+    /// valid。NS Management Delete 直接 drop Namespace → drop mmap → munmap。
+    /// 若未来支持 NS Resize，必须 drop 并重建 mmap。
+    pub(super) mmap: Option<memmap2::MmapMut>,
     /// LBA 数（按当前 lbads + meta_size 计算 = file_size / block_bytes）。
     pub(super) total_lba: u64,
     /// Backing 文件路径 — 仅供日志 / Identify Namespace 扩展用。
@@ -361,10 +370,45 @@ impl Namespace {
         self.pi_type != 0
     }
 
-    /// **Reviewer H3** — 位置无关的 read（不依赖 file cursor）。Linux
-    /// `pread`、Windows `seek_read`。避免 seek+read 之间被并发任务覆盖
-    /// cursor 导致脏数据。同时省一次 syscall。
+    /// **Reviewer H3 + Phase M2** — 位置无关的 read（不依赖 file cursor）。
+    ///
+    /// 当 mmap available 时走零拷贝（`memcpy from mmap slice`），节省一次
+    /// kernel→user copy。否则 fallback `pread`/`seek_read`。
+    ///
+    /// 安全：mmap slice 与 file 后端一致，但 mmap 写入由 OS 异步 flush；
+    /// FLUSH cmd 强制 `mmap.flush()` 保证持久化（spec § 5.10 Flush）。
     pub(super) fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        // Fast path：mmap available + 范围在内 → 直接 memcpy
+        if let Some(mmap) = self.mmap.as_ref()
+            && let Some(slice) = mmap.get(offset as usize..).and_then(|s| s.get(..buf.len()))
+        {
+            buf.copy_from_slice(slice);
+            return Ok(());
+        }
+        // Fallback：positional file IO（Format 后未重建 mmap 等场景）
+        self.file_read_at(buf, offset)
+    }
+
+    /// **Reviewer H3 + Phase M2** — 位置无关的 write，与 `read_at` 对称。
+    ///
+    /// mmap 路径：直接写入 mmap slice（OS dirty page，FLUSH 时 msync）。
+    /// 注：必须用 `&mut self` 因为 mmap slice 是 `&mut [u8]`。
+    pub(super) fn write_at(&mut self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+        // Fast path
+        if let Some(mmap) = self.mmap.as_mut()
+            && let Some(slice) = mmap
+                .get_mut(offset as usize..)
+                .and_then(|s| s.get_mut(..buf.len()))
+        {
+            slice.copy_from_slice(buf);
+            return Ok(());
+        }
+        // Fallback
+        Self::file_write_at_static(&self.file, buf, offset)
+    }
+
+    /// File IO fallback for read（Phase M2 之前的实现）。
+    fn file_read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
@@ -390,21 +434,19 @@ impl Namespace {
         }
     }
 
-    /// **Reviewer H3** — 位置无关的 write，与 `read_at` 对称。
-    pub(super) fn write_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    /// File IO fallback for write（static so 不冲突 mmap `&mut self`）。
+    fn file_write_at_static(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
-            self.file.write_all_at(buf, offset)
+            file.write_all_at(buf, offset)
         }
         #[cfg(windows)]
         {
             use std::os::windows::fs::FileExt;
             let mut written = 0usize;
             while written < buf.len() {
-                let n = self
-                    .file
-                    .seek_write(&buf[written..], offset + written as u64)?;
+                let n = file.seek_write(&buf[written..], offset + written as u64)?;
                 if n == 0 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
@@ -414,6 +456,37 @@ impl Namespace {
                 written += n;
             }
             Ok(())
+        }
+    }
+
+    /// **Phase M2** — Flush mmap 已 dirty 的页到 disk（用于 NVM FLUSH cmd）。
+    /// `mmap.flush()` 内部对 Unix = `msync(MS_SYNC)`，Windows = `FlushViewOfFile`
+    /// + `FlushFileBuffers`。失败时回退 `file.sync_all()`。
+    pub(super) fn flush(&self) -> std::io::Result<()> {
+        if let Some(mmap) = self.mmap.as_ref() {
+            return mmap.flush();
+        }
+        self.file.sync_all()
+    }
+}
+
+/// **Phase M2** — 尝试 mmap 整个 backing file。失败（如 /tmp 不支持 mmap、
+/// 文件被独占等）返 None，调用方走 file IO 回退。
+///
+/// # Safety
+///
+/// `MmapMut::map_mut(file)` 是 `unsafe`：要求 file 在 mmap 生命周期内不能
+/// 被其他进程同步 write（page contents 可能不一致）。教学示例的 backing
+/// file 只由本 controller 自己持有 + 单线程访问，前置条件满足。
+pub(super) fn try_mmap_file(file: &File) -> Option<memmap2::MmapMut> {
+    // SAFETY: backing file 仅由本进程持有；NvmeController 单线程访问；
+    // 没有其他 writer / mmap，符合 memmap2::MmapMut::map_mut 安全前置条件。
+    let mmap = unsafe { memmap2::MmapMut::map_mut(file) };
+    match mmap {
+        Ok(m) => Some(m),
+        Err(e) => {
+            tracing::warn!(error = %e, "Phase M2: mmap failed, falling back to file IO");
+            None
         }
     }
 }
@@ -725,6 +798,7 @@ impl NvmeController {
             namespaces.insert(
                 nsid,
                 Namespace {
+                    mmap: try_mmap_file(&file),
                     file,
                     total_lba,
                     path: path.clone(),
@@ -1217,11 +1291,9 @@ impl NvmeController {
             !ns.pi_enabled(),
             "compare_finalize: PI NS not supported (dispatch should reject)"
         );
-        match ns
-            .file
-            .seek(SeekFrom::Start(lba * SECTOR_SIZE))
-            .and_then(|_| std::io::Read::read_exact(&mut ns.file, &mut backing_buf))
-        {
+        // **Phase M2** — read_at 走 mmap 零拷贝（read 路径 immutable，
+        // 多个 reader 并发安全）
+        match ns.read_at(&mut backing_buf, lba * SECTOR_SIZE) {
             Ok(()) => {
                 if host_data == backing_buf {
                     self.stat_host_reads += 1;
@@ -1738,12 +1810,11 @@ impl PcieDevice for NvmeController {
                             "NVM Write DMA-read byte mismatch"
                         );
                     }
-                    // **Phase H4** — 用 p.nsid 选 NS file（admin DMA-write
-                    // 是 NvmReadDmaWrite { num_blocks: 0 } 不走这里）。
+                    // **Phase H4 + M2** — 用 p.nsid 选 NS，走 write_at（mmap
+                    // 零拷贝 fast path）。Admin DMA-write 是 NvmReadDmaWrite
+                    // { num_blocks: 0 } 不走这里。
                     let res = if let Some(ns) = self.namespaces.get_mut(&p.nsid) {
-                        ns.file
-                            .seek(SeekFrom::Start(lba * SECTOR_SIZE))
-                            .and_then(|_| ns.file.write_all(&data))
+                        ns.write_at(&data, lba * SECTOR_SIZE)
                     } else {
                         Err(std::io::Error::other(format!("unknown NSID {}", p.nsid)))
                     };
@@ -1832,10 +1903,8 @@ impl PcieDevice for NvmeController {
                                 block[0..data_bytes].copy_from_slice(&data);
                                 block[data_bytes..data_bytes + 8].copy_from_slice(&tuple_bytes);
                             }
-                            let res = ns
-                                .file
-                                .seek(SeekFrom::Start(lba * block_bytes as u64))
-                                .and_then(|_| ns.file.write_all(&block));
+                            // **Phase M2** — write_at 走 mmap 零拷贝
+                            let res = ns.write_at(&block, lba * block_bytes as u64);
                             match res {
                                 Ok(()) => {
                                     self.stat_host_writes += 1;
@@ -1899,9 +1968,8 @@ impl PcieDevice for NvmeController {
                     let bytes = num_blocks as u64 * SECTOR_SIZE;
                     let nsid = p.nsid;
                     let res = if let Some(ns) = self.namespaces.get_mut(&nsid) {
-                        ns.file
-                            .seek(SeekFrom::Start(assigned_lba * SECTOR_SIZE))
-                            .and_then(|_| ns.file.write_all(&data[..bytes as usize]))
+                        // **Phase M2** — write_at 走 mmap 零拷贝
+                        ns.write_at(&data[..bytes as usize], assigned_lba * SECTOR_SIZE)
                     } else {
                         Err(std::io::Error::other(format!("unknown NSID {}", nsid)))
                     };
@@ -2062,6 +2130,7 @@ impl PcieDevice for NvmeController {
                                         self.namespaces.insert(
                                             new_nsid,
                                             Namespace {
+                                                mmap: try_mmap_file(&file),
                                                 file,
                                                 total_lba: nsze,
                                                 path: path_str,
@@ -2224,11 +2293,8 @@ impl PcieDevice for NvmeController {
                     let cq = self.cqs.get(&p.cq_id);
                     let phase = cq.map(|c| c.phase).unwrap_or(1);
                     let cqe = if let Some(ns) = self.namespaces.get_mut(&p.nsid) {
-                        match ns
-                            .file
-                            .seek(SeekFrom::Start(lba * SECTOR_SIZE))
-                            .and_then(|_| std::io::Read::read_exact(&mut ns.file, &mut backing_buf))
-                        {
+                        // **Phase M2** — read_at 走 mmap 零拷贝
+                        match ns.read_at(&mut backing_buf, lba * SECTOR_SIZE) {
                             Ok(()) => {
                                 if data == backing_buf {
                                     tracing::debug!(
@@ -2327,9 +2393,8 @@ impl PcieDevice for NvmeController {
                             "NVM Write dual-PRP: both segments ready, writing"
                         );
                         let res = if let Some(ns) = self.namespaces.get_mut(&accum.nsid) {
-                            ns.file
-                                .seek(SeekFrom::Start(accum.lba * SECTOR_SIZE))
-                                .and_then(|_| ns.file.write_all(&full))
+                            // **Phase M2** — write_at 走 mmap 零拷贝
+                            ns.write_at(&full, accum.lba * SECTOR_SIZE)
                         } else {
                             Err(std::io::Error::other(format!(
                                 "unknown NSID {}",
@@ -2466,9 +2531,8 @@ impl PcieDevice for NvmeController {
                             "NVM Write PRP-list: all pages ready, writing"
                         );
                         let res = if let Some(ns) = self.namespaces.get_mut(&op.nsid) {
-                            ns.file
-                                .seek(SeekFrom::Start(op.lba * SECTOR_SIZE))
-                                .and_then(|_| ns.file.write_all(&full))
+                            // **Phase M2** — write_at 走 mmap 零拷贝
+                            ns.write_at(&full, op.lba * SECTOR_SIZE)
                         } else {
                             Err(std::io::Error::other(format!("unknown NSID {}", op.nsid)))
                         };

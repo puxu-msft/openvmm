@@ -446,11 +446,8 @@ impl NvmeController {
                     let data_bytes = ns.data_bytes() as usize; // 4096
                     let mut block_buf = vec![0u8; block_bytes];
                     let ns_mut = self.ns_mut(nsid).unwrap();
-                    if let Err(e) = ns_mut
-                        .file
-                        .seek(SeekFrom::Start(slba * block_bytes as u64))
-                        .and_then(|_| ns_mut.file.read_exact(&mut block_buf))
-                    {
+                    // **Phase M2** — read_at 走 mmap 零拷贝
+                    if let Err(e) = ns_mut.read_at(&mut block_buf, slba * block_bytes as u64) {
                         tracing::warn!(error = %e, nsid, slba, "PI READ: backing read failed");
                         return Some(Cqe::error(
                             cid,
@@ -497,11 +494,8 @@ impl NvmeController {
                 }
                 let mut buf = vec![0u8; bytes as usize];
                 let ns_mut = self.ns_mut(nsid).unwrap();
-                if let Err(e) = ns_mut
-                    .file
-                    .seek(SeekFrom::Start(slba * SECTOR_SIZE))
-                    .and_then(|_| ns_mut.file.read_exact(&mut buf))
-                {
+                // **Phase M2** — read_at 走 mmap 零拷贝
+                if let Err(e) = ns_mut.read_at(&mut buf, slba * SECTOR_SIZE) {
                     tracing::warn!(error = %e, nsid, slba, nlb, "READ: backing file read failed");
                     return Some(Cqe::error(
                         cid,
@@ -865,8 +859,11 @@ impl NvmeController {
                 };
                 for target in targets {
                     let ns = self.namespaces.get_mut(&target).unwrap();
-                    if let Err(e) = ns.file.sync_all() {
-                        tracing::warn!(error = %e, nsid = target, "FLUSH sync_all failed");
+                    // **Phase M2** — 走 ns.flush()：mmap 路径 → msync；否则
+                    // file.sync_all()。Flush 是 NVMe driver 拿持久化承诺
+                    // 的唯一同步点（VWC=1 让 driver 主动发）。
+                    if let Err(e) = ns.flush() {
+                        tracing::warn!(error = %e, nsid = target, "FLUSH failed");
                         return Some(Cqe::error(
                             cid,
                             sq_id,
@@ -976,25 +973,17 @@ impl NvmeController {
                 // **C2 修复**：分块写复用 4 KiB 零 buffer，避免大 nlb 时
                 // 一次性分配 32 MiB+ Vec OOM。每块独立 write，spec 允许
                 // controller 在中途因 error abort（我们这里若中途失败直接返）。
+                // **Phase M2** — write_at 走 mmap 零拷贝（chunk-by-chunk
+                // 是历史 file IO 分块；mmap 路径下其实可以一次性 copy，但
+                // 保留 chunked 让 fallback file IO 路径不一次写 32 MiB）。
                 const CHUNK: usize = 4096;
                 let zero_buf = [0u8; CHUNK];
                 let mut remaining = bytes as usize;
                 let mut off = slba * SECTOR_SIZE;
                 let ns = self.ns_mut(nsid).unwrap();
-                if let Err(e) = ns.file.seek(SeekFrom::Start(off)) {
-                    tracing::warn!(error = %e, slba, "WRITE ZEROES seek failed");
-                    return Some(Cqe::error(
-                        cid,
-                        sq_id,
-                        sq_head,
-                        phase,
-                        sc::DATA_TRANSFER_ERROR,
-                        0,
-                    ));
-                }
                 while remaining > 0 {
                     let n = remaining.min(CHUNK);
-                    if let Err(e) = std::io::Write::write_all(&mut ns.file, &zero_buf[..n]) {
+                    if let Err(e) = ns.write_at(&zero_buf[..n], off) {
                         tracing::warn!(error = %e, slba, nlb, off, "WRITE ZEROES chunk failed");
                         return Some(Cqe::error(
                             cid,

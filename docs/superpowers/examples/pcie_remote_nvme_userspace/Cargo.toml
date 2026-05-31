@@ -23,3 +23,8 @@ anyhow = "1.0.102"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zerocopy = { version = "0.8", features = ["derive"] }
+# **Phase M2** — mmap zero-copy backing。memmap2 是 Rust 生态事实标准
+# mmap wrapper（Unix mmap + Windows CreateFileMapping），avoid 重新发明
+# 不安全 mmap 边界。教学：演示 file IO → mmap 零拷贝路径减 2 次 kernel
+# memcpy（Read/Write 各一次）。
+memmap2 = "0.9"

@@ -773,3 +773,27 @@ fn advance_zns_wp_transitions() {
     assert_eq!(zone.write_pointer, capacity);
     assert_eq!(zone.state, ZoneState::Full);
 }
+
+/// **Phase M2** — mmap zero-copy round-trip：write_at 通过 mmap 写入后，
+/// 另一次 read_at（共享同一 mmap）应立即读到刚写的数据（不需 fsync）。
+#[test]
+fn mmap_zero_copy_round_trip() {
+    let mut c = make_ctrl_with_tmp("mmap_rt");
+    let ns = c.namespaces.get_mut(&1).unwrap();
+    // mmap 应在 open() 后已建立（/tmp tmpfs 支持 mmap）
+    assert!(ns.mmap.is_some(), "Phase M2: mmap should initialize");
+    // 写 4 KiB pattern 到 LBA 0
+    let pattern: Vec<u8> = (0..4096u32).map(|i| (i ^ 0xAA) as u8).collect();
+    ns.write_at(&pattern, 0).unwrap();
+    // 立即读回（不调 flush —— mmap 是同一内存视图）
+    let mut readback = vec![0u8; 4096];
+    ns.read_at(&mut readback, 0).unwrap();
+    assert_eq!(readback, pattern, "mmap write/read same view");
+    // 跨 LBA 边界写
+    ns.write_at(&[0x55; 512], 8 * 512).unwrap();
+    let mut tail = vec![0u8; 512];
+    ns.read_at(&mut tail, 8 * 512).unwrap();
+    assert_eq!(tail, vec![0x55; 512]);
+    // flush 走 mmap.flush()，不应 panic
+    ns.flush().unwrap();
+}

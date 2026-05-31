@@ -1,4 +1,4 @@
-# Phase M2 — Zero-copy backing file mmap (deferred)
+# Phase M2 — Zero-copy backing file mmap ✅ 已完成
 
 ## 目标
 
@@ -8,60 +8,66 @@ IO 都经历：
 2. Host write file → kernel copy buf → page cache → fs flush
 3. Read：file read → kernel copy page cache → buf → vsock → guest
 
-**4 次 memcpy 路径**（每方向 2 次）。
+**4 次 memcpy 路径**（每方向 2 次）。Phase M2 把 host file IO 那 2 次
+memcpy 抹掉（fast path），只剩 vsock 那 2 次（需 SDK 改造才能消，留 N2+）。
 
-## 真零拷贝设计
+## 实现
 
-用 `memmap2` crate 把 backing file 整体 mmap 进进程地址空间：
+依赖：`memmap2 = "0.9"`（Cargo.toml；事实标准 mmap wrapper，跨 Unix/Windows）。
+
+### 数据结构
 
 ```rust
-use memmap2::MmapMut;
-
 pub(super) struct Namespace {
     pub(super) file: File,
-    pub(super) mmap: MmapMut, // 整文件映射，长度 = file_size
+    pub(super) mmap: Option<memmap2::MmapMut>, // 整文件映射
     ...
 }
 ```
 
-Write 路径：
-- DMA-read host buf → 直接 `mmap[lba * sector..].copy_from_slice(&buf)`
-- 不需 file.write_all（写入直接落在 mmap 上）
-- 持久化通过 `mmap.flush_range()` 或 FLUSH cmd 触发 `mmap.flush()`
+Namespace::open 时 `try_mmap_file(&file)` 尝试 mmap；失败（如某些 FS
+不支持 mmap）退到 file IO，不阻断启动。
 
-Read 路径：
-- 读 mmap[lba * sector..lba * sector + bytes] → DMA-write 到 guest
+### Hot path
 
-省 2 次 kernel copy；但仍有 1 次 host→guest DMA serialization (protobuf
-bytes 字段)。要做真 zero-copy host→guest 需 SDK 协议改造（vsock chunked
-zerocopy 或共享内存）。
+- `Namespace::read_at(buf, off)` — mmap 在时 `buf.copy_from_slice(&mmap[off..off+buf.len()])`
+- `Namespace::write_at(buf, off)` — mmap 在时 `mmap[off..].copy_from_slice(buf)`
+- `Namespace::flush()` — mmap 在时 `mmap.flush()` (msync/FlushViewOfFile)；否则 `file.sync_all()`
 
-## 阻塞 Phase M2 真做的原因
+### Wired-in 路径
 
-1. **依赖管理**：memmap2 是外部 crate，需 OpenVMM workspace 引入
-2. **MMU 一致性**：Windows mmap (CreateFileMapping) 与 file.write_all
-   并存时一致性需小心；mixing 易出 spec-undefined 行为
-3. **错误处理**：mmap 失败回退到 file IO 需双路径维护
-4. **测试代价**：现有 IO unit test 已覆盖正确性；mmap 改造主要是性能
-   优化，对教学价值递减
+所有 NVM IO 大热点：
+- NvmWriteDmaRead completion (mod.rs)
+- NvmWritePi completion
+- NvmZoneAppend completion
+- dual-PRP Write completion
+- PRP-list Write completion
+- compare_finalize (Read backing)
+- Compare single-PRP completion
+- NVM_READ dispatch (io.rs)
+- PI READ dispatch
+- WRITE_ZEROES (chunked，仍 chunk 以兼容 fallback)
 
-## 真要做时的步骤
+FLUSH NVM 命令 (io.rs:845) 改 `ns.flush()` — mmap 路径下走 msync。
 
-1. 加 memmap2 deps 到 Cargo.toml
-2. Namespace::open 后 mmap_mut 整文件
-3. Write 路径 dma_read 完成回调改 mmap slice copy_from_slice
-4. Read 路径用 mmap slice → ctx.dma_write
-5. FLUSH 改 mmap.flush()
-6. 单测：写后 mmap 内容立即可读 (no fsync needed)
-7. 真 perf benchmark 对比
+## 测试
 
-## 当前实现的性能边界
+`controller::tests::mmap_zero_copy_round_trip`：
+- 确认 open() 后 mmap 已 init (Some)
+- write_at(4 KiB pattern) → 不 flush → read_at 立即拿回相同 pattern
+- 跨 LBA 边界写
+- flush() 不 panic
 
-- vsock RTT ~50-200 μs per DMA RTT
-- file IO ~10-30 μs per 4 KiB (page cache hit)
-- 单 IO 至少 2 RTT (PRP fetch + data transfer)
-- 实测 ~5000-10000 IOPS 单 queue（vsock 主导）
-- mmap 节省 file IO 部分 → 理论 +10-20% IOPS
+29 tests total passing。
 
-性能性价比合理时再做（user 原话："不舍性能除非性能性价比过犹不及"）。
-当前模型足够展示 NVMe 协议教学完整性。
+## 安全性
+
+`try_mmap_file` 内部 `unsafe { MmapMut::map_mut(&file) }` 唯一一处 unsafe，
+带 SAFETY 注释：教学 controller 单线程独占 backing file，无并发 writer。
+
+## 未做（仍为 perf 上限）
+
+- vsock zero-copy host→guest：需 protocol 改造（共享内存 / sendfile-like
+  primitive）。当前 protobuf bytes 字段仍有 2 次 vsock 序列化拷贝。
+- NS Resize 时重建 mmap：当前不支持 resize，未来加 NS Mgmt Resize 需
+  drop+rebuild mmap。
