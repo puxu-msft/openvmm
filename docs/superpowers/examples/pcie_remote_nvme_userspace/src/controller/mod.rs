@@ -293,6 +293,7 @@ pub(super) struct Namespace {
     ///   完成后 try_mmap_file 重建（Reviewer C-2 修复）
     /// - NS Management Delete：drop Namespace 自动 drop mmap
     /// - 未来 NS Resize：必须 drop+rebuild
+    ///
     /// Format SES=0 不改 size，mmap 仍 valid。
     pub(super) mmap: Option<memmap2::MmapMut>,
     /// LBA 数（按当前 lbads + meta_size 计算 = file_size / block_bytes）。
