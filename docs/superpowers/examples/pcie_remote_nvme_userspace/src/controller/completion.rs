@@ -946,6 +946,7 @@ impl NvmeController {
                                                 registrants: Vec::new(),
                                                 reservation: None,
                                                 reservation_gen: 0,
+                                                ptpl: false,
                                                 zns: None,
                                             },
                                         );
@@ -1080,13 +1081,16 @@ impl NvmeController {
                     op_kind,
                     action,
                     rtype,
+                    cptpl,
                 } => {
-                    // **Phase H6** — reservation cmd 数据已 DMA-read 到 `data`
-                    // (16 byte 或 8 byte)；按 op_kind 修 ns.reservation 状态。
+                    // **Phase H6 + P1** — reservation cmd 数据已 DMA-read 到
+                    // `data` (16 byte 或 8 byte)；按 op_kind 修 ns.reservation
+                    // 状态。Register 路径会按 cptpl 触发 PTPL 持久化。
                     let cq = self.cqs.get(&p.cq_id);
                     let phase = cq.map(|c| c.phase).unwrap_or(1);
                     let cqe = self.apply_reservation_cmd(
-                        p.nsid, op_kind, action, rtype, &data, p.cid, p.sq_id, p.sq_head, phase,
+                        p.nsid, op_kind, action, rtype, cptpl, &data, p.cid, p.sq_id, p.sq_head,
+                        phase,
                     );
                     self.post_cqe(ctx, p.cq_id, cqe);
                 }

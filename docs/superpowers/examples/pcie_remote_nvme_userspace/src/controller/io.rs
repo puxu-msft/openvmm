@@ -2147,6 +2147,10 @@ impl NvmeController {
         }
         let action = (sqe.cdw10 & 0x7) as u8;
         let rtype = ((sqe.cdw10 >> 8) & 0xff) as u8;
+        // **Phase P1** — CPTPL only applicable to Register（spec § 6.13）；
+        // 其它命令该字段保留。00=no change / 01=clear PTPL / 11=set PTPL；
+        // 02=reserved。
+        let cptpl = ((sqe.cdw10 >> 30) & 0x3) as u8;
         // 所有三个 cmd 数据 buffer 都 ≤ 16 byte，单 PRP1 足够。
         let bytes = match kind {
             crate::controller::ReservationKind::Release => 8u32,
@@ -2165,6 +2169,7 @@ impl NvmeController {
                     op_kind: kind,
                     action,
                     rtype,
+                    cptpl,
                 },
             },
         );

@@ -247,21 +247,21 @@ fn reservation_state_machine() {
     // Register host A with rkey=0x1001
     let mut buf = vec![0u8; 16];
     buf[8..16].copy_from_slice(&0x1001u64.to_le_bytes()); // NRKEY
-    let cqe = c.apply_reservation_cmd(nsid, ReservationKind::Register, 0, 0, &buf, 0, 0, 0, 1);
+    let cqe = c.apply_reservation_cmd(nsid, ReservationKind::Register, 0, 0, 0, &buf, 0, 0, 0, 1);
     assert_eq!(sc(&cqe), 0, "Register OK");
     assert_eq!(c.namespaces[&nsid].registrants, vec![(0x1001, 0, 0)]);
     // Acquire WriteExclusive (type=1)
     let mut buf = vec![0u8; 16];
     buf[0..8].copy_from_slice(&0x1001u64.to_le_bytes()); // CRKEY
-    let cqe = c.apply_reservation_cmd(nsid, ReservationKind::Acquire, 0, 1, &buf, 0, 0, 0, 1);
+    let cqe = c.apply_reservation_cmd(nsid, ReservationKind::Acquire, 0, 1, 0, &buf, 0, 0, 0, 1);
     assert_eq!(sc(&cqe), 0, "Acquire OK");
     assert_eq!(c.namespaces[&nsid].reservation, Some((0x1001, 1)));
     // Second Acquire 应失败 (RESERVATION_CONFLICT)
-    let cqe = c.apply_reservation_cmd(nsid, ReservationKind::Acquire, 0, 1, &buf, 0, 0, 0, 1);
+    let cqe = c.apply_reservation_cmd(nsid, ReservationKind::Acquire, 0, 1, 0, &buf, 0, 0, 0, 1);
     assert_eq!(sc(&cqe), crate::cmd::sc::RESERVATION_CONFLICT);
     // Release
     let buf = 0x1001u64.to_le_bytes().to_vec();
-    let cqe = c.apply_reservation_cmd(nsid, ReservationKind::Release, 0, 1, &buf, 0, 0, 0, 1);
+    let cqe = c.apply_reservation_cmd(nsid, ReservationKind::Release, 0, 1, 0, &buf, 0, 0, 0, 1);
     assert_eq!(sc(&cqe), 0, "Release OK");
     assert_eq!(c.namespaces[&nsid].reservation, None);
 }
@@ -962,4 +962,53 @@ fn fused_on_admin_sq_rejected_by_design() {
     sqe.cdw0 = 0x0042_0100; // fuse=01, opc=0x00 admin Delete IO SQ
     assert_eq!(sqe.fuse(), 1);
     // 不直接 dispatch — 由 dispatch_sqe 的 is_admin && fuse!=0 守卫处理
+}
+
+/// **Phase P1** — PTPL persistence：cptpl=11 写 sidecar；下次 open()
+/// 自动 reload 让 reservation state 跨 "power loss" 存活。
+#[test]
+fn ptpl_register_persists_across_open() {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
+        "nvme_test_ptpl_{}_{:?}.img",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let f = std::fs::File::create(&path).unwrap();
+    f.set_len(1024 * 1024).unwrap();
+    drop(f);
+    let path_str = path.to_str().unwrap().to_string();
+    // 第一次 open + Register + cptpl=set
+    {
+        let mut c = NvmeController::open(&[path_str.clone()], 0x1414, 0, &[]).unwrap();
+        let mut buf = vec![0u8; 16];
+        buf[8..16].copy_from_slice(&0xDEAD_BEEFu64.to_le_bytes()); // NRKEY
+        let cqe = c.apply_reservation_cmd(
+            1,
+            ReservationKind::Register,
+            0,
+            0,
+            0b11, // CPTPL = set
+            &buf,
+            0,
+            0,
+            0,
+            1,
+        );
+        assert_eq!((cqe.dw3 >> 17) as u8, 0, "Register OK");
+        assert!(c.namespaces[&1].ptpl, "PTPL flag set");
+    }
+    // 第二次 open — sidecar 应让 registrant 自动出现
+    {
+        let c = NvmeController::open(&[path_str.clone()], 0x1414, 0, &[]).unwrap();
+        let ns = &c.namespaces[&1];
+        assert!(ns.ptpl, "PTPL reload sets flag");
+        assert_eq!(
+            ns.registrants,
+            vec![(0xDEAD_BEEF, 0, 0)],
+            "Registrant survived 'power loss'"
+        );
+    }
+    // 清 sidecar
+    let _ = std::fs::remove_file(format!("{path_str}.ptpl"));
 }

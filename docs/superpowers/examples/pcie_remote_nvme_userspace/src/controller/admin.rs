@@ -209,6 +209,25 @@ impl NvmeController {
                         // 非 ZNS CSI 也返零 buffer。
                         vec![0u8; 4096]
                     }
+                    0x04 => {
+                        // **Phase P1** — CNS 0x04 = NVM Set List (spec NVMe 2.0
+                        // § 5.17.2.5)。4 KiB；header byte 0 = num NVM Sets，
+                        // 之后是 128-byte 描述符 array。教学 controller 不分
+                        // NVM Set（所有 NS 在默认 Set 0），返 num=1 + 一个
+                        // default-set descriptor。
+                        let mut buf = vec![0u8; 4096];
+                        buf[0] = 1; // 1 NVM Set
+                        // Descriptor @ off 4 (header 0..4)：
+                        //   bytes 0..2 NVM Set ID = 1
+                        //   bytes 2..4 ENDGID = 1（属于 Endurance Group 1）
+                        //   bytes 4..8 reserved
+                        //   bytes 8..16 Random 4 KiB Read Typical (ns)
+                        //   bytes 16..32 Optimal Write Size (LBA) 等
+                        let desc_off = 4;
+                        buf[desc_off..desc_off + 2].copy_from_slice(&1u16.to_le_bytes());
+                        buf[desc_off + 2..desc_off + 4].copy_from_slice(&1u16.to_le_bytes());
+                        buf
+                    }
                     0x08 => {
                         // **Phase L1d 修正后** — CNS 0x08 = I/O Command Set
                         // Independent Identify Namespace (spec NVMe 2.0
@@ -226,6 +245,16 @@ impl NvmeController {
                             ));
                         }
                         build_cs_indep_ns_identify()
+                    }
+                    0x19 => {
+                        // **Phase P1** — CNS 0x19 = Endurance Group List (spec
+                        // § 5.17.2.20)。4 KiB；byte 0 = num groups + 后续
+                        // 描述符。教学：1 个 group covering 所有 NS。
+                        let mut buf = vec![0u8; 4096];
+                        buf[0] = 1;
+                        let desc_off = 4;
+                        buf[desc_off..desc_off + 2].copy_from_slice(&1u16.to_le_bytes());
+                        buf
                     }
                     0x1c => {
                         // **Phase L1d** — CNS 0x1c = I/O Command Set data

@@ -128,12 +128,38 @@ pub(super) fn build_reservation_notification(_c: &NvmeController, bytes: usize) 
 
 /// **Phase L2** — Log Page 0x09 Endurance Group Information (spec § 5.16.1.9)。
 ///
-/// 512 字节，per endurance group。我们只有 1 个 endurance group (id=1)，
-/// 字段大多为 0：no critical warnings, no data tracked。
-pub(super) fn build_endurance_group(_c: &NvmeController, bytes: usize) -> Vec<u8> {
+/// 512 字节，per endurance group。教学 controller 1 个 endurance group (id=1)，
+/// 关键字段（spec § 5.16.1.7 Figure 211）：
+///   byte 0..2 Critical Warning (bit 0=Spare<thresh / 1=Temp / 2=Reliability)
+///   byte 2 Available Spare (% remaining)
+///   byte 3 Available Spare Threshold
+///   byte 4 Percentage Used (0-100)
+///   bytes 32..48 Endurance Estimate (LBAs written 单位 1k)
+///   bytes 48..64 Data Units Read (1k 单位)
+///   bytes 64..80 Data Units Written (1k 单位)
+///   bytes 80..96 Media and Data Integrity Errors
+///   bytes 96..112 Number of Error Information Log Entries
+pub(super) fn build_endurance_group(c: &NvmeController, bytes: usize) -> Vec<u8> {
     let mut buf = vec![0u8; bytes.max(512)];
-    buf[2] = 100; // available_spare = 100%
-    buf[3] = 10; // available_spare_threshold
+    // critical_warning 0..2 = 0 (no warnings)
+    buf[2] = 100; // Available Spare = 100%
+    buf[3] = 10; // Available Spare Threshold
+    buf[4] = 0; // Percentage Used = 0
+    // Endurance Estimate @ 32..48: 1 PB / 1000 = 10^12 LBA units of 1k
+    let endurance_est: u128 = 1_000_000_000_000u128;
+    buf[32..48].copy_from_slice(&endurance_est.to_le_bytes());
+    // Data Units Read @ 48..64: 同 SMART data_units_read
+    let dur = (c.stat_lba_read.div_ceil(1000)) as u128;
+    buf[48..64].copy_from_slice(&dur.to_le_bytes());
+    // Data Units Written @ 64..80
+    let duw = (c.stat_lba_written.div_ceil(1000)) as u128;
+    buf[64..80].copy_from_slice(&duw.to_le_bytes());
+    // Media and Data Integrity Errors @ 80..96
+    let mdie = c.stat_num_err_log_entries as u128;
+    buf[80..96].copy_from_slice(&mdie.to_le_bytes());
+    // Number of Error Information Log Entries @ 96..112
+    let nelogs = c.stat_num_err_log_entries as u128;
+    buf[96..112].copy_from_slice(&nelogs.to_le_bytes());
     buf.truncate(bytes);
     buf
 }

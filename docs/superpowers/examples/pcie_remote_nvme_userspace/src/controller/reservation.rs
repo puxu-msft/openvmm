@@ -64,6 +64,7 @@ impl NvmeController {
         kind: ReservationKind,
         action: u8,
         rtype: u8,
+        cptpl: u8,
         data: &[u8],
         cid: u16,
         sq_id: u16,
@@ -171,6 +172,35 @@ impl NvmeController {
                         tracing::info!(nsid, crkey, nrkey, "Reservation Replace OK");
                     }
                     _ => return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0),
+                }
+                // **Phase P1 (PTPL)** — Register 命令的 cdw10 bits 31:30
+                // 控制 PTPL（spec § 6.13）：
+                //   00 = no change（默认）
+                //   01 = clear PTPL（删 sidecar）
+                //   10 = reserved
+                //   11 = set PTPL（写 sidecar 持久化当前 reservation state）
+                match cptpl {
+                    0b01 => {
+                        ns.ptpl = false;
+                        if let Err(e) = delete_ptpl_sidecar(&ns.path) {
+                            tracing::warn!(error = %e, nsid, "PTPL clear: sidecar delete failed");
+                        }
+                    }
+                    0b11 => {
+                        ns.ptpl = true;
+                        if let Err(e) = persist_ptpl_sidecar(ns) {
+                            tracing::warn!(error = %e, nsid, "PTPL set: persist failed");
+                        }
+                    }
+                    _ => {
+                        // 00 / 10：不变；但若 ptpl 已开启，每次 Register
+                        // 完成都重写 sidecar 保证下次 open 看到最新状态。
+                        if ns.ptpl
+                            && let Err(e) = persist_ptpl_sidecar(ns)
+                        {
+                            tracing::warn!(error = %e, nsid, "PTPL persist on Register failed");
+                        }
+                    }
                 }
             }
             ReservationKind::Acquire => {
@@ -340,4 +370,103 @@ pub(super) fn build_reservation_report(ns: &Namespace, bytes: usize) -> Vec<u8> 
     }
     buf.truncate(bytes);
     buf
+}
+
+/// **Phase P1** — sidecar file path for PTPL persistence。
+/// 把 backing file 路径加 ".ptpl" 后缀（同目录避免跨设备 rename）。
+fn ptpl_path(backing_path: &str) -> String {
+    format!("{}.ptpl", backing_path)
+}
+
+/// **Phase P1** — 把 Namespace 的 reservation state (registrants + reservation
+/// + gen) 序列化写到 sidecar。格式简单二进制：
+///
+/// ```text
+/// magic     u32 = 0x50545054 'PTPT'
+/// version   u32 = 1
+/// gen       u32
+/// reserved  u32
+/// reservation_present u8（0 or 1）
+/// reservation_key     u64
+/// reservation_type    u8
+/// padding   6 byte
+/// n_registrants       u32
+/// per registrant: rkey u64 + hostid_lo u64 + hostid_hi u64 = 24 byte
+/// ```
+pub(super) fn persist_ptpl_sidecar(ns: &crate::controller::Namespace) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let path = ptpl_path(&ns.path);
+    let mut buf = Vec::with_capacity(64 + 24 * ns.registrants.len());
+    buf.extend_from_slice(&0x50545054u32.to_le_bytes()); // 'PTPT'
+    buf.extend_from_slice(&1u32.to_le_bytes()); // version
+    buf.extend_from_slice(&ns.reservation_gen.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    let (present, rkey, rtype) = match ns.reservation {
+        Some((k, t)) => (1u8, k, t),
+        None => (0u8, 0u64, 0u8),
+    };
+    buf.push(present);
+    buf.extend_from_slice(&rkey.to_le_bytes());
+    buf.push(rtype);
+    buf.extend_from_slice(&[0u8; 6]); // padding
+    buf.extend_from_slice(&(ns.registrants.len() as u32).to_le_bytes());
+    for &(rk, hi_lo, hi_hi) in &ns.registrants {
+        buf.extend_from_slice(&rk.to_le_bytes());
+        buf.extend_from_slice(&hi_lo.to_le_bytes());
+        buf.extend_from_slice(&hi_hi.to_le_bytes());
+    }
+    let mut f = std::fs::File::create(&path)?;
+    f.write_all(&buf)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// **Phase P1** — open() 时若 sidecar 存在则 reload reservation state；
+/// 否则 (ptpl=false) 返 None 让 Namespace 用 fresh state。
+pub(super) fn load_ptpl_sidecar(
+    backing_path: &str,
+) -> Option<(u32, Option<(u64, u8)>, Vec<(u64, u64, u64)>)> {
+    use std::io::Read as _;
+    let path = ptpl_path(backing_path);
+    let mut f = std::fs::File::open(&path).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    if buf.len() < 32 {
+        return None;
+    }
+    let magic = u32::from_le_bytes(buf[0..4].try_into().ok()?);
+    let version = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+    if magic != 0x50545054 || version != 1 {
+        return None;
+    }
+    let gen_ = u32::from_le_bytes(buf[8..12].try_into().ok()?);
+    let present = buf[16];
+    let rkey = u64::from_le_bytes(buf[17..25].try_into().ok()?);
+    let rtype = buf[25];
+    let reservation = (present == 1).then_some((rkey, rtype));
+    let n_off = 32;
+    let n = u32::from_le_bytes(buf[n_off..n_off + 4].try_into().ok()?) as usize;
+    let mut regs = Vec::with_capacity(n);
+    let mut off = n_off + 4;
+    for _ in 0..n {
+        if off + 24 > buf.len() {
+            break;
+        }
+        let rk = u64::from_le_bytes(buf[off..off + 8].try_into().ok()?);
+        let hi_lo = u64::from_le_bytes(buf[off + 8..off + 16].try_into().ok()?);
+        let hi_hi = u64::from_le_bytes(buf[off + 16..off + 24].try_into().ok()?);
+        regs.push((rk, hi_lo, hi_hi));
+        off += 24;
+    }
+    Some((gen_, reservation, regs))
+}
+
+/// **Phase P1** — Register cdw10[31:30]=01 显式清 PTPL。删 sidecar 文件。
+pub(super) fn delete_ptpl_sidecar(backing_path: &str) -> std::io::Result<()> {
+    let path = ptpl_path(backing_path);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }

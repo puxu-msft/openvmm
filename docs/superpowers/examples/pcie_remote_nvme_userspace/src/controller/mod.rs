@@ -130,14 +130,17 @@ pub(super) enum PendingOp {
     /// **Phase H5** — Firmware Image Download chunk DMA-read 完成。
     /// `offset_bytes` = byte offset into fw_download_buf。
     AdminFwDownloadChunk { offset_bytes: u32 },
-    /// **Phase H6** — Reservation 命令 DMA-read 完成。
+    /// **Phase H6 + P1 (PTPL)** — Reservation 命令 DMA-read 完成。
     /// `rrega/racqa/rrela` 是 spec cdw10 bits 2:0（Register/Acquire/Release
-    /// Action）；`rtype` 是 cdw10 bits 15:8 reservation type。统一变体
-    /// 让完成回调按 op_kind 分流。
+    /// Action）；`rtype` 是 cdw10 bits 15:8 reservation type。
+    /// `cptpl` = cdw10 bits 31:30（Register only；00=不变 / 01=clear /
+    /// 11=set）触发 controller 把 reservation state 持久化到 sidecar 文件，
+    /// reset / re-open 时自动 reload。统一变体让完成回调按 op_kind 分流。
     NvmReservationCmd {
         op_kind: ReservationKind,
         action: u8,
         rtype: u8,
+        cptpl: u8,
     },
     /// **Phase K3** — NS Management Create：DMA-read 完成后 parse 4 KiB
     /// NS Identify 结构（含 NSZE/NCAP/FLBAS/DPS），分配新 NSID + RAM
@@ -371,6 +374,11 @@ pub(super) struct Namespace {
     /// 单调递增（即使 unregister 也 +1），driver 用此感知 state 变化。
     /// spec § 6.14。
     pub(super) reservation_gen: u32,
+    /// **Phase P1** — Persist Through Power Loss 标志。Register cdw10 bits
+    /// 31:30 = 11 时 set，01 时 clear。set 后每次 Register/Acquire/Release
+    /// 完成都把 registrants + reservation + gen 写到 sidecar `.ptpl` 文件；
+    /// open() 时若 sidecar 存在则 reload，模拟 power-loss 恢复。
+    pub(super) ptpl: bool,
     /// **Phase L1** — Zoned Namespace 状态（None = 普通 NVM NS，Some = ZNS）。
     /// ZNS NS 的 CSI=0x02，Identify NS CNS=0x05 返 ZNS-specific 字段；
     /// Read/Write 必须遵循 SWR（Sequential Write Required）。
@@ -886,6 +894,20 @@ impl NvmeController {
                 meta_size,
                 "NVMe controller: namespace registered"
             );
+            // **Phase P1** — open() 时若 sidecar PTPL 存在则 reload
+            // reservation state（模拟 power-loss survival）。
+            let (gen_, reservation, registrants, ptpl) =
+                match crate::controller::reservation::load_ptpl_sidecar(path) {
+                    Some((g, r, regs)) => {
+                        tracing::info!(
+                            nsid,
+                            n_reg = regs.len(),
+                            "PTPL: reloaded reservation state from sidecar"
+                        );
+                        (g, r, regs, true)
+                    }
+                    None => (0, None, Vec::new(), false),
+                };
             namespaces.insert(
                 nsid,
                 Namespace {
@@ -897,9 +919,10 @@ impl NvmeController {
                     meta_size,
                     pi_type: 0,
                     pi_first: true,
-                    registrants: Vec::new(),
-                    reservation: None,
-                    reservation_gen: 0,
+                    registrants,
+                    reservation,
+                    reservation_gen: gen_,
+                    ptpl,
                     zns: None,
                 },
             );
