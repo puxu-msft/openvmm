@@ -141,6 +141,15 @@ pub(super) enum PendingOp {
     /// **Phase K9** — Set Features 0x81 Host Identifier DMA-read 完成。
     /// cdw11 bit 0 EXHID = 1 → 16 byte HOSTID；= 0 → 8 byte。
     AdminSetHostIdentifier { exhid: bool },
+    /// **Phase K4a** — PI Write 完成回调：DMA-read 完成后按 LBA 切 4KiB
+    /// data，每 LBA 计算 T10 DIF tuple，interleave 写到 backing file
+    /// (data + 8B tuple per LBA)。支持任意 nlb（≤ MDTS）。
+    /// 限制：单 PRP 路径（bytes ≤ NVME_PAGE_SIZE = 4 KiB = 1 LBA when
+    /// lbads=12）。多 LBA 需 dual-PRP / PRP list — 留 K4c。
+    NvmWritePi { lba: u64, num_blocks: u32 },
+    /// **Phase K4b** — PI Read sibling 占位（per-LBA file read + verify
+    /// 在 dispatch 时同步完成，DMA-write 数据回 PRP1 在 PendingIo 路径）。
+    NvmReadPiDmaWrite { num_blocks: u32 },
 }
 
 /// 双 PRP Write 累积：两段 DMA-read 任一先到都填到 prp1_data/prp2_data；
@@ -1497,6 +1506,92 @@ impl PcieDevice for NvmeController {
                     let cqe = Cqe::success(p.cid, p.sq_id, p.sq_head, phase);
                     self.post_cqe(ctx, p.cq_id, cqe);
                 }
+                PendingOp::NvmReadPiDmaWrite { num_blocks } => {
+                    // **Phase K4b** — PI Read 已 verify + dma_write data 完成，
+                    // 与 NvmReadDmaWrite 等价（计数）。
+                    let cq = self.cqs.get(&p.cq_id);
+                    let phase = cq.map(|c| c.phase).unwrap_or(1);
+                    self.stat_host_reads += 1;
+                    self.stat_lba_read += num_blocks as u64;
+                    let cqe = Cqe::success(p.cid, p.sq_id, p.sq_head, phase);
+                    self.post_cqe(ctx, p.cq_id, cqe);
+                }
+                PendingOp::NvmWritePi { lba, num_blocks } => {
+                    // **Phase K4a** — DMA-read 4 KiB data 完成；compute PI
+                    // tuple + interleave 写到 backing file (block_bytes=4104)。
+                    let cq = self.cqs.get(&p.cq_id);
+                    let phase = cq.map(|c| c.phase).unwrap_or(1);
+                    let nsid = p.nsid;
+                    let cqe = if let Some(ns) = self.namespaces.get_mut(&nsid) {
+                        let pi_type = ns.pi_type;
+                        let pi_first = ns.pi_first;
+                        let block_bytes = ns.block_bytes() as usize;
+                        let data_bytes = ns.data_bytes() as usize;
+                        if data.len() != data_bytes {
+                            tracing::warn!(
+                                got = data.len(),
+                                want = data_bytes,
+                                "PI Write DMA-read length mismatch"
+                            );
+                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR, 0)
+                        } else {
+                            let tuple = crate::pi::PiTuple::compute(&data, lba, pi_type);
+                            let tuple_bytes = tuple.to_bytes();
+                            // Interleave: pi_first → [tuple(8)][data(4096)]
+                            //             else      → [data(4096)][tuple(8)]
+                            let mut block = vec![0u8; block_bytes];
+                            if pi_first {
+                                block[0..8].copy_from_slice(&tuple_bytes);
+                                block[8..8 + data_bytes].copy_from_slice(&data);
+                            } else {
+                                block[0..data_bytes].copy_from_slice(&data);
+                                block[data_bytes..data_bytes + 8].copy_from_slice(&tuple_bytes);
+                            }
+                            let res = ns
+                                .file
+                                .seek(SeekFrom::Start(lba * block_bytes as u64))
+                                .and_then(|_| ns.file.write_all(&block));
+                            match res {
+                                Ok(()) => {
+                                    self.stat_host_writes += 1;
+                                    self.stat_lba_written += num_blocks as u64;
+                                    tracing::debug!(
+                                        nsid,
+                                        lba,
+                                        pi_type,
+                                        pi_first,
+                                        guard = tuple.guard,
+                                        ref_tag = tuple.ref_tag,
+                                        "PI Write OK"
+                                    );
+                                    Cqe::success(p.cid, p.sq_id, p.sq_head, phase)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, nsid, lba, "PI Write backing fail");
+                                    self.stat_num_err_log_entries += 1;
+                                    self.push_error_log(
+                                        p.sq_id,
+                                        p.cid,
+                                        (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                                        lba,
+                                        nsid,
+                                    );
+                                    Cqe::error(
+                                        p.cid,
+                                        p.sq_id,
+                                        p.sq_head,
+                                        phase,
+                                        sc::DATA_TRANSFER_ERROR,
+                                        0,
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE, 0)
+                    };
+                    self.post_cqe(ctx, p.cq_id, cqe);
+                }
                 PendingOp::NvmReadDualPrpSiblingHalf => {
                     // **H4**：成功路径无 op — counter + success CQE 全由
                     // tok2 (NvmReadDmaWrite) 处理；这里只是消化 token
@@ -2429,5 +2524,58 @@ mod tests {
         let cqe = c.apply_reservation_cmd(nsid, ReservationKind::Release, 0, 1, &buf, 0, 0, 0, 1);
         assert_eq!(sc(&cqe), 0, "Release OK");
         assert_eq!(c.namespaces[&nsid].reservation, None);
+    }
+
+    /// Phase K4a/b：PI Write interleave + Read 解析 round-trip。
+    ///
+    /// 单 LBA 4 KiB data + 8 byte T10 DIF tuple inline。verify 必须通过。
+    #[test]
+    fn pi_write_read_round_trip() {
+        let mut c = make_ctrl_with_tmp("pi");
+        let nsid = 1u32;
+        // 切到 PI 配置
+        let ns = c.namespaces.get_mut(&nsid).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+        ns.pi_first = true;
+        // 重算 total_lba
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / ns.block_bytes();
+
+        // 模拟 PI Write 完成路径：compute tuple + interleave write
+        let lba = 0u64;
+        let data: Vec<u8> = (0..4096).map(|i| (i & 0xff) as u8).collect();
+        let tuple = crate::pi::PiTuple::compute(&data, lba, 1);
+        let mut block = vec![0u8; 4096 + 8];
+        block[0..8].copy_from_slice(&tuple.to_bytes());
+        block[8..4104].copy_from_slice(&data);
+        let ns = c.namespaces.get_mut(&nsid).unwrap();
+        use std::io::Seek as _;
+        use std::io::Write as _;
+        ns.file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        ns.file.write_all(&block).unwrap();
+        ns.file.sync_all().unwrap();
+
+        // 模拟 PI Read 路径：读 4104 → 拆 tuple/data → verify
+        let mut read_block = vec![0u8; 4096 + 8];
+        let ns = c.namespaces.get_mut(&nsid).unwrap();
+        ns.file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        std::io::Read::read_exact(&mut ns.file, &mut read_block).unwrap();
+        let tuple_arr: [u8; 8] = read_block[0..8].try_into().unwrap();
+        let pi = crate::pi::PiTuple::from_bytes(&tuple_arr);
+        let data_slice = &read_block[8..4104];
+        assert_eq!(pi.verify(data_slice, lba, 1), crate::pi::PiCheck::Ok);
+        assert_eq!(data_slice, &data[..]);
+
+        // 篡改 1 byte → guard fail
+        let mut bad = read_block.clone();
+        bad[100] ^= 0xff;
+        let bad_pi = crate::pi::PiTuple::from_bytes(&bad[0..8].try_into().unwrap());
+        let bad_data = &bad[8..4104];
+        assert_eq!(
+            bad_pi.verify(bad_data, lba, 1),
+            crate::pi::PiCheck::GuardFail
+        );
     }
 }

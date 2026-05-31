@@ -88,10 +88,19 @@ impl NvmeController {
                         0,
                     ));
                 };
-                // **Phase K1** — IO 路径只走 LBAF[0] (512B no-meta no-PI)；
-                // 真 PI/4K 路径见 K4_DESIGN.md (deferred)。当前 lbaf 切了
-                // 但 IO 不支持时返 INVALID_FIELD 让 driver 走 PRACT=0 fallback。
-                if ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled() {
+                // **Phase K1/K4** — IO 路径分流：
+                //   - LBAF[0] (512B no-meta no-PI) → 默认走原路径
+                //   - LBAF[1] (4 KiB + 8B meta) + PI Type 1 + 单 LBA →
+                //     走 K4a/K4b 真 PI 路径
+                //   - 其它（如 LBAF[1] 多 LBA、Type 2/3）→ INVALID_FIELD
+                //     直到 K4c 多 LBA 路径完整实现
+                let is_pi_path = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
+                if !is_pi_path && (ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled()) {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
+                if is_pi_path && nlb != 1 {
+                    // K4a/b 单 LBA only；多 LBA 留 K4c
+                    tracing::warn!(nsid, nlb, "PI multi-LBA path not yet impl");
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
                 let total_lba = ns.total_lba;
@@ -110,6 +119,64 @@ impl NvmeController {
                     }
                 }
                 // 从文件读到 buf（per-NSID）
+                // **Phase K4b** — PI 路径单 LBA：file size = 4096 + 8 = 4104；
+                // 拆 data / tuple → verify → 只 dma_write data 部分给 PRP1
+                if is_pi_path {
+                    let pi_type = ns.pi_type;
+                    let pi_first = ns.pi_first;
+                    let block_bytes = ns.block_bytes() as usize; // 4104
+                    let data_bytes = ns.data_bytes() as usize; // 4096
+                    let mut block_buf = vec![0u8; block_bytes];
+                    let ns_mut = self.ns_mut(nsid).unwrap();
+                    if let Err(e) = ns_mut
+                        .file
+                        .seek(SeekFrom::Start(slba * block_bytes as u64))
+                        .and_then(|_| ns_mut.file.read_exact(&mut block_buf))
+                    {
+                        tracing::warn!(error = %e, nsid, slba, "PI READ: backing read failed");
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::DATA_TRANSFER_ERROR,
+                            0,
+                        ));
+                    }
+                    // 拆 data / tuple — pi_first 决定 tuple 在头还是尾
+                    let (data_slice, tuple_slice) = if pi_first {
+                        (&block_buf[8..8 + data_bytes], &block_buf[0..8])
+                    } else {
+                        (
+                            &block_buf[0..data_bytes],
+                            &block_buf[data_bytes..data_bytes + 8],
+                        )
+                    };
+                    let tuple_arr: [u8; 8] = tuple_slice.try_into().unwrap();
+                    let pi = crate::pi::PiTuple::from_bytes(&tuple_arr);
+                    let check = pi.verify(data_slice, slba, pi_type);
+                    if let Some(sc) = check.to_sc() {
+                        // PI 校验失败 → 返 Media/Data Integrity SC
+                        tracing::warn!(nsid, slba, ?check, "PI READ verify FAIL");
+                        self.stat_num_err_log_entries += 1;
+                        self.push_error_log(sq_id, cid, (sc as u16) << 1, slba, nsid);
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc, 0));
+                    }
+                    // verify OK → dma_write 仅 data 部分 (4 KiB)
+                    let tok = ctx.dma_write(prp1, data_slice.to_vec());
+                    self.pending_ios.insert(
+                        tok,
+                        PendingIo {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            nsid,
+                            op: PendingOp::NvmReadPiDmaWrite { num_blocks: nlb },
+                        },
+                    );
+                    return None;
+                }
                 let mut buf = vec![0u8; bytes as usize];
                 let ns_mut = self.ns_mut(nsid).unwrap();
                 if let Err(e) = ns_mut
@@ -255,7 +322,39 @@ impl NvmeController {
                     ));
                 };
                 if ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled() {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    // **Phase K4a** — PI 单 LBA Write 路径
+                    let is_pi_path = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
+                    if !is_pi_path || nlb != 1 {
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    }
+                    let total_lba = ns.total_lba;
+                    if slba >= total_lba {
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::LBA_OUT_OF_RANGE,
+                            0,
+                        ));
+                    }
+                    let pi_bytes = ns.data_bytes() as u32;
+                    let tok = ctx.dma_read(prp1, pi_bytes);
+                    self.pending_ios.insert(
+                        tok,
+                        PendingIo {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            nsid,
+                            op: PendingOp::NvmWritePi {
+                                lba: slba,
+                                num_blocks: nlb,
+                            },
+                        },
+                    );
+                    return None;
                 }
                 let total_lba = ns.total_lba;
                 match slba.checked_add(nlb as u64) {
