@@ -245,16 +245,8 @@ impl NvmeController {
                     0x01 => self.build_error_info_log(bytes),
                     0x02 => self.build_smart_health_log(bytes),
                     0x03 => self.build_fw_slot_info_log(bytes),
-                    0x06 => {
-                        // Device Self-Test — 我们 OACS.self_test=true 但
-                        // 不真追踪 self-test 进度；返全零（spec 允许 "no
-                        // self-test in progress, never run"）。
-                        vec![0u8; bytes]
-                    }
-                    0x80 => {
-                        // Reservation Notification — 不支持 reservations。
-                        vec![0u8; bytes]
-                    }
+                    0x06 => self.build_self_test_log(bytes),
+                    0x80 => self.build_reservation_log(bytes),
                     _ => {
                         tracing::debug!(
                             lid = format_args!("{:#x}", lid),
@@ -361,12 +353,49 @@ impl NvmeController {
                 Some(Cqe::success(cid, 0, sq_head, phase))
             }
             admin_opc::DEVICE_SELF_TEST => {
-                // NVMe spec § 5.11 Device Self-test。CDW10 bits 3:0 = STC
-                // (0=abort, 1=short, 2=extended, 15=vendor). 我们 always
-                // success 不真自检（教学：真实现要起 background task 周期
-                // 性更新 self-test log 页）。
-                tracing::debug!(cid, "Device Self-Test (no-op success)");
-                Some(Cqe::success(cid, 0, sq_head, phase))
+                // **Phase G** — NVMe spec § 5.11 Device Self-test。
+                // CDW10 bits 3:0 = STC：
+                //   0x0 = abort current self-test
+                //   0x1 = short self-test (≤ 2 min spec 推荐)
+                //   0x2 = extended self-test (≤ 2 hour spec 推荐)
+                //   0xf = vendor specific
+                // 教学：把时间常数压成秒级（5 s / 20 s），让 tick 推进
+                // percent_complete + Get Log Page 0x06 反映；完成后自动
+                // fire AEN Notice (type=0x02, info=0x01) 通知 driver。
+                let stc = (sqe.cdw10 & 0xf) as u8;
+                match stc {
+                    0x0 => {
+                        // Abort：清掉 in-progress（last_result 设 0x09 = aborted
+                        // by host，spec § 5.16.1.6 Table）
+                        if let Some(st) = self.self_test.as_mut() {
+                            st.stc = 0;
+                            st.last_result = 0x09;
+                            tracing::info!("Self-Test aborted by host");
+                        }
+                        Some(Cqe::success(cid, 0, sq_head, phase))
+                    }
+                    0x1 | 0x2 => {
+                        if self.self_test.as_ref().is_some_and(|s| s.stc != 0) {
+                            // Spec：已在进行 → 0x1d Self-Test In Progress
+                            tracing::warn!(stc, "Self-Test rejected: already in progress");
+                            return Some(Cqe::error(cid, 0, sq_head, phase, 0x1d, 0));
+                        }
+                        let total = if stc == 0x1 { 5 } else { 20 };
+                        self.self_test = Some(crate::controller::SelfTestState {
+                            started_at: std::time::Instant::now(),
+                            stc,
+                            total_seconds: total,
+                            percent_complete: 0,
+                            last_result: 0,
+                        });
+                        tracing::info!(stc, total, "Self-Test started");
+                        Some(Cqe::success(cid, 0, sq_head, phase))
+                    }
+                    _ => {
+                        tracing::warn!(stc, "Self-Test: unsupported STC");
+                        Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0))
+                    }
+                }
             }
             admin_opc::NS_MANAGEMENT => {
                 // NVMe spec § 5.22 Namespace Management。CDW10 bits 3:0 = SEL

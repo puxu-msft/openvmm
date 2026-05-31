@@ -197,6 +197,20 @@ pub struct NvmeController {
     /// 当有事件触发时弹一条，构造 CQE 带 event info → post 到 admin CQ。
     /// 元组：(cid, sq_id, sq_head, cq_id)。
     pub(super) aen_pending: std::collections::VecDeque<(u16, u16, u16, u16)>,
+    /// **Phase G** — 上次 AEN 触发时观测到的 stat_num_err_log_entries
+    /// 快照；tick 中比较新值 → 自动 fire AEN type 0x00 Error。
+    pub(super) aen_last_err_count: u64,
+
+    // ----- Phase G: Device Self-Test 状态机 -----
+    /// 当前自检状态（None = idle，Some(...) = 进行中）。NVMe spec § 5.11
+    /// + § 5.16.1.6 (Self-Test Log)。
+    pub(super) self_test: Option<SelfTestState>,
+
+    // ----- Phase G: Error Information Log entry 真累积 -----
+    /// 最近 64 条 error log entry（环形 FIFO，spec ELPE=63 → 64 entry）。
+    /// 真追踪 fail 命令的 cid / sq_id / status_field / LBA。Get Log Page
+    /// 0x01 时填入。
+    pub(super) error_log: std::collections::VecDeque<ErrorLogEntry>,
 
     // ----- 配置 -----
     vid: u16,
@@ -210,6 +224,48 @@ struct FetchCtx {
     count: u32,
     /// 起始 slot index（在 SQ 中）。
     start_slot: u32,
+}
+
+/// **Phase G** — Device Self-Test 状态机（NVMe spec § 5.11 + § 5.16.1.6）。
+///
+/// 真硬件自检会跑分钟级（短）或小时级（长）；我们把时间常数压成秒级
+/// 教学演示：short = 5 s，extended = 20 s。每秒在 `tick` 推进一次
+/// progress；完成后 mark result 让 Get Log Page 0x06 反映。
+#[derive(Debug, Clone)]
+pub(super) struct SelfTestState {
+    /// Started_at — 用 Instant 算 elapsed。
+    pub(super) started_at: std::time::Instant,
+    /// Spec § 5.11 CDW10 bits 3:0 STC：1 = short，2 = extended。
+    pub(super) stc: u8,
+    /// 完成需多少秒（教学常数）。
+    pub(super) total_seconds: u32,
+    /// 上次 tick 时更新的进度百分比（0..100）。
+    pub(super) percent_complete: u8,
+    /// 上一次跑完的结果 code（spec § 5.16.1.6 Self-Test Result）。
+    /// 0 = Operation completed without error。
+    pub(super) last_result: u8,
+}
+
+/// **Phase G** — Error Information Log entry（NVMe spec § 5.16.1.1，64 字节）。
+///
+/// 真追踪 fail 命令 metadata，供 Get Log Page 0x01 序列化。当 CQE 发出
+/// status code != 0 时 push 一条到 controller.error_log（环形 64 entry）。
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ErrorLogEntry {
+    /// 单调 error_count（spec offset 0..8）。重启后从 0 起。
+    pub(super) error_count: u64,
+    /// SQ id (spec offset 8..10)。
+    pub(super) sq_id: u16,
+    /// Command ID (spec offset 10..12)。
+    pub(super) cid: u16,
+    /// Status Field（spec offset 12..14）— 复用 CQE 的 SF 位 (bits 15:1)。
+    pub(super) status_field: u16,
+    /// Parameter Error Location (spec offset 14..16)。我们不细化 → 0。
+    pub(super) param_loc: u16,
+    /// LBA (spec offset 16..24)。NVM IO 失败时填 SLBA；admin 失败 = 0。
+    pub(super) lba: u64,
+    /// Namespace ID (spec offset 24..28)。
+    pub(super) nsid: u32,
 }
 
 impl NvmeController {
@@ -260,6 +316,9 @@ impl NvmeController {
             power_on_instant: std::time::Instant::now(),
             stat_num_err_log_entries: 0,
             aen_pending: std::collections::VecDeque::new(),
+            aen_last_err_count: 0,
+            self_test: None,
+            error_log: std::collections::VecDeque::new(),
             vid,
             ssvid,
             msix_count: 4, // admin (vec 0) + IO (vec 1) + 2 spare
@@ -331,6 +390,11 @@ impl NvmeController {
         self.sqe_inbox.clear();
         // AEN queue 跨 reset 不保留 (NVMe spec § 5.2 "Implicit Aborts on Reset")
         self.aen_pending.clear();
+        self.aen_last_err_count = self.stat_num_err_log_entries;
+        // Phase G：self-test 跨 reset 撤回（spec § 5.11 "Reset terminates
+        // any in-progress Device Self-test"）；error log 跨 reset 保留
+        // （spec § 5.16.1.1 持久化，仅 power-cycle 清空）。
+        self.self_test = None;
         self.state = CtrlState::Disabled;
         self.csts &= !csts::RDY;
     }
@@ -509,7 +573,7 @@ impl NvmeController {
     /// 供基础设施 + tests 用；外部代码可调 `fire_aen(0x01, 0x00, 0x02)`
     /// 模拟 SMART critical。返 true = AER 已 fire；false = 无 pending AER
     /// 可弹（事件丢弃 — driver 下次投 AER 不会重发，与真硬件一致）。
-    #[allow(dead_code)] // 当前无自然事件源；保留 API 供未来 SMART/NS hook。
+    #[allow(dead_code)] // Phase G tick 调；保留 visibility 供后续单测/外部触发
     pub(super) fn fire_aen(
         &mut self,
         ctx: &mut DeviceCtx<'_>,
@@ -549,11 +613,102 @@ impl NvmeController {
     /// CMDID / Status Field / Param Error Loc / LBA / NSID / Vendor /
     /// Cmd Specific Info。我们当前不追踪 per-cmd error history，返单条
     /// 全零 entry 作 "no errors" 占位。
+    /// **Phase C/G** — Log Page 0x01 Error Information Log。
+    ///
+    /// NVMe spec § 5.16.1.1。每 entry 64 字节。Phase G 之前返全零；现在
+    /// 真序列化 `self.error_log` 环形 buffer。Driver 顺序读到 error_count
+    /// 单调递增的 entry 列表（最旧→最新）。entry 0 是 "最近一次" — 我们
+    /// 按 spec 反序：buf[0..64] = 最新，buf[64..128] = 次新，…。
     fn build_error_info_log(&self, bytes: usize) -> Vec<u8> {
-        // Spec：每 entry 64 字节，list 长度 = ELPE+1 (Identify Controller
-        // .elpe，我们当前 = 0 → 1 entry)。NUMDL 给的 bytes 通常 ≥ 64。
-        // Entry 0 全 0 表示 "no error logged yet"，spec allowed。
+        let mut buf = vec![0u8; bytes];
+        // 最多塞 bytes/64 个；error_log 按 push 顺序（旧→新），spec 要求
+        // entry 0 = most recent，所以 rev()。
+        for (i, e) in self.error_log.iter().rev().enumerate() {
+            let off = i * 64;
+            if off + 64 > bytes {
+                break;
+            }
+            buf[off..off + 8].copy_from_slice(&e.error_count.to_le_bytes());
+            buf[off + 8..off + 10].copy_from_slice(&e.sq_id.to_le_bytes());
+            buf[off + 10..off + 12].copy_from_slice(&e.cid.to_le_bytes());
+            buf[off + 12..off + 14].copy_from_slice(&e.status_field.to_le_bytes());
+            buf[off + 14..off + 16].copy_from_slice(&e.param_loc.to_le_bytes());
+            buf[off + 16..off + 24].copy_from_slice(&e.lba.to_le_bytes());
+            buf[off + 24..off + 28].copy_from_slice(&e.nsid.to_le_bytes());
+            // offset 28..64 = vendor info / log page ver / cmd-specific = 0
+        }
+        buf
+    }
+
+    /// **Phase G** — Log Page 0x06 Device Self-Test (NVMe spec § 5.16.1.6)。
+    ///
+    /// 564 字节布局：
+    /// - offset 0 (1 byte): Current Self-Test Operation
+    ///   bits 3:0 = 0x0 (none), 0x1 short, 0x2 extended
+    /// - offset 1 (1 byte): Current Self-Test Completion (0..100 %)
+    /// - offset 4 + N * 28 (N=0..19): Self-Test Result Data Structure
+    ///   Result 数据结构 28 byte：
+    ///   byte 0 bits 7:4 = Self-Test Code (1=short, 2=extended)
+    ///   byte 0 bits 3:0 = Self-Test Result (0=ok, 0x09=aborted, …)
+    ///   byte 1 = Segment number; byte 2 = valid diagnostic info bitmap
+    ///   byte 3 reserved; byte 4..12 = Power On Hours when run
+    ///   byte 12..16 = NSID; byte 16..24 = Failing LBA;
+    ///   byte 24..28 = Status Code / vendor specific
+    fn build_self_test_log(&self, bytes: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; bytes.max(564)];
+        if let Some(st) = &self.self_test {
+            if st.stc != 0 {
+                // in-progress：current op + completion percent
+                buf[0] = st.stc;
+                buf[1] = st.percent_complete;
+            } else if st.percent_complete == 100 {
+                // 已完成一次自检：current=0, pct=0, result entry @ offset 4
+                // 简化：上次类型暂记为 1 (short)；真实现要追踪 last STC。
+                buf[4] = (1u8 << 4) | (st.last_result & 0x0f);
+                let hours = self.power_on_instant.elapsed().as_secs() / 3600;
+                buf[8..16].copy_from_slice(&hours.to_le_bytes());
+                buf[16..20].copy_from_slice(&1u32.to_le_bytes());
+            }
+        }
+        buf.truncate(bytes);
+        buf
+    }
+
+    /// **Phase G** — Log Page 0x80 Reservation Notification (NVMe spec
+    /// § 5.16.1.16)。
+    ///
+    /// 我们不支持 reservation（ONCS.reservations=0），返 spec 允许的
+    /// "no notifications" 占位 buffer：64 字节固定。Driver 不应在这种
+    /// 情况下发此 cmd（Identify Controller 已声明），返零是 graceful
+    /// fallback 比 INVALID_FIELD 友好。
+    fn build_reservation_log(&self, bytes: usize) -> Vec<u8> {
         vec![0u8; bytes]
+    }
+
+    /// **Phase G** — push error log entry（CQE 携 non-zero status 时调）。
+    /// 环形 buffer，最多 64 entry（spec ELPE=63）。
+    pub(super) fn push_error_log(
+        &mut self,
+        sq_id: u16,
+        cid: u16,
+        status_field: u16,
+        lba: u64,
+        nsid: u32,
+    ) {
+        const ELPE_MAX: usize = 64;
+        let count = self.stat_num_err_log_entries; // 调 push 时已 ++
+        self.error_log.push_back(ErrorLogEntry {
+            error_count: count,
+            sq_id,
+            cid,
+            status_field,
+            param_loc: 0,
+            lba,
+            nsid,
+        });
+        while self.error_log.len() > ELPE_MAX {
+            self.error_log.pop_front();
+        }
     }
 
     /// **Phase C/F** — Log Page 0x02 SMART / Health Information。
@@ -850,8 +1005,42 @@ impl PcieDevice for NvmeController {
         self.disable();
     }
 
-    fn tick(&mut self, _ctx: &mut DeviceCtx<'_>) {
-        // 没事可做；NVMe 是 reactive
+    fn tick(&mut self, ctx: &mut DeviceCtx<'_>) {
+        // **Phase G** — self-test 进度推进 + AEN 自动触发。
+        // tick 默认每秒被 SDK 触发；NVMe 是 reactive 但 self-test 需要
+        // background 推进 percent_complete + last_result。
+        if let Some(st) = self.self_test.as_mut() {
+            let elapsed = st.started_at.elapsed().as_secs();
+            let pct = ((elapsed as f64 / st.total_seconds as f64) * 100.0).min(100.0) as u8;
+            if pct != st.percent_complete {
+                st.percent_complete = pct;
+                tracing::debug!(pct, stc = st.stc, "Self-Test progress");
+            }
+            if elapsed >= st.total_seconds as u64 {
+                // 自检完成 — 真硬件可能根据 backing media health 设非零
+                // result。我们 backing 是普通 file，假设永远成功。
+                let last_result = 0u8; // 0 = completed without error
+                let stc = st.stc;
+                tracing::info!(stc, "Self-Test completed (result=0)");
+                self.self_test = Some(SelfTestState {
+                    started_at: st.started_at,
+                    stc: 0, // 0 in last_result means "no in-progress test"
+                    total_seconds: st.total_seconds,
+                    percent_complete: 100,
+                    last_result,
+                });
+                // 触发 AEN Notice (type 0x02) + log id 0x06 Self-Test Log
+                // available（spec § 5.2 + Figure 174 Async Event Info
+                // for Notice = "Device Self-test Completed" = 0x01）。
+                let _ = self.fire_aen(ctx, 0x02, 0x01, 0x06);
+            }
+        }
+        // AEN: 新出现的 error 触发 type=0x00 Error。
+        if self.stat_num_err_log_entries > self.aen_last_err_count {
+            self.aen_last_err_count = self.stat_num_err_log_entries;
+            // info=0x00 reserved/generic，log_id=0x01 Error Information Log
+            let _ = self.fire_aen(ctx, 0x00, 0x00, 0x01);
+        }
     }
 
     fn on_dma_complete(&mut self, ctx: &mut DeviceCtx<'_>, token: u64, ok: bool, data: Vec<u8>) {
@@ -901,6 +1090,10 @@ impl PcieDevice for NvmeController {
                     _ => {}
                 }
                 self.stat_num_err_log_entries += 1;
+                // Phase G：push 进 error_log 环形 buffer，Get Log Page 0x01 用。
+                // sc=DATA_TRANSFER_ERROR (0x04) 在 SF bits 8..1 = 0x04 << 1
+                let sf = (sc::DATA_TRANSFER_ERROR as u16) << 1;
+                self.push_error_log(p.sq_id, p.cid, sf, 0, 1);
                 let cq = self.cqs.get(&p.cq_id);
                 let phase = cq.map(|c| c.phase).unwrap_or(1);
                 let cqe = Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR, 0);
@@ -962,6 +1155,13 @@ impl PcieDevice for NvmeController {
                         Err(e) => {
                             tracing::warn!(error = %e, lba, num_blocks, "NVM Write file write failed");
                             self.stat_num_err_log_entries += 1;
+                            self.push_error_log(
+                                p.sq_id,
+                                p.cid,
+                                (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                                lba,
+                                1,
+                            );
                             Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR, 0)
                         }
                     };
@@ -1038,6 +1238,13 @@ impl PcieDevice for NvmeController {
                                     "NVM Write dual-PRP file write failed"
                                 );
                                 self.stat_num_err_log_entries += 1;
+                                self.push_error_log(
+                                    accum.sq_id,
+                                    accum.cid,
+                                    (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                                    accum.lba,
+                                    1,
+                                );
                                 Cqe::error(
                                     accum.cid,
                                     accum.sq_id,
@@ -1148,6 +1355,13 @@ impl PcieDevice for NvmeController {
                             Err(e) => {
                                 tracing::warn!(error = %e, lba = op.lba, "PRP-list write failed");
                                 self.stat_num_err_log_entries += 1;
+                                self.push_error_log(
+                                    op.sq_id,
+                                    op.cid,
+                                    (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                                    op.lba,
+                                    1,
+                                );
                                 Cqe::error(
                                     op.cid,
                                     op.sq_id,
@@ -1373,5 +1587,62 @@ mod tests {
         assert_eq!(c.aen_pending.pop_front().unwrap().0, 2);
         assert_eq!(c.aen_pending.pop_front().unwrap().0, 3);
         assert!(c.aen_pending.is_empty());
+    }
+
+    /// Phase G：error_log 环形 buffer 截到 64 (ELPE+1)；最新在 build 输出
+    /// 头部（spec § 5.16.1.1 entry 0 = most recent）。
+    #[test]
+    fn error_log_ring_buffer_64_max_recent_first() {
+        let mut c = make_ctrl_with_tmp("errlog");
+        // 推 70 条 → 应只保留 last 64
+        for i in 0..70u16 {
+            c.stat_num_err_log_entries += 1;
+            c.push_error_log(1, i, 0x8, (i as u64) * 100, 1);
+        }
+        assert_eq!(c.error_log.len(), 64);
+        // 最旧保留的 error_count = 7 (70 个推入 - 64 保留 = 6 个丢弃)
+        assert_eq!(c.error_log.front().unwrap().error_count, 7);
+        // 序列化：entry 0 应是最新的 (cid=69)
+        let buf = c.build_error_info_log(4096);
+        let cid_at_entry0 = u16::from_le_bytes([buf[10], buf[11]]);
+        assert_eq!(cid_at_entry0, 69, "entry 0 must be most recent");
+        // entry 1 = 次新 cid=68
+        let cid_at_entry1 = u16::from_le_bytes([buf[64 + 10], buf[64 + 11]]);
+        assert_eq!(cid_at_entry1, 68);
+    }
+
+    /// Phase G：Self-Test Log 0x06 反映 in-progress + 完成状态。
+    #[test]
+    fn self_test_log_layout_in_progress_and_done() {
+        let mut c = make_ctrl_with_tmp("st");
+        // idle → buf[0]=0, buf[1]=0
+        let buf = c.build_self_test_log(564);
+        assert_eq!(buf[0], 0);
+        assert_eq!(buf[1], 0);
+        // in-progress short, 42% done
+        c.self_test = Some(SelfTestState {
+            started_at: std::time::Instant::now(),
+            stc: 1,
+            total_seconds: 5,
+            percent_complete: 42,
+            last_result: 0,
+        });
+        let buf = c.build_self_test_log(564);
+        assert_eq!(buf[0], 1);
+        assert_eq!(buf[1], 42);
+        // 完成（stc=0 且 pct=100）→ result 进 offset 4
+        c.self_test = Some(SelfTestState {
+            started_at: std::time::Instant::now(),
+            stc: 0,
+            total_seconds: 5,
+            percent_complete: 100,
+            last_result: 0,
+        });
+        let buf = c.build_self_test_log(564);
+        assert_eq!(buf[0], 0); // no current
+        assert_eq!(buf[1], 0);
+        // Result entry @ offset 4：上半 nibble = STC=1 (short), 下半 = 0 (ok)
+        assert_eq!(buf[4] & 0xf0, 0x10);
+        assert_eq!(buf[4] & 0x0f, 0x00);
     }
 }
