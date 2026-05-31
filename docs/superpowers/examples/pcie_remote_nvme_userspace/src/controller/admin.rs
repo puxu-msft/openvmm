@@ -352,7 +352,12 @@ impl NvmeController {
                     0x01 => super::logs::build_error_info(self, bytes),
                     0x02 => super::logs::build_smart_health(self, bytes),
                     0x03 => super::logs::build_fw_slot_info(self, bytes),
+                    0x05 => super::logs::build_cmds_supported_effects(self, bytes),
                     0x06 => super::logs::build_self_test(self, bytes),
+                    0x07 => super::logs::build_telemetry_host(self, bytes),
+                    0x08 => super::logs::build_telemetry_ctrl(self, bytes),
+                    0x0d => super::logs::build_persistent_event(self, bytes),
+                    0x0e => super::logs::build_lba_status_info(self, bytes),
                     0x80 => super::logs::build_reservation_notification(self, bytes),
                     0x81 => super::logs::build_sanitize_status(self, bytes),
                     _ => {

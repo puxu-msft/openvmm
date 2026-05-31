@@ -126,6 +126,128 @@ pub(super) fn build_reservation_notification(_c: &NvmeController, bytes: usize) 
     buf
 }
 
+/// **Phase K7** — Log Page 0x07 Telemetry Host-Initiated (spec § 5.16.1.10)。
+///
+/// 512 字节 header + per-area data blocks。Telemetry 是 controller 内部
+/// 诊断快照（generation #, data area 1/2/3 offsets, controller-defined
+/// 字节）。教学版返 header-only：仅 LogIdentifier + generation #=1，data
+/// area pointers 全 0 (driver 看到 'no telemetry data'）。
+pub(super) fn build_telemetry_host(_c: &NvmeController, bytes: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; bytes.max(512)];
+    buf[0] = 0x07; // Log Identifier
+    // bytes 1..4 reserved；byte 5..8 IEEE OUI 全 0
+    // byte 8..10 = Telemetry Host-Initiated Data Area 1 Last Block (0=no data)
+    // byte 10..12 = Area 2 / 12..14 Area 3 — 全 0 表示 no data
+    // byte 14..382 reserved
+    // byte 382..384 = Telemetry Controller-Initiated Data Available (=0)
+    // byte 384..388 = Telemetry Data Area 4 Last Block
+    buf[388] = 1; // Generation Number = 1（任何 ≥1 即可）
+    buf.truncate(bytes);
+    buf
+}
+
+/// **Phase K7** — Log Page 0x08 Telemetry Controller-Initiated (同 0x07
+/// 布局，content 由 controller 自主生成而非 driver 触发)。
+pub(super) fn build_telemetry_ctrl(_c: &NvmeController, bytes: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; bytes.max(512)];
+    buf[0] = 0x08;
+    buf[388] = 1;
+    buf.truncate(bytes);
+    buf
+}
+
+/// **Phase K7** — Log Page 0x0D Persistent Event Log (spec § 5.16.1.14)。
+///
+/// 512 byte header + variable-length event records。Header：
+/// - byte 0 = Log Identifier = 0x0D
+/// - byte 1..4 reserved
+/// - byte 4..8 = Total Number of Events (TNEV)
+/// - byte 8..16 = Total Log Length (TLL)
+/// - byte 16 = Log Revision (= 1 in spec)
+/// - byte 17 reserved
+/// - byte 18..20 = Log Header Length
+///
+/// 教学版：TNEV=0, TLL=512, 无 event 数据。
+pub(super) fn build_persistent_event(_c: &NvmeController, bytes: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; bytes.max(512)];
+    buf[0] = 0x0D;
+    // TLL @ 8..16 = 512
+    buf[8..16].copy_from_slice(&512u64.to_le_bytes());
+    buf[16] = 1; // Log Revision
+    // Log Header Length @ 18..20 = 512
+    buf[18..20].copy_from_slice(&512u16.to_le_bytes());
+    buf.truncate(bytes);
+    buf
+}
+
+/// **Phase K7** — Log Page 0x0E LBA Status Information (spec § 5.16.1.18)。
+///
+/// 报告 LBA 范围的 'unrecovered / pending media error' 状态。我们 backing
+/// 无 ECC → 全无 error；header 设 'no descriptors'：
+/// - byte 0..4 = Number of LBA Status Descriptors (NLSD) = 0
+/// - byte 4..8 = Completion Condition Indicator (CCI) = 0 (no condition)
+/// - byte 8..40 reserved
+pub(super) fn build_lba_status_info(_c: &NvmeController, bytes: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; bytes.max(40)];
+    buf.truncate(bytes);
+    buf
+}
+
+/// **Phase K7** — Log Page 0x05 Commands Supported and Effects (spec § 5.16.1.5)。
+///
+/// 4096 字节：256 × 4 byte for admin opcodes (offset 0..1024) + 256 × 4
+/// byte for NVM opcodes (offset 1024..2048) + rsvd。每 entry：
+///   bit 0 = Command Supported (CSUPP)
+///   bit 1 = Logical Block Content Change (LBCC) — 写盘类
+///   bit 2 = Namespace Capability Change (NCC) — 改 NS 配置类
+///   bit 3 = Namespace Inventory Change (NIC) — 创/删 NS
+///   bit 4 = Controller Capability Change (CCC) — 改 controller 配置
+///   bits 19:16 = Command Submission and Execution (CSE):
+///     0 = no special, 1 = serialize per NS, 2 = serialize entire ctrl
+pub(super) fn build_cmds_supported_effects(_c: &NvmeController, bytes: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; bytes.max(4096)];
+    // Helper: 写 entry
+    let set = |buf: &mut [u8], opc: u8, base: usize, csupp: bool, flags: u32| {
+        let off = base + (opc as usize) * 4;
+        let v = if csupp { 0x1 | flags } else { 0 };
+        buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    };
+    // Admin opcodes (base 0)
+    set(&mut buf, 0x00, 0, true, 0); // Delete IO SQ — CCC
+    set(&mut buf, 0x01, 0, true, 0x10);
+    set(&mut buf, 0x02, 0, true, 0); // Get Log Page
+    set(&mut buf, 0x04, 0, true, 0); // Delete IO CQ
+    set(&mut buf, 0x05, 0, true, 0x10);
+    set(&mut buf, 0x06, 0, true, 0); // Identify
+    set(&mut buf, 0x08, 0, true, 0); // Abort
+    set(&mut buf, 0x09, 0, true, 0x10); // Set Features — CCC
+    set(&mut buf, 0x0a, 0, true, 0);
+    set(&mut buf, 0x0c, 0, true, 0); // AER
+    set(&mut buf, 0x0d, 0, true, 0x08 | 0x10); // NS Mgmt — NIC + CCC
+    set(&mut buf, 0x10, 0, true, 0x10); // FW Commit
+    set(&mut buf, 0x11, 0, true, 0); // FW Download
+    set(&mut buf, 0x14, 0, true, 0); // Self-Test
+    set(&mut buf, 0x15, 0, true, 0); // NS Attach
+    set(&mut buf, 0x18, 0, true, 0); // Keep Alive
+    set(&mut buf, 0x7c, 0, true, 0); // Doorbell Buffer Config
+    set(&mut buf, 0x80, 0, true, 0x02 | 0x10); // Format — LBCC + CCC
+    set(&mut buf, 0x84, 0, true, 0x02 | 0x10); // Sanitize
+    // NVM opcodes (base 1024)
+    set(&mut buf, 0x00, 1024, true, 0); // Flush
+    set(&mut buf, 0x01, 1024, true, 0x02); // Write
+    set(&mut buf, 0x02, 1024, true, 0); // Read
+    set(&mut buf, 0x05, 1024, true, 0); // Compare
+    set(&mut buf, 0x08, 1024, true, 0x02); // Write Zeroes
+    set(&mut buf, 0x09, 1024, true, 0x02); // DSM
+    set(&mut buf, 0x0c, 1024, true, 0); // Verify
+    set(&mut buf, 0x0d, 1024, true, 0); // Reservation Register
+    set(&mut buf, 0x0e, 1024, true, 0); // Reservation Report
+    set(&mut buf, 0x11, 1024, true, 0); // Reservation Acquire
+    set(&mut buf, 0x15, 1024, true, 0); // Reservation Release
+    buf.truncate(bytes);
+    buf
+}
+
 /// **Phase K5** — Log Page 0x81 Sanitize Status (spec § 5.16.1.18, 512 byte)。
 ///
 /// - offset 0..2 SPROG (sanitize progress) — 0..=65535 (=100% 时 0xFFFF)
