@@ -49,8 +49,15 @@ impl NvmeController {
                                 0,
                             ));
                         };
-                        /* Phase A: spec-correct 200+ fields via nvme_spec */
-                        IdentifyNamespace::build_v2_bytes(ns.total_lba)
+                        /* Phase A+K1: spec-correct 200+ fields via nvme_spec
+                         * with per-NS LBAF/PI parameters */
+                        IdentifyNamespace::build_v2_bytes(
+                            ns.total_lba,
+                            ns.lbads,
+                            ns.meta_size,
+                            ns.pi_type,
+                            ns.pi_first,
+                        )
                     }
                     0x01 => {
                         // Identify Controller
@@ -376,25 +383,28 @@ impl NvmeController {
                 let pil = ((sqe.cdw10 >> 8) & 0x1) as u8;
                 let ses = ((sqe.cdw10 >> 9) & 0x7) as u8;
                 tracing::info!(lbafl, mset, pi, pil, ses, "Format NVM");
-                if lbafl != 0 || pi != 0 || mset != 0 {
-                    // **Phase H7 reviewer C3 修复** — 完整 PI 路径未实现：
-                    // SECTOR_SIZE 在 mod.rs 是 const 512，IO pipeline 用
-                    // 512 算 offset。若接受 LBAF[1] (4 KiB) 但 IO 仍按
-                    // 512B sector → 8x address 错位 → 87.5% 数据静默损坏。
-                    //
-                    // 在 SECTOR_SIZE 改为 per-NS + PI CRC 引擎落地前，
-                    // Format 必须拒绝 lbafl != 0 / pi != 0。Identify NS
-                    // 仍声明 DPC 能力（spec § 8.3 允许 capability 暴露
-                    // 但 disabled）；driver 看到 LBAF[1] 也行，但 Format
-                    // 选它会被这里拒绝。
+                if lbafl > 1 || pi > 1 || mset != 0 {
+                    // **Phase K1** — 真支持 LBAF[0] (512B no-meta) +
+                    // LBAF[1] (4096B+8B meta) + PI Type 0/1。mset=1
+                    // (separate metadata buffer) 需 MPTR 二级 DMA，未实现；
+                    // driver 用 mset=0 把 meta 与 data inline 存。其余拒绝。
                     tracing::warn!(
                         lbafl,
                         pi,
                         mset,
-                        "Format rejected: only LBAF[0]+PI=0 supported (SECTOR_SIZE/PI未真实现)"
+                        "Format rejected: only LBAF[0/1] + PI Type 0/1 supported"
                     );
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
+                // **Phase K1** 计算新 LBAF + PI 配置
+                let new_lbads: u8 = if lbafl == 0 { 9 } else { 12 };
+                let new_meta_size: u8 = if lbafl == 0 { 0 } else { 8 };
+                if pi != 0 && new_meta_size == 0 {
+                    // PI 需要 metadata 空间承载 8-byte tuple
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
+                let new_pi_type = pi;
+                let new_pi_first = pil == 0; // PIL=0 → first 8, PIL=1 → last 8
                 // **C1 修复**：FORMAT 不能在有 in-flight IO 时执行。否则
                 // outstanding dma_read 完成后 write_all 到已被 truncate 后
                 // 重新分配的 sparse hole，导致 driver 视角"擦除前的写已
@@ -454,11 +464,49 @@ impl NvmeController {
                             tracing::warn!(error = %e, nsid = target_nsid, "Format NVM: flush failed");
                             return Some(Cqe::error(cid, 0, sq_head, phase, sc::INTERNAL_ERROR, 0));
                         }
+                        // **Phase K1** — 应用新 LBAF + PI 配置
+                        ns.lbads = new_lbads;
+                        ns.meta_size = new_meta_size;
+                        ns.pi_type = new_pi_type;
+                        ns.pi_first = new_pi_first;
+                        // total_lba 按新 block_bytes 重算
+                        ns.total_lba = size / ns.block_bytes();
                         tracing::info!(
                             nsid = target_nsid,
                             size,
                             ses,
-                            "Format NVM: sparse-hole erase done"
+                            lbads = new_lbads,
+                            meta_size = new_meta_size,
+                            pi_type = new_pi_type,
+                            total_lba = ns.total_lba,
+                            "Format NVM: reconfigured"
+                        );
+                    }
+                } else {
+                    // SES=0 — 只切换 LBAF/PI 而不擦盘（spec § 5.14 允许）
+                    let nsid = sqe.nsid;
+                    let targets: Vec<u32> = if nsid == 0xFFFF_FFFF {
+                        self.namespaces.keys().copied().collect()
+                    } else if self.namespaces.contains_key(&nsid) {
+                        vec![nsid]
+                    } else {
+                        return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE, 0));
+                    };
+                    for target_nsid in targets {
+                        let ns = self.namespaces.get_mut(&target_nsid).unwrap();
+                        let size = ns.file.metadata().map(|m| m.len()).unwrap_or(0);
+                        ns.lbads = new_lbads;
+                        ns.meta_size = new_meta_size;
+                        ns.pi_type = new_pi_type;
+                        ns.pi_first = new_pi_first;
+                        ns.total_lba = size / ns.block_bytes();
+                        tracing::info!(
+                            nsid = target_nsid,
+                            lbads = new_lbads,
+                            meta_size = new_meta_size,
+                            pi_type = new_pi_type,
+                            total_lba = ns.total_lba,
+                            "Format NVM: LBAF/PI switched (SES=0)"
                         );
                     }
                 }

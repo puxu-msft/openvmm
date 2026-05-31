@@ -167,31 +167,65 @@ pub(super) struct PrpListOp {
     pub(super) data_pages: Vec<Option<Vec<u8>>>,
 }
 
-/// **Phase H4** — 单个 namespace 状态（spec § 1.6 "An NSID maps to one
-/// namespace"）。每 NS 有独立 backing file + 容量。
+/// **Phase H4 + K1** — 单个 namespace 状态。
+///
+/// 每 NS 有独立 backing file + 容量 + LBA 格式 + Protection Information
+/// 配置。spec § 1.6 "An NSID maps to one namespace"。
 pub(super) struct Namespace {
     pub(super) file: File,
+    /// LBA 数（按当前 lbads + meta_size 计算 = file_size / block_bytes）。
     pub(super) total_lba: u64,
     /// Backing 文件路径 — 仅供日志 / Identify Namespace 扩展用。
     #[allow(dead_code)]
     pub(super) path: String,
-    /// **Phase H6** — 已注册的 host (HOSTID + RKEY) → 注册时间索引顺序。
+    /// **Phase K1** — LBA Data Size shift。9=512B / 12=4096B。Format NVM
+    /// 时由 LBAF index 决定。spec § 5.17.2.1 LBAF[N].LBADS。
+    pub(super) lbads: u8,
+    /// **Phase K1** — Metadata bytes per LBA。0 = 无 metadata (PI 不能开)；
+    /// 8 = PI 占用整个 metadata。spec § 5.17.2.1 LBAF[N].MS。
+    pub(super) meta_size: u8,
+    /// **Phase K1** — Protection Information Type (DPS bits 2:0)。
+    /// 0=none / 1=T10 DIF Type 1 / 2=Type 2 / 3=Type 3。spec § 8.3.1。
+    pub(super) pi_type: u8,
+    /// **Phase K1** — PI in first 8 bytes of metadata (DPS bit 3)。
+    /// true = first，false = last。spec § 5.17.2.1。
+    pub(super) pi_first: bool,
+    /// **Phase H6** — 已注册的 host (HOSTID + RKEY)。
     /// 简化：单 controller 模型下 host 由 64-bit reservation key 唯一标识。
     /// 真硬件 multi-host 用 HOSTID（NVMe 2.0 spec § 6.13 推荐 16-byte）。
     pub(super) registrants: Vec<u64>,
     /// 当前 reservation 持有者的 key + type。None = unowned。
-    /// Type 编码（spec § 8.19.1）：
-    ///   1 = Write Exclusive
-    ///   2 = Exclusive Access
-    ///   3 = Write Exclusive Registrants Only
-    ///   4 = Exclusive Access Registrants Only
-    ///   5 = Write Exclusive All Registrants
-    ///   6 = Exclusive Access All Registrants
     pub(super) reservation: Option<(u64, u8)>,
     /// **Phase J reviewer M3 修复** — Reservation Status 'GEN' 字段，
     /// 单调递增（即使 unregister 也 +1），driver 用此感知 state 变化。
     /// spec § 6.14。
     pub(super) reservation_gen: u32,
+}
+
+impl Namespace {
+    /// 一个 LBA 在 backing file 占多少字节（含 metadata，T10 PI 时
+    /// = data + meta）。
+    #[inline]
+    pub(super) fn block_bytes(&self) -> u64 {
+        (1u64 << self.lbads) + self.meta_size as u64
+    }
+    /// 仅数据部分字节数（不含 metadata）。
+    #[inline]
+    #[allow(dead_code)] // Phase K4 真 PI/4K IO 路径会用
+    pub(super) fn data_bytes(&self) -> u64 {
+        1u64 << self.lbads
+    }
+    /// metadata 字节数 per LBA（0 = 无 metadata）。
+    #[inline]
+    #[allow(dead_code)]
+    pub(super) fn meta_bytes(&self) -> u64 {
+        self.meta_size as u64
+    }
+    /// 当前是否启用 PI（pi_type != 0）。
+    #[inline]
+    pub(super) fn pi_enabled(&self) -> bool {
+        self.pi_type != 0
+    }
 }
 
 /// NVMe Controller 主结构 — 实现 `PcieDevice`。
@@ -395,10 +429,15 @@ impl NvmeController {
                 .write(true)
                 .open(path)?;
             let size = file.metadata()?.len();
-            let total_lba = size >> SECTOR_SHIFT;
+            // Phase K1：默认 LBAF[0] = 512B no-meta no-PI（向后兼容）。
+            // 真 PI 路径需 Format 切到 LBAF[1] + DPS=1 才启用。
+            let lbads = 9u8;
+            let meta_size = 0u8;
+            let total_lba = size >> lbads;
             if total_lba == 0 {
                 return Err(anyhow::anyhow!(
-                    "backing file too small (< 512 bytes): {path}"
+                    "backing file too small (< {} bytes): {path}",
+                    1u64 << lbads
                 ));
             }
             let nsid = (idx as u32) + 1;
@@ -407,6 +446,8 @@ impl NvmeController {
                 path = %path,
                 size,
                 total_lba,
+                lbads,
+                meta_size,
                 "NVMe controller: namespace registered"
             );
             namespaces.insert(
@@ -415,6 +456,10 @@ impl NvmeController {
                     file,
                     total_lba,
                     path: path.clone(),
+                    lbads,
+                    meta_size,
+                    pi_type: 0,
+                    pi_first: true,
                     registrants: Vec::new(),
                     reservation: None,
                     reservation_gen: 0,

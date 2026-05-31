@@ -455,49 +455,40 @@ impl IdentifyNamespace {
     /// 之前手写版本只 ~8 字段（nsze/ncap/nuse/nsfeat/nlbaf/flbas/lbaf[0]/_resv），
     /// 现在通过 nvme_spec::nvm::IdentifyNamespace 拿到完整 60+ 字段（含 mssrl/mcl/
     /// msrc/anagrpid/nvmsetid/endgid/eui64 等 spec 后续版本字段）。
-    pub fn build_v2_bytes(total_lba: u64) -> Vec<u8> {
+    /// Phase K1：参数化 lbads/meta_size/pi_type 反映 NS 当前真实格式。
+    pub fn build_v2_bytes(
+        total_lba: u64,
+        lbads: u8,
+        meta_size: u8,
+        pi_type: u8,
+        pi_first: bool,
+    ) -> Vec<u8> {
         let mut ns = SpecIdentifyNamespace::new_zeroed();
         ns.nsze = total_lba;
         ns.ncap = total_lba;
         ns.nuse = 0;
         ns.nsfeat = 0x01.into(); // THINP
-        ns.flbas = 0.into();
-        ns.nlbaf = 0;
+        // FLBAS bits 3:0 = current LBAF index (0 or 1)；bit 4 = metadata
+        // inline with data (我们 mset=0 → 0)
+        let lbaf_idx = if lbads == 9 { 0u8 } else { 1u8 };
+        ns.flbas = lbaf_idx.into();
+        ns.nlbaf = 1; // 2 LBAF slots
         ns.lbaf[0] = nvme_spec::nvm::Lbaf::new()
             .with_ms(0)
-            .with_lbads(9) // 2^9 = 512 byte sector
+            .with_lbads(9)
             .with_rp(0);
-        // **Phase H6** — RESCAP (spec § 5.17.2.1 Figure 274) reservation
-        // capabilities：bit 0 PTPL persist through power loss（我们不持
-        // 久化所以 0），bits 1-7 supported types。我们实现 type 1 (Write
-        // Exclusive) + type 2 (Exclusive Access) + Registrants-Only 变体
-        // (3/4)，简化不实现 All-Registrants (5/6)。RESCAP byte:
-        //   bit 1 = Write Exclusive (type 1)
-        //   bit 2 = Exclusive Access (type 2)
-        //   bit 3 = Write Excl. Registrants Only (type 3)
-        //   bit 4 = Excl. Access Registrants Only (type 4)
-        ns.rescap = 0b0001_1110u8.into();
-        // **Phase H7** — Protection Information (spec § 8.3 PI)：
-        //   DPC (Data Protection Capabilities) byte：声明硬件能力
-        //     bit 0 = PI Type 1 supported (T10 DIF Guard+RefTag)
-        //     bit 1 = Type 2 (deferred RefTag check)
-        //     bit 2 = Type 3 (no RefTag)
-        //     bit 3 = first 8 bytes of metadata are PI
-        //     bit 4 = last 8 bytes of metadata are PI
-        //   DPS (Data Protection Settings) byte：per-NS 当前启用的 type
-        //     bits 2:0 = 0 (none), 1 (T1), 2 (T2), 3 (T3)
-        //     bit 3 = PI in first 8 bytes
-        // 教学声明：DPC 暴露 Type 1 + first-8 能力；DPS=0 默认不启用
-        // （Format 才切换）。LBAF[1] = 4096B data + 8B metadata（PI tuple
-        // 占整个 8 byte metadata）；driver 选 LBAF[1] 才走 PI 路径，目前
-        // 我们 IO 路径不真做 CRC 计算（见 H7 注释）。
-        ns.dpc = 0b0000_1001; // T1 + first-8 metadata
-        ns.dps = 0; // 默认禁用
-        ns.nlbaf = 1; // 1+1 = 2 LBAF
         ns.lbaf[1] = nvme_spec::nvm::Lbaf::new()
-            .with_ms(8) // 8 byte metadata
-            .with_lbads(12) // 4096 byte data
+            .with_ms(8)
+            .with_lbads(12)
             .with_rp(0);
+        // RESCAP — Phase H6 reservation capabilities
+        ns.rescap = 0b0001_1110u8.into();
+        // DPC — Phase H7 PI capability (T1 + first-8 metadata)
+        ns.dpc = 0b0000_1001;
+        // DPS — current PI settings (bits 2:0 type + bit 3 first/last)
+        ns.dps = (pi_type & 0x7) | if pi_first { 0x8 } else { 0x0 };
+        // 静默 unused warning（meta_size 通过 lbaf[1].ms 暴露）
+        let _ = meta_size;
         ns.as_bytes().to_vec()
     }
 }
@@ -546,7 +537,7 @@ mod tests {
     /// IdentifyNamespace LBAF[0] 必须落在 offset 128，spec § 5.17.2.1。
     #[test]
     fn identify_namespace_byte_layout() {
-        let buf = IdentifyNamespace::build_v2_bytes(2097152); // 1 GiB / 512
+        let buf = IdentifyNamespace::build_v2_bytes(2097152, 9, 0, 0, true); // 1 GiB / 512
         assert_eq!(buf.len(), 4096);
         // NSZE/NCAP/NUSE u64 LE @ 0/8/16
         assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 2097152);

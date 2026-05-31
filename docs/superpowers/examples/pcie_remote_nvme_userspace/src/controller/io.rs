@@ -74,6 +74,12 @@ impl NvmeController {
                         0,
                     ));
                 };
+                // **Phase K1** — IO 路径只走 LBAF[0] (512B no-meta no-PI)；
+                // 真 PI/4K 路径留 K4 完整实现。当前 lbaf 切了但 IO 不支持
+                // 时返 INVALID_FIELD 让 driver 走 PRACT=0 fallback。
+                if ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled() {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
                 let total_lba = ns.total_lba;
                 // H4：checked_add 防 slba + nlb 溢出（driver bug / 恶意输入）。
                 match slba.checked_add(nlb as u64) {
@@ -234,6 +240,9 @@ impl NvmeController {
                         0,
                     ));
                 };
+                if ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled() {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
                 let total_lba = ns.total_lba;
                 match slba.checked_add(nlb as u64) {
                     Some(end) if end <= total_lba => {}
@@ -440,6 +449,9 @@ impl NvmeController {
                         0,
                     ));
                 };
+                if ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled() {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
                 let total_lba = ns.total_lba;
                 // **H4 修复**：用 checked_add 防 slba + nlb 溢出。
                 match slba.checked_add(nlb as u64) {
@@ -531,6 +543,9 @@ impl NvmeController {
                         0,
                     ));
                 };
+                if ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled() {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
                 let total_lba = ns.total_lba;
                 match slba.checked_add(nlb as u64) {
                     Some(end) if end <= total_lba => {}
@@ -588,6 +603,9 @@ impl NvmeController {
                         0,
                     ));
                 };
+                if ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled() {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
                 let total_lba = ns.total_lba;
                 match slba.checked_add(nlb as u64) {
                     Some(end) if end <= total_lba => {}
