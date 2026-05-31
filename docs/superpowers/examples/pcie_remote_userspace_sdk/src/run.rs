@@ -214,6 +214,7 @@ fn mask_value(value: u64, size: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pcie_remote_protocol::to_openhcl::Body;
 
     #[test]
     fn mask_value_clears_high_bits() {
@@ -221,5 +222,94 @@ mod tests {
         assert_eq!(mask_value(0xdead_beef_cafe_babe, 2), 0xbabe);
         assert_eq!(mask_value(0xdead_beef_cafe_babe, 4), 0xcafe_babe);
         assert_eq!(mask_value(0xdead_beef_cafe_babe, 8), 0xdead_beef_cafe_babe);
+    }
+
+    /// **Phase N1** — DeviceCtx 基础 API：每个动作往 outbound 队列加一条
+    /// protobuf message，seq 单调递增。
+    #[test]
+    fn device_ctx_outbound_seq_monotonic() {
+        let mut outbound = Vec::new();
+        let mut seq = 0u64;
+        let mut tok = 0u64;
+        let mut ctx = crate::DeviceCtx {
+            outbound: &mut outbound,
+            next_seq: &mut seq,
+            next_dma_token: &mut tok,
+        };
+        ctx.fire_interrupt(0);
+        let t1 = ctx.dma_read(0x1000, 4096);
+        let t2 = ctx.dma_write(0x2000, vec![0xab; 256]);
+        assert_eq!(outbound.len(), 3);
+        // seq 从 0 起，alloc 返回当前再 +1
+        assert_eq!(outbound[0].seq, 0);
+        assert_eq!(outbound[1].seq, 1);
+        assert_eq!(outbound[2].seq, 2);
+        // 同样 tokens 从 0 起
+        assert_eq!(t1, 0);
+        assert_eq!(t2, 1);
+    }
+
+    /// **Phase N1** — fire_interrupt 生成 InterruptFire body，msix_index 透传。
+    #[test]
+    fn device_ctx_fire_interrupt_body() {
+        let mut outbound = Vec::new();
+        let mut seq = 0u64;
+        let mut tok = 0u64;
+        let mut ctx = crate::DeviceCtx {
+            outbound: &mut outbound,
+            next_seq: &mut seq,
+            next_dma_token: &mut tok,
+        };
+        ctx.fire_interrupt(3);
+        let msg = &outbound[0];
+        match msg.body.as_ref().unwrap() {
+            Body::InterruptFire(ifire) => assert_eq!(ifire.msix_index, 3),
+            _ => panic!("expected InterruptFire body"),
+        }
+    }
+
+    /// **Phase N1** — dma_read 生成 ReadGpaRequest with token + gpa + len 一致。
+    #[test]
+    fn device_ctx_dma_read_body() {
+        let mut outbound = Vec::new();
+        let mut seq = 0u64;
+        let mut tok = 0u64;
+        let mut ctx = crate::DeviceCtx {
+            outbound: &mut outbound,
+            next_seq: &mut seq,
+            next_dma_token: &mut tok,
+        };
+        let t = ctx.dma_read(0xdead_beef, 8192);
+        match outbound[0].body.as_ref().unwrap() {
+            Body::ReadGpa(r) => {
+                assert_eq!(r.token, t);
+                assert_eq!(r.gpa, 0xdead_beef);
+                assert_eq!(r.len, 8192);
+            }
+            _ => panic!("expected ReadGpa body"),
+        }
+    }
+
+    /// **Phase N1** — dma_write 生成 WriteGpaRequest with data 透传。
+    #[test]
+    fn device_ctx_dma_write_body() {
+        let mut outbound = Vec::new();
+        let mut seq = 0u64;
+        let mut tok = 0u64;
+        let mut ctx = crate::DeviceCtx {
+            outbound: &mut outbound,
+            next_seq: &mut seq,
+            next_dma_token: &mut tok,
+        };
+        let payload = vec![1, 2, 3, 4, 5];
+        let t = ctx.dma_write(0xcafe_babe, payload.clone());
+        match outbound[0].body.as_ref().unwrap() {
+            Body::WriteGpa(w) => {
+                assert_eq!(w.token, t);
+                assert_eq!(w.gpa, 0xcafe_babe);
+                assert_eq!(w.data, payload);
+            }
+            _ => panic!("expected WriteGpa body"),
+        }
     }
 }

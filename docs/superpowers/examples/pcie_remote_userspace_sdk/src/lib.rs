@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+#![allow(clippy::disallowed_macros)] // futures::pin_mut / select_biased 惯用法
+
 //! Userspace SDK for implementing PCIe devices over the pcie_remote vsock protocol.
 //!
 //! 让任意用户态程序通过 `vsock` 连入 OpenHCL VTL2 的 `pcie_remote_device`，

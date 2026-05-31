@@ -57,13 +57,7 @@ pub trait PcieDevice: 'static {
     /// - 对 `dma_write`：`data` 始终为空；`ok` 表示写入成功。
     ///
     /// 默认实现 no-op；只发 `dma_*_fire_and_forget` 的设备无需 override。
-    fn on_dma_complete(
-        &mut self,
-        ctx: &mut DeviceCtx<'_>,
-        token: u64,
-        ok: bool,
-        data: Vec<u8>,
-    ) {
+    fn on_dma_complete(&mut self, ctx: &mut DeviceCtx<'_>, token: u64, ok: bool, data: Vec<u8>) {
         let _ = (ctx, token, ok, data);
     }
 }
@@ -154,4 +148,3 @@ impl<'a> DeviceCtx<'a> {
         t
     }
 }
-
