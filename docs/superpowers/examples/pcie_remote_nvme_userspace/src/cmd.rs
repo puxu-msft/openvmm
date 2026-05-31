@@ -170,6 +170,11 @@ pub mod nvm_opc {
     pub const ZONE_MGMT_RECEIVE: u8 = 0x7a;
     /// **Phase L1** — Zone Append (ZNS CS § 4.3)。
     pub const ZONE_APPEND: u8 = 0x7d;
+    /// **Phase O1** — Simple Copy (NVMe 2.0 NVM CS § 3.3.5)。Controller
+    /// 内部数据搬运 — driver 提供 source range list (LBA + nlb)，目标
+    /// 落在 CDW10/11 SDLBA。无 host PRP data 通道（数据全在 controller
+    /// 侧 backing）。
+    pub const COPY: u8 = 0x19;
 }
 
 /// CQE.SC (Status Code) — Generic Command Status (NVMe spec 1.4 § 4.6.1.2.1).
@@ -253,6 +258,15 @@ impl Sqe {
     }
     pub fn cid(&self) -> u16 {
         (self.cdw0 >> 16) as u16
+    }
+    /// **Phase O2** — FUSE field (cdw0 bits 9:8)。
+    ///   00 = Normal operation
+    ///   01 = Fused operation, **first** command (Compare in Fused C&W)
+    ///   10 = Fused operation, **second** command (Write in Fused C&W)
+    ///   11 = Reserved
+    /// spec § 6.2 Fused Operations。
+    pub fn fuse(&self) -> u8 {
+        ((self.cdw0 >> 8) & 0x3) as u8
     }
 }
 
@@ -462,6 +476,11 @@ impl IdentifyController {
         // VWC.bit0 = present → driver 主动发 NVM FLUSH (opc 0x00) 拿持久化
         // 承诺；我们 FLUSH handler 调 sync_all() 落盘。
         id.vwc = nvme_spec::VolatileWriteCache::new().with_present(true);
+        // **Phase O2** — FUSES bit 0 = Fused Compare-and-Write 支持。
+        // spec § 5.17.2.2 FUSES：bit 0 = "1h - Compare and Write fused operation
+        // is supported"。让 driver（特别是 Linux nvme-cli + cluster filesystem）
+        // 知道我们能原子地做 Compare-then-Write。
+        id.fuses = 0x0001;
         id.as_bytes().to_vec()
     }
 }

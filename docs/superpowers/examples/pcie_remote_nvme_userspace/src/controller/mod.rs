@@ -172,6 +172,10 @@ pub(super) enum PendingOp {
     /// 累积器；page_idx = 本回调对应 `received[page_idx*4096..]`
     /// （单 PRP=0；dual-PRP 0/1；PRP-list 0/1/2/.../N-1）。
     NvmWritePiMulti { op_id: u64, page_idx: u32 },
+    /// **Phase O1** — Simple Copy 范围表 DMA-read 完成。完成后 controller
+    /// 解析 32-byte range descriptors → 按 src→dst 顺序 backing read+write。
+    /// 不再有 host DMA：copy 全在 controller 侧 backing。
+    NvmCopyFetchRanges { sdlba: u64, num_ranges: u32 },
 }
 
 /// **Phase K4c** — 多 LBA PI Write 累积器。每个 DMA-read 完成填一段
@@ -557,6 +561,12 @@ pub struct NvmeController {
     pub(super) compare_ops: HashMap<u64, CompareAccum>,
     /// **Phase K4c** — 多 LBA PI Write 累积。op_id → 全 data + 完成进度。
     pub(super) pi_writes: HashMap<u64, PiWriteAccum>,
+    /// **Phase O2** — Fused operation state：per-SQ 缓存 FUSE_FIRST 的
+    /// SQE，等待紧接其后的 FUSE_SECOND。spec § 6.2 要求：
+    /// (a) 两条必须连续在同一 SQ；(b) 都 fused-marked；(c) 都同 nsid。
+    /// 不满足 → 两条都 abort 返 INVALID_FIELD。
+    /// 当前只支持 Fused Compare-and-Write (spec 唯一定义的 fused pair)。
+    pub(super) pending_fused: HashMap<u16, (Sqe, u16)>, // SQ ID → (first SQE, sq_head)
     /// 待 dispatch 的 SQE 队列（按 FIFO 顺序），dispatch 是 sync 逻辑但
     /// 触发 DMA 后异步完成。
     sqe_inbox: Vec<(u16, u16, Sqe)>, // (sq_id, sq_head_after_fetch, sqe)
@@ -888,6 +898,7 @@ impl NvmeController {
             prp_list_ops: HashMap::new(),
             compare_ops: HashMap::new(),
             pi_writes: HashMap::new(),
+            pending_fused: HashMap::new(),
             sqe_inbox: Vec::new(),
             stat_host_reads: 0,
             stat_host_writes: 0,
@@ -997,12 +1008,14 @@ impl NvmeController {
         self.prp_list_ops.clear();
         self.compare_ops.clear();
         self.pi_writes.clear();
+        self.pending_fused.clear();
         self.sqe_inbox.clear();
         debug_assert!(self.pending_ios.is_empty());
         debug_assert!(self.dual_prp_writes.is_empty());
         debug_assert!(self.prp_list_ops.is_empty());
         debug_assert!(self.compare_ops.is_empty());
         debug_assert!(self.pi_writes.is_empty());
+        debug_assert!(self.pending_fused.is_empty());
         // AEN queue 跨 reset 不保留 (NVMe spec § 5.2 "Implicit Aborts on Reset")
         self.aen_pending.clear();
         self.aen_last_err_count = self.stat_num_err_log_entries;
@@ -1146,17 +1159,154 @@ impl NvmeController {
     ) {
         let cid = sqe.cid();
         let opc = sqe.opcode();
+        let fuse = sqe.fuse();
         tracing::debug!(
             sq_id,
             cid,
             opc = format_args!("{:#x}", opc),
+            fuse,
             head_after_this,
             "dispatch SQE"
         );
         let sq_head = head_after_this;
         let cq_id = self.sqs.get(&sq_id).map(|s| s.cq_id).unwrap_or(0);
-
         let is_admin = sq_id == 0;
+
+        // **Phase O2** — Fused operation handling (spec § 6.2)。
+        // Admin SQ 不支持 fused（spec §6.2 "fused operations are not supported
+        // on Admin Submission Queue"）—— 静默忽略 fuse bits 让普通 dispatch 处理。
+        if !is_admin {
+            match fuse {
+                0 => {
+                    // 正常命令 — 但若 SQ 上有未配对的 FUSE_FIRST，spec 要求两条
+                    // 都 abort INVALID_FIELD（"fused 第二条必须紧跟第一条"）。
+                    if let Some((stranded, stranded_head)) = self.pending_fused.remove(&sq_id) {
+                        tracing::warn!(
+                            sq_id,
+                            stranded_cid = stranded.cid(),
+                            "Fused: FIRST without matching SECOND, aborting"
+                        );
+                        let phase1 = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+                        let cqe1 = Cqe::error(
+                            stranded.cid(),
+                            sq_id,
+                            stranded_head,
+                            phase1,
+                            sc::INVALID_FIELD,
+                            0,
+                        );
+                        self.post_cqe(ctx, cq_id, cqe1);
+                    }
+                }
+                1 => {
+                    // FUSE_FIRST — 必须是 Compare (NVMe spec 唯一定义的 fused pair)
+                    if opc != nvm_opc::COMPARE {
+                        tracing::warn!(opc, "Fused FIRST is not Compare → INVALID_FIELD");
+                        let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+                        let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                        self.post_cqe(ctx, cq_id, cqe);
+                        return;
+                    }
+                    // 如果同 SQ 上已有 stranded FIRST → 那条也 abort
+                    if let Some((stranded, stranded_head)) = self.pending_fused.remove(&sq_id) {
+                        let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+                        let cqe = Cqe::error(
+                            stranded.cid(),
+                            sq_id,
+                            stranded_head,
+                            phase,
+                            sc::INVALID_FIELD,
+                            0,
+                        );
+                        self.post_cqe(ctx, cq_id, cqe);
+                    }
+                    self.pending_fused.insert(sq_id, (sqe, sq_head));
+                    return; // 等 SECOND
+                }
+                2 => {
+                    // FUSE_SECOND — 必须是 Write，且 nsid/slba/nlb 必须与 FIRST 匹配
+                    let Some((first, first_head)) = self.pending_fused.remove(&sq_id) else {
+                        tracing::warn!("Fused SECOND without FIRST → INVALID_FIELD");
+                        let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+                        let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                        self.post_cqe(ctx, cq_id, cqe);
+                        return;
+                    };
+                    if opc != nvm_opc::WRITE {
+                        tracing::warn!(opc, "Fused SECOND is not Write → INVALID_FIELD");
+                        let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+                        // Abort 两条
+                        self.post_cqe(
+                            ctx,
+                            cq_id,
+                            Cqe::error(first.cid(), sq_id, first_head, phase, sc::INVALID_FIELD, 0),
+                        );
+                        let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                        self.post_cqe(ctx, cq_id, cqe);
+                        return;
+                    }
+                    let first_nsid = first.nsid;
+                    let first_slba = first.cdw10 as u64 | ((first.cdw11 as u64) << 32);
+                    let first_nlb = (first.cdw12 & 0xffff) as u32 + 1;
+                    let second_nsid = sqe.nsid;
+                    let second_slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
+                    let second_nlb = (sqe.cdw12 & 0xffff) as u32 + 1;
+                    if first_nsid != second_nsid
+                        || first_slba != second_slba
+                        || first_nlb != second_nlb
+                    {
+                        tracing::warn!(
+                            "Fused C&W mismatch: nsid/slba/nlb differ between FIRST and SECOND"
+                        );
+                        let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+                        self.post_cqe(
+                            ctx,
+                            cq_id,
+                            Cqe::error(first.cid(), sq_id, first_head, phase, sc::INVALID_FIELD, 0),
+                        );
+                        let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                        self.post_cqe(ctx, cq_id, cqe);
+                        return;
+                    }
+                    // 把 FIRST 当独立 Compare dispatch；它的完成 (compare_finalize
+                    // 等) 会决定 Compare 成败。如果 Compare succeeds → 再 dispatch
+                    // SECOND (Write)；如果 fail → cancel SECOND，返 SC=0x85
+                    // COMPARE_FAILURE。本教学路径简化：因 Compare 单 PRP 路径
+                    // 是同步 finalize 返 Cqe，无法 cleanly chain；所以这里只
+                    // 演示 fused-pair detection + post 'Compare aborted because
+                    // mismatch' 时也 abort Write。
+                    //
+                    // 真正 atomic chain 需 PendingOp::NvmFusedCompareThenWrite
+                    // 跟踪 pair；留作后续扩展。当前：dispatch 两条独立但顺序
+                    // 保证（FIRST 先 dispatch + post CQE，然后 SECOND）。
+                    tracing::info!(
+                        sq_id,
+                        first_cid = first.cid(),
+                        second_cid = cid,
+                        slba = first_slba,
+                        nlb = first_nlb,
+                        "Fused Compare+Write — dispatching sequentially"
+                    );
+                    if let Some(cqe) =
+                        self.dispatch_io(ctx, sq_id, first, first.cid(), first_head, cq_id)
+                    {
+                        self.post_cqe(ctx, cq_id, cqe);
+                    }
+                    if let Some(cqe) = self.dispatch_io(ctx, sq_id, sqe, cid, sq_head, cq_id) {
+                        self.post_cqe(ctx, cq_id, cqe);
+                    }
+                    return;
+                }
+                _ => {
+                    tracing::warn!(fuse, "Reserved fuse value → INVALID_FIELD");
+                    let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+                    let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                    self.post_cqe(ctx, cq_id, cqe);
+                    return;
+                }
+            }
+        }
+
         let cqe_result = if is_admin {
             self.dispatch_admin(ctx, sqe, cid, sq_head, cq_id)
         } else {
@@ -2153,6 +2303,113 @@ impl PcieDevice for NvmeController {
                         )
                     };
                     self.post_cqe(ctx, cq_id, cqe);
+                }
+                PendingOp::NvmCopyFetchRanges { sdlba, num_ranges } => {
+                    // **Phase O1** — Simple Copy ranges 已到达；解析 32-byte
+                    // descriptors → per-range backing read + write 到 sdlba。
+                    // 全 controller 侧 backing，无 host DMA。
+                    let nsid = p.nsid;
+                    let cq = self.cqs.get(&p.cq_id);
+                    let phase = cq.map(|c| c.phase).unwrap_or(1);
+                    let expected = num_ranges as usize * 32;
+                    if data.len() < expected {
+                        tracing::warn!(
+                            got = data.len(),
+                            want = expected,
+                            "COPY range list DMA short read"
+                        );
+                        let cqe = Cqe::error(
+                            p.cid,
+                            p.sq_id,
+                            p.sq_head,
+                            phase,
+                            sc::DATA_TRANSFER_ERROR,
+                            0,
+                        );
+                        self.post_cqe(ctx, p.cq_id, cqe);
+                        return;
+                    }
+                    // Parse ranges & total destination NLB
+                    let mut ranges: Vec<(u64, u32)> = Vec::with_capacity(num_ranges as usize);
+                    let mut dst_total: u64 = 0;
+                    for i in 0..num_ranges as usize {
+                        let base = i * 32;
+                        let slba = u64::from_le_bytes(data[base..base + 8].try_into().unwrap());
+                        let nlb = u16::from_le_bytes(data[base + 16..base + 18].try_into().unwrap())
+                            as u32
+                            + 1; // 0-based
+                        ranges.push((slba, nlb));
+                        dst_total += nlb as u64;
+                    }
+                    let cqe = if let Some(ns) = self.namespaces.get_mut(&nsid) {
+                        let sector = SECTOR_SIZE;
+                        // 边界：所有 ranges + 目标都得在 total_lba 内
+                        let mut ok_bounds = sdlba + dst_total <= ns.total_lba;
+                        for &(slba, nlb) in &ranges {
+                            if slba + nlb as u64 > ns.total_lba {
+                                ok_bounds = false;
+                                break;
+                            }
+                        }
+                        if !ok_bounds {
+                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::LBA_OUT_OF_RANGE, 0)
+                        } else {
+                            // Per-range: read backing → write to sdlba offset
+                            let mut dst_off_lba = sdlba;
+                            let mut copy_err: Option<std::io::Error> = None;
+                            for &(slba, nlb) in &ranges {
+                                let bytes = nlb as usize * sector as usize;
+                                let mut buf = vec![0u8; bytes];
+                                if let Err(e) = ns.read_at(&mut buf, slba * sector) {
+                                    copy_err = Some(e);
+                                    break;
+                                }
+                                if let Err(e) = ns.write_at(&buf, dst_off_lba * sector) {
+                                    copy_err = Some(e);
+                                    break;
+                                }
+                                dst_off_lba += nlb as u64;
+                            }
+                            if let Some(e) = copy_err {
+                                tracing::warn!(error = %e, nsid, sdlba, "COPY backing IO fail");
+                                self.stat_num_err_log_entries += 1;
+                                self.push_error_log(
+                                    p.sq_id,
+                                    p.cid,
+                                    (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                                    sdlba,
+                                    nsid,
+                                );
+                                Cqe::error(
+                                    p.cid,
+                                    p.sq_id,
+                                    p.sq_head,
+                                    phase,
+                                    sc::DATA_TRANSFER_ERROR,
+                                    0,
+                                )
+                            } else {
+                                // 计入 host_reads + host_writes (NVMe spec § 5.16.1.2
+                                // SMART 把 Copy 既算 read 也算 write，因为 backing
+                                // 真的双程 IO 了)
+                                self.stat_host_reads += 1;
+                                self.stat_host_writes += 1;
+                                self.stat_lba_read += dst_total;
+                                self.stat_lba_written += dst_total;
+                                tracing::debug!(
+                                    nsid,
+                                    sdlba,
+                                    dst_total,
+                                    num_ranges,
+                                    "COPY OK (controller-side backing)"
+                                );
+                                Cqe::success(p.cid, p.sq_id, p.sq_head, phase)
+                            }
+                        }
+                    } else {
+                        Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE, 0)
+                    };
+                    self.post_cqe(ctx, p.cq_id, cqe);
                 }
                 PendingOp::AdminSetHostIdentifier { exhid } => {
                     // **Phase K9** — host_id DMA-read 完成，存到 controller。

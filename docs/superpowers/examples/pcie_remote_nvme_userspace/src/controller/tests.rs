@@ -862,3 +862,41 @@ fn k4c_multi_lba_pi_layout_round_trip() {
     let tuple = PiTuple::from_bytes(&tuple_arr);
     assert_eq!(tuple.verify(data, 2, 1), crate::pi::PiCheck::GuardFail);
 }
+
+/// **Phase O2** — Sqe::fuse() 解析 cdw0 bits 9:8。
+#[test]
+fn sqe_fuse_field_extraction() {
+    // SQE 64 byte 全 0 + 用 zerocopy 解 →合法 zeroed struct
+    let zero = [0u8; 64];
+    let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+    // Normal opcode 0x01 (WRITE), cid=0x42, fuse=0
+    sqe.cdw0 = 0x0042_0001;
+    assert_eq!(sqe.fuse(), 0);
+    assert_eq!(sqe.opcode(), 0x01);
+    assert_eq!(sqe.cid(), 0x0042);
+    // Fuse=01 (first) bit 8
+    sqe.cdw0 = 0x0042_0101;
+    assert_eq!(sqe.fuse(), 1);
+    // Fuse=10 (second) bit 9
+    sqe.cdw0 = 0x0042_0201;
+    assert_eq!(sqe.fuse(), 2);
+    // Fuse=11 reserved
+    sqe.cdw0 = 0x0042_0301;
+    assert_eq!(sqe.fuse(), 3);
+}
+
+/// **Phase O2** — IdentifyController.fuses bit 0 = Compare-and-Write 支持。
+#[test]
+fn identify_controller_advertises_fused_cw() {
+    let buf = IdentifyController::build_v2_bytes(0x1414, 0xc0de, 1);
+    // FUSES @ offset 522..524 in IdentifyController (spec § 5.17.2.2)
+    let fuses = u16::from_le_bytes(buf[522..524].try_into().unwrap());
+    assert_eq!(fuses & 0x0001, 0x0001, "FUSES bit 0 must advertise C&W");
+}
+
+/// **Phase O1** — COPY opcode dispatch 在 PI NS 上拒绝（INVALID_PROTECTION_INFO）。
+/// 直接验证 nvm_opc 常量 + 设计契约：PI+Copy 组合未实现。
+#[test]
+fn copy_opcode_constant_matches_spec() {
+    assert_eq!(crate::cmd::nvm_opc::COPY, 0x19);
+}

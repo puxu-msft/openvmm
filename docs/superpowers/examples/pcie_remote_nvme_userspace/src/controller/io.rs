@@ -1235,6 +1235,87 @@ impl NvmeController {
                 tracing::debug!(nr, ad, "DSM Dataset Management (no-op success)");
                 Some(Cqe::success(cid, sq_id, sq_head, phase))
             }
+            nvm_opc::COPY => {
+                // **Phase O1** — Simple Copy (NVMe 2.0 NVM CS § 3.3.5)。
+                //
+                // 教学价值：演示 controller-side 数据搬运 — driver 提供
+                // source range list，controller 自己读 backing + 写到
+                // SDLBA。host 端无 data PRP，节省 host↔guest DMA 双程。
+                //
+                // 字段：
+                //   CDW10/11 = SDLBA (destination start LBA)
+                //   CDW12 bits 7:0 = NR (number of source ranges - 1, 0-based)
+                //   CDW12 bits 15:8 = Source Range Format (我们只支持 0x00 = Format 0)
+                //   PRP1 = source range list buffer，每条 32 byte：
+                //     bytes 0..8  = SLBA
+                //     bytes 16..18 = NLB (0-based)
+                //     其余字段（ELBT/EATM/...）= PI / 高级特性，本路径忽略
+                //
+                // 我们走 DMA-read PRP1 → 完成回调 per-range copy backing。
+                let nsid = sqe.nsid;
+                let sdlba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
+                let nr = ((sqe.cdw12 & 0xff) as u32) + 1; // 0-based → count
+                let srf = ((sqe.cdw12 >> 8) & 0xff) as u8;
+                if srf != 0 {
+                    tracing::warn!(srf, "COPY: only Source Range Format 0 supported");
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
+                let Some(ns) = self.ns(nsid) else {
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_NAMESPACE,
+                        0,
+                    ));
+                };
+                if ns.pi_enabled() {
+                    // PI + Copy 组合需要 per-range PI tuple verify/regen，
+                    // 教学路径未实现，返 INVALID_PROTECTION_INFO 让 driver 知道。
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_PROTECTION_INFO,
+                        0,
+                    ));
+                }
+                // ZNS：Copy 目标 zone 需走 SWR 校验，简化先拒
+                if ns.zns.is_some() {
+                    tracing::warn!(nsid, "COPY on ZNS NS not supported");
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_OPCODE,
+                        0,
+                    ));
+                }
+                let range_list_bytes = nr as u32 * 32;
+                if range_list_bytes as u64 > NVME_PAGE_SIZE {
+                    // 教学：range list > 1 page 需 PRP-list 取，本路径暂限 1 page = 128 ranges
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
+                let tok = ctx.dma_read(sqe.prp1, range_list_bytes);
+                self.pending_ios.insert(
+                    tok,
+                    PendingIo {
+                        sq_id,
+                        cid,
+                        sq_head,
+                        cq_id,
+                        nsid,
+                        op: PendingOp::NvmCopyFetchRanges {
+                            sdlba,
+                            num_ranges: nr,
+                        },
+                    },
+                );
+                None
+            }
             nvm_opc::COMPARE => {
                 // **Phase H3 + K2** — NVMe NVM CS Spec § 3.3.2 Compare：
                 // 全 3 档 PRP 路径 (≤4K / ≤8K / PRP list 至 MDTS=128K)。
