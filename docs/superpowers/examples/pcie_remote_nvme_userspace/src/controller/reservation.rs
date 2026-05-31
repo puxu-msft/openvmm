@@ -423,9 +423,11 @@ pub(super) fn persist_ptpl_sidecar(ns: &crate::controller::Namespace) -> std::io
 
 /// **Phase P1** — open() 时若 sidecar 存在则 reload reservation state；
 /// 否则 (ptpl=false) 返 None 让 Namespace 用 fresh state。
-pub(super) fn load_ptpl_sidecar(
-    backing_path: &str,
-) -> Option<(u32, Option<(u64, u8)>, Vec<(u64, u64, u64)>)> {
+///
+/// 返回元组：(gen, reservation_holder, registrants)。
+pub(super) type PtplSnapshot = (u32, Option<(u64, u8)>, Vec<(u64, u64, u64)>);
+
+pub(super) fn load_ptpl_sidecar(backing_path: &str) -> Option<PtplSnapshot> {
     use std::io::Read as _;
     let path = ptpl_path(backing_path);
     let mut f = std::fs::File::open(&path).ok()?;
