@@ -11,6 +11,7 @@
 //!
 //! 注：所有 packed struct field 访问已 copy 到本地变量，避免 UB。
 
+use crate::cmd;
 use crate::cmd::*;
 use crate::controller::NvmeController;
 use crate::regs::*;
@@ -149,35 +150,99 @@ impl NvmeController {
                 Some(Cqe::success(cid, 0, sq_head, phase))
             }
             admin_opc::SET_FEATURES => {
+                // **Phase H1+H2** — NVMe spec § 5.21 Set Features。
+                // CDW10 bits 7:0 = FID；bits 31 = SV (Save，我们不实现持
+                // 久化，保留 spec 默认 = 易失，reset 清空)。CDW11 = 值。
+                // 大部分 fid 行为 = 存进 features map，Get 回填；少数
+                // (0x07 NumberOfQueues、0x06 VWC) 有 controller 强约束。
                 let fid = (sqe.cdw10 & 0xff) as u8;
-                // NVMe spec § 5.21.1.7 (Feature 0x07 = Number of Queues)：driver
-                // 写 cdw11 = (NSQR-1) | ((NCQR-1) << 16) 请求 queue 数；controller
-                // 在 CQE cdw0 回 (NSQA-1) | ((NCQA-1) << 16) 表示实际授予。
-                // 不响应正确 cdw0，nvme.sys 会 bail（无法决定开几个 IO queue）。
+                let cdw11 = sqe.cdw11;
                 let mut cqe = Cqe::success(cid, 0, sq_head, phase);
-                if fid == 0x07 {
-                    // v1 仅给 1 IO SQ + 1 IO CQ；0-based。
-                    let nsqa = 0u32; // (count-1)
-                    let ncqa = 0u32;
-                    cqe.cdw0 = nsqa | (ncqa << 16);
-                    // 复制到本地变量避免 packed struct 字段取引用 UB。
-                    let req_cdw11 = sqe.cdw11;
-                    let granted_cdw0 = cqe.cdw0;
-                    tracing::info!(
-                        requested = format_args!("{:#x}", req_cdw11),
-                        granted = format_args!("{:#x}", granted_cdw0),
-                        "Set Features Number-of-Queues"
-                    );
-                } else {
-                    tracing::debug!(fid, "Set Features (no-op success)");
+                match fid {
+                    cmd::fid::NUMBER_OF_QUEUES => {
+                        // 真实硬件常授 ≤ requested；我们 cap=IO_QUEUE_CAP。
+                        // driver 写 cdw11 = (NSQR-1) | ((NCQR-1) << 16) 请
+                        // 求 queue 数；controller 在 CQE cdw0 回 (NSQA-1)
+                        // | ((NCQA-1) << 16) 表示实际授予（0-based）。
+                        let req_nsq = (cdw11 & 0xffff) as u16 + 1;
+                        let req_ncq = ((cdw11 >> 16) & 0xffff) as u16 + 1;
+                        let granted = req_nsq.min(req_ncq).min(crate::controller::IO_QUEUE_CAP);
+                        self.granted_io_queues = granted;
+                        let nsqa_minus_1 = (granted - 1) as u32;
+                        let ncqa_minus_1 = (granted - 1) as u32;
+                        cqe.cdw0 = nsqa_minus_1 | (ncqa_minus_1 << 16);
+                        let req_dump = cdw11;
+                        let granted_dump = cqe.cdw0;
+                        tracing::info!(
+                            req_nsq,
+                            req_ncq,
+                            granted,
+                            requested = format_args!("{:#x}", req_dump),
+                            granted_cdw0 = format_args!("{:#x}", granted_dump),
+                            "Set Features Number-of-Queues"
+                        );
+                        // 不写入 features map：Get 时直接根据 granted_io_queues 重算
+                    }
+                    cmd::fid::VOLATILE_WRITE_CACHE => {
+                        // VWC bit 0 = WCE (Write Cache Enable)。我们 backing
+                        // file 始终有 host page cache → WCE 实际不可关；
+                        // 接受 driver 写但行为不变；Get 回 WCE=1。
+                        self.features.insert(fid, cdw11 | 0x1);
+                        tracing::info!(
+                            wce = (cdw11 & 0x1),
+                            "Set Features VWC (强制 WCE=1 反映 backing cache)"
+                        );
+                    }
+                    cmd::fid::TIMESTAMP => {
+                        // spec § 5.21.1.14：cdw11 在 Set 时 reserved；
+                        // 真值通过 PRP1 指向 8 字节 timestamp。我们当前
+                        // 只走 cdw11 路径不做 PRP fetch（spec 允许返
+                        // success 但实际 ignore，driver fallback host clock）。
+                        // 把 0 存进让 Get 至少能回。
+                        self.features.insert(fid, 0);
+                        tracing::debug!("Set Features Timestamp (no-PRP, stored 0)");
+                    }
+                    _ => {
+                        // 其它 fid：原样存 cdw11，Get 回填
+                        self.features.insert(fid, cdw11);
+                        tracing::debug!(
+                            fid,
+                            cdw11 = format_args!("{:#x}", cdw11),
+                            "Set Features (stored)"
+                        );
+                    }
                 }
                 Some(cqe)
             }
             admin_opc::GET_FEATURES => {
+                // **Phase H1** — spec § 5.21.2 Get Features。CDW10 bits 7:0
+                // = FID，bits 10:8 = SEL (0=current, 1=default, 2=saved,
+                // 3=supported)。我们都按 current 返回。
                 let fid = (sqe.cdw10 & 0xff) as u8;
-                tracing::debug!(fid, "Get Features (return cdw0=0)");
+                let sel = ((sqe.cdw10 >> 8) & 0x7) as u8;
                 let mut cqe = Cqe::success(cid, 0, sq_head, phase);
-                cqe.cdw0 = 0; // 默认值
+                cqe.cdw0 = match fid {
+                    cmd::fid::NUMBER_OF_QUEUES => {
+                        // 实时返实际授予数（不查 features map）
+                        let g = (self.granted_io_queues - 1) as u32;
+                        g | (g << 16)
+                    }
+                    cmd::fid::VOLATILE_WRITE_CACHE => {
+                        // 始终回 WCE=1（参 Set 路径）
+                        *self.features.get(&fid).unwrap_or(&0x1)
+                    }
+                    _ => {
+                        // 其它：未 Set 过返 0 = spec 默认（多数 fid 默认 0
+                        // 即可，少数 fid 如 ASYNC_EVENT_CONFIG 默认 0 也合理）
+                        *self.features.get(&fid).unwrap_or(&0)
+                    }
+                };
+                tracing::debug!(
+                    fid,
+                    sel,
+                    cdw0 = format_args!("{:#x}", { cqe.cdw0 }),
+                    "Get Features"
+                );
                 Some(cqe)
             }
             admin_opc::KEEP_ALIVE => Some(Cqe::success(cid, 0, sq_head, phase)),

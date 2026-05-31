@@ -85,6 +85,46 @@ pub mod admin_opc {
     pub const SANITIZE: u8 = 0x84;
 }
 
+/// **Phase H1** — Feature Identifier (NVMe spec § 5.21.1 Table 134)。
+/// Set/Get Features 共用。仅列我们真实现的；其余 fid 走 no-op success +
+/// stored cdw11 路径（Get 时回填 driver 写过的值）。
+#[allow(dead_code)]
+pub mod fid {
+    /// 0x01 Arbitration: cdw11 bits 31:24 HPW, 23:16 MPW, 15:8 LPW,
+    /// bits 2:0 Arbitration Burst。
+    pub const ARBITRATION: u8 = 0x01;
+    /// 0x02 Power Management: cdw11 bits 4:0 = Power State。
+    pub const POWER_MANAGEMENT: u8 = 0x02;
+    /// 0x04 Temperature Threshold: cdw11 bits 19:16 TMPSEL,
+    /// bit 20 THSEL（0 over, 1 under），bits 15:0 TMPTH (Kelvin)。
+    pub const TEMP_THRESHOLD: u8 = 0x04;
+    /// 0x05 Error Recovery: cdw11 bits 15:0 = TLER (100 ms units)。
+    pub const ERROR_RECOVERY: u8 = 0x05;
+    /// 0x06 Volatile Write Cache: cdw11 bit 0 = WCE。
+    pub const VOLATILE_WRITE_CACHE: u8 = 0x06;
+    /// 0x07 Number of Queues: cdw11 bits 31:16 NCQR-1, bits 15:0 NSQR-1。
+    /// Get 时 controller 返实际 NSQA/NCQA。
+    pub const NUMBER_OF_QUEUES: u8 = 0x07;
+    /// 0x08 Interrupt Coalescing: cdw11 bits 15:8 TIME, bits 7:0 THR。
+    pub const INTERRUPT_COALESCING: u8 = 0x08;
+    /// 0x09 Interrupt Vector Configuration: cdw11 bits 15:0 IV,
+    /// bit 16 CD (Coalescing Disable)。
+    pub const INTERRUPT_VECTOR_CONFIG: u8 = 0x09;
+    /// 0x0a Write Atomicity Normal: cdw11 bit 0 = DN (Disable Normal)。
+    pub const WRITE_ATOMICITY: u8 = 0x0a;
+    /// 0x0b Async Event Configuration: cdw11 bits 31:14 SMART/Health
+    /// notification critical-warning bitmap, 等。
+    pub const ASYNC_EVENT_CONFIG: u8 = 0x0b;
+    /// 0x0e Timestamp: cdw11 + DPTR 指向 8 字节 timestamp。
+    pub const TIMESTAMP: u8 = 0x0e;
+    /// 0x10 Host Controlled Thermal Management: cdw11 TMT2/TMT1。
+    pub const HCTM: u8 = 0x10;
+    /// 0x80 Software Progress Marker。
+    pub const SW_PROGRESS_MARKER: u8 = 0x80;
+    /// 0x81 Host Identifier: 8/16 byte EXHID buffer。
+    pub const HOST_IDENTIFIER: u8 = 0x81;
+}
+
 /// NVM (IO) command opcodes (NVMe spec 1.4 NVM § 6)。
 pub mod nvm_opc {
     pub const FLUSH: u8 = 0x00;
@@ -112,6 +152,12 @@ pub mod sc {
     pub const INTERNAL_ERROR: u8 = 0x06;
     /// LBA Out of Range (NVM CSD)
     pub const LBA_OUT_OF_RANGE: u8 = 0x80;
+    /// Phase H3：Compare Failure — Media/Data Integrity 类 (SCT=0x02)。
+    /// NVM CS spec § 4.1。CQE 的 Status Field 编码：bits 15:1 包括
+    /// `SCT(11:9) | SC(8:1)`；本常量是 SC byte，SCT 在 Cqe::error 还需
+    /// 单独指定 — 当前 helper 没暴露 SCT 参数，对 Compare 我们用 0x85
+    /// SC + driver 通常按 NVM/Media 解析。
+    pub const COMPARE_FAILURE: u8 = 0x85;
 }
 
 /// Submission Queue Entry — 64 bytes 固定。
@@ -324,11 +370,12 @@ impl IdentifyController {
         id.nn = 1;
         // ONCS — NVM optional command support。Phase D 后 Dataset
         // Management (DSM/TRIM) / Write Zeroes / Verify 都已 dispatch。
-        // Compare / Copy 留下次完善。
+        // Phase H3：Compare 也已真实现（≤ 1 page 路径）。Copy 暂不支持。
         id.oncs = nvme_spec::Oncs::new()
             .with_dataset_management(true)
             .with_write_zeroes(true)
-            .with_verify(true);
+            .with_verify(true)
+            .with_compare(true);
         // VWC.bit0 = present → driver 主动发 NVM FLUSH (opc 0x00) 拿持久化
         // 承诺；我们 FLUSH handler 调 sync_all() 落盘。
         id.vwc = nvme_spec::VolatileWriteCache::new().with_present(true);

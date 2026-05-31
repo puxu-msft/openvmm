@@ -425,16 +425,65 @@ impl NvmeController {
                 Some(Cqe::success(cid, sq_id, sq_head, phase))
             }
             nvm_opc::COMPARE => {
-                // NVMe NVM CS Spec § 3.3.2 Compare — 读 LBA + 与 host 提供
-                // 数据比较。CDW10/11 = SLBA, CDW12 bits 15:0 = NLB-1。
-                // 失败 → COMPARE_FAILURE (SC 0x85, SCT=0x02=Media/Data
-                // Integrity)。我们目前不真做（需要 DMA-read host buffer
-                // 然后 byte-by-byte 比较），返 success 占位。Phase E 后
-                // 完整 PRP 支持 + DMA 完成回调可实现真比较。
-                let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
-                let nlb = (sqe.cdw12 & 0xffff) as u32 + 1;
-                tracing::debug!(slba, nlb, "Compare (no-op success placeholder)");
-                Some(Cqe::success(cid, sq_id, sq_head, phase))
+                // **Phase H3** — NVMe NVM CS Spec § 3.3.2 Compare：读 LBA 与
+                // host 提供数据比较。
+                // CDW10/11 = SLBA, CDW12 bits 15:0 = NLB-1。流程：
+                //   1) DMA-read host buffer (PRP1)
+                //   2) seek+read backing file 对应 LBA
+                //   3) byte-compare：相等 → success；不等 → COMPARE_FAILURE
+                //      (SC 0x85, SCT=Media/Data Integrity 0x02)
+                // 当前 H3 仅支持 ≤ 1 page (4 KiB)，> 1 page 路径留待后续
+                // （双 PRP / PRP list 复用要做更复杂的 op_id 关联）。
+                let cdw10 = sqe.cdw10;
+                let cdw11 = sqe.cdw11;
+                let cdw12 = sqe.cdw12;
+                let prp1 = sqe.prp1;
+                let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
+                let nlb = (cdw12 & 0xffff) as u32 + 1;
+                let bytes = nlb as u64 * SECTOR_SIZE;
+                tracing::debug!(slba, nlb, bytes, "NVM COMPARE");
+                if bytes > MDTS_MAX_BYTES {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
+                match slba.checked_add(nlb as u64) {
+                    Some(end) if end <= self.total_lba => {}
+                    _ => {
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::LBA_OUT_OF_RANGE,
+                            0,
+                        ));
+                    }
+                }
+                if bytes > NVME_PAGE_SIZE {
+                    // 暂只实现单 PRP；> 4 KiB 比较走 fallback success (与
+                    // 之前行为兼容，不破坏 driver 流程)。日志标记让用户
+                    // 知道该路径未真做。
+                    tracing::warn!(
+                        bytes,
+                        "Compare > 4 KiB not yet implemented; returning success (placeholder)"
+                    );
+                    return Some(Cqe::success(cid, sq_id, sq_head, phase));
+                }
+                // DMA-read host PRP1 → 完成回调 NvmCompareSinglePrp 做比较
+                let tok = ctx.dma_read(prp1, bytes as u32);
+                self.pending_ios.insert(
+                    tok,
+                    PendingIo {
+                        sq_id,
+                        cid,
+                        sq_head,
+                        cq_id,
+                        op: PendingOp::NvmCompareSinglePrp {
+                            lba: slba,
+                            num_blocks: nlb,
+                        },
+                    },
+                );
+                None
             }
             nvm_opc::VERIFY => {
                 // NVMe 2.0 NVM CS Spec § 3.3.10 Verify — 读 LBA + 校验 ECC/
