@@ -312,4 +312,213 @@ mod tests {
             _ => panic!("expected WriteGpa body"),
         }
     }
+
+    /// **Phase N1b** — Test harness: capture device callbacks for inbound assertions.
+    #[derive(Default)]
+    struct CaptureDevice {
+        last_mmio_read: Option<(u32, u64, u32)>,
+        mmio_read_return: u64,
+        last_mmio_write: Option<(u32, u64, u32, u64)>,
+        last_cfg: Option<(u32, u32)>,
+        last_reset: Option<u32>,
+        last_dma: Option<(u64, bool, Vec<u8>)>,
+    }
+
+    impl crate::PcieDevice for CaptureDevice {
+        fn describe(&self) -> pcie_remote_protocol::DeviceDescribe {
+            pcie_remote_protocol::DeviceDescribe::default()
+        }
+        fn mmio_read(&mut self, bar: u32, offset: u64, size: u32) -> u64 {
+            self.last_mmio_read = Some((bar, offset, size));
+            self.mmio_read_return
+        }
+        fn mmio_write(
+            &mut self,
+            _ctx: &mut crate::DeviceCtx<'_>,
+            bar: u32,
+            offset: u64,
+            size: u32,
+            value: u64,
+        ) {
+            self.last_mmio_write = Some((bar, offset, size, value));
+        }
+        fn cfg_write_side_effect(&mut self, offset: u32, value: u32) {
+            self.last_cfg = Some((offset, value));
+        }
+        fn reset(&mut self, kind: u32) {
+            self.last_reset = Some(kind);
+        }
+        fn on_dma_complete(
+            &mut self,
+            _ctx: &mut crate::DeviceCtx<'_>,
+            token: u64,
+            ok: bool,
+            data: Vec<u8>,
+        ) {
+            self.last_dma = Some((token, ok, data));
+        }
+    }
+
+    fn make_req(seq: u64, body: HostBody) -> ToHost {
+        ToHost {
+            seq,
+            body: Some(body),
+        }
+    }
+
+    /// **Phase N1b** — MmioRead inbound 经过 mask 后返回；调用 device.mmio_read。
+    #[test]
+    fn dispatch_inbound_mmio_read_masks_value() {
+        let mut dev = CaptureDevice::default();
+        dev.mmio_read_return = 0xDEAD_BEEF_CAFE_BABE;
+        let mut out = Vec::new();
+        let mut seq = 0u64;
+        let mut tok = 0u64;
+        let req = make_req(
+            42,
+            HostBody::MmioRead(pcie_remote_protocol::MmioAccess {
+                bar: 0,
+                offset: 0x10,
+                size: 2, // 16-bit
+                value: 0,
+            }),
+        );
+        super::dispatch_inbound(&mut dev, req, &mut out, &mut seq, &mut tok).unwrap();
+        // 设备被调用且参数透传
+        assert_eq!(dev.last_mmio_read, Some((0, 0x10, 2)));
+        assert_eq!(out.len(), 1);
+        // outbound seq = 入站 seq
+        assert_eq!(out[0].seq, 42);
+        match out[0].body.as_ref().unwrap() {
+            Body::MmioReadResult(r) => assert_eq!(r.value, 0xBABE), // mask 到低 16 位
+            _ => panic!("expected MmioReadResult"),
+        }
+    }
+
+    /// **Phase N1b** — MmioRead 非法 size 触发 SDK 防御性拒绝（dispatch 返 Err）。
+    #[test]
+    fn dispatch_inbound_mmio_read_rejects_bad_size() {
+        let mut dev = CaptureDevice::default();
+        let mut out = Vec::new();
+        let mut seq = 0u64;
+        let mut tok = 0u64;
+        let req = make_req(
+            1,
+            HostBody::MmioRead(pcie_remote_protocol::MmioAccess {
+                bar: 0,
+                offset: 0,
+                size: 3, // 非法（only 1/2/4/8）
+                value: 0,
+            }),
+        );
+        let r = super::dispatch_inbound(&mut dev, req, &mut out, &mut seq, &mut tok);
+        assert!(r.is_err());
+        // 设备未被调用
+        assert_eq!(dev.last_mmio_read, None);
+        assert!(out.is_empty());
+    }
+
+    /// **Phase N1b** — MmioWrite 入站只调用 device.mmio_write，无 outbound。
+    #[test]
+    fn dispatch_inbound_mmio_write_no_outbound() {
+        let mut dev = CaptureDevice::default();
+        let mut out = Vec::new();
+        let mut seq = 0u64;
+        let mut tok = 0u64;
+        let req = make_req(
+            7,
+            HostBody::MmioWrite(pcie_remote_protocol::MmioAccess {
+                bar: 1,
+                offset: 0x1000,
+                size: 4,
+                value: 0xCAFEBABE,
+            }),
+        );
+        super::dispatch_inbound(&mut dev, req, &mut out, &mut seq, &mut tok).unwrap();
+        assert_eq!(dev.last_mmio_write, Some((1, 0x1000, 4, 0xCAFEBABE)));
+        assert!(out.is_empty()); // MMIO Write 无 response
+    }
+
+    /// **Phase N1b** — CfgWriteSideEffect 路由到 device。
+    #[test]
+    fn dispatch_inbound_cfg_write_side_effect() {
+        let mut dev = CaptureDevice::default();
+        let mut out = Vec::new();
+        let mut seq = 0u64;
+        let mut tok = 0u64;
+        let req = make_req(
+            5,
+            HostBody::CfgWriteSideEffect(pcie_remote_protocol::CfgAccess {
+                offset: 0x04,
+                size: 4,
+                value: 0x0006_0000, // PCI_COMMAND
+            }),
+        );
+        super::dispatch_inbound(&mut dev, req, &mut out, &mut seq, &mut tok).unwrap();
+        assert_eq!(dev.last_cfg, Some((0x04, 0x0006_0000)));
+    }
+
+    /// **Phase N1b** — Reset 路由 kind 给 device。
+    #[test]
+    fn dispatch_inbound_reset() {
+        let mut dev = CaptureDevice::default();
+        let mut out = Vec::new();
+        let mut seq = 0u64;
+        let mut tok = 0u64;
+        let req = make_req(9, HostBody::Reset(pcie_remote_protocol::Reset { kind: 2 }));
+        super::dispatch_inbound(&mut dev, req, &mut out, &mut seq, &mut tok).unwrap();
+        assert_eq!(dev.last_reset, Some(2));
+    }
+
+    /// **Phase N1b** — DmaCompletion 透传 (token, ok, data) 给 device。
+    #[test]
+    fn dispatch_inbound_dma_completion() {
+        let mut dev = CaptureDevice::default();
+        let mut out = Vec::new();
+        let mut seq = 0u64;
+        let mut tok = 0u64;
+        let req = make_req(
+            11,
+            HostBody::DmaCompletion(pcie_remote_protocol::DmaCompletion {
+                token: 0xAA,
+                ok: true,
+                data: vec![0x11, 0x22, 0x33],
+            }),
+        );
+        super::dispatch_inbound(&mut dev, req, &mut out, &mut seq, &mut tok).unwrap();
+        assert_eq!(dev.last_dma, Some((0xAA, true, vec![0x11, 0x22, 0x33])));
+    }
+
+    /// **Phase N1b** — DmaCompletion ok=false 时 data 也应原样透传（教学：
+    /// device 可能用 data 长度或 magic byte 判别）。
+    #[test]
+    fn dispatch_inbound_dma_completion_failure() {
+        let mut dev = CaptureDevice::default();
+        let mut out = Vec::new();
+        let mut seq = 0u64;
+        let mut tok = 0u64;
+        let req = make_req(
+            13,
+            HostBody::DmaCompletion(pcie_remote_protocol::DmaCompletion {
+                token: 0xBB,
+                ok: false,
+                data: vec![],
+            }),
+        );
+        super::dispatch_inbound(&mut dev, req, &mut out, &mut seq, &mut tok).unwrap();
+        assert_eq!(dev.last_dma, Some((0xBB, false, vec![])));
+    }
+
+    /// **Phase N1b** — req.body=None 不 crash，warn + 跳过。
+    #[test]
+    fn dispatch_inbound_empty_body_is_ignored() {
+        let mut dev = CaptureDevice::default();
+        let mut out = Vec::new();
+        let mut seq = 0u64;
+        let mut tok = 0u64;
+        let req = ToHost { seq: 0, body: None };
+        let r = super::dispatch_inbound(&mut dev, req, &mut out, &mut seq, &mut tok);
+        assert!(r.is_ok());
+        assert!(out.is_empty());
+    }
 }
