@@ -99,8 +99,11 @@ impl NvmeController {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
                 if is_pi_path && nlb != 1 {
-                    // K4a/b 单 LBA only；多 LBA 留 K4c
-                    tracing::warn!(nsid, nlb, "PI multi-LBA path not yet impl");
+                    // K4a/b 单 LBA only；多 LBA 路径 (K4c) 限定 ≤ 1 page 因
+                    // 单 4 KiB 只能装 1 个 LBA，driver 用多 LBA 必发 ≥ 2 page
+                    // = dual-PRP / PRP-list 路径才能传完整 data；这里
+                    // single-PRP entry 已最大 1 LBA。
+                    tracing::warn!(nsid, nlb, "PI multi-LBA path requires dual-PRP/PRP-list, not yet impl");
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
                 let total_lba = ns.total_lba;
@@ -562,7 +565,8 @@ impl NvmeController {
                         0,
                     ));
                 };
-                if ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled() {
+                let is_pi_path = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
+                if !is_pi_path && (ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled()) {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
                 let total_lba = ns.total_lba;
@@ -579,6 +583,40 @@ impl NvmeController {
                             0,
                         ));
                     }
+                }
+                if is_pi_path {
+                    // **Phase K4c** — PI Write Zeroes：每 LBA 写 zero data
+                    // + 自 compute PI tuple (Guard=CRC16(zeros)=0, RefTag=LBA
+                    // for Type 1)。
+                    let pi_type = ns.pi_type;
+                    let pi_first = ns.pi_first;
+                    let block_bytes = ns.block_bytes() as usize;
+                    let data_bytes = ns.data_bytes() as usize;
+                    let zero_data = vec![0u8; data_bytes];
+                    let ns_mut = self.ns_mut(nsid).unwrap();
+                    for off in 0..nlb {
+                        let lba = slba + off as u64;
+                        let tuple = crate::pi::PiTuple::compute(&zero_data, lba, pi_type);
+                        let tuple_bytes = tuple.to_bytes();
+                        let mut block = vec![0u8; block_bytes];
+                        if pi_first {
+                            block[0..8].copy_from_slice(&tuple_bytes);
+                            // data 部分已是全 0
+                        } else {
+                            block[data_bytes..data_bytes + 8].copy_from_slice(&tuple_bytes);
+                        }
+                        if let Err(e) = ns_mut
+                            .file
+                            .seek(SeekFrom::Start(lba * block_bytes as u64))
+                            .and_then(|_| std::io::Write::write_all(&mut ns_mut.file, &block))
+                        {
+                            tracing::warn!(error = %e, nsid, lba, "WZ PI write fail");
+                            return Some(Cqe::error(
+                                cid, sq_id, sq_head, phase, sc::DATA_TRANSFER_ERROR, 0,
+                            ));
+                        }
+                    }
+                    return Some(Cqe::success(cid, sq_id, sq_head, phase));
                 }
                 // **C2 修复**：分块写复用 4 KiB 零 buffer，避免大 nlb 时
                 // 一次性分配 32 MiB+ Vec OOM。每块独立 write，spec 允许
@@ -797,10 +835,12 @@ impl NvmeController {
                 None
             }
             nvm_opc::VERIFY => {
+                // **Phase K4c (partial)** — Verify spec § 3.3.10：仅 read
+                // backing + verify PI（无 data transfer）。
                 let nsid = sqe.nsid;
                 let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
                 let nlb = (sqe.cdw12 & 0xffff) as u32 + 1;
-                tracing::debug!(nsid, slba, nlb, "Verify (no-op success)");
+                tracing::debug!(nsid, slba, nlb, "Verify");
                 let Some(ns) = self.ns(nsid) else {
                     return Some(Cqe::error(
                         cid,
@@ -811,7 +851,8 @@ impl NvmeController {
                         0,
                     ));
                 };
-                if ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled() {
+                let is_pi_path = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
+                if !is_pi_path && (ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled()) {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
                 let total_lba = ns.total_lba;
@@ -827,6 +868,58 @@ impl NvmeController {
                             0,
                         ));
                     }
+                }
+                if is_pi_path {
+                    // Phase K4c — 逐 LBA 读 4104 byte + verify tuple；任一
+                    // fail 返对应 Media/Data Integrity SC + 立即停（spec 允许）
+                    let pi_type = ns.pi_type;
+                    let pi_first = ns.pi_first;
+                    let block_bytes = ns.block_bytes() as usize;
+                    let data_bytes = ns.data_bytes() as usize;
+                    let ns_mut = self.ns_mut(nsid).unwrap();
+                    for off in 0..nlb {
+                        let lba = slba + off as u64;
+                        let mut block = vec![0u8; block_bytes];
+                        if let Err(e) = ns_mut
+                            .file
+                            .seek(SeekFrom::Start(lba * block_bytes as u64))
+                            .and_then(|_| ns_mut.file.read_exact(&mut block))
+                        {
+                            tracing::warn!(error = %e, nsid, lba, "Verify PI read fail");
+                            return Some(Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::DATA_TRANSFER_ERROR,
+                                0,
+                            ));
+                        }
+                        let (data_slice, tuple_slice) = if pi_first {
+                            (&block[8..8 + data_bytes], &block[0..8])
+                        } else {
+                            (
+                                &block[0..data_bytes],
+                                &block[data_bytes..data_bytes + 8],
+                            )
+                        };
+                        let tuple_arr: [u8; 8] = tuple_slice.try_into().unwrap();
+                        let pi = crate::pi::PiTuple::from_bytes(&tuple_arr);
+                        let check = pi.verify(data_slice, lba, pi_type);
+                        if let Some(sc_code) = check.to_sc() {
+                            tracing::warn!(nsid, lba, ?check, "Verify PI FAIL");
+                            self.stat_num_err_log_entries += 1;
+                            self.push_error_log(
+                                sq_id,
+                                cid,
+                                (sc_code as u16) << 1,
+                                lba,
+                                nsid,
+                            );
+                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_code, 0));
+                        }
+                    }
+                    tracing::debug!(nsid, slba, nlb, "Verify PI OK");
                 }
                 Some(Cqe::success(cid, sq_id, sq_head, phase))
             }
