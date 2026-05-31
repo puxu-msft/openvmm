@@ -48,6 +48,10 @@ pub(super) struct PendingIo {
     cid: u16,
     sq_head: u16,
     cq_id: u16,
+    /// **Phase H4** — 本 IO 所属 NSID。完成回调据此选 namespaces[nsid] 操作。
+    /// Admin DMA-write Identify / Get Log Page 等无 NS 关联 = 0（特殊值，
+    /// completion 看到 0 不查 namespace）。
+    pub(super) nsid: u32,
     /// Read 路径：远端 DMA 完成后我们已读出数据，把 data 写到 LBA file，
     /// 然后构造 success CQE。
     /// Write 路径：DMA write 完成后构造 success CQE。
@@ -100,6 +104,8 @@ pub(super) struct WriteAccum {
     cid: u16,
     sq_head: u16,
     cq_id: u16,
+    /// **Phase H4** — 目标 NSID
+    nsid: u32,
     lba: u64,
     num_blocks: u32,
     prp1_data: Option<Vec<u8>>,
@@ -125,6 +131,8 @@ pub(super) struct PrpListOp {
     pub(super) cid: u16,
     pub(super) sq_head: u16,
     pub(super) cq_id: u16,
+    /// **Phase H4** — 目标 NSID
+    pub(super) nsid: u32,
     pub(super) lba: u64,
     pub(super) num_blocks: u32,
     /// true = Write (host→device data flow)；false = Read。
@@ -145,11 +153,23 @@ pub(super) struct PrpListOp {
     pub(super) data_pages: Vec<Option<Vec<u8>>>,
 }
 
+/// **Phase H4** — 单个 namespace 状态（spec § 1.6 "An NSID maps to one
+/// namespace"）。每 NS 有独立 backing file + 容量。
+pub(super) struct Namespace {
+    pub(super) file: File,
+    pub(super) total_lba: u64,
+    /// Backing 文件路径 — 仅供日志 / Identify Namespace 扩展用。
+    #[allow(dead_code)]
+    pub(super) path: String,
+}
+
 /// NVMe Controller 主结构 — 实现 `PcieDevice`。
 pub struct NvmeController {
-    // ----- Backing file -----
-    file: File,
-    total_lba: u64,
+    // ----- Backing namespaces (NSID -> NS state) -----
+    /// NSID → Namespace。spec § 1.6：NSID 0 reserved (controller broadcast)，
+    /// NSID 1..N 数据 namespace，NSID 0xFFFF_FFFF = broadcast。本实现单
+    /// controller，NS 从 1 起编号。Phase H4 之前只支持 NSID=1。
+    pub(super) namespaces: HashMap<u32, Namespace>,
 
     // ----- Controller registers -----
     cap: u64,
@@ -308,28 +328,45 @@ pub(super) struct ErrorLogEntry {
 }
 
 impl NvmeController {
-    /// `backing_file`：必须存在；其大小决定 namespace 容量（向下 round 到 512 倍数）。
-    pub fn open(backing_file_path: &str, vid: u16, ssvid: u16) -> anyhow::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(backing_file_path)?;
-        let size = file.metadata()?.len();
-        let total_lba = size >> SECTOR_SHIFT;
-        if total_lba == 0 {
-            return Err(anyhow::anyhow!(
-                "backing file too small (< 512 bytes): {backing_file_path}"
-            ));
+    /// `backing_files`：每个文件成为一个 namespace（NSID 1, 2, ...）。
+    /// 文件大小决定该 NS 容量（÷ 512 round down 到 LBA 数）。
+    /// Phase H4：之前接受单 path string；现在 slice，至少 1 个。
+    pub fn open(backing_files: &[String], vid: u16, ssvid: u16) -> anyhow::Result<Self> {
+        if backing_files.is_empty() {
+            return Err(anyhow::anyhow!("at least one --backing-file required"));
         }
-        tracing::info!(
-            backing_file_path,
-            size,
-            total_lba,
-            "NVMe controller: backing file opened"
-        );
+        let mut namespaces: HashMap<u32, Namespace> = HashMap::new();
+        for (idx, path) in backing_files.iter().enumerate() {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)?;
+            let size = file.metadata()?.len();
+            let total_lba = size >> SECTOR_SHIFT;
+            if total_lba == 0 {
+                return Err(anyhow::anyhow!(
+                    "backing file too small (< 512 bytes): {path}"
+                ));
+            }
+            let nsid = (idx as u32) + 1;
+            tracing::info!(
+                nsid,
+                path = %path,
+                size,
+                total_lba,
+                "NVMe controller: namespace registered"
+            );
+            namespaces.insert(
+                nsid,
+                Namespace {
+                    file,
+                    total_lba,
+                    path: path.clone(),
+                },
+            );
+        }
         Ok(Self {
-            file,
-            total_lba,
+            namespaces,
             cap: build_cap(64),
             vs: VS_NVME_1_4,
             intms: 0,
@@ -596,6 +633,24 @@ impl NvmeController {
         id
     }
 
+    /// **Phase H4** — NSID 校验：返 Some(&mut Namespace) 或 None（NSID
+    /// 不存在）。dispatch_io 必须先校验，spec § 6.1：invalid NSID 返
+    /// SC=0x0b "Invalid Namespace or Format"。NSID 0xFFFF_FFFF 是
+    /// broadcast 仅 admin 命令允许（如 Format All），IO 命令不允许。
+    pub(super) fn ns_mut(&mut self, nsid: u32) -> Option<&mut Namespace> {
+        if nsid == 0 || nsid == 0xFFFF_FFFF {
+            return None;
+        }
+        self.namespaces.get_mut(&nsid)
+    }
+    /// 只读版（用于 LBA 边界校验等不需 mut 的场景）。
+    pub(super) fn ns(&self, nsid: u32) -> Option<&Namespace> {
+        if nsid == 0 || nsid == 0xFFFF_FFFF {
+            return None;
+        }
+        self.namespaces.get(&nsid)
+    }
+
     /// **Phase F** — 触发 AEN (Async Event Notification)。
     ///
     /// NVMe spec § 5.2：当 controller 发生 async 事件（health critical /
@@ -858,6 +913,7 @@ impl NvmeController {
                 cid,
                 sq_head,
                 cq_id,
+                nsid: 0, // admin payload，无 NS 关联
                 op: PendingOp::NvmReadDmaWrite { num_blocks: 0 },
             },
         );
@@ -1193,10 +1249,15 @@ impl PcieDevice for NvmeController {
                             "NVM Write DMA-read byte mismatch"
                         );
                     }
-                    let res = self
-                        .file
-                        .seek(SeekFrom::Start(lba * SECTOR_SIZE))
-                        .and_then(|_| self.file.write_all(&data));
+                    // **Phase H4** — 用 p.nsid 选 NS file（admin DMA-write
+                    // 是 NvmReadDmaWrite { num_blocks: 0 } 不走这里）。
+                    let res = if let Some(ns) = self.namespaces.get_mut(&p.nsid) {
+                        ns.file
+                            .seek(SeekFrom::Start(lba * SECTOR_SIZE))
+                            .and_then(|_| ns.file.write_all(&data))
+                    } else {
+                        Err(std::io::Error::other(format!("unknown NSID {}", p.nsid)))
+                    };
                     // 注：不 per-IO fsync（H5）；driver 用 NVM FLUSH (opc 0x00)
                     // 显式拿持久化承诺；Identify Controller VWC=1 已声明
                     // volatile write cache，driver 会主动发 FLUSH。
@@ -1250,58 +1311,77 @@ impl PcieDevice for NvmeController {
                     let mut backing_buf = vec![0u8; bytes as usize];
                     let cq = self.cqs.get(&p.cq_id);
                     let phase = cq.map(|c| c.phase).unwrap_or(1);
-                    let cqe = match self
-                        .file
-                        .seek(SeekFrom::Start(lba * SECTOR_SIZE))
-                        .and_then(|_| std::io::Read::read_exact(&mut self.file, &mut backing_buf))
-                    {
-                        Ok(()) => {
-                            if data == backing_buf {
-                                tracing::debug!(
-                                    lba,
-                                    num_blocks,
-                                    "Compare success (data == backing)"
-                                );
-                                // 真 IO 读完成 → counter（Compare 也算读 host）
-                                self.stat_host_reads += 1;
-                                self.stat_lba_read += num_blocks as u64;
-                                Cqe::success(p.cid, p.sq_id, p.sq_head, phase)
-                            } else {
-                                // 找第一个差异位置便于教学日志
-                                let mismatch_at = data
-                                    .iter()
-                                    .zip(backing_buf.iter())
-                                    .position(|(a, b)| a != b)
-                                    .unwrap_or(0);
-                                tracing::warn!(
-                                    lba,
-                                    num_blocks,
-                                    mismatch_at,
-                                    "Compare FAILURE: host vs backing mismatch"
-                                );
+                    let cqe = if let Some(ns) = self.namespaces.get_mut(&p.nsid) {
+                        match ns
+                            .file
+                            .seek(SeekFrom::Start(lba * SECTOR_SIZE))
+                            .and_then(|_| std::io::Read::read_exact(&mut ns.file, &mut backing_buf))
+                        {
+                            Ok(()) => {
+                                if data == backing_buf {
+                                    tracing::debug!(
+                                        lba,
+                                        num_blocks,
+                                        "Compare success (data == backing)"
+                                    );
+                                    // 真 IO 读完成 → counter（Compare 也算读 host）
+                                    self.stat_host_reads += 1;
+                                    self.stat_lba_read += num_blocks as u64;
+                                    Cqe::success(p.cid, p.sq_id, p.sq_head, phase)
+                                } else {
+                                    // 找第一个差异位置便于教学日志
+                                    let mismatch_at = data
+                                        .iter()
+                                        .zip(backing_buf.iter())
+                                        .position(|(a, b)| a != b)
+                                        .unwrap_or(0);
+                                    tracing::warn!(
+                                        lba,
+                                        num_blocks,
+                                        mismatch_at,
+                                        "Compare FAILURE: host vs backing mismatch"
+                                    );
+                                    self.stat_num_err_log_entries += 1;
+                                    self.push_error_log(
+                                        p.sq_id,
+                                        p.cid,
+                                        (sc::COMPARE_FAILURE as u16) << 1,
+                                        lba,
+                                        1,
+                                    );
+                                    Cqe::error(
+                                        p.cid,
+                                        p.sq_id,
+                                        p.sq_head,
+                                        phase,
+                                        sc::COMPARE_FAILURE,
+                                        0,
+                                    )
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, lba, "Compare: backing read failed");
                                 self.stat_num_err_log_entries += 1;
                                 self.push_error_log(
                                     p.sq_id,
                                     p.cid,
-                                    (sc::COMPARE_FAILURE as u16) << 1,
+                                    (sc::DATA_TRANSFER_ERROR as u16) << 1,
                                     lba,
                                     1,
                                 );
-                                Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::COMPARE_FAILURE, 0)
+                                Cqe::error(
+                                    p.cid,
+                                    p.sq_id,
+                                    p.sq_head,
+                                    phase,
+                                    sc::DATA_TRANSFER_ERROR,
+                                    0,
+                                )
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!(error = %e, lba, "Compare: backing read failed");
-                            self.stat_num_err_log_entries += 1;
-                            self.push_error_log(
-                                p.sq_id,
-                                p.cid,
-                                (sc::DATA_TRANSFER_ERROR as u16) << 1,
-                                lba,
-                                1,
-                            );
-                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR, 0)
-                        }
+                    } else {
+                        tracing::warn!(nsid = p.nsid, "Compare: unknown NSID at completion");
+                        Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE, 0)
                     };
                     self.post_cqe(ctx, p.cq_id, cqe);
                 }
@@ -1334,10 +1414,16 @@ impl PcieDevice for NvmeController {
                             op_id,
                             "NVM Write dual-PRP: both segments ready, writing"
                         );
-                        let res = self
-                            .file
-                            .seek(SeekFrom::Start(accum.lba * SECTOR_SIZE))
-                            .and_then(|_| self.file.write_all(&full));
+                        let res = if let Some(ns) = self.namespaces.get_mut(&accum.nsid) {
+                            ns.file
+                                .seek(SeekFrom::Start(accum.lba * SECTOR_SIZE))
+                                .and_then(|_| ns.file.write_all(&full))
+                        } else {
+                            Err(std::io::Error::other(format!(
+                                "unknown NSID {}",
+                                accum.nsid
+                            )))
+                        };
                         // 注：不再 per-IO sync_data（H5）；driver 用 NVM FLUSH
                         // (opcode 0x00) 拿持久化承诺，spec-compliant 行为。
                         let cq = self.cqs.get(&accum.cq_id);
@@ -1410,10 +1496,10 @@ impl PcieDevice for NvmeController {
                             NVME_PAGE_SIZE as u32
                         };
                         let tok = ctx.dma_read(*gpa, want_bytes);
-                        // 借用 PendingIo 共用字段 sq_id/cid/sq_head/cq_id
-                        let (sq_id, cid, sq_head, cq_id) = {
+                        // 借用 PendingIo 共用字段 sq_id/cid/sq_head/cq_id/nsid
+                        let (sq_id, cid, sq_head, cq_id, nsid) = {
                             let op = &self.prp_list_ops[&op_id];
-                            (op.sq_id, op.cid, op.sq_head, op.cq_id)
+                            (op.sq_id, op.cid, op.sq_head, op.cq_id, op.nsid)
                         };
                         self.pending_ios.insert(
                             tok,
@@ -1422,6 +1508,7 @@ impl PcieDevice for NvmeController {
                                 cid,
                                 sq_head,
                                 cq_id,
+                                nsid,
                                 op: PendingOp::NvmWritePrpListData { op_id, page_idx },
                             },
                         );
@@ -1458,10 +1545,13 @@ impl PcieDevice for NvmeController {
                             full_len = full.len(),
                             "NVM Write PRP-list: all pages ready, writing"
                         );
-                        let res = self
-                            .file
-                            .seek(SeekFrom::Start(op.lba * SECTOR_SIZE))
-                            .and_then(|_| self.file.write_all(&full));
+                        let res = if let Some(ns) = self.namespaces.get_mut(&op.nsid) {
+                            ns.file
+                                .seek(SeekFrom::Start(op.lba * SECTOR_SIZE))
+                                .and_then(|_| ns.file.write_all(&full))
+                        } else {
+                            Err(std::io::Error::other(format!("unknown NSID {}", op.nsid)))
+                        };
                         let cq = self.cqs.get(&op.cq_id);
                         let phase = cq.map(|c| c.phase).unwrap_or(1);
                         let cqe = match res {
@@ -1524,9 +1614,9 @@ impl PcieDevice for NvmeController {
                     if let Some(op) = self.prp_list_ops.get_mut(&op_id) {
                         op.list_entries = Some(list.clone());
                     }
-                    let (sq_id, cid, sq_head, cq_id) = {
+                    let (sq_id, cid, sq_head, cq_id, nsid) = {
                         let op = &self.prp_list_ops[&op_id];
-                        (op.sq_id, op.cid, op.sq_head, op.cq_id)
+                        (op.sq_id, op.cid, op.sq_head, op.cq_id, op.nsid)
                     };
                     // 不变量校验：list.len() + 1 (PRP1) == total_pages
                     debug_assert_eq!(
@@ -1545,6 +1635,7 @@ impl PcieDevice for NvmeController {
                             cid,
                             sq_head,
                             cq_id,
+                            nsid,
                             op: PendingOp::NvmReadPrpListData { op_id, page_idx: 0 },
                         },
                     );
@@ -1560,6 +1651,7 @@ impl PcieDevice for NvmeController {
                                 cid,
                                 sq_head,
                                 cq_id,
+                                nsid,
                                 op: PendingOp::NvmReadPrpListData { op_id, page_idx },
                             },
                         );
@@ -1631,7 +1723,7 @@ mod tests {
         let f = std::fs::File::create(&path).unwrap();
         f.set_len(1024 * 1024).unwrap(); // 1 MiB → 2048 LBA
         drop(f);
-        let c = NvmeController::open(path.to_str().unwrap(), 0x1414, 0).unwrap();
+        let c = NvmeController::open(&[path.to_str().unwrap().to_string()], 0x1414, 0).unwrap();
         // 不能立即 remove —— Windows 上仍持有的 File 句柄被删后导致后续操作
         // 失败；Unix 下 unlink-while-open 没问题但为可移植性也 keep。测试
         // 结束 OS tempdir 清理（best-effort）。
@@ -1798,5 +1890,41 @@ mod tests {
             c.features[&crate::cmd::fid::VOLATILE_WRITE_CACHE] & 0x1,
             0x1
         );
+    }
+
+    /// Phase H4：多 namespace open + Active NSID list 序列化 + ns_mut
+    /// 返 None for NSID 0 / 0xFFFF_FFFF。
+    #[test]
+    fn multi_namespace_open_and_active_list() {
+        let dir = std::env::temp_dir();
+        let p1 = dir.join(format!(
+            "nvme_test_ns1_{}_{:?}.img",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let p2 = dir.join(format!(
+            "nvme_test_ns2_{}_{:?}.img",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        for p in [&p1, &p2] {
+            let f = std::fs::File::create(p).unwrap();
+            f.set_len(1024 * 1024).unwrap();
+        }
+        let paths = vec![
+            p1.to_str().unwrap().to_string(),
+            p2.to_str().unwrap().to_string(),
+        ];
+        let c = NvmeController::open(&paths, 0x1414, 0).unwrap();
+        assert_eq!(c.namespaces.len(), 2);
+        assert!(c.namespaces.contains_key(&1));
+        assert!(c.namespaces.contains_key(&2));
+        // NSID 0 / 0xFFFF_FFFF 不可用
+        assert!(c.ns(0).is_none());
+        assert!(c.ns(0xFFFF_FFFF).is_none());
+        assert!(c.ns(3).is_none());
+        // NS 都是 2048 LBA (1 MiB / 512)
+        assert_eq!(c.ns(1).unwrap().total_lba, 2048);
+        assert_eq!(c.ns(2).unwrap().total_lba, 2048);
     }
 }

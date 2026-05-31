@@ -158,6 +158,9 @@ pub mod sc {
     /// 单独指定 — 当前 helper 没暴露 SCT 参数，对 Compare 我们用 0x85
     /// SC + driver 通常按 NVM/Media 解析。
     pub const COMPARE_FAILURE: u8 = 0x85;
+    /// Phase H4：Invalid Namespace or Format — NVMe spec § 6.1 当 IO
+    /// 命令带未注册 NSID 时返。
+    pub const INVALID_NAMESPACE: u8 = 0x0b;
 }
 
 /// Submission Queue Entry — 64 bytes 固定。
@@ -325,7 +328,7 @@ impl IdentifyController {
     /// 到 spec-correct byte layout（含 RTD3R/RTD3E/OAES/CTRATT/CNTRLTYPE/
     /// FGUID/HMPRE/SANICAP/ANATT/SUBNQN/IOCCSZ/SGLS 等之前我们 padding
     /// 字段的位置）。
-    pub fn build_v2_bytes(vid: u16, ssvid: u16) -> Vec<u8> {
+    pub fn build_v2_bytes(vid: u16, ssvid: u16, nn: u32) -> Vec<u8> {
         let mut id = SpecIdentifyController::new_zeroed();
         id.vid = vid;
         id.ssvid = ssvid;
@@ -367,7 +370,7 @@ impl IdentifyController {
         id.sqes = nvme_spec::QueueEntrySize::new().with_min(6).with_max(6);
         id.cqes = nvme_spec::QueueEntrySize::new().with_min(4).with_max(4);
         id.maxcmd = 64;
-        id.nn = 1;
+        id.nn = nn;
         // ONCS — NVM optional command support。Phase D 后 Dataset
         // Management (DSM/TRIM) / Write Zeroes / Verify 都已 dispatch。
         // Phase H3：Compare 也已真实现（≤ 1 page 路径）。Copy 暂不支持。
@@ -479,7 +482,7 @@ mod tests {
     /// VID/SSVID 在 0/2，VER 在 80，VWC 在 525，全部 spec § 5.17.2.2。
     #[test]
     fn identify_controller_byte_layout() {
-        let buf = IdentifyController::build_v2_bytes(0x1414, 0xc0de);
+        let buf = IdentifyController::build_v2_bytes(0x1414, 0xc0de, 1);
         assert_eq!(buf.len(), 4096, "Identify Controller must be 4 KiB");
         // VID = u16 LE @ 0
         assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 0x1414);

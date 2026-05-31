@@ -38,23 +38,42 @@ impl NvmeController {
                 tracing::info!(cns, nsid, "Identify");
                 let buf: Vec<u8> = match cns {
                     0x00 => {
-                        // Identify Namespace
-                        if nsid != 1 {
-                            // invalid NSID
-                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
-                        }
+                        // Identify Namespace — 用 NSID 选具体 NS（Phase H4）
+                        let Some(ns) = self.ns(nsid) else {
+                            return Some(Cqe::error(
+                                cid,
+                                0,
+                                sq_head,
+                                phase,
+                                sc::INVALID_NAMESPACE,
+                                0,
+                            ));
+                        };
                         /* Phase A: spec-correct 200+ fields via nvme_spec */
-                        IdentifyNamespace::build_v2_bytes(self.total_lba)
+                        IdentifyNamespace::build_v2_bytes(ns.total_lba)
                     }
                     0x01 => {
                         // Identify Controller
                         /* Phase A: spec-correct 200+ fields via nvme_spec */
-                        IdentifyController::build_v2_bytes(self.vid, self.ssvid)
+                        IdentifyController::build_v2_bytes(
+                            self.vid,
+                            self.ssvid,
+                            self.namespaces.len() as u32,
+                        )
                     }
                     0x02 => {
-                        // Active NSID list (4 KiB of u32, list active NSIDs)
+                        // Active NSID list — 列所有已注册 NSID（spec § 5.15.1）。
+                        // Phase H4：动态枚举 self.namespaces；按 NSID 升序。
                         let mut buf = vec![0u8; 4096];
-                        buf[..4].copy_from_slice(&1u32.to_le_bytes());
+                        let mut nsids: Vec<u32> = self.namespaces.keys().copied().collect();
+                        nsids.sort();
+                        for (i, n) in nsids.iter().enumerate() {
+                            let off = i * 4;
+                            if off + 4 > buf.len() {
+                                break;
+                            }
+                            buf[off..off + 4].copy_from_slice(&n.to_le_bytes());
+                        }
                         buf
                     }
                     0x03 => {
@@ -385,23 +404,49 @@ impl NvmeController {
                     // 或调 fallocate(FALLOC_FL_ZERO_RANGE)。本 example 教学
                     // 用，sparse hole 行为对 guest 而言等价 "全零盘"。SES=2
                     // 没有加密 key 销毁概念，因为我们没加密；行为等价 SES=1。
-                    let size = match self.file.metadata() {
-                        Ok(m) => m.len(),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Format NVM: stat failed");
+                    //
+                    // **Phase H4**：sqe.nsid 0xFFFF_FFFF = broadcast，format
+                    // 所有 NS；具体 NSID 仅 format 该 NS。
+                    let nsid = sqe.nsid;
+                    let targets: Vec<u32> = if nsid == 0xFFFF_FFFF {
+                        self.namespaces.keys().copied().collect()
+                    } else if self.namespaces.contains_key(&nsid) {
+                        vec![nsid]
+                    } else {
+                        return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE, 0));
+                    };
+                    for target_nsid in targets {
+                        let ns = self.namespaces.get_mut(&target_nsid).unwrap();
+                        let size = match ns.file.metadata() {
+                            Ok(m) => m.len(),
+                            Err(e) => {
+                                tracing::warn!(error = %e, nsid = target_nsid, "Format NVM: stat failed");
+                                return Some(Cqe::error(
+                                    cid,
+                                    0,
+                                    sq_head,
+                                    phase,
+                                    sc::INTERNAL_ERROR,
+                                    0,
+                                ));
+                            }
+                        };
+                        if let Err(e) = ns.file.set_len(0).and_then(|_| ns.file.set_len(size)) {
+                            tracing::warn!(error = %e, nsid = target_nsid, "Format NVM: truncate failed");
                             return Some(Cqe::error(cid, 0, sq_head, phase, sc::INTERNAL_ERROR, 0));
                         }
-                    };
-                    if let Err(e) = self.file.set_len(0).and_then(|_| self.file.set_len(size)) {
-                        tracing::warn!(error = %e, "Format NVM: truncate failed");
-                        return Some(Cqe::error(cid, 0, sq_head, phase, sc::INTERNAL_ERROR, 0));
+                        use std::io::Write as _;
+                        if let Err(e) = ns.file.flush() {
+                            tracing::warn!(error = %e, nsid = target_nsid, "Format NVM: flush failed");
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INTERNAL_ERROR, 0));
+                        }
+                        tracing::info!(
+                            nsid = target_nsid,
+                            size,
+                            ses,
+                            "Format NVM: sparse-hole erase done"
+                        );
                     }
-                    use std::io::Write as _;
-                    if let Err(e) = self.file.flush() {
-                        tracing::warn!(error = %e, "Format NVM: flush failed");
-                        return Some(Cqe::error(cid, 0, sq_head, phase, sc::INTERNAL_ERROR, 0));
-                    }
-                    tracing::info!(size, ses, "Format NVM: sparse-hole erase done");
                 }
                 Some(Cqe::success(cid, 0, sq_head, phase))
             }

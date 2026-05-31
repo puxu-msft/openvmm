@@ -38,10 +38,12 @@ impl NvmeController {
                 let cdw12 = sqe.cdw12;
                 let prp1 = sqe.prp1;
                 let prp2 = sqe.prp2;
+                let nsid = sqe.nsid;
                 let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
                 let nlb = (cdw12 & 0xffff) as u32 + 1;
                 let bytes = nlb as u64 * SECTOR_SIZE;
                 tracing::debug!(
+                    nsid,
                     slba,
                     nlb,
                     bytes,
@@ -51,9 +53,21 @@ impl NvmeController {
                 if bytes > MDTS_MAX_BYTES {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
+                // **Phase H4** — NSID 校验 + 取 NS（含 total_lba）
+                let Some(ns) = self.ns(nsid) else {
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_NAMESPACE,
+                        0,
+                    ));
+                };
+                let total_lba = ns.total_lba;
                 // H4：checked_add 防 slba + nlb 溢出（driver bug / 恶意输入）。
                 match slba.checked_add(nlb as u64) {
-                    Some(end) if end <= self.total_lba => {}
+                    Some(end) if end <= total_lba => {}
                     _ => {
                         return Some(Cqe::error(
                             cid,
@@ -65,14 +79,15 @@ impl NvmeController {
                         ));
                     }
                 }
-                // 从文件读到 buf
+                // 从文件读到 buf（per-NSID）
                 let mut buf = vec![0u8; bytes as usize];
-                if let Err(e) = self
+                let ns_mut = self.ns_mut(nsid).unwrap();
+                if let Err(e) = ns_mut
                     .file
                     .seek(SeekFrom::Start(slba * SECTOR_SIZE))
-                    .and_then(|_| self.file.read_exact(&mut buf))
+                    .and_then(|_| ns_mut.file.read_exact(&mut buf))
                 {
-                    tracing::warn!(error = %e, slba, nlb, "READ: backing file read failed");
+                    tracing::warn!(error = %e, nsid, slba, nlb, "READ: backing file read failed");
                     return Some(Cqe::error(
                         cid,
                         sq_id,
@@ -95,6 +110,7 @@ impl NvmeController {
                             cid,
                             sq_head,
                             cq_id,
+                            nsid,
                             op: PendingOp::NvmReadDmaWrite { num_blocks: nlb },
                         },
                     );
@@ -103,10 +119,6 @@ impl NvmeController {
                     let (b1, b2) = buf.split_at(half);
                     let tok1 = ctx.dma_write(prp1, b1.to_vec());
                     let tok2 = ctx.dma_write(prp2, b2.to_vec());
-                    // **H4 修复**：tok1 也入 pending_ios，否则失败时通用
-                    // DMA-fail 路径找不到上下文 → driver 永远收不到 error
-                    // CQE，直至 timeout。tok1 走 sibling 变体（成功时无
-                    // op，由 tok2 的 NvmReadDmaWrite 负责 success CQE）。
                     self.pending_ios.insert(
                         tok1,
                         PendingIo {
@@ -114,6 +126,7 @@ impl NvmeController {
                             cid,
                             sq_head,
                             cq_id,
+                            nsid,
                             op: PendingOp::NvmReadDualPrpSiblingHalf,
                         },
                     );
@@ -124,20 +137,12 @@ impl NvmeController {
                             cid,
                             sq_head,
                             cq_id,
+                            nsid,
                             op: PendingOp::NvmReadDmaWrite { num_blocks: nlb },
                         },
                     );
                 } else {
                     // **Phase E** — PRP list path (Read > 2 page)。
-                    // 1) DMA-read PRP list page (PRP2 指向)，4 KiB 含
-                    //    (total_pages-1) 个 u64 entry。
-                    // 2) list 到达后：写 PRP1 + 各 list page。
-                    //
-                    // **C3 修复**：之前 `data_pages: vec![Some(buf)]` 把整段
-                    // transfer（>= 12 KiB）塞进 data_pages[0]，随后 dma_write
-                    // 把整段写到 PRP1 GPA → 覆盖 PRP1 边界外的 guest 内存。
-                    // 现在按页切分预读 buffer，data_pages[i] 严格对应第 i 页
-                    // 的数据。
                     let total_pages = bytes.div_ceil(NVME_PAGE_SIZE) as u32;
                     let mut data_pages: Vec<Option<Vec<u8>>> =
                         Vec::with_capacity(total_pages as usize);
@@ -154,6 +159,7 @@ impl NvmeController {
                             cid,
                             sq_head,
                             cq_id,
+                            nsid,
                             lba: slba,
                             num_blocks: nlb,
                             is_write: false,
@@ -172,6 +178,7 @@ impl NvmeController {
                             cid,
                             sq_head,
                             cq_id,
+                            nsid,
                             op: PendingOp::NvmReadPrpListFetch { op_id },
                         },
                     );
@@ -186,10 +193,12 @@ impl NvmeController {
                 let cdw12 = sqe.cdw12;
                 let prp1 = sqe.prp1;
                 let prp2 = sqe.prp2;
+                let nsid = sqe.nsid;
                 let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
                 let nlb = (cdw12 & 0xffff) as u32 + 1;
                 let bytes = nlb as u64 * SECTOR_SIZE;
                 tracing::debug!(
+                    nsid,
                     slba,
                     nlb,
                     bytes,
@@ -199,9 +208,20 @@ impl NvmeController {
                 if bytes > MDTS_MAX_BYTES {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
-                // H4：checked_add 防 slba + nlb 溢出（driver bug / 恶意输入）。
+                // **Phase H4** — NSID 校验
+                let Some(ns) = self.ns(nsid) else {
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_NAMESPACE,
+                        0,
+                    ));
+                };
+                let total_lba = ns.total_lba;
                 match slba.checked_add(nlb as u64) {
-                    Some(end) if end <= self.total_lba => {}
+                    Some(end) if end <= total_lba => {}
                     _ => {
                         return Some(Cqe::error(
                             cid,
@@ -223,6 +243,7 @@ impl NvmeController {
                             cid,
                             sq_head,
                             cq_id,
+                            nsid,
                             op: PendingOp::NvmWriteDmaRead {
                                 lba: slba,
                                 num_blocks: nlb,
@@ -230,11 +251,7 @@ impl NvmeController {
                         },
                     );
                 } else if bytes <= 2 * NVME_PAGE_SIZE {
-                    // 双 PRP：PRP1 = 第一页 (4 KiB)，PRP2 = 第二页（最多 4 KiB）。
-                    // 分配独立 op_id，PRP1/PRP2 完成回调通过 op_id 关联 ——
-                    // 解决 PRP2 先到 PRP1 的乱序数据损坏 + leak 问题（C1）。
-                    let op_id = self.next_op_id;
-                    self.next_op_id = self.next_op_id.wrapping_add(1);
+                    let op_id = self.alloc_op_id();
                     self.dual_prp_writes.insert(
                         op_id,
                         WriteAccum {
@@ -242,6 +259,7 @@ impl NvmeController {
                             cid,
                             sq_head,
                             cq_id,
+                            nsid,
                             lba: slba,
                             num_blocks: nlb,
                             prp1_data: None,
@@ -258,6 +276,7 @@ impl NvmeController {
                             cid,
                             sq_head,
                             cq_id,
+                            nsid,
                             op: PendingOp::NvmWriteDualPrp {
                                 op_id,
                                 is_prp1: true,
@@ -271,6 +290,7 @@ impl NvmeController {
                             cid,
                             sq_head,
                             cq_id,
+                            nsid,
                             op: PendingOp::NvmWriteDualPrp {
                                 op_id,
                                 is_prp1: false,
@@ -279,9 +299,6 @@ impl NvmeController {
                     );
                 } else {
                     // **Phase E** — PRP list path (Write > 2 page)。
-                    // Step 1: 同时 DMA-read PRP1 数据 + PRP list 页。
-                    // Step 2: PRP list 到达后解析 + dma_read 每个 list 中数据页。
-                    // Step 3: 所有数据页齐 → 合并写文件 → CQE。
                     let total_pages = bytes.div_ceil(NVME_PAGE_SIZE) as u32;
                     let op_id = self.alloc_op_id();
                     let mut data_pages: Vec<Option<Vec<u8>>> =
@@ -296,6 +313,7 @@ impl NvmeController {
                             cid,
                             sq_head,
                             cq_id,
+                            nsid,
                             lba: slba,
                             num_blocks: nlb,
                             is_write: true,
@@ -315,6 +333,7 @@ impl NvmeController {
                             cid,
                             sq_head,
                             cq_id,
+                            nsid,
                             op: PendingOp::NvmWritePrpListFetch { op_id },
                         },
                     );
@@ -327,6 +346,7 @@ impl NvmeController {
                             cid,
                             sq_head,
                             cq_id,
+                            nsid,
                             op: PendingOp::NvmWritePrpListData { op_id, page_idx: 0 },
                         },
                     );
@@ -337,32 +357,62 @@ impl NvmeController {
                 // **H3 修复**：FLUSH 失败必须返 DATA_TRANSFER_ERROR。
                 // VWC=present 让 driver 依赖 FLUSH 做 durability 承诺；
                 // 吞错会让 driver 误信数据已落盘。
-                match self.file.sync_all() {
-                    Ok(()) => Some(Cqe::success(cid, sq_id, sq_head, phase)),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "FLUSH sync_all failed");
-                        Some(Cqe::error(
+                // **Phase H4**：nsid=0xFFFF_FFFF = flush all NS（spec
+                // § 6.7）；具体 NSID 仅 flush 该 NS。
+                let nsid = sqe.nsid;
+                let targets: Vec<u32> = if nsid == 0xFFFF_FFFF {
+                    self.namespaces.keys().copied().collect()
+                } else if self.namespaces.contains_key(&nsid) {
+                    vec![nsid]
+                } else {
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_NAMESPACE,
+                        0,
+                    ));
+                };
+                for target in targets {
+                    let ns = self.namespaces.get_mut(&target).unwrap();
+                    if let Err(e) = ns.file.sync_all() {
+                        tracing::warn!(error = %e, nsid = target, "FLUSH sync_all failed");
+                        return Some(Cqe::error(
                             cid,
                             sq_id,
                             sq_head,
                             phase,
                             sc::DATA_TRANSFER_ERROR,
                             0,
-                        ))
+                        ));
                     }
                 }
+                Some(Cqe::success(cid, sq_id, sq_head, phase))
             }
             nvm_opc::WRITE_ZEROES => {
                 // NVMe NVM CS Spec § 3.3.4 Write Zeroes — 把 [SLBA, SLBA+NLB)
                 // 范围内的 LBA 全清零。CDW10/11 = SLBA，CDW12 bits 15:0 = NLB
                 // (zero-based)。无 DMA，无 MDTS 限制（spec 允许整盘 nlb）。
+                let nsid = sqe.nsid;
                 let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
                 let nlb = (sqe.cdw12 & 0xffff) as u32 + 1;
                 let bytes = nlb as u64 * SECTOR_SIZE;
-                tracing::debug!(slba, nlb, bytes, "NVM WRITE ZEROES");
+                tracing::debug!(nsid, slba, nlb, bytes, "NVM WRITE ZEROES");
+                let Some(ns) = self.ns(nsid) else {
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_NAMESPACE,
+                        0,
+                    ));
+                };
+                let total_lba = ns.total_lba;
                 // **H4 修复**：用 checked_add 防 slba + nlb 溢出。
                 match slba.checked_add(nlb as u64) {
-                    Some(end) if end <= self.total_lba => {} // 范围合法
+                    Some(end) if end <= total_lba => {} // 范围合法
                     _ => {
                         return Some(Cqe::error(
                             cid,
@@ -381,7 +431,8 @@ impl NvmeController {
                 let zero_buf = [0u8; CHUNK];
                 let mut remaining = bytes as usize;
                 let mut off = slba * SECTOR_SIZE;
-                if let Err(e) = self.file.seek(SeekFrom::Start(off)) {
+                let ns = self.ns_mut(nsid).unwrap();
+                if let Err(e) = ns.file.seek(SeekFrom::Start(off)) {
                     tracing::warn!(error = %e, slba, "WRITE ZEROES seek failed");
                     return Some(Cqe::error(
                         cid,
@@ -394,7 +445,7 @@ impl NvmeController {
                 }
                 while remaining > 0 {
                     let n = remaining.min(CHUNK);
-                    if let Err(e) = std::io::Write::write_all(&mut self.file, &zero_buf[..n]) {
+                    if let Err(e) = std::io::Write::write_all(&mut ns.file, &zero_buf[..n]) {
                         tracing::warn!(error = %e, slba, nlb, off, "WRITE ZEROES chunk failed");
                         return Some(Cqe::error(
                             cid,
@@ -427,26 +478,31 @@ impl NvmeController {
             nvm_opc::COMPARE => {
                 // **Phase H3** — NVMe NVM CS Spec § 3.3.2 Compare：读 LBA 与
                 // host 提供数据比较。
-                // CDW10/11 = SLBA, CDW12 bits 15:0 = NLB-1。流程：
-                //   1) DMA-read host buffer (PRP1)
-                //   2) seek+read backing file 对应 LBA
-                //   3) byte-compare：相等 → success；不等 → COMPARE_FAILURE
-                //      (SC 0x85, SCT=Media/Data Integrity 0x02)
-                // 当前 H3 仅支持 ≤ 1 page (4 KiB)，> 1 page 路径留待后续
-                // （双 PRP / PRP list 复用要做更复杂的 op_id 关联）。
                 let cdw10 = sqe.cdw10;
                 let cdw11 = sqe.cdw11;
                 let cdw12 = sqe.cdw12;
                 let prp1 = sqe.prp1;
+                let nsid = sqe.nsid;
                 let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
                 let nlb = (cdw12 & 0xffff) as u32 + 1;
                 let bytes = nlb as u64 * SECTOR_SIZE;
-                tracing::debug!(slba, nlb, bytes, "NVM COMPARE");
+                tracing::debug!(nsid, slba, nlb, bytes, "NVM COMPARE");
                 if bytes > MDTS_MAX_BYTES {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
+                let Some(ns) = self.ns(nsid) else {
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_NAMESPACE,
+                        0,
+                    ));
+                };
+                let total_lba = ns.total_lba;
                 match slba.checked_add(nlb as u64) {
-                    Some(end) if end <= self.total_lba => {}
+                    Some(end) if end <= total_lba => {}
                     _ => {
                         return Some(Cqe::error(
                             cid,
@@ -459,16 +515,12 @@ impl NvmeController {
                     }
                 }
                 if bytes > NVME_PAGE_SIZE {
-                    // 暂只实现单 PRP；> 4 KiB 比较走 fallback success (与
-                    // 之前行为兼容，不破坏 driver 流程)。日志标记让用户
-                    // 知道该路径未真做。
                     tracing::warn!(
                         bytes,
                         "Compare > 4 KiB not yet implemented; returning success (placeholder)"
                     );
                     return Some(Cqe::success(cid, sq_id, sq_head, phase));
                 }
-                // DMA-read host PRP1 → 完成回调 NvmCompareSinglePrp 做比较
                 let tok = ctx.dma_read(prp1, bytes as u32);
                 self.pending_ios.insert(
                     tok,
@@ -477,6 +529,7 @@ impl NvmeController {
                         cid,
                         sq_head,
                         cq_id,
+                        nsid,
                         op: PendingOp::NvmCompareSinglePrp {
                             lba: slba,
                             num_blocks: nlb,
@@ -486,14 +539,23 @@ impl NvmeController {
                 None
             }
             nvm_opc::VERIFY => {
-                // NVMe 2.0 NVM CS Spec § 3.3.10 Verify — 读 LBA + 校验 ECC/
-                // CRC，无 data transfer。CDW10/11 = SLBA, CDW12 bits 15:0 =
-                // NLB-1。我们 backing 没 ECC，永远 success；H4 checked_add 边界。
+                let nsid = sqe.nsid;
                 let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
                 let nlb = (sqe.cdw12 & 0xffff) as u32 + 1;
-                tracing::debug!(slba, nlb, "Verify (no-op success)");
+                tracing::debug!(nsid, slba, nlb, "Verify (no-op success)");
+                let Some(ns) = self.ns(nsid) else {
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_NAMESPACE,
+                        0,
+                    ));
+                };
+                let total_lba = ns.total_lba;
                 match slba.checked_add(nlb as u64) {
-                    Some(end) if end <= self.total_lba => {}
+                    Some(end) if end <= total_lba => {}
                     _ => {
                         return Some(Cqe::error(
                             cid,

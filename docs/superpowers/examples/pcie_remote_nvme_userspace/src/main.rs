@@ -13,16 +13,20 @@
 //! 用法（Windows host）：
 //!
 //! ```bash
-//! # 1. 准备 backing 文件（一次性，1 GiB 示例）
-//! fsutil file createnew C:\temp\nvme_backing.img 1073741824
+//! # 1. 准备 backing 文件
+//! fsutil file createnew C:\temp\nvme_ns1.img 1073741824
+//! fsutil file createnew C:\temp\nvme_ns2.img 1073741824  # 可选 NS 2
 //!
-//! # 2. 跑 controller
+//! # 2. 跑 controller — Phase H4：支持多 namespace
 //! pcie_remote_nvme_userspace --vm-id <vm-guid> --port 50000 \
-//!     --backing-file C:\temp\nvme_backing.img
+//!     --backing-file C:\temp\nvme_ns1.img \
+//!     --backing-file C:\temp\nvme_ns2.img
+//! # 等价：--backing-file C:\temp\nvme_ns1.img,C:\temp\nvme_ns2.img
 //! ```
 //!
 //! VM 内 Windows guest 装好 OS 后会自动加载 nvme.sys 并把这个虚拟 NVMe
-//! 设备识别为 `Disk` —— `Get-Disk` 应该能看到，且可 Initialize / format。
+//! 设备识别为 `Disk` —— `Get-Disk` 应该能看到（每 NS 一块盘），且可
+//! Initialize / format。
 
 mod cmd;
 mod controller;
@@ -44,9 +48,15 @@ struct Args {
     /// vsock port (matches OPENHCL_PCIE_REMOTE_INSTANCE/TAKEOVER cmdline)。
     #[arg(long, default_value_t = 50000)]
     port: u32,
-    /// Backing file path（必填）。文件大小决定 namespace LBA 数（÷512）。
-    #[arg(long)]
-    backing_file: String,
+    /// Backing 文件路径（必填，可重复 / 逗号分隔）。每个文件成为一个
+    /// namespace（NSID 1, 2, ...）。Phase H4：支持 multiple namespaces。
+    ///
+    /// 例：`--backing-file ns1.img --backing-file ns2.img`
+    /// 或：`--backing-file ns1.img,ns2.img,ns3.img`
+    ///
+    /// 文件大小决定 NS 容量（÷ 512 round down 到 LBA 数）。
+    #[arg(long = "backing-file", value_delimiter = ',', num_args = 1..)]
+    backing_files: Vec<String>,
     /// PCI Vendor ID（默认 0x1414 = Microsoft，配合 OpenHCL 的 default 路由）。
     #[arg(long, default_value_t = 0x1414)]
     vid: u16,
@@ -92,7 +102,7 @@ fn run_main(args: Args) -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
     pal_async::DefaultPool::run_with(|driver| async move {
         tracing::info!(
-            backing_file = %args.backing_file,
+            backing_files = ?args.backing_files,
             vid = format_args!("{:#x}", args.vid),
             "NVMe userspace starting"
         );
@@ -111,7 +121,7 @@ fn run_main(args: Args) -> Result<()> {
             tracing::info!("connected; spawning NvmeController");
 
             // 每次重连重新 open file（让 hot-reconnect 也能切换 backing）
-            let device = NvmeController::open(&args.backing_file, args.vid, args.ssvid)?;
+            let device = NvmeController::open(&args.backing_files, args.vid, args.ssvid)?;
             let opts = RunOptions {
                 tick_interval: Duration::from_secs(60),
                 read_timeout: Duration::from_secs(60),
