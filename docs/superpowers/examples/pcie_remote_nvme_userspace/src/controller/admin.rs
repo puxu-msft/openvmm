@@ -174,10 +174,59 @@ impl NvmeController {
                         }
                     }
                     0x06 => {
-                        // CNS 0x06 = Identify Controller for the controller list /
-                        // I/O Command Set Independent for NS. 返 4 KiB 零即可，
-                        // 让 driver 走默认；不发错保证 Windows 后续 init 继续。
-                        vec![0u8; 4096]
+                        // **Phase L1d** — Identify Namespace I/O Command Set
+                        // Independent Identify (spec NVMe 2.0 § 5.17.2.6)。
+                        // 4 KiB；驱动用它感知 NS 的 NSFEAT/NMIC/RESCAP 等
+                        // command-set-agnostic 属性。最关键的是字节 9 = NSTAT
+                        // 中 bit 0 = NRDY (NS Ready)；我们的 NS 总是 Ready。
+                        let Some(ns) = self.ns(nsid) else {
+                            // 0xFFFFFFFF broadcast / 未知 NSID → 零 buffer
+                            return Some(Cqe::error(
+                                cid,
+                                0,
+                                sq_head,
+                                phase,
+                                sc::INVALID_NAMESPACE,
+                                0,
+                            ));
+                        };
+                        let mut buf = vec![0u8; 4096];
+                        // NSFEAT @ off 0 — bit 0 = THINP (thin provisioning)，
+                        // bit 1 = NSABP (deallocate after format) — 都 0
+                        buf[0] = 0x00;
+                        // NMIC @ off 1 — bit 0 = shared NS（不 share）
+                        buf[1] = 0x00;
+                        // RESCAP @ off 2 — Reservation Capabilities；
+                        // 与 Identify NS (CNS 0x00) RESCAP 字段保持一致。
+                        // 我们支持 Write/Exclusive Access 等 → bit 0..6 = 1
+                        // (spec § 5.17.2.1 RESCAP layout)
+                        buf[2] = 0x7F;
+                        // FPI @ off 3 — Format Progress Indicator；0 = 完成
+                        buf[3] = 0x00;
+                        // ANAGRPID @ off 4..8 — Asymmetric NS Access GID = 0
+                        // NSATTR @ off 9 — bit 0 = WP（write protect）；0
+                        // NVMSETID @ off 10..12 = 0
+                        // ENDGID @ off 12..14 = 0
+                        // NSTAT @ off 14 — bit 0 NRDY (NS Ready) = 1
+                        buf[14] = 0x01;
+                        // 其余 4082 bytes 留 0（教学；real device 还有 KPIOS
+                        // / MAXKT 等 KV-CS 字段）
+                        let _ = ns;
+                        buf
+                    }
+                    0x1c => {
+                        // **Phase L1d** — CNS 0x1c = I/O Command Set data
+                        // structure (spec NVMe 2.0 § 5.17.2.21)。4 KiB，每
+                        // 8 byte 一个 entry，512 个 'I/O Command Set Combination'
+                        // descriptor (uint64 bitmap)。Entry 0 必须支持，
+                        // controller Identify CC.CSS 与之联动。
+                        //
+                        // 我们：entry 0 = bit0 (NVM)|bit1 (KV=0)|bit2 (ZNS) 启用
+                        let mut buf = vec![0u8; 4096];
+                        // bit 0 = NVM Command Set，bit 2 = Zoned Namespace CS
+                        let combo0: u64 = (1 << 0) | (1 << 2);
+                        buf[0..8].copy_from_slice(&combo0.to_le_bytes());
+                        buf
                     }
                     _ => {
                         tracing::warn!(cns, "Identify: unsupported CNS, returning zeros");
