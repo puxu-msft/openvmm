@@ -11,6 +11,7 @@ use crate::cmd::*;
 use crate::controller::NvmeController;
 use crate::controller::PendingIo;
 use crate::controller::PendingOp;
+use crate::controller::PiReadAccum;
 use crate::controller::PiWriteAccum;
 use crate::controller::SECTOR_SIZE;
 use crate::controller::WriteAccum;
@@ -516,25 +517,62 @@ impl NvmeController {
                             },
                         );
                     } else {
-                        // PRP list 路径：fetch list 页 + 按 page_idx dma_write
-                        // 借 prp_list_ops accumulator，但 data 已在 host 端
-                        // pre-built。简化教学版：本路径限 ≤ 2 page (K4c-list
-                        // 留后续；driver 端 NVMe 通常用 PRP list 才到 ≥ 3 page，
-                        // 教学小 LBA 用例罕见)。
-                        tracing::error!(
+                        // **Phase K4c-list** — PI Read PRP-list 路径。data_only
+                        // 已 verified + extracted；按 PRP 三档 + per-page DMA-write。
+                        // PRP1 = page 0；PRP2 → list 页（u64 array of subsequent
+                        // page GPAs）。dispatch list 页 fetch 后，per-entry
+                        // dma_write 各页。
+                        let op_id = self.alloc_op_id();
+                        let pages_total = payload_bytes.div_ceil(NVME_PAGE_SIZE) as u32;
+                        self.pi_reads.insert(
+                            op_id,
+                            PiReadAccum {
+                                nsid,
+                                num_blocks: nlb,
+                                data_only,
+                                pages_done: 0,
+                                pages_total,
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                            },
+                        );
+                        // 先 dispatch page 0 → PRP1
+                        let accum = self.pi_reads.get(&op_id).unwrap();
+                        let first = accum.data_only[..NVME_PAGE_SIZE as usize].to_vec();
+                        let tok0 = ctx.dma_write(prp1, first);
+                        self.pending_ios.insert(
+                            tok0,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmReadPiListData { op_id, page_idx: 0 },
+                            },
+                        );
+                        // 然后 fetch PRP2 list 页
+                        let list_tok = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+                        self.pending_ios.insert(
+                            list_tok,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmReadPiListFetch { op_id },
+                            },
+                        );
+                        tracing::info!(
                             nsid,
                             nlb,
                             payload_bytes,
-                            "K4c PI Read > 2 page not yet supported (PRP-list TODO)"
+                            pages_total,
+                            "K4c-list PI Read: PRP1 sent + list fetch dispatched"
                         );
-                        return Some(Cqe::error(
-                            cid,
-                            sq_id,
-                            sq_head,
-                            phase,
-                            sc::INVALID_PROTECTION_INFO,
-                            0,
-                        ));
                     }
                     return None;
                 }
@@ -822,6 +860,8 @@ impl NvmeController {
                             ));
                         }
                         let op_id = self.alloc_op_id();
+                        let pages_total = data_bytes_total.div_ceil(NVME_PAGE_SIZE) as u32;
+                        let prp_list_pending = data_bytes_total > 2 * NVME_PAGE_SIZE;
                         self.pi_writes.insert(
                             op_id,
                             PiWriteAccum {
@@ -831,11 +871,12 @@ impl NvmeController {
                                 data_bytes_total: data_bytes_total as usize,
                                 received: vec![0u8; data_bytes_total as usize],
                                 pages_done: 0,
-                                pages_total: data_bytes_total.div_ceil(NVME_PAGE_SIZE) as u32,
+                                pages_total,
                                 sq_id,
                                 cid,
                                 sq_head,
                                 cq_id,
+                                prp_list_pending,
                             },
                         );
                         // 三档：单 PRP / dual-PRP / PRP-list
@@ -880,25 +921,48 @@ impl NvmeController {
                                 },
                             );
                         } else {
-                            // PRP-list：先 fetch list 页 + 后续 per-page DMA-read
-                            // 简化：本路径暂未在 PendingOp 加 PRP-list 变体，
-                            // 留为后续 K4c-list 扩展。当前 ≤ 2 page 已覆盖
-                            // ≤ 8 KiB = 2 个 4KiB-PI-LBA，足够 demo。
-                            self.pi_writes.remove(&op_id);
-                            tracing::error!(
+                            // **Phase K4c-list** — PRP-list 路径。spec § 4.4：
+                            // PRP1 仍指向第一页数据，PRP2 指向 PRP-list 页
+                            // （4 KiB array of u64 entries，每 entry = 后续
+                            // 数据页 GPA）。教学限制：PRP-list 单页 = 512 entry
+                            // = 2 MiB；MDTS=5 把 transfer 上限钉在 128 KiB，
+                            // 远小于 single list 页容量，所以不需 chained list。
+                            //
+                            // 流程：DMA-read PRP1 第一页 + DMA-read PRP2 list 页
+                            // → on_dma_complete NvmWritePiListFetch 解析 entries
+                            // → 逐 entry DMA-read 各页数据。
+                            let first_tok = ctx.dma_read(prp1, NVME_PAGE_SIZE as u32);
+                            self.pending_ios.insert(
+                                first_tok,
+                                PendingIo {
+                                    sq_id,
+                                    cid,
+                                    sq_head,
+                                    cq_id,
+                                    nsid,
+                                    op: PendingOp::NvmWritePiMulti { op_id, page_idx: 0 },
+                                },
+                            );
+                            // Fetch PRP-list 页本身（4 KiB u64 array）
+                            let list_tok = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+                            self.pending_ios.insert(
+                                list_tok,
+                                PendingIo {
+                                    sq_id,
+                                    cid,
+                                    sq_head,
+                                    cq_id,
+                                    nsid,
+                                    op: PendingOp::NvmWritePiListFetch { op_id },
+                                },
+                            );
+                            tracing::info!(
                                 nsid,
                                 nlb,
                                 data_bytes_total,
-                                "K4c PI Write > 2 page (PRP-list TODO)"
+                                pages_total,
+                                "K4c-list PI Write: PRP1 + list fetch dispatched"
                             );
-                            return Some(Cqe::error(
-                                cid,
-                                sq_id,
-                                sq_head,
-                                phase,
-                                sc::INVALID_PROTECTION_INFO,
-                                0,
-                            ));
                         }
                         return None;
                     }

@@ -657,6 +657,7 @@ impl NvmeController {
                     || !self.prp_list_ops.is_empty()
                     || !self.compare_ops.is_empty()
                     || !self.pi_writes.is_empty()
+                    || !self.pi_reads.is_empty()
                     || !self.pending_fused.is_empty();
                 if inflight {
                     tracing::warn!(
@@ -665,6 +666,7 @@ impl NvmeController {
                         pending_prp_list = self.prp_list_ops.len(),
                         pending_compare = self.compare_ops.len(),
                         pending_pi_writes = self.pi_writes.len(),
+                        pending_pi_reads = self.pi_reads.len(),
                         pending_fused = self.pending_fused.len(),
                         "Format NVM rejected: IO in flight"
                     );

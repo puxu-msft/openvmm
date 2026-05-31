@@ -183,6 +183,21 @@ pub(super) enum PendingOp {
     /// 累积器；page_idx = 本回调对应 `received[page_idx*4096..]`
     /// （单 PRP=0；dual-PRP 0/1；PRP-list 0/1/2/.../N-1）。
     NvmWritePiMulti { op_id: u64, page_idx: u32 },
+    /// **Phase K4c-list** — PI Write PRP-list fetch：PRP2 指向的 list 页
+    /// 已 DMA-read 到 data；解析 u64 array → 逐页 DMA-read 数据。
+    NvmWritePiListFetch { op_id: u64 },
+    /// **Phase K4c-list** — PI Read PRP-list fetch：list 页 DMA-read 完成；
+    /// 解析 u64 array → 把 backing 已 verified 的 data per-page DMA-write
+    /// 到 host 各页。
+    NvmReadPiListFetch { op_id: u64 },
+    /// **Phase K4c-list** — PI Read PRP-list per-page DMA-write 完成。
+    /// 全 page 完成 → post success CQE。`page_idx` 仅用于 trace/debug
+    /// （完成路径只增 pages_done）。
+    NvmReadPiListData {
+        op_id: u64,
+        #[allow(dead_code)]
+        page_idx: u32,
+    },
     /// **Phase O1** — Simple Copy 范围表 DMA-read 完成。完成后 controller
     /// 解析 32-byte range descriptors → 按 src→dst 顺序 backing read+write。
     /// 不再有 host DMA：copy 全在 controller 侧 backing。
@@ -200,6 +215,23 @@ pub(super) struct PiWriteAccum {
     pub(super) data_bytes_total: usize,
     /// 全 LBA data，已按 page_idx 顺序填入。
     pub(super) received: Vec<u8>,
+    pub(super) pages_done: u32,
+    pub(super) pages_total: u32,
+    pub(super) sq_id: u16,
+    pub(super) cid: u16,
+    pub(super) sq_head: u16,
+    pub(super) cq_id: u16,
+    /// **Phase K4c-list** — PRP-list 路径用：PRP1 已 dispatch（page 0），
+    /// 仍待 fetch list 页解析后再 dispatch page 1..N 的标志。
+    pub(super) prp_list_pending: bool,
+}
+
+/// **Phase K4c-list** — 多 LBA PI Read 累积器。dispatch 时 backing 已 verify
+/// 完成 + data 提取到 `data_only`；按 PRP 三档拆 + 逐页 DMA-write 到 host。
+pub(super) struct PiReadAccum {
+    pub(super) nsid: u32,
+    pub(super) num_blocks: u32,
+    pub(super) data_only: Vec<u8>,
     pub(super) pages_done: u32,
     pub(super) pages_total: u32,
     pub(super) sq_id: u16,
@@ -581,6 +613,9 @@ pub struct NvmeController {
     pub(super) compare_ops: HashMap<u64, CompareAccum>,
     /// **Phase K4c** — 多 LBA PI Write 累积。op_id → 全 data + 完成进度。
     pub(super) pi_writes: HashMap<u64, PiWriteAccum>,
+    /// **Phase K4c-list** — 多 LBA PI Read PRP-list 累积器。op_id → 已
+    /// verified data + DMA-write to host 进度。
+    pub(super) pi_reads: HashMap<u64, PiReadAccum>,
     /// **Phase O2** — Fused operation state：per-SQ 缓存 FUSE_FIRST 的
     /// SQE，等待紧接其后的 FUSE_SECOND。spec § 6.2 要求：
     /// (a) 两条必须连续在同一 SQ；(b) 都 fused-marked；(c) 都同 nsid。
@@ -918,6 +953,7 @@ impl NvmeController {
             prp_list_ops: HashMap::new(),
             compare_ops: HashMap::new(),
             pi_writes: HashMap::new(),
+            pi_reads: HashMap::new(),
             pending_fused: HashMap::new(),
             sqe_inbox: Vec::new(),
             stat_host_reads: 0,
@@ -1028,6 +1064,7 @@ impl NvmeController {
         self.prp_list_ops.clear();
         self.compare_ops.clear();
         self.pi_writes.clear();
+        self.pi_reads.clear();
         self.pending_fused.clear();
         self.sqe_inbox.clear();
         debug_assert!(self.pending_ios.is_empty());
@@ -1035,6 +1072,7 @@ impl NvmeController {
         debug_assert!(self.prp_list_ops.is_empty());
         debug_assert!(self.compare_ops.is_empty());
         debug_assert!(self.pi_writes.is_empty());
+        debug_assert!(self.pi_reads.is_empty());
         debug_assert!(self.pending_fused.is_empty());
         // AEN queue 跨 reset 不保留 (NVMe spec § 5.2 "Implicit Aborts on Reset")
         self.aen_pending.clear();
@@ -2029,7 +2067,28 @@ impl PcieDevice for NvmeController {
                             !matches!(q.op,
                                 PendingOp::NvmWritePiMulti { op_id: o, .. } if o == op_id)
                         });
+                        // **Phase K4c-list** — 同 op 的 list fetch 也清
+                        self.pending_ios.retain(|_, q| {
+                            !matches!(q.op,
+                                PendingOp::NvmWritePiListFetch { op_id: o } if o == op_id)
+                        });
                         self.pi_writes.remove(&op_id);
+                    }
+                    PendingOp::NvmWritePiListFetch { op_id } => {
+                        self.pending_ios.retain(|_, q| {
+                            !matches!(q.op,
+                                PendingOp::NvmWritePiMulti { op_id: o, .. } if o == op_id)
+                        });
+                        self.pi_writes.remove(&op_id);
+                    }
+                    PendingOp::NvmReadPiListFetch { op_id }
+                    | PendingOp::NvmReadPiListData { op_id, .. } => {
+                        self.pending_ios.retain(|_, q| match q.op {
+                            PendingOp::NvmReadPiListFetch { op_id: o }
+                            | PendingOp::NvmReadPiListData { op_id: o, .. } => o != op_id,
+                            _ => true,
+                        });
+                        self.pi_reads.remove(&op_id);
                     }
                     PendingOp::NvmReadDualPrpSiblingHalf => {
                         // sibling tok2 (NvmReadDmaWrite) 还在 pending_ios 中；
@@ -2189,6 +2248,88 @@ impl PcieDevice for NvmeController {
                     let cqe = Cqe::success(p.cid, p.sq_id, p.sq_head, phase);
                     self.post_cqe(ctx, p.cq_id, cqe);
                 }
+                PendingOp::NvmReadPiListFetch { op_id } => {
+                    // **Phase K4c-list** — PI Read list 页解析；逐 entry
+                    // dma_write 后续数据页（page_idx 1..pages_total）。
+                    let Some(accum) = self.pi_reads.get(&op_id) else {
+                        tracing::warn!(op_id, "NvmReadPiListFetch: unknown op_id");
+                        return;
+                    };
+                    let entries_needed = (accum.pages_total - 1) as usize;
+                    if data.len() < entries_needed * 8 {
+                        tracing::error!(
+                            op_id,
+                            got = data.len(),
+                            want = entries_needed * 8,
+                            "K4c-list PI Read: list page short read"
+                        );
+                        let accum = self.pi_reads.remove(&op_id).unwrap();
+                        let phase = self.cqs.get(&accum.cq_id).map(|c| c.phase).unwrap_or(1);
+                        let cqe = Cqe::error(
+                            accum.cid,
+                            accum.sq_id,
+                            accum.sq_head,
+                            phase,
+                            sc::DATA_TRANSFER_ERROR,
+                            0,
+                        );
+                        self.post_cqe(ctx, accum.cq_id, cqe);
+                        self.pending_ios.retain(|_, q| {
+                            !matches!(q.op,
+                                PendingOp::NvmReadPiListData { op_id: o, .. } if o == op_id)
+                        });
+                        return;
+                    }
+                    let sq_id = accum.sq_id;
+                    let cid = accum.cid;
+                    let sq_head = accum.sq_head;
+                    let cq_id = accum.cq_id;
+                    let nsid = accum.nsid;
+                    let total = accum.data_only.len();
+                    for i in 0..entries_needed {
+                        let gpa = u64::from_le_bytes(data[i * 8..i * 8 + 8].try_into().unwrap());
+                        let page_idx = (i + 1) as u32;
+                        let off = page_idx as usize * NVME_PAGE_SIZE as usize;
+                        let remaining = total.saturating_sub(off);
+                        if remaining == 0 {
+                            break;
+                        }
+                        let bytes = remaining.min(NVME_PAGE_SIZE as usize);
+                        // 取 slice copy 出来发 dma_write
+                        let accum_ref = self.pi_reads.get(&op_id).unwrap();
+                        let chunk = accum_ref.data_only[off..off + bytes].to_vec();
+                        let tok = ctx.dma_write(gpa, chunk);
+                        self.pending_ios.insert(
+                            tok,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmReadPiListData { op_id, page_idx },
+                            },
+                        );
+                    }
+                }
+                PendingOp::NvmReadPiListData { op_id, page_idx: _ } => {
+                    // **Phase K4c-list** — per-page dma_write 完成；累 pages_done
+                    // 直到全 page 完成 → post success CQE + 计 counter。
+                    let Some(accum) = self.pi_reads.get_mut(&op_id) else {
+                        tracing::warn!(op_id, "NvmReadPiListData: unknown op_id");
+                        return;
+                    };
+                    accum.pages_done += 1;
+                    if accum.pages_done < accum.pages_total {
+                        return;
+                    }
+                    let accum = self.pi_reads.remove(&op_id).unwrap();
+                    let phase = self.cqs.get(&accum.cq_id).map(|c| c.phase).unwrap_or(1);
+                    self.stat_host_reads += 1;
+                    self.stat_lba_read += accum.num_blocks as u64;
+                    let cqe = Cqe::success(accum.cid, accum.sq_id, accum.sq_head, phase);
+                    self.post_cqe(ctx, accum.cq_id, cqe);
+                }
                 PendingOp::NvmWritePi { lba, num_blocks } => {
                     // **Phase K4a** — DMA-read 4 KiB data 完成；compute PI
                     // tuple + interleave 写到 backing file (block_bytes=4104)。
@@ -2345,6 +2486,72 @@ impl PcieDevice for NvmeController {
                         }
                     };
                     self.post_cqe(ctx, p.cq_id, cqe);
+                }
+                PendingOp::NvmWritePiListFetch { op_id } => {
+                    // **Phase K4c-list** — PRP-list 页已到。解析 u64 array，
+                    // 逐 entry DMA-read 数据页（page_idx 从 1 开始；page 0
+                    // 是 PRP1 直接发的）。每页大小 = NVME_PAGE_SIZE，最后页
+                    // 可能 < page（dispatch 时按 received.len() truncate）。
+                    let Some(accum) = self.pi_writes.get_mut(&op_id) else {
+                        tracing::warn!(op_id, "NvmWritePiListFetch: unknown op_id");
+                        return;
+                    };
+                    let entries_needed = (accum.pages_total - 1) as usize;
+                    if data.len() < entries_needed * 8 {
+                        tracing::error!(
+                            op_id,
+                            got = data.len(),
+                            want = entries_needed * 8,
+                            "K4c-list: PRP list page short read"
+                        );
+                        let accum = self.pi_writes.remove(&op_id).unwrap();
+                        let phase = self.cqs.get(&accum.cq_id).map(|c| c.phase).unwrap_or(1);
+                        let cqe = Cqe::error(
+                            accum.cid,
+                            accum.sq_id,
+                            accum.sq_head,
+                            phase,
+                            sc::DATA_TRANSFER_ERROR,
+                            0,
+                        );
+                        self.post_cqe(ctx, accum.cq_id, cqe);
+                        self.pending_ios.retain(|_, q| {
+                            !matches!(q.op,
+                                PendingOp::NvmWritePiMulti { op_id: o, .. } if o == op_id)
+                        });
+                        return;
+                    }
+                    accum.prp_list_pending = false;
+                    let sq_id = accum.sq_id;
+                    let cid = accum.cid;
+                    let sq_head = accum.sq_head;
+                    let cq_id = accum.cq_id;
+                    let nsid = accum.nsid;
+                    let total = accum.data_bytes_total;
+                    // Drop &mut accum，开始 dispatch DMA-read
+                    let _ = accum;
+                    for i in 0..entries_needed {
+                        let gpa = u64::from_le_bytes(data[i * 8..i * 8 + 8].try_into().unwrap());
+                        let page_idx = (i + 1) as u32;
+                        let off = page_idx as usize * NVME_PAGE_SIZE as usize;
+                        let remaining = total.saturating_sub(off);
+                        let bytes = remaining.min(NVME_PAGE_SIZE as usize) as u32;
+                        if bytes == 0 {
+                            break;
+                        }
+                        let tok = ctx.dma_read(gpa, bytes);
+                        self.pending_ios.insert(
+                            tok,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmWritePiMulti { op_id, page_idx },
+                            },
+                        );
+                    }
                 }
                 PendingOp::NvmWritePiMulti { op_id, page_idx } => {
                     // **Phase K4c + Reviewer H-3 (7轮)** — 多 LBA PI Write
