@@ -21,6 +21,56 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 
+/// **Reviewer H2** — Zone State Machine spec 一致性（ZNS CS § 4.4 Figure
+/// "Zone State Machine"）。返回 `None` = 合法 transition，`Some(sc)` = SC byte。
+///
+/// 真硬件的 transition matrix（来源 spec）：
+///
+/// | from \ ZSA | Close(1) | Finish(2) | Open(3)  | Reset(4) | Offline(5) |
+/// |------------|----------|-----------|----------|----------|------------|
+/// | Empty      | -        | OK        | OK       | OK(no-op)| ZSTI       |
+/// | ImplOpen   | OK       | OK        | OK       | OK       | ZSTI       |
+/// | ExplOpen   | OK       | OK        | OK(no-op)| OK       | ZSTI       |
+/// | Closed     | OK(no-op)| OK        | OK       | OK       | ZSTI       |
+/// | Full       | -        | -(no-op)  | ZSTI     | OK       | OK         |
+/// | ReadOnly   | ZRO      | ZRO       | ZRO      | ZRO      | OK         |
+/// | Offline    | ZOFF     | ZOFF      | ZOFF     | ZOFF     | OK(no-op)  |
+///
+/// 缩写：ZSTI = INVALID_ZONE_STATE_TRANSITION (0xBF), ZRO = ZONE_IS_READ_ONLY,
+/// ZOFF = ZONE_IS_OFFLINE。`-` = no-op（成功无副作用）。
+///
+/// 不在表中的 ZSA → INVALID_FIELD。
+pub(crate) fn check_zsa_transition(state: ZoneState, zsa: u8) -> Option<u8> {
+    use ZoneState::*;
+    match (state, zsa) {
+        // Close
+        (Empty, 0x01) | (Full, 0x01) => None, // no-op
+        (ImplicitOpen | ExplicitOpen | Closed, 0x01) => None,
+        (ReadOnly, 0x01) => Some(sc::ZONE_IS_READ_ONLY),
+        (Offline, 0x01) => Some(sc::ZONE_IS_OFFLINE),
+        // Finish
+        (Empty | ImplicitOpen | ExplicitOpen | Closed | Full, 0x02) => None,
+        (ReadOnly, 0x02) => Some(sc::ZONE_IS_READ_ONLY),
+        (Offline, 0x02) => Some(sc::ZONE_IS_OFFLINE),
+        // Open
+        (Empty | ImplicitOpen | ExplicitOpen | Closed, 0x03) => None,
+        (Full, 0x03) => Some(sc::INVALID_ZONE_STATE_TRANSITION),
+        (ReadOnly, 0x03) => Some(sc::ZONE_IS_READ_ONLY),
+        (Offline, 0x03) => Some(sc::ZONE_IS_OFFLINE),
+        // Reset
+        (Empty | ImplicitOpen | ExplicitOpen | Closed | Full, 0x04) => None,
+        (ReadOnly, 0x04) => Some(sc::ZONE_IS_READ_ONLY),
+        (Offline, 0x04) => Some(sc::ZONE_IS_OFFLINE),
+        // Offline（只能从 Full/ReadOnly/Offline 进入；ImplicitOpen 等违反 SWR）
+        (Full | ReadOnly | Offline, 0x05) => None,
+        (Empty | ImplicitOpen | ExplicitOpen | Closed, 0x05) => {
+            Some(sc::INVALID_ZONE_STATE_TRANSITION)
+        }
+        // Unknown ZSA
+        _ => Some(sc::INVALID_FIELD),
+    }
+}
+
 /// **Phase L1** — 构造 ZNS Report Zones 响应 buffer (spec ZNS § 4.5.2)。
 ///
 /// 64-byte header + 64-byte * 每 zone descriptor。
@@ -145,19 +195,35 @@ impl NvmeController {
                 //     直到 K4c 多 LBA 路径完整实现
                 let is_pi_path = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
                 if !is_pi_path && (ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled()) {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    // **Reviewer H5** — 用 INVALID_PROTECTION_INFO 而非 INVALID_FIELD
+                    // 让 driver 区分 "PI 格式不受支持" vs "命令字段错误"。
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_PROTECTION_INFO,
+                        0,
+                    ));
                 }
                 if is_pi_path && nlb != 1 {
                     // K4a/b 单 LBA only；多 LBA 路径 (K4c) 限定 ≤ 1 page 因
                     // 单 4 KiB 只能装 1 个 LBA，driver 用多 LBA 必发 ≥ 2 page
                     // = dual-PRP / PRP-list 路径才能传完整 data；这里
                     // single-PRP entry 已最大 1 LBA。
-                    tracing::warn!(
+                    tracing::error!(
                         nsid,
                         nlb,
-                        "PI multi-LBA path requires dual-PRP/PRP-list, not yet impl"
+                        "multi-LBA PI Read rejected (K4c TODO; use INVALID_PROTECTION_INFO)"
                     );
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_PROTECTION_INFO,
+                        0,
+                    ));
                 }
                 let total_lba = ns.total_lba;
                 // H4：checked_add 防 slba + nlb 溢出（driver bug / 恶意输入）。
@@ -380,8 +446,30 @@ impl NvmeController {
                 if ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled() {
                     // **Phase K4a** — PI 单 LBA Write 路径
                     let is_pi_path = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
-                    if !is_pi_path || nlb != 1 {
-                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    if !is_pi_path {
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::INVALID_PROTECTION_INFO,
+                            0,
+                        ));
+                    }
+                    if nlb != 1 {
+                        // **Reviewer H5** — 多 LBA PI Write 未实现（K4c TODO）。
+                        // INVALID_PROTECTION_INFO 让 driver 知道是 PI 限制而非
+                        // command bug；driver 可降级回 LBAF[0]+DPS=0 重试。
+                        tracing::error!(nsid, slba, nlb,
+                            "multi-LBA PI Write rejected (K4c TODO)");
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::INVALID_PROTECTION_INFO,
+                            0,
+                        ));
                     }
                     let total_lba = ns.total_lba;
                     if slba >= total_lba {
@@ -638,9 +726,10 @@ impl NvmeController {
                     }
                 }
                 if is_pi_path {
-                    // **Phase K4c** — PI Write Zeroes：每 LBA 写 zero data
-                    // + 自 compute PI tuple (Guard=CRC16(zeros)=0, RefTag=LBA
-                    // for Type 1)。
+                    // **Phase K4c + reviewer H3** — PI Write Zeroes：每 LBA 写
+                    // zero data + 自 compute PI tuple (Guard=CRC16(zeros)=0,
+                    // RefTag=LBA for Type 1)。用 positional IO 避免与并发 PI
+                    // Read 共用 file cursor 导致 race。
                     let pi_type = ns.pi_type;
                     let pi_first = ns.pi_first;
                     let block_bytes = ns.block_bytes() as usize;
@@ -658,11 +747,7 @@ impl NvmeController {
                         } else {
                             block[data_bytes..data_bytes + 8].copy_from_slice(&tuple_bytes);
                         }
-                        if let Err(e) = ns_mut
-                            .file
-                            .seek(SeekFrom::Start(lba * block_bytes as u64))
-                            .and_then(|_| std::io::Write::write_all(&mut ns_mut.file, &block))
-                        {
+                        if let Err(e) = ns_mut.write_at(&block, lba * block_bytes as u64) {
                             tracing::warn!(error = %e, nsid, lba, "WZ PI write fail");
                             return Some(Cqe::error(
                                 cid,
@@ -928,8 +1013,10 @@ impl NvmeController {
                     }
                 }
                 if is_pi_path {
-                    // Phase K4c — 逐 LBA 读 4104 byte + verify tuple；任一
-                    // fail 返对应 Media/Data Integrity SC + 立即停（spec 允许）
+                    // Phase K4c + reviewer H3 — 逐 LBA 读 4104 byte + verify
+                    // tuple；任一 fail 返对应 Media/Data Integrity SC + 立即停
+                    // （spec 允许）。用 positional read_at 避免与并发 PI Write
+                    // 共用 file cursor。
                     let pi_type = ns.pi_type;
                     let pi_first = ns.pi_first;
                     let block_bytes = ns.block_bytes() as usize;
@@ -938,11 +1025,7 @@ impl NvmeController {
                     for off in 0..nlb {
                         let lba = slba + off as u64;
                         let mut block = vec![0u8; block_bytes];
-                        if let Err(e) = ns_mut
-                            .file
-                            .seek(SeekFrom::Start(lba * block_bytes as u64))
-                            .and_then(|_| ns_mut.file.read_exact(&mut block))
-                        {
+                        if let Err(e) = ns_mut.read_at(&mut block, lba * block_bytes as u64) {
                             tracing::warn!(error = %e, nsid, lba, "Verify PI read fail");
                             return Some(Cqe::error(
                                 cid,
@@ -973,13 +1056,17 @@ impl NvmeController {
                 Some(Cqe::success(cid, sq_id, sq_head, phase))
             }
             nvm_opc::ZONE_MGMT_SEND => {
-                // **Phase L1** — Zone Management Send (ZNS CS § 4.4)。
+                // **Phase L1 + reviewer H2 修复** — Zone Management Send
+                // (ZNS CS § 4.4)。
                 // CDW10/11 = SLBA (zone 起点)；CDW13 bits 7:0 = ZSA
                 // (Zone Send Action)：
                 //   0x01 Close, 0x02 Finish, 0x03 Open, 0x04 Reset, 0x05 Offline
+                // CDW13 bit 8 = Select All（无视 SLBA，对全 zone 生效，spec
+                // 主要给 Reset All / Offline All / Close All / Finish All 用）
                 let nsid = sqe.nsid;
                 let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
                 let zsa = (sqe.cdw13 & 0xff) as u8;
+                let select_all = (sqe.cdw13 & 0x100) != 0;
                 let Some(ns) = self.ns_mut(nsid) else {
                     return Some(Cqe::error(
                         cid,
@@ -1001,50 +1088,113 @@ impl NvmeController {
                         0,
                     ));
                 };
-                let zone_idx = (slba / zns.zone_size) as usize;
-                if zone_idx >= zns.zones.len() {
-                    return Some(Cqe::error(
-                        cid,
-                        sq_id,
-                        sq_head,
-                        phase,
-                        sc::LBA_OUT_OF_RANGE,
-                        0,
-                    ));
-                }
-                let zone = &mut zns.zones[zone_idx];
-                match zsa {
-                    0x01 => {
-                        // Close: ImplicitOpen/ExplicitOpen → Closed
-                        if matches!(
-                            zone.state,
-                            ZoneState::ImplicitOpen | ZoneState::ExplicitOpen
-                        ) {
-                            zone.state = ZoneState::Closed;
+                // 构造要处理的 zone 索引列表（select-all → 全部；否则只一个）
+                let zone_indices: Vec<usize> = if select_all {
+                    (0..zns.zones.len()).collect()
+                } else {
+                    let zone_idx = (slba / zns.zone_size) as usize;
+                    if zone_idx >= zns.zones.len() {
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::LBA_OUT_OF_RANGE,
+                            0,
+                        ));
+                    }
+                    vec![zone_idx]
+                };
+                // 第一遍：spec-compliant transition 校验（任一非法 → 整命令 fail）
+                // + 提前算 open/active 资源差额
+                let max_open = zns.max_open as usize;
+                let max_active = zns.max_active as usize;
+                let cur_open = zns
+                    .zones
+                    .iter()
+                    .filter(|z| {
+                        matches!(z.state, ZoneState::ImplicitOpen | ZoneState::ExplicitOpen)
+                    })
+                    .count();
+                let cur_active = zns
+                    .zones
+                    .iter()
+                    .filter(|z| {
+                        matches!(
+                            z.state,
+                            ZoneState::ImplicitOpen | ZoneState::ExplicitOpen | ZoneState::Closed
+                        )
+                    })
+                    .count();
+                let mut new_opens = 0usize;
+                let mut new_active = 0usize;
+                for &i in &zone_indices {
+                    let z = zns.zones[i];
+                    let sc_check = check_zsa_transition(z.state, zsa);
+                    if let Some(sc_byte) = sc_check {
+                        if select_all {
+                            // Select-All 时仅跳过不合法 zone（Linux blkzone reset-all
+                            // 在 zone Offline 上不该 fail 整命令）
+                            tracing::trace!(zone_idx = i, ?z.state, zsa, "skip illegal in select-all");
+                            continue;
+                        }
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte, 0));
+                    }
+                    // 资源差额：Open ZSA 把 Closed/Empty 变 ExplicitOpen
+                    if zsa == 0x03 && matches!(z.state, ZoneState::Empty | ZoneState::Closed) {
+                        new_opens += 1;
+                        if matches!(z.state, ZoneState::Empty) {
+                            new_active += 1;
                         }
                     }
-                    0x02 => {
-                        // Finish: state → Full, WP = capacity
-                        zone.state = ZoneState::Full;
-                        zone.write_pointer = zns.zone_capacity;
+                }
+                // 资源 cap 检查（Open ZSA only；max_open/max_active = 0 表示 unlimited）
+                if zsa == 0x03 {
+                    if max_open > 0 && cur_open + new_opens > max_open {
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::TOO_MANY_OPEN_ZONES,
+                            0,
+                        ));
                     }
-                    0x03 => {
-                        // Open: → ExplicitOpen (Empty/Closed/Implicit allowed)
-                        zone.state = ZoneState::ExplicitOpen;
-                    }
-                    0x04 => {
-                        // Reset: → Empty, WP = 0
-                        zone.state = ZoneState::Empty;
-                        zone.write_pointer = 0;
-                    }
-                    0x05 => {
-                        zone.state = ZoneState::Offline;
-                    }
-                    _ => {
-                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    if max_active > 0 && cur_active + new_active > max_active {
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::TOO_MANY_ACTIVE_ZONES,
+                            0,
+                        ));
                     }
                 }
-                tracing::info!(nsid, zone_idx, zsa, ?zone.state, "Zone Mgmt Send OK");
+                // 第二遍：apply transitions
+                let zone_capacity = zns.zone_capacity;
+                for i in zone_indices {
+                    // 二次校验（应已通过；select-all 时跳过非法）
+                    let zone = &mut zns.zones[i];
+                    if check_zsa_transition(zone.state, zsa).is_some() {
+                        continue;
+                    }
+                    match zsa {
+                        0x01 => zone.state = ZoneState::Closed,
+                        0x02 => {
+                            zone.state = ZoneState::Full;
+                            zone.write_pointer = zone_capacity;
+                        }
+                        0x03 => zone.state = ZoneState::ExplicitOpen,
+                        0x04 => {
+                            zone.state = ZoneState::Empty;
+                            zone.write_pointer = 0;
+                        }
+                        0x05 => zone.state = ZoneState::Offline,
+                        _ => unreachable!("check_zsa_transition gates unknown ZSA"),
+                    }
+                }
+                tracing::info!(nsid, zsa, select_all, "Zone Mgmt Send OK");
                 Some(Cqe::success(cid, sq_id, sq_head, phase))
             }
             nvm_opc::ZONE_MGMT_RECEIVE => {
@@ -1085,7 +1235,7 @@ impl NvmeController {
                 None
             }
             nvm_opc::ZONE_APPEND => {
-                // **Phase L1** — Zone Append (ZNS CS § 4.3)。
+                // **Phase L1 + reviewer H1/H8 修复** — Zone Append (ZNS CS § 4.3)。
                 // CDW10/11 = ZSLBA (zone 起点)；driver 不知 WP，controller
                 // 把数据写在当前 WP 处，把实际 LBA 写回 CQE.dw0/dw1。
                 // CDW12 bits 15:0 = NLB - 1。
@@ -1104,6 +1254,21 @@ impl NvmeController {
                         0,
                     ));
                 };
+                // **H8 修复** — PI-enabled NS 上的 ZONE_APPEND 暂未实现
+                // (data 路径 4096 → backing 4104 转换尚未与 ZNS 路径合并)；
+                // 拒绝避免静默落 4 KiB 到本应 4104 块对齐的位置导致后续
+                // PI Read 全 GuardFail。
+                if ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled() {
+                    tracing::warn!(nsid, "ZONE_APPEND on PI NS rejected (K4c-ZNS unimplemented)");
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_PROTECTION_INFO,
+                        0,
+                    ));
+                }
                 let Some(zns) = ns.zns.as_ref() else {
                     return Some(Cqe::error(
                         cid,
@@ -1130,10 +1295,20 @@ impl NvmeController {
                     ));
                 }
                 let zone = zns.zones[zone_idx];
-                if matches!(
-                    zone.state,
-                    ZoneState::Full | ZoneState::ReadOnly | ZoneState::Offline
-                ) {
+                if matches!(zone.state, ZoneState::ReadOnly) {
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::ZONE_IS_READ_ONLY,
+                        0,
+                    ));
+                }
+                if matches!(zone.state, ZoneState::Offline) {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::ZONE_IS_OFFLINE, 0));
+                }
+                if matches!(zone.state, ZoneState::Full) {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::ZONE_IS_FULL, 0));
                 }
                 if zone.write_pointer + nlb as u64 > zns.zone_capacity {
@@ -1146,13 +1321,75 @@ impl NvmeController {
                         0,
                     ));
                 }
+                // **Reviewer H2** — 隐式 Open 也要受 MAR/MOR 约束（spec ZNS § 2.2）
+                if matches!(zone.state, ZoneState::Empty | ZoneState::Closed) {
+                    let max_open = zns.max_open as usize;
+                    let max_active = zns.max_active as usize;
+                    let cur_open = zns
+                        .zones
+                        .iter()
+                        .filter(|z| {
+                            matches!(
+                                z.state,
+                                ZoneState::ImplicitOpen | ZoneState::ExplicitOpen
+                            )
+                        })
+                        .count();
+                    let cur_active = zns
+                        .zones
+                        .iter()
+                        .filter(|z| {
+                            matches!(
+                                z.state,
+                                ZoneState::ImplicitOpen
+                                    | ZoneState::ExplicitOpen
+                                    | ZoneState::Closed
+                            )
+                        })
+                        .count();
+                    if max_open > 0 && cur_open + 1 > max_open {
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::TOO_MANY_OPEN_ZONES,
+                            0,
+                        ));
+                    }
+                    if matches!(zone.state, ZoneState::Empty)
+                        && max_active > 0
+                        && cur_active + 1 > max_active
+                    {
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::TOO_MANY_ACTIVE_ZONES,
+                            0,
+                        ));
+                    }
+                }
                 let assigned_lba = zslba + zone.write_pointer;
-                // DMA-read data → 完成回调通用 NvmWriteDmaRead；assigned_lba
-                // 通过 cdw0/cdw1 在 success CQE 返。我们简化：append 借
-                // NvmWriteDmaRead 路径写文件，append 完成时 driver 仍读
-                // CQE.dw0/dw1 — 这里我们 success CQE 默认 dw0=0/dw1=0；
-                // **教学限制**：assigned LBA 不真返给 driver；真硬件应
-                // post 携 lba 的 CQE。
+                let prev_wp = zone.write_pointer;
+                let prev_state = zone.state;
+                // 预占 WP + state（实际 LBA 已通过 assigned_lba 锁定）。
+                // 失败回滚走 NvmZoneAppend completion 路径。
+                {
+                    let ns_mut = self.ns_mut(nsid).unwrap();
+                    let zns_mut = ns_mut.zns.as_mut().unwrap();
+                    let zone_mut = &mut zns_mut.zones[zone_idx];
+                    zone_mut.write_pointer += nlb as u64;
+                    if zone_mut.write_pointer >= zns_mut.zone_capacity {
+                        zone_mut.state = ZoneState::Full;
+                    } else if matches!(zone_mut.state, ZoneState::Empty | ZoneState::Closed) {
+                        zone_mut.state = ZoneState::ImplicitOpen;
+                    }
+                }
+                // DMA-read data → 完成回调 NvmZoneAppend 负责：写文件 +
+                // success(CQE dw0/dw1=assigned_lba) 或 failure(rollback +
+                // error CQE)。
                 let tok = ctx.dma_read(prp1, bytes as u32);
                 self.pending_ios.insert(
                     tok,
@@ -1162,23 +1399,22 @@ impl NvmeController {
                         sq_head,
                         cq_id,
                         nsid,
-                        op: PendingOp::NvmWriteDmaRead {
-                            lba: assigned_lba,
+                        op: PendingOp::NvmZoneAppend {
+                            zone_idx,
+                            assigned_lba,
+                            prev_wp,
+                            prev_state,
                             num_blocks: nlb,
                         },
                     },
                 );
-                // 更新 WP + state
-                let ns_mut = self.ns_mut(nsid).unwrap();
-                let zns_mut = ns_mut.zns.as_mut().unwrap();
-                let zone = &mut zns_mut.zones[zone_idx];
-                zone.write_pointer += nlb as u64;
-                if zone.write_pointer >= zns_mut.zone_capacity {
-                    zone.state = ZoneState::Full;
-                } else if matches!(zone.state, ZoneState::Empty | ZoneState::Closed) {
-                    zone.state = ZoneState::ImplicitOpen;
-                }
-                tracing::info!(nsid, zone_idx, assigned_lba, nlb, "Zone Append at WP");
+                tracing::info!(
+                    nsid,
+                    zone_idx,
+                    assigned_lba,
+                    nlb,
+                    "Zone Append: WP reserved, awaiting DMA"
+                );
                 None
             }
             nvm_opc::WRITE_UNCORRECTABLE => {

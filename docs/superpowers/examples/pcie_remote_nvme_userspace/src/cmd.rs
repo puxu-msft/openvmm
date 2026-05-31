@@ -208,6 +208,12 @@ pub mod sc {
     /// **Phase H6** — Reservation 相关 SC (NVM CS § 4.1)。
     /// Reservation Conflict — 命令与现有 reservation 冲突。
     pub const RESERVATION_CONFLICT: u8 = 0x83;
+    /// **Reviewer H4/H5/H8** — NVM CS § 4.2 Protection Information SC.
+    /// Driver 看到此 SC 知道是 PI 不支持，而不是误判 driver bug。
+    pub const INVALID_PROTECTION_INFO: u8 = 0x81;
+    /// **Reviewer H2** — ZNS Invalid Zone State Transition (spec ZNS § 5)。
+    /// Zone Mgmt Send 在非法 source state 上请求 transition 时返。
+    pub const INVALID_ZONE_STATE_TRANSITION: u8 = 0xBF;
 }
 
 /// Submission Queue Entry — 64 bytes 固定。

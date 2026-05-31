@@ -224,10 +224,30 @@ impl NvmeController {
                         tracing::info!(ps, "Set Features Power Management");
                     }
                     cmd::fid::INTERRUPT_COALESCING => {
-                        // **Phase M1** — spec § 5.21.1.8。cdw11 bits 7:0 =
-                        // AGGR_THR (0-based)，bits 15:8 = AGGR_TIME (100 us)。
-                        self.irq_aggr_threshold = (cdw11 & 0xff) as u8;
-                        self.irq_aggr_time = ((cdw11 >> 8) & 0xff) as u8;
+                        // **Phase M1 + reviewer H6** — spec § 5.21.1.8。
+                        // cdw11 bits 7:0 = AGGR_THR (0-based)，
+                        // bits 15:8 = AGGR_TIME (100 us 单位)。
+                        //
+                        // 教学 host 主循环 tick 周期 100 ms = 1000×100 us，
+                        // 实际能保证的 time-flush 上限 ≈ 100 ms。若 driver
+                        // 请求更细粒度（time < 1000 = 100 ms），我们诚实拒绝
+                        // 让 driver 知道而不是静默劣化 3 数量级。time=0 (关闭
+                        // time 维度) 与 time ≥ 1000 都接受。
+                        let aggr_thr = (cdw11 & 0xff) as u8;
+                        let aggr_time = ((cdw11 >> 8) & 0xff) as u8;
+                        // 100 ms = 1000 × 100 us > u8::MAX (255)。所以任何
+                        // 非零 AGGR_TIME 都会被 tick 抹粗到 ≥ 100 ms。
+                        // 我们告知 driver 而非假装支持 100 us。
+                        if aggr_time != 0 {
+                            tracing::warn!(
+                                aggr_time,
+                                tick_ms = 100,
+                                "Set Features INTERRUPT_COALESCING: AGGR_TIME finer than tick; \
+                                 actual time flush is bounded by tick (~100 ms)"
+                            );
+                        }
+                        self.irq_aggr_threshold = aggr_thr;
+                        self.irq_aggr_time = aggr_time;
                         self.features.insert(fid, cdw11);
                         tracing::info!(
                             thr = self.irq_aggr_threshold,

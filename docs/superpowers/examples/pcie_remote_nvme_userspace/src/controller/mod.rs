@@ -150,6 +150,24 @@ pub(super) enum PendingOp {
     /// **Phase K4b** — PI Read sibling 占位（per-LBA file read + verify
     /// 在 dispatch 时同步完成，DMA-write 数据回 PRP1 在 PendingIo 路径）。
     NvmReadPiDmaWrite { num_blocks: u32 },
+    /// **Phase L1+ (reviewer H1 修复)** — ZNS Zone Append 完成回调。
+    ///
+    /// Append 与 Write 不同：driver 不知 WP，controller 决定落点。所以必须
+    /// 在 success CQE 把 `assigned_lba` 通过 cdw0/cdw1 返回（ZNS CS § 3.2.4）。
+    /// 失败时还要回滚之前预占的 WP / state（否则 zone 永久错位）。
+    ///
+    /// 为此区别于 `NvmWriteDmaRead`：
+    /// - `zone_idx`: 命中的 zone（用于 rollback / state transition）
+    /// - `assigned_lba`: WP-based 落点（success 时返回 driver）
+    /// - `prev_wp` / `prev_state`: rollback 用的旧值
+    /// - `num_blocks`: 计数用
+    NvmZoneAppend {
+        zone_idx: usize,
+        assigned_lba: u64,
+        prev_wp: u64,
+        prev_state: ZoneState,
+        num_blocks: u32,
+    },
 }
 
 /// 双 PRP Write 累积：两段 DMA-read 任一先到都填到 prp1_data/prp2_data；
@@ -283,10 +301,9 @@ pub(super) struct ZnsState {
     /// 单 zone 可写 LBA 数（≤ zone_size；spec 留 capacity 给 metadata）。
     pub(super) zone_capacity: u64,
     /// Max Active Zones / Max Open Zones 限制（0 = 无限）。
-    /// 未来 ZoneAppend 真 enforce 这些限制（spec ZNS § 2.2）。
-    #[allow(dead_code)]
+    /// **Reviewer H2 修复** — Zone Mgmt Send Open 现在真 enforce 这些限制
+    /// (spec ZNS § 2.2)。Identify NS ZNS 字段 MAR/MOR 会上报本值。
     pub(super) max_open: u32,
-    #[allow(dead_code)]
     pub(super) max_active: u32,
     /// per-zone 状态。zones[i] 对应 LBA 范围 [i*zone_size, (i+1)*zone_size)。
     pub(super) zones: Vec<Zone>,
@@ -341,6 +358,62 @@ impl Namespace {
     #[inline]
     pub(super) fn pi_enabled(&self) -> bool {
         self.pi_type != 0
+    }
+
+    /// **Reviewer H3** — 位置无关的 read（不依赖 file cursor）。Linux
+    /// `pread`、Windows `seek_read`。避免 seek+read 之间被并发任务覆盖
+    /// cursor 导致脏数据。同时省一次 syscall。
+    pub(super) fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read_exact_at(buf, offset)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            let mut filled = 0usize;
+            while filled < buf.len() {
+                let n = self
+                    .file
+                    .seek_read(&mut buf[filled..], offset + filled as u64)?;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "EOF before fill",
+                    ));
+                }
+                filled += n;
+            }
+            Ok(())
+        }
+    }
+
+    /// **Reviewer H3** — 位置无关的 write，与 `read_at` 对称。
+    pub(super) fn write_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.write_all_at(buf, offset)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            let mut written = 0usize;
+            while written < buf.len() {
+                let n = self
+                    .file
+                    .seek_write(&buf[written..], offset + written as u64)?;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "wrote 0 bytes",
+                    ));
+                }
+                written += n;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -686,6 +759,8 @@ impl NvmeController {
             ns.zns = Some(ZnsState {
                 zone_size,
                 zone_capacity: zone_size,
+                // 教学：默认无限制，避免简单 demo 触发 TOO_MANY_OPEN_ZONES。
+                // 真硬件典型 MAR=14, MOR=14（NVMe ZNS 默认值，但 spec 无强约束）。
                 max_open: 0,
                 max_active: 0,
                 zones,
@@ -1558,6 +1633,23 @@ impl PcieDevice for NvmeController {
                             )
                         });
                     }
+                    PendingOp::NvmZoneAppend {
+                        zone_idx,
+                        prev_wp,
+                        prev_state,
+                        ..
+                    } => {
+                        // **Reviewer H1** — Append DMA-fail：回滚预占的 WP/state。
+                        // 不回滚 zone 会永久错位（下次 Append 写到 hole 后面）。
+                        if let Some(ns) = self.namespaces.get_mut(&p.nsid) {
+                            if let Some(zns) = ns.zns.as_mut() {
+                                if let Some(zone) = zns.zones.get_mut(zone_idx) {
+                                    zone.write_pointer = prev_wp;
+                                    zone.state = prev_state;
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 self.stat_num_err_log_entries += 1;
@@ -1751,6 +1843,79 @@ impl PcieDevice for NvmeController {
                     // 让生命周期闭合。失败路径在 on_dma_complete 顶部 ok==
                     // false 分支统一 post error CQE（参 mod.rs DMA fail）。
                     tracing::trace!(token, "dual-PRP Read sibling half ok (no-op)");
+                }
+                PendingOp::NvmZoneAppend {
+                    zone_idx,
+                    assigned_lba,
+                    prev_wp,
+                    prev_state,
+                    num_blocks,
+                } => {
+                    // **Phase L1 + reviewer H1 修复** — ZNS Zone Append 完成回调。
+                    // 1. DMA-read 数据落盘到 assigned_lba 处
+                    // 2. 成功 → success CQE 携 assigned_lba（dw0=low32, dw1=hi32）
+                    //    （ZNS CS § 3.2.4 要求）
+                    // 3. 失败 → 回滚 WP/state 到 prev_wp/prev_state，post error CQE
+                    let bytes = num_blocks as u64 * SECTOR_SIZE;
+                    let nsid = p.nsid;
+                    let res = if let Some(ns) = self.namespaces.get_mut(&nsid) {
+                        ns.file
+                            .seek(SeekFrom::Start(assigned_lba * SECTOR_SIZE))
+                            .and_then(|_| ns.file.write_all(&data[..bytes as usize]))
+                    } else {
+                        Err(std::io::Error::other(format!("unknown NSID {}", nsid)))
+                    };
+                    let cq = self.cqs.get(&p.cq_id);
+                    let phase = cq.map(|c| c.phase).unwrap_or(1);
+                    let cqe = match res {
+                        Ok(()) => {
+                            self.stat_host_writes += 1;
+                            self.stat_lba_written += num_blocks as u64;
+                            tracing::debug!(
+                                nsid,
+                                zone_idx,
+                                assigned_lba,
+                                num_blocks,
+                                "Zone Append OK"
+                            );
+                            let mut c = Cqe::success(p.cid, p.sq_id, p.sq_head, phase);
+                            // ZNS spec：CQE dw0/dw1 = assigned LBA（little-endian
+                            // 双字拼成 64-bit）。driver 用这个值后续 Read。
+                            c.cdw0 = (assigned_lba & 0xFFFF_FFFF) as u32;
+                            c.cdw1 = (assigned_lba >> 32) as u32;
+                            c
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, nsid, zone_idx, assigned_lba,
+                                "Zone Append backing failed; rolling back WP/state");
+                            // Rollback WP + state（避免下次 Append 落到错位）
+                            if let Some(ns) = self.namespaces.get_mut(&nsid) {
+                                if let Some(zns) = ns.zns.as_mut() {
+                                    if let Some(zone) = zns.zones.get_mut(zone_idx) {
+                                        zone.write_pointer = prev_wp;
+                                        zone.state = prev_state;
+                                    }
+                                }
+                            }
+                            self.stat_num_err_log_entries += 1;
+                            self.push_error_log(
+                                p.sq_id,
+                                p.cid,
+                                (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                                assigned_lba,
+                                nsid,
+                            );
+                            Cqe::error(
+                                p.cid,
+                                p.sq_id,
+                                p.sq_head,
+                                phase,
+                                sc::DATA_TRANSFER_ERROR,
+                                0,
+                            )
+                        }
+                    };
+                    self.post_cqe(ctx, p.cq_id, cqe);
                 }
                 PendingOp::AdminSetHostIdentifier { exhid } => {
                     // **Phase K9** — host_id DMA-read 完成，存到 controller。
@@ -2760,7 +2925,8 @@ mod tests {
     /// Phase M1b：Interrupt Coalescing 决策。
     #[test]
     fn irq_coalesce_decision() {
-        // Admin CQ 永远立即 fire
+        // Admin CQ 永远立即 fire（pending=0 也 fire — admin 路径不 batch）
+        assert!(should_fire_irq(0, 0, 200, 200));
         assert!(should_fire_irq(0, 1, 100, 100));
         // 默认（thr=0）退化为 fire-on-every（0's-based：阈值=1）
         assert!(should_fire_irq(1, 1, 0, 0));
@@ -2774,5 +2940,75 @@ mod tests {
         // thr=1 → 阈值=2，第 2 条 fire
         assert!(!should_fire_irq(1, 1, 1, 0));
         assert!(should_fire_irq(1, 2, 1, 0));
+        // thr=255 max → 阈值=256，pending=u32::MAX fire
+        assert!(should_fire_irq(1, 256, 255, 0));
+        assert!(!should_fire_irq(1, 255, 255, 0));
+    }
+
+    /// **Reviewer H2** — ZNS state machine transition table。覆盖
+    /// 7 states × 5 ZSAs + unknown action。
+    #[test]
+    fn zns_state_machine_transitions() {
+        use crate::controller::io::check_zsa_transition;
+        use ZoneState::*;
+        // (state, zsa) → None=OK / Some(sc)=fail
+        // Close (0x01)
+        assert_eq!(check_zsa_transition(Empty, 0x01), None); // no-op
+        assert_eq!(check_zsa_transition(ImplicitOpen, 0x01), None);
+        assert_eq!(check_zsa_transition(ExplicitOpen, 0x01), None);
+        assert_eq!(check_zsa_transition(Closed, 0x01), None);
+        assert_eq!(check_zsa_transition(Full, 0x01), None);
+        assert_eq!(
+            check_zsa_transition(ReadOnly, 0x01),
+            Some(sc::ZONE_IS_READ_ONLY)
+        );
+        assert_eq!(
+            check_zsa_transition(Offline, 0x01),
+            Some(sc::ZONE_IS_OFFLINE)
+        );
+        // Finish (0x02) — 全 active states OK，RO/Offline fail
+        assert_eq!(check_zsa_transition(Empty, 0x02), None);
+        assert_eq!(check_zsa_transition(Full, 0x02), None);
+        assert_eq!(
+            check_zsa_transition(ReadOnly, 0x02),
+            Some(sc::ZONE_IS_READ_ONLY)
+        );
+        // Open (0x03) — Full → ZSTI，RO/Offline fail
+        assert_eq!(check_zsa_transition(Empty, 0x03), None);
+        assert_eq!(check_zsa_transition(Closed, 0x03), None);
+        assert_eq!(
+            check_zsa_transition(Full, 0x03),
+            Some(sc::INVALID_ZONE_STATE_TRANSITION)
+        );
+        assert_eq!(
+            check_zsa_transition(Offline, 0x03),
+            Some(sc::ZONE_IS_OFFLINE)
+        );
+        // Reset (0x04) — 全 active OK，RO/Offline fail
+        assert_eq!(check_zsa_transition(Full, 0x04), None);
+        assert_eq!(check_zsa_transition(ImplicitOpen, 0x04), None);
+        assert_eq!(
+            check_zsa_transition(ReadOnly, 0x04),
+            Some(sc::ZONE_IS_READ_ONLY)
+        );
+        // Offline (0x05) — 只能从 Full/RO/Offline；Empty/Open/Closed 都 ZSTI
+        assert_eq!(check_zsa_transition(Full, 0x05), None);
+        assert_eq!(check_zsa_transition(ReadOnly, 0x05), None);
+        assert_eq!(check_zsa_transition(Offline, 0x05), None); // no-op
+        assert_eq!(
+            check_zsa_transition(Empty, 0x05),
+            Some(sc::INVALID_ZONE_STATE_TRANSITION)
+        );
+        assert_eq!(
+            check_zsa_transition(ImplicitOpen, 0x05),
+            Some(sc::INVALID_ZONE_STATE_TRANSITION)
+        );
+        assert_eq!(
+            check_zsa_transition(Closed, 0x05),
+            Some(sc::INVALID_ZONE_STATE_TRANSITION)
+        );
+        // Unknown ZSA
+        assert_eq!(check_zsa_transition(Empty, 0xAA), Some(sc::INVALID_FIELD));
+        assert_eq!(check_zsa_transition(Full, 0x00), Some(sc::INVALID_FIELD));
     }
 }
