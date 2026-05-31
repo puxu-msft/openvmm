@@ -92,6 +92,9 @@ pub(super) enum PendingOp {
     /// COMPARE_FAILURE (SC 0x85, SCT=0x02 Media/Data Integrity)。
     /// 单 PRP 路径（≤ 1 page）。
     NvmCompareSinglePrp { lba: u64, num_blocks: u32 },
+    /// **Phase H5** — Firmware Image Download chunk DMA-read 完成。
+    /// `offset_bytes` = byte offset into fw_download_buf。
+    AdminFwDownloadChunk { offset_bytes: u32 },
 }
 
 /// 双 PRP Write 累积：两段 DMA-read 任一先到都填到 prp1_data/prp2_data；
@@ -255,6 +258,20 @@ pub struct NvmeController {
     /// 0x01 时填入。
     pub(super) error_log: std::collections::VecDeque<ErrorLogEntry>,
 
+    // ----- Phase H5: Firmware download / commit / activate 状态机 -----
+    /// FW image 累积 buffer（FW Image Download cmd 分块写入）。
+    /// 每个 Download cmd 带 cdw10=NUMD（4 KiB units，0-based）+
+    /// cdw11=OFFSET（4 KiB units），写到 self.fw_download_buf[OFFSET..]。
+    pub(super) fw_download_buf: Vec<u8>,
+    /// 当前活跃 FW slot (1..7)。Commit 后切换。Identify Controller
+    /// .frmw + Get Log Page 0x03 AFI 反映此值。
+    pub(super) fw_active_slot: u8,
+    /// 每个 slot 的 FW revision string（8 ASCII chars，spec § 5.16.1.3）。
+    /// slot 0 未使用，1..7 真值。空字符串表示该 slot 未填。
+    pub(super) fw_slot_revisions: [String; 8],
+    /// 待下次启动激活的 slot（Commit Action=2 设置）；0 = 立即激活。
+    pub(super) fw_next_active_slot: u8,
+
     // ----- 配置 -----
     vid: u16,
     ssvid: u16,
@@ -398,6 +415,14 @@ impl NvmeController {
             self_test_in_progress: None,
             self_test_last: None,
             error_log: std::collections::VecDeque::new(),
+            fw_download_buf: Vec::new(),
+            fw_active_slot: 1,
+            fw_slot_revisions: {
+                let mut s = std::array::from_fn(|_| String::new());
+                s[1] = "v2.0    ".to_string(); // 默认 slot 1 已 factory-loaded
+                s
+            },
+            fw_next_active_slot: 0,
             vid,
             ssvid,
             msix_count: 4, // admin (vec 0) + IO (vec 1) + 2 spare
@@ -878,17 +903,34 @@ impl NvmeController {
         buf
     }
 
-    /// **Phase C** — Log Page 0x03 Firmware Slot Information。
+    /// **Phase C/H5** — Log Page 0x03 Firmware Slot Information。
     ///
-    /// NVMe spec § 5.16.1.3，512 字节固定。AFI bit 2:0 = 当前激活槽，
-    /// bits 6:4 = 下次启动激活槽。FRS[N] = 8 字节 ASCII FW revision。
+    /// NVMe spec § 5.16.1.3，512 字节固定。AFI bit 2:0 = 当前激活槽
+    /// (1..7)，bits 6:4 = 下次启动激活槽（0 表示无 pending activation）。
+    /// FRS[1..7] = 8 字节 ASCII FW revision；FRS[0] 不存在（spec FRS 索引
+    /// 1-based）。Phase H5：从 self.fw_active_slot / fw_next_active_slot /
+    /// fw_slot_revisions 真序列化。
     fn build_fw_slot_info_log(&self, bytes: usize) -> Vec<u8> {
         let mut buf = vec![0u8; bytes.max(512)];
-        // AFI: 当前激活槽 = 1, 下次启动激活槽 = 1
-        buf[0] = 0x11; // bits 2:0 = 1, bits 6:4 = 1
-        // FRS[0] (offset 8-15): firmware revision string (ASCII)
-        let fr = b"v2.0    ";
-        buf[8..16].copy_from_slice(fr);
+        // AFI = (next << 4) | active
+        let afi = (self.fw_next_active_slot & 0x7) << 4 | (self.fw_active_slot & 0x7);
+        buf[0] = afi;
+        // FRS[1..7] @ offset 8..64（每槽 8 byte），index 1-based 但
+        // spec layout 是 offset 8 = FRS for slot 1
+        for slot in 1..=7usize {
+            let rev = &self.fw_slot_revisions[slot];
+            if rev.is_empty() {
+                continue;
+            }
+            let off = (slot - 1) * 8 + 8;
+            let rev_bytes = rev.as_bytes();
+            let n = rev_bytes.len().min(8);
+            buf[off..off + n].copy_from_slice(&rev_bytes[..n]);
+            // pad 不足 8 字节为 ASCII space
+            for b in buf[off + n..off + 8].iter_mut() {
+                *b = b' ';
+            }
+        }
         buf.truncate(bytes);
         buf
     }
@@ -1303,6 +1345,25 @@ impl PcieDevice for NvmeController {
                     // 让生命周期闭合。失败路径在 on_dma_complete 顶部 ok==
                     // false 分支统一 post error CQE（参 mod.rs DMA fail）。
                     tracing::trace!(token, "dual-PRP Read sibling half ok (no-op)");
+                }
+                PendingOp::AdminFwDownloadChunk { offset_bytes } => {
+                    // **Phase H5** — FW chunk DMA-read 完成，写入累积 buffer
+                    let off = offset_bytes as usize;
+                    let end = off + data.len();
+                    if end > self.fw_download_buf.len() {
+                        self.fw_download_buf.resize(end, 0);
+                    }
+                    self.fw_download_buf[off..end].copy_from_slice(&data);
+                    tracing::debug!(
+                        offset_bytes,
+                        len = data.len(),
+                        total_buf = self.fw_download_buf.len(),
+                        "FW Download chunk applied"
+                    );
+                    let cq = self.cqs.get(&p.cq_id);
+                    let phase = cq.map(|c| c.phase).unwrap_or(1);
+                    let cqe = Cqe::success(p.cid, p.sq_id, p.sq_head, phase);
+                    self.post_cqe(ctx, p.cq_id, cqe);
                 }
                 PendingOp::NvmCompareSinglePrp { lba, num_blocks } => {
                     // **Phase H3** — host buffer 已 DMA-read 到 `data`；
@@ -1926,5 +1987,25 @@ mod tests {
         // NS 都是 2048 LBA (1 MiB / 512)
         assert_eq!(c.ns(1).unwrap().total_lba, 2048);
         assert_eq!(c.ns(2).unwrap().total_lba, 2048);
+    }
+
+    /// Phase H5：FW Slot Info Log 反映 active_slot / next_active_slot /
+    /// per-slot revision string；AFI 编码 bits 2:0 = active, 6:4 = next。
+    #[test]
+    fn fw_slot_info_log_reflects_state() {
+        let mut c = make_ctrl_with_tmp("fw");
+        c.fw_active_slot = 2;
+        c.fw_next_active_slot = 3;
+        c.fw_slot_revisions[2] = "newrev1 ".to_string();
+        c.fw_slot_revisions[3] = "newrev2 ".to_string();
+        let buf = c.build_fw_slot_info_log(512);
+        // AFI = (3 << 4) | 2 = 0x32
+        assert_eq!(buf[0], 0x32);
+        // FRS[slot 1] @ offset 8..16（默认 v2.0    ，保留自 init）
+        assert_eq!(&buf[8..16], b"v2.0    ");
+        // FRS[slot 2] @ offset 16..24
+        assert_eq!(&buf[16..24], b"newrev1 ");
+        // FRS[slot 3] @ offset 24..32
+        assert_eq!(&buf[24..32], b"newrev2 ");
     }
 }

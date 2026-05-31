@@ -451,16 +451,117 @@ impl NvmeController {
                 Some(Cqe::success(cid, 0, sq_head, phase))
             }
             admin_opc::FW_COMMIT => {
-                // NVMe spec § 5.16 Firmware Commit。我们没真正 firmware；
-                // 返 success + cdw0=0 (Activation 完成，无需 reset)。
-                tracing::debug!(cid, "Firmware Commit (no-op success)");
+                // **Phase H5** — NVMe spec § 5.16 Firmware Commit。
+                // CDW10 字段：
+                //   bits 2:0   FS  — Firmware Slot (1..7)
+                //   bits 5:3   CA  — Commit Action
+                //     0 = downloaded image replaces FS (no activation)
+                //     1 = downloaded image replaces FS + activates on next reset
+                //     2 = activate existing FS on next reset
+                //     3 = activate downloaded image immediately
+                //   bit 31     BPID — Boot Partition ID（无 BP 不用）
+                // CQE cdw0：activation 状态码：
+                //   0x00 = success (no reset needed)
+                //   0x01 = success, NVM subsystem reset required
+                //   0x02 = success, controller-level reset required
+                //   0x10 + reason = error
+                let fs = (sqe.cdw10 & 0x7) as u8;
+                let ca = ((sqe.cdw10 >> 3) & 0x7) as u8;
+                tracing::info!(fs, ca, "Firmware Commit");
+                if !(1..=7).contains(&fs) {
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
+                let buf_len = self.fw_download_buf.len();
+                match ca {
+                    0 | 1 => {
+                        // 把 download buffer 内容 'flash' 到 slot FS。我们用
+                        // download size 头 8 字节作 ASCII revision string；
+                        // 真硬件这是 vendor 编码 image。
+                        if buf_len < 8 {
+                            tracing::warn!(buf_len, "FW Commit: insufficient downloaded image");
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                        }
+                        let rev_bytes: [u8; 8] = self.fw_download_buf[..8].try_into().unwrap();
+                        let rev = String::from_utf8_lossy(&rev_bytes).to_string();
+                        self.fw_slot_revisions[fs as usize] = rev.clone();
+                        tracing::info!(fs, rev = %rev, "FW Commit: slot replaced");
+                        if ca == 1 {
+                            self.fw_next_active_slot = fs;
+                        }
+                    }
+                    2 => {
+                        // 仅 mark next-boot active
+                        if self.fw_slot_revisions[fs as usize].is_empty() {
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                        }
+                        self.fw_next_active_slot = fs;
+                    }
+                    3 => {
+                        // 立即激活
+                        if self.fw_slot_revisions[fs as usize].is_empty() {
+                            // 没 image：用 download buffer 先 flash 再激活
+                            if buf_len < 8 {
+                                return Some(Cqe::error(
+                                    cid,
+                                    0,
+                                    sq_head,
+                                    phase,
+                                    sc::INVALID_FIELD,
+                                    0,
+                                ));
+                            }
+                            let rev_bytes: [u8; 8] = self.fw_download_buf[..8].try_into().unwrap();
+                            self.fw_slot_revisions[fs as usize] =
+                                String::from_utf8_lossy(&rev_bytes).to_string();
+                        }
+                        self.fw_active_slot = fs;
+                        tracing::info!(fs, "FW Commit: activated immediately");
+                    }
+                    _ => return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0)),
+                }
+                // 清 download buffer（spec § 5.16：commit consumes download)
+                self.fw_download_buf.clear();
                 Some(Cqe::success(cid, 0, sq_head, phase))
             }
             admin_opc::FW_IMAGE_DOWNLOAD => {
-                // NVMe spec § 5.17 Firmware Image Download。我们直接 success
-                // 不存（FW_COMMIT 也不真激活，行为一致）。
-                tracing::debug!(cid, "Firmware Image Download (discarded, no-op success)");
-                Some(Cqe::success(cid, 0, sq_head, phase))
+                // **Phase H5** — NVMe spec § 5.17 Firmware Image Download。
+                // CDW10 = NUMD (dwords - 1)；CDW11 = OFFSET (dwords)。Data
+                // 通过 PRP1 提供。我们 DMA-read PRP1 到 fw_download_buf
+                // 对应 offset，完成后构造 success CQE。
+                let numd = sqe.cdw10 + 1; // dwords (4 byte units)
+                let offset_dwords = sqe.cdw11;
+                let bytes_count = numd * 4;
+                let offset_bytes = offset_dwords * 4;
+                let prp1 = sqe.prp1;
+                tracing::info!(
+                    bytes = bytes_count,
+                    offset = offset_bytes,
+                    "FW Image Download chunk"
+                );
+                // sanity：cap 8 MiB 避免无限分配
+                const FW_MAX: usize = 8 * 1024 * 1024;
+                let need_total = (offset_bytes + bytes_count) as usize;
+                if need_total > FW_MAX {
+                    tracing::warn!(need_total, "FW Download exceeds 8 MiB cap");
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
+                if self.fw_download_buf.len() < need_total {
+                    self.fw_download_buf.resize(need_total, 0);
+                }
+                // DMA-read PRP1 → 完成回调 AdminFwDownloadChunk
+                let tok = ctx.dma_read(prp1, bytes_count);
+                self.pending_ios.insert(
+                    tok,
+                    crate::controller::PendingIo {
+                        sq_id: 0,
+                        cid,
+                        sq_head,
+                        cq_id,
+                        nsid: 0,
+                        op: crate::controller::PendingOp::AdminFwDownloadChunk { offset_bytes },
+                    },
+                );
+                None
             }
             admin_opc::DEVICE_SELF_TEST => {
                 // **Phase G (rev. CRITICAL fix)** — NVMe spec § 5.11
