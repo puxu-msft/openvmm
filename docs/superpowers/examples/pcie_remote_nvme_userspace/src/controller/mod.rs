@@ -106,6 +106,10 @@ pub(super) enum PendingOp {
         action: u8,
         rtype: u8,
     },
+    /// **Phase K3** — NS Management Create：DMA-read 完成后 parse 4 KiB
+    /// NS Identify 结构（含 NSZE/NCAP/FLBAS/DPS），分配新 NSID + RAM
+    /// backing。Create 选 SEL=0，新 NSID 在 CQE.cdw0 返。
+    AdminNsCreate,
 }
 
 /// 双 PRP Write 累积：两段 DMA-read 任一先到都填到 prp1_data/prp2_data；
@@ -1283,6 +1287,101 @@ impl PcieDevice for NvmeController {
                     let cq = self.cqs.get(&p.cq_id);
                     let phase = cq.map(|c| c.phase).unwrap_or(1);
                     let cqe = Cqe::success(p.cid, p.sq_id, p.sq_head, phase);
+                    self.post_cqe(ctx, p.cq_id, cqe);
+                }
+                PendingOp::AdminNsCreate => {
+                    // **Phase K3** — NS Mgmt Create：parse 4 KiB Identify NS：
+                    //   NSZE @ 0..8 (LBA count)
+                    //   NCAP @ 8..16
+                    //   FLBAS @ 26 (LBAF index bits 3:0)
+                    //   DPS @ 29 (PI type bits 2:0 + bit 3 first/last)
+                    let cq = self.cqs.get(&p.cq_id);
+                    let phase = cq.map(|c| c.phase).unwrap_or(1);
+                    let mut cqe = if data.len() < 30 {
+                        Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_FIELD, 0)
+                    } else {
+                        let nsze = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                        let flbas = data[26] & 0x0f;
+                        let dps = data[29];
+                        let pi_type = dps & 0x07;
+                        let pi_first = (dps & 0x08) == 0;
+                        if nsze == 0 || flbas > 1 || pi_type > 1 {
+                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_FIELD, 0)
+                        } else {
+                            let new_lbads = if flbas == 0 { 9u8 } else { 12u8 };
+                            let new_meta_size = if flbas == 0 { 0u8 } else { 8u8 };
+                            // 分配新 NSID（next available）+ 创 temp file backing
+                            let new_nsid = (1..=u32::MAX)
+                                .find(|n| !self.namespaces.contains_key(n))
+                                .unwrap_or(0);
+                            if new_nsid == 0 {
+                                Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INTERNAL_ERROR, 0)
+                            } else {
+                                let dir = std::env::temp_dir();
+                                let path = dir.join(format!(
+                                    "nvme_ns_{}_{}.img",
+                                    std::process::id(),
+                                    new_nsid
+                                ));
+                                let block = (1u64 << new_lbads) + new_meta_size as u64;
+                                let total_bytes = nsze * block;
+                                let create_result = std::fs::OpenOptions::new()
+                                    .read(true)
+                                    .write(true)
+                                    .create(true)
+                                    .truncate(true)
+                                    .open(&path)
+                                    .and_then(|f| {
+                                        f.set_len(total_bytes)?;
+                                        Ok(f)
+                                    });
+                                match create_result {
+                                    Ok(file) => {
+                                        let path_str = path.to_string_lossy().into_owned();
+                                        tracing::info!(
+                                            new_nsid,
+                                            nsze,
+                                            new_lbads,
+                                            new_meta_size,
+                                            pi_type,
+                                            path = %path_str,
+                                            "NS Mgmt Create OK"
+                                        );
+                                        self.namespaces.insert(
+                                            new_nsid,
+                                            Namespace {
+                                                file,
+                                                total_lba: nsze,
+                                                path: path_str,
+                                                lbads: new_lbads,
+                                                meta_size: new_meta_size,
+                                                pi_type,
+                                                pi_first,
+                                                registrants: Vec::new(),
+                                                reservation: None,
+                                                reservation_gen: 0,
+                                            },
+                                        );
+                                        let mut c = Cqe::success(p.cid, p.sq_id, p.sq_head, phase);
+                                        c.cdw0 = new_nsid;
+                                        c
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "NS Mgmt Create: file alloc failed");
+                                        Cqe::error(
+                                            p.cid,
+                                            p.sq_id,
+                                            p.sq_head,
+                                            phase,
+                                            sc::INTERNAL_ERROR,
+                                            0,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    let _ = &mut cqe; // suppress unused_mut if no future mutation
                     self.post_cqe(ctx, p.cq_id, cqe);
                 }
                 PendingOp::NvmReservationCmd {

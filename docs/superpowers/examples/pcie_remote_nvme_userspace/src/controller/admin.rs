@@ -693,12 +693,57 @@ impl NvmeController {
                 }
             }
             admin_opc::NS_MANAGEMENT => {
-                // NVMe spec § 5.22 Namespace Management。CDW10 bits 3:0 = SEL
-                // (0=Create, 1=Delete)。我们 single-namespace 不真支持创建/
-                // 删除，返 INVALID_FIELD（spec 允许，driver 会 fall back 到
-                // pre-existing namespace）。
-                tracing::debug!(cid, "Namespace Management (not supported; INVALID_FIELD)");
-                Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0))
+                // **Phase K3** — NVMe spec § 5.22 Namespace Management。
+                // CDW10 bits 3:0 = SEL：
+                //   0 = Create — NSID 必须 = 0xFFFF_FFFF；CQE.cdw0 返新 NSID
+                //   1 = Delete — NSID = 要删的 NS（不可 0/0xFFFFFFFF）
+                // Create 需 DMA-read PRP1 4 KiB Identify NS 结构：
+                //   - NSZE @ 0..8 = size in LBA
+                //   - NCAP @ 8..16 = capacity
+                //   - FLBAS @ 26 = LBAF index
+                //   - DPS @ 29 = PI type
+                let sel = (sqe.cdw10 & 0xf) as u8;
+                match sel {
+                    0 => {
+                        // Create — DMA-read 4 KiB Identify NS 结构
+                        if sqe.nsid != 0xFFFF_FFFF {
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                        }
+                        let tok = ctx.dma_read(sqe.prp1, 4096);
+                        self.pending_ios.insert(
+                            tok,
+                            crate::controller::PendingIo {
+                                sq_id: 0,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid: 0,
+                                op: crate::controller::PendingOp::AdminNsCreate,
+                            },
+                        );
+                        None
+                    }
+                    1 => {
+                        // Delete — NSID 立即删
+                        let nsid = sqe.nsid;
+                        if nsid == 0 || nsid == 0xFFFF_FFFF {
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                        }
+                        if self.namespaces.remove(&nsid).is_none() {
+                            return Some(Cqe::error(
+                                cid,
+                                0,
+                                sq_head,
+                                phase,
+                                sc::INVALID_NAMESPACE,
+                                0,
+                            ));
+                        }
+                        tracing::info!(nsid, "NS Mgmt Delete OK");
+                        Some(Cqe::success(cid, 0, sq_head, phase))
+                    }
+                    _ => Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0)),
+                }
             }
             admin_opc::NS_ATTACHMENT => {
                 // NVMe spec § 5.20 Namespace Attachment。单 controller 单
