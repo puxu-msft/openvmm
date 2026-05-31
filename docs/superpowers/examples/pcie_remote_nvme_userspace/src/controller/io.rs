@@ -136,10 +136,13 @@ pub(crate) fn __test_build_zone_report(
     build_zone_report(zns, start_zone_idx, bytes)
 }
 
-/// **Reviewer H-1** — Apply a single ZSA action to a zone in-place，仅在合法
-/// (check_zsa_transition 返 None) 且 non-no-op 时变更。返回 `true` 表示发生
-/// 状态变更。抽成纯函数便于单元测试 apply 路径的副作用（spec 表中标 `-`
-/// 的 no-op 不应有副作用 — 之前 commit 误改写）。
+/// **Reviewer H2 (apply 2nd) + LOW** — Apply a single ZSA action to a zone
+/// in-place，仅在合法 (check_zsa_transition 返 None) 且 non-no-op 时变更。
+/// 返回 `true` 表示发生状态变更。抽成纯函数便于单元测试 apply 路径的副作用
+/// （spec 表中标 `-` 的 no-op 不应有副作用 — 之前 commit 误改写）。
+///
+/// 防御：若 ZSA 未识别（不应发生，调用方已 gate），返 false + trace::error
+/// 而非 `unreachable!()` panic，遵循 "never panic on driver input"。
 pub(crate) fn apply_zsa(zone: &mut crate::controller::Zone, zsa: u8, zone_capacity: u64) -> bool {
     if check_zsa_transition(zone.state, zsa).is_some() {
         return false;
@@ -168,7 +171,10 @@ pub(crate) fn apply_zsa(zone: &mut crate::controller::Zone, zsa: u8, zone_capaci
             zone.write_pointer = 0;
         }
         0x05 => zone.state = ZoneState::Offline,
-        _ => unreachable!("check_zsa_transition gates unknown ZSA"),
+        _ => {
+            tracing::error!(zsa, "apply_zsa: unknown ZSA (caller should gate)");
+            return false;
+        }
     }
     true
 }

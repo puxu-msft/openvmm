@@ -613,8 +613,10 @@ fn zns_ns_identify_unlimited_translation() {
     );
 }
 
-/// **Reviewer H-L1d-1/2** — CNS 0x06 I/O CS Independent NS Identify 字段
-/// offset 与 RESCAP cross-CNS 一致性。
+/// **Reviewer H-L1d-1/2 + C-1 (5th round)** — CNS 0x08 I/O CS Independent
+/// NS Identify (NVMe 2.0 § 5.17.2)：字段 offset + RESCAP cross-CNS 一致性。
+/// **注**：之前 commit 误用 CNS 0x06；C-1 修正后 build_cs_indep_ns_identify
+/// 服务于 CNS 0x08 dispatch arm。
 #[test]
 fn cs_indep_ns_identify_layout_and_rescap_consistency() {
     use crate::controller::admin::build_cs_indep_ns_identify;
@@ -634,4 +636,140 @@ fn cs_indep_ns_identify_layout_and_rescap_consistency() {
     assert_eq!(buf[13], 0x00, "NSTAT @ offset 13, NRDY=0 means ready");
     // byte 14 是 NVMe 2.0 reserved，必须 0
     assert_eq!(buf[14], 0x00, "byte 14 is reserved per NVMe 2.0");
+}
+
+/// **Reviewer (final round)** — `check_zns_write` 直接单测覆盖 boundary +
+/// Offline/Full/ReadOnly + SWR mismatch 拒绝路径，避免依赖 dispatch_io
+/// 间接验证。
+#[test]
+fn check_zns_write_rejections() {
+    use crate::controller::io::check_zns_write;
+    let mut c = make_ctrl_with_tmp("zns_write_check");
+    // 把 NS 1 转成 ZNS 用 helper
+    let path = c.namespaces[&1].path.clone();
+    drop(c); // 关 file 让 open() 走 ZNS path 重新装
+    let path_clone = path.clone();
+    let mut c = NvmeController::open(&[path_clone.clone()], 0x1414, 0, &[1]).unwrap();
+    let ns = &c.namespaces[&1];
+    // 准备 Full / Offline / ReadOnly zone 各一个用来 reject
+    let zns = ns.zns.as_ref().unwrap();
+    let zone_size = zns.zone_size;
+    drop(zns);
+    // 全 Empty 初始：legal write 应 None
+    assert!(check_zns_write(&c.namespaces[&1], 0, 1, 0, 0, 0, 1).is_none());
+    // 跨 zone 边界 → ZONE_BOUNDARY_ERR
+    let cqe = check_zns_write(&c.namespaces[&1], zone_size - 1, 2, 0, 0, 0, 1).unwrap();
+    let sc = (cqe.dw3 >> 17) as u8;
+    assert_eq!(sc, sc::ZONE_BOUNDARY_ERR);
+    let sct = ((cqe.dw3 >> 25) & 0x7) as u8;
+    assert_eq!(sct, sc::SCT_COMMAND_SPECIFIC);
+    // SWR mismatch：在 Empty zone WP=0 写 LBA=5 应 ZONE_INVALID_WRITE
+    let cqe = check_zns_write(&c.namespaces[&1], 5, 1, 0, 0, 0, 1).unwrap();
+    let sc = (cqe.dw3 >> 17) as u8;
+    assert_eq!(sc, sc::ZONE_INVALID_WRITE);
+    // 模拟 zone 0 Full
+    {
+        let zns = c.namespaces.get_mut(&1).unwrap().zns.as_mut().unwrap();
+        zns.zones[0].state = ZoneState::Full;
+    }
+    let cqe = check_zns_write(&c.namespaces[&1], 0, 1, 0, 0, 0, 1).unwrap();
+    assert_eq!((cqe.dw3 >> 17) as u8, sc::ZONE_IS_FULL);
+    // Offline
+    {
+        let zns = c.namespaces.get_mut(&1).unwrap().zns.as_mut().unwrap();
+        zns.zones[0].state = ZoneState::Offline;
+    }
+    let cqe = check_zns_write(&c.namespaces[&1], 0, 1, 0, 0, 0, 1).unwrap();
+    assert_eq!((cqe.dw3 >> 17) as u8, sc::ZONE_IS_OFFLINE);
+    // ReadOnly
+    {
+        let zns = c.namespaces.get_mut(&1).unwrap().zns.as_mut().unwrap();
+        zns.zones[0].state = ZoneState::ReadOnly;
+    }
+    let cqe = check_zns_write(&c.namespaces[&1], 0, 1, 0, 0, 0, 1).unwrap();
+    assert_eq!((cqe.dw3 >> 17) as u8, sc::ZONE_IS_READ_ONLY);
+}
+
+/// **Reviewer (final round)** — `check_zns_read` 只对 Offline zone reject。
+#[test]
+fn check_zns_read_offline_only() {
+    use crate::controller::io::check_zns_read;
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
+        "nvme_test_zns_read_{}_{:?}.img",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let f = std::fs::File::create(&path).unwrap();
+    f.set_len(8 * 1024 * 1024).unwrap();
+    drop(f);
+    let mut c =
+        NvmeController::open(&[path.to_str().unwrap().to_string()], 0x1414, 0, &[1]).unwrap();
+    // Empty zone：legal
+    assert!(check_zns_read(&c.namespaces[&1], 0, 0, 0, 0, 1).is_none());
+    // 把 zone 0 标 Offline → 拒
+    c.namespaces
+        .get_mut(&1)
+        .unwrap()
+        .zns
+        .as_mut()
+        .unwrap()
+        .zones[0]
+        .state = ZoneState::Offline;
+    let cqe = check_zns_read(&c.namespaces[&1], 0, 0, 0, 0, 1).unwrap();
+    assert_eq!((cqe.dw3 >> 17) as u8, sc::ZONE_IS_OFFLINE);
+    // ReadOnly / Full 允许读
+    c.namespaces
+        .get_mut(&1)
+        .unwrap()
+        .zns
+        .as_mut()
+        .unwrap()
+        .zones[0]
+        .state = ZoneState::ReadOnly;
+    assert!(check_zns_read(&c.namespaces[&1], 0, 0, 0, 0, 1).is_none());
+    c.namespaces
+        .get_mut(&1)
+        .unwrap()
+        .zns
+        .as_mut()
+        .unwrap()
+        .zones[0]
+        .state = ZoneState::Full;
+    assert!(check_zns_read(&c.namespaces[&1], 0, 0, 0, 0, 1).is_none());
+}
+
+/// **Reviewer (final round)** — `advance_zns_wp` Empty→ImplicitOpen +
+/// WP=capacity→Full 直接断言。
+#[test]
+fn advance_zns_wp_transitions() {
+    use crate::controller::io::advance_zns_wp;
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
+        "nvme_test_zns_wp_{}_{:?}.img",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let f = std::fs::File::create(&path).unwrap();
+    f.set_len(8 * 1024 * 1024).unwrap();
+    drop(f);
+    let mut c =
+        NvmeController::open(&[path.to_str().unwrap().to_string()], 0x1414, 0, &[1]).unwrap();
+    let ns = c.namespaces.get_mut(&1).unwrap();
+    let capacity = ns.zns.as_ref().unwrap().zone_capacity;
+    // Empty → ImplicitOpen (WP=10)
+    advance_zns_wp(ns, 0, 10);
+    let zone = &ns.zns.as_ref().unwrap().zones[0];
+    assert_eq!(zone.write_pointer, 10);
+    assert_eq!(zone.state, ZoneState::ImplicitOpen);
+    // ImplicitOpen 继续 → WP=20，state 不变
+    advance_zns_wp(ns, 10, 10);
+    let zone = &ns.zns.as_ref().unwrap().zones[0];
+    assert_eq!(zone.write_pointer, 20);
+    assert_eq!(zone.state, ZoneState::ImplicitOpen);
+    // WP 推进到 capacity → Full
+    advance_zns_wp(ns, 20, (capacity - 20) as u32);
+    let zone = &ns.zns.as_ref().unwrap().zones[0];
+    assert_eq!(zone.write_pointer, capacity);
+    assert_eq!(zone.state, ZoneState::Full);
 }
