@@ -476,12 +476,13 @@ impl IdentifyController {
         // VWC.bit0 = present → driver 主动发 NVM FLUSH (opc 0x00) 拿持久化
         // 承诺；我们 FLUSH handler 调 sync_all() 落盘。
         id.vwc = nvme_spec::VolatileWriteCache::new().with_present(true);
-        // **Phase O2 + reviewer C-1** — FUSES bit 0 = Fused Compare-and-Write
-        // 支持。**当前 dispatch 路径不真做 atomic chain**（Compare 是 async
-        // 完成的，Write 在 Compare 完成前已 dispatch），所以**不能 advertise**，
-        // 否则 driver 误以为 atomic CAS 可用，distributed lock 类用例会静默
-        // corrupt。等 PendingOp::NvmFusedCompareThenWrite 真做出来再启用。
-        id.fuses = 0x0000;
+        // **Phase O3** — FUSES bit 0 = 1 真 advertise Fused Compare-and-Write
+        // 支持。dispatch_sqe 检测 fuse 01/10 → NvmCompareSinglePrpFused PendingOp
+        // 真做 atomic chain（Compare pass → 真 Write；Compare fail → Write 也
+        // 收 COMPARE_FAILURE 不写盘）。spec § 5.17.2.2 FUSES bit 0。
+        // 限制：教学路径只支持 ≤ 1 page (8 LBA at 512B) 的 fused C+W；超过
+        // dispatcher 返 INVALID_FIELD。
+        id.fuses = 0x0001;
         id.as_bytes().to_vec()
     }
 }

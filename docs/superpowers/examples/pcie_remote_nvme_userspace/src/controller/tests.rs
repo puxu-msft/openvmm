@@ -885,18 +885,18 @@ fn sqe_fuse_field_extraction() {
     assert_eq!(sqe.fuse(), 3);
 }
 
-/// **Phase O2 + Reviewer C-1 (7轮)** — IdentifyController.fuses bit 0 必须
-/// 为 0：fused C&W 真 atomic chain 未实现，advertise=1 会让 driver 误以为
-/// 可做 atomic CAS。等 NvmFusedCompareThenWrite 真做出来再翻 1。
+/// **Phase O3** — IdentifyController.fuses bit 0 = 1 advertise Fused C+W
+/// 真 atomic chain（NvmCompareSinglePrpFused 完成时按 Compare 结果决定
+/// Write dispatch）。
 #[test]
-fn identify_controller_does_not_advertise_fused_cw_yet() {
+fn identify_controller_advertises_fused_cw() {
     let buf = IdentifyController::build_v2_bytes(0x1414, 0xc0de, 1);
     // FUSES @ offset 522..524 in IdentifyController (spec § 5.17.2.2)
     let fuses = u16::from_le_bytes(buf[522..524].try_into().unwrap());
     assert_eq!(
         fuses & 0x0001,
-        0,
-        "FUSES.C&W must be 0 until real atomic chain is implemented (C-1 fix)"
+        0x0001,
+        "FUSES.C&W must be advertised once real atomic chain is implemented (O3)"
     );
 }
 

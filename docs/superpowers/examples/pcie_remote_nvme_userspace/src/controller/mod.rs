@@ -115,6 +115,17 @@ pub(super) enum PendingOp {
     /// COMPARE_FAILURE (SC 0x85, SCT=0x02 Media/Data Integrity)。
     /// 单 PRP 路径（≤ 1 page）。
     NvmCompareSinglePrp { lba: u64, num_blocks: u32 },
+    /// **Phase O3** — Fused Compare (single-PRP) 真 atomic chain：Compare
+    /// 完成后**若 pass** → dispatch the captured Write SQE；若 fail → abort
+    /// Write with COMPARE_FAILURE，不写盘。spec § 6.2 atomic CAS 语义。
+    NvmCompareSinglePrpFused {
+        lba: u64,
+        num_blocks: u32,
+        /// 待执行的 Write SQE（Compare 完成后真 dispatch）
+        write_sqe: Sqe,
+        write_sq_head: u16,
+        write_sq_id: u16,
+    },
     /// **Phase H5** — Firmware Image Download chunk DMA-read 完成。
     /// `offset_bytes` = byte offset into fw_download_buf。
     AdminFwDownloadChunk { offset_bytes: u32 },
@@ -1291,35 +1302,48 @@ impl NvmeController {
                     // COMPARE_FAILURE。本教学路径简化：因 Compare 单 PRP 路径
                     // 是同步 finalize 返 Cqe，无法 cleanly chain；所以这里只
                     // 演示 fused-pair detection + post 'Compare aborted because
-                    // mismatch' 时也 abort Write。
-                    //
-                    // 真正 atomic chain 需 PendingOp::NvmFusedCompareThenWrite
-                    // 跟踪 pair；留作后续扩展。当前：dispatch 两条独立但顺序
-                    // 保证（FIRST 先 dispatch + post CQE，然后 SECOND）。
-                    // **Reviewer C-1 修正** — 当前 dispatch 不真做 atomic chain
-                    // （Compare 的 single-PRP 路径返 None async；Write 在 Compare
-                    // 完成前已 dispatch）。所以 IdentifyController.fuses=0 不
-                    // advertise，但保留 dispatcher 路径让 driver / 测试能识别
-                    // fused-pair 协议是 understood。真 atomic chain 需新
-                    // PendingOp::NvmFusedCompareThenWrite 在 Compare 完成时
-                    // 决定是否 dispatch Write（pass=dispatch，fail=COMPARE_FAILURE
-                    // 给 Write 而非真 write）。Tracked as Phase O3 TODO。
-                    tracing::warn!(
+                    // **Phase O3** — Fused Compare-and-Write 真 atomic chain。
+                    // Compare（FIRST）执行的同时把 Write（SECOND）的整条 SQE
+                    // 存进 NvmCompareSinglePrpFused PendingOp；Compare 完成
+                    // 时按结果决定是否真 dispatch Write（pass = dispatch；
+                    // fail = post COMPARE_FAILURE for Write 不写盘）。
+                    // 限制：教学路径只支持单 PRP Compare（≤ 1 page = 8 LBA at
+                    // 512B）。超过此尺寸 → abort 两条 INVALID_FIELD（spec 允许
+                    // controller 不支持任意尺寸的 fused）。
+                    let bytes = first_nlb as u64 * SECTOR_SIZE;
+                    if bytes > NVME_PAGE_SIZE {
+                        tracing::warn!(
+                            slba = first_slba,
+                            nlb = first_nlb,
+                            bytes,
+                            "Fused C+W > 1 page not supported"
+                        );
+                        let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+                        self.post_cqe(
+                            ctx,
+                            cq_id,
+                            Cqe::error(first.cid(), sq_id, first_head, phase, sc::INVALID_FIELD, 0),
+                        );
+                        let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                        self.post_cqe(ctx, cq_id, cqe);
+                        return;
+                    }
+                    // Build NvmCompareSinglePrpFused op: 走 Compare 的 DMA-read
+                    // 流程，但 PendingOp 变体携 write_sqe 让完成路径区分。
+                    let prp1 = first.prp1;
+                    self.dispatch_fused_compare_write(
+                        ctx,
                         sq_id,
-                        first_cid = first.cid(),
-                        second_cid = cid,
-                        slba = first_slba,
-                        nlb = first_nlb,
-                        "Fused C+W dispatched sequentially (NOT atomic; fuses=0 advertise)"
+                        first,
+                        first.cid(),
+                        first_head,
+                        first_slba,
+                        first_nlb,
+                        prp1,
+                        sqe,
+                        sq_head,
+                        cq_id,
                     );
-                    if let Some(cqe) =
-                        self.dispatch_io(ctx, sq_id, first, first.cid(), first_head, cq_id)
-                    {
-                        self.post_cqe(ctx, cq_id, cqe);
-                    }
-                    if let Some(cqe) = self.dispatch_io(ctx, sq_id, sqe, cid, sq_head, cq_id) {
-                        self.post_cqe(ctx, cq_id, cqe);
-                    }
                     return;
                 }
                 _ => {
@@ -1346,6 +1370,88 @@ impl NvmeController {
     // dispatch_admin moved to controller/admin.rs (H6 reviewer split)
 
     // dispatch_io moved to controller/io.rs (H6 split)
+
+    /// **Phase O3** — Fused Compare-and-Write dispatch helper（spec § 6.2
+    /// atomic CAS）。Compare 完成后按结果决定 Write 是否执行：
+    /// - 数据 == backing → dispatch Write 走正常 NvmWriteDmaRead
+    /// - 数据 != backing → post COMPARE_FAILURE 给 Compare CID +
+    ///   post 同 SC 给 Write CID（spec § 6.2：fused 两条都需个别 CQE）
+    ///
+    /// nsid/slba/nlb 已在 dispatcher 校验过对齐，调用方只需提供 Write SQE。
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_fused_compare_write(
+        &mut self,
+        ctx: &mut DeviceCtx<'_>,
+        sq_id: u16,
+        compare_sqe: Sqe,
+        compare_cid: u16,
+        compare_sq_head: u16,
+        slba: u64,
+        nlb: u32,
+        prp1: u64,
+        write_sqe: Sqe,
+        write_sq_head: u16,
+        cq_id: u16,
+    ) {
+        // 基础校验复用普通 IO 路径的 ns 判断
+        let nsid = compare_sqe.nsid;
+        let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+        if self.ns(nsid).is_none() {
+            self.post_cqe(
+                ctx,
+                cq_id,
+                Cqe::error(
+                    compare_cid,
+                    sq_id,
+                    compare_sq_head,
+                    phase,
+                    sc::INVALID_NAMESPACE,
+                    0,
+                ),
+            );
+            self.post_cqe(
+                ctx,
+                cq_id,
+                Cqe::error(
+                    write_sqe.cid(),
+                    sq_id,
+                    write_sq_head,
+                    phase,
+                    sc::INVALID_NAMESPACE,
+                    0,
+                ),
+            );
+            return;
+        }
+        // DMA-read host Compare 数据 → NvmCompareSinglePrpFused 完成回调
+        let bytes = nlb as u64 * SECTOR_SIZE;
+        let tok = ctx.dma_read(prp1, bytes as u32);
+        self.pending_ios.insert(
+            tok,
+            PendingIo {
+                sq_id,
+                cid: compare_cid,
+                sq_head: compare_sq_head,
+                cq_id,
+                nsid,
+                op: PendingOp::NvmCompareSinglePrpFused {
+                    lba: slba,
+                    num_blocks: nlb,
+                    write_sqe,
+                    write_sq_head,
+                    write_sq_id: sq_id,
+                },
+            },
+        );
+        tracing::info!(
+            sq_id,
+            compare_cid,
+            write_cid = write_sqe.cid(),
+            slba,
+            nlb,
+            "Fused C+W: dispatched as atomic chain (Compare → Write)"
+        );
+    }
 
     /// 分配单调递增的 op_id（独立于 SDK DMA token），用于关联多段
     /// DMA 完成回调（双 PRP / PRP list 等）。
@@ -2824,6 +2930,131 @@ impl PcieDevice for NvmeController {
                         Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE, 0)
                     };
                     self.post_cqe(ctx, p.cq_id, cqe);
+                }
+                PendingOp::NvmCompareSinglePrpFused {
+                    lba,
+                    num_blocks,
+                    write_sqe,
+                    write_sq_head,
+                    write_sq_id,
+                } => {
+                    // **Phase O3** — Fused Compare-and-Write completion (atomic chain)。
+                    // Compare 完成判断：
+                    //   pass → 真 dispatch Write (走标准 dispatch_io 路径)
+                    //   fail → post COMPARE_FAILURE 给 Compare CID + post 同 SC 给
+                    //          Write CID（spec § 6.2：fused 两条都需 individual CQE）
+                    let bytes = num_blocks as u64 * SECTOR_SIZE;
+                    let mut backing_buf = vec![0u8; bytes as usize];
+                    let phase = self.cqs.get(&p.cq_id).map(|c| c.phase).unwrap_or(1);
+                    let write_cid = write_sqe.cid();
+                    let (compare_cqe, write_action) = if let Some(ns) =
+                        self.namespaces.get_mut(&p.nsid)
+                    {
+                        match ns.read_at(&mut backing_buf, lba * SECTOR_SIZE) {
+                            Ok(()) => {
+                                if data == backing_buf {
+                                    // Compare success → 计 counter + 真 dispatch Write
+                                    self.stat_host_reads += 1;
+                                    self.stat_lba_read += num_blocks as u64;
+                                    tracing::info!(
+                                        lba,
+                                        num_blocks,
+                                        "Fused C+W: Compare PASS → dispatching Write"
+                                    );
+                                    (Cqe::success(p.cid, p.sq_id, p.sq_head, phase), Some(()))
+                                } else {
+                                    // Compare fail → 两条都 fail，Write 不写盘
+                                    let mismatch_at = data
+                                        .iter()
+                                        .zip(backing_buf.iter())
+                                        .position(|(a, b)| a != b)
+                                        .unwrap_or(0);
+                                    tracing::warn!(
+                                        lba,
+                                        num_blocks,
+                                        mismatch_at,
+                                        "Fused C+W: Compare FAIL → aborting Write (atomic)"
+                                    );
+                                    self.stat_num_err_log_entries += 1;
+                                    self.push_error_log(
+                                        p.sq_id,
+                                        p.cid,
+                                        (sc::COMPARE_FAILURE as u16) << 1,
+                                        lba,
+                                        p.nsid,
+                                    );
+                                    (
+                                        Cqe::error(
+                                            p.cid,
+                                            p.sq_id,
+                                            p.sq_head,
+                                            phase,
+                                            sc::COMPARE_FAILURE,
+                                            sc::SCT_MEDIA_DATA_INTEGRITY,
+                                        ),
+                                        None,
+                                    )
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, lba, "Fused C+W: backing read failed");
+                                self.stat_num_err_log_entries += 1;
+                                self.push_error_log(
+                                    p.sq_id,
+                                    p.cid,
+                                    (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                                    lba,
+                                    p.nsid,
+                                );
+                                (
+                                    Cqe::error(
+                                        p.cid,
+                                        p.sq_id,
+                                        p.sq_head,
+                                        phase,
+                                        sc::DATA_TRANSFER_ERROR,
+                                        0,
+                                    ),
+                                    None,
+                                )
+                            }
+                        }
+                    } else {
+                        (
+                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE, 0),
+                            None,
+                        )
+                    };
+                    self.post_cqe(ctx, p.cq_id, compare_cqe);
+                    match write_action {
+                        Some(()) => {
+                            // Compare pass → 真 dispatch Write 走 NvmWriteDmaRead /
+                            // dual-PRP / PRP-list 普通路径
+                            if let Some(cqe) = self.dispatch_io(
+                                ctx,
+                                write_sq_id,
+                                write_sqe,
+                                write_cid,
+                                write_sq_head,
+                                p.cq_id,
+                            ) {
+                                self.post_cqe(ctx, p.cq_id, cqe);
+                            }
+                        }
+                        None => {
+                            // Compare fail → Write 也 fail（spec § 6.2：fused 两条都
+                            // 个别 CQE 但同 SC；driver 看 atomic 语义保证）
+                            let cqe = Cqe::error(
+                                write_cid,
+                                write_sq_id,
+                                write_sq_head,
+                                phase,
+                                sc::COMPARE_FAILURE,
+                                sc::SCT_MEDIA_DATA_INTEGRITY,
+                            );
+                            self.post_cqe(ctx, p.cq_id, cqe);
+                        }
+                    }
                 }
                 PendingOp::NvmWriteDualPrp { op_id, is_prp1 } => {
                     // 任一段到达：填入 accum 对应槽；两段都到时 dispatch 写盘。
