@@ -277,6 +277,13 @@ pub(super) fn build_lba_status_info(_c: &NvmeController, bytes: usize) -> Vec<u8
 ///     0 = no special, 1 = serialize per NS, 2 = serialize entire ctrl
 pub(super) fn build_cmds_supported_effects(_c: &NvmeController, bytes: usize) -> Vec<u8> {
     let mut buf = vec![0u8; bytes.max(4096)];
+    // CSE 字段 (bits 18:16)：
+    //   0 = no special, 1 = serialize per NS, 2 = serialize controller-wide
+    // **reviewer H5 修复**：Format / Sanitize / NS Mgmt 内部都拒绝
+    // in-flight IO 期间执行（admin.rs in-flight 检查 + IO 路径 sanitize
+    // 检查），等价"serialize controller-wide"，必须把 CSE=2 告诉 driver
+    // 让其预先 quiesce 而非等 SC=0x84/0x12 反复重试。
+    const CSE_CTRL_SERIALIZE: u32 = 0x2 << 16;
     // Helper: 写 entry
     let set = |buf: &mut [u8], opc: u8, base: usize, csupp: bool, flags: u32| {
         let off = base + (opc as usize) * 4;
@@ -294,15 +301,15 @@ pub(super) fn build_cmds_supported_effects(_c: &NvmeController, bytes: usize) ->
     set(&mut buf, 0x09, 0, true, 0x10); // Set Features — CCC
     set(&mut buf, 0x0a, 0, true, 0);
     set(&mut buf, 0x0c, 0, true, 0); // AER
-    set(&mut buf, 0x0d, 0, true, 0x08 | 0x10); // NS Mgmt — NIC + CCC
+    set(&mut buf, 0x0d, 0, true, 0x08 | 0x10 | CSE_CTRL_SERIALIZE); // NS Mgmt
     set(&mut buf, 0x10, 0, true, 0x10); // FW Commit
     set(&mut buf, 0x11, 0, true, 0); // FW Download
     set(&mut buf, 0x14, 0, true, 0); // Self-Test
     set(&mut buf, 0x15, 0, true, 0); // NS Attach
     set(&mut buf, 0x18, 0, true, 0); // Keep Alive
     set(&mut buf, 0x7c, 0, true, 0); // Doorbell Buffer Config
-    set(&mut buf, 0x80, 0, true, 0x02 | 0x10); // Format — LBCC + CCC
-    set(&mut buf, 0x84, 0, true, 0x02 | 0x10); // Sanitize
+    set(&mut buf, 0x80, 0, true, 0x02 | 0x10 | CSE_CTRL_SERIALIZE); // Format
+    set(&mut buf, 0x84, 0, true, 0x02 | 0x10 | CSE_CTRL_SERIALIZE); // Sanitize
     // NVM opcodes (base 1024)
     set(&mut buf, 0x00, 1024, true, 0); // Flush
     set(&mut buf, 0x01, 1024, true, 0x02); // Write

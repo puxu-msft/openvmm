@@ -1,6 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+#![allow(dead_code)]
+// Phase K4 deferred — engine ready for real PI Write/Read IO，
+// 见 K4_DESIGN.md. 当前未在 IO 路径调用；保留供未来接入。
+
 //! T10 DIF (Data Integrity Field) CRC16 + PI tuple 序列化 / 校验。
 //!
 //! NVMe spec § 8.3 Protection Information。Phase K1 实现。

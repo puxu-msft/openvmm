@@ -495,7 +495,14 @@ impl NvmeController {
                         "Format NVM rejected: IO in flight"
                     );
                     // SC 0x84 Format In Progress (NVMe 1.4 § 4.6.1.2.1)。
-                    return Some(Cqe::error(cid, 0, sq_head, phase, 0x84, 0));
+                    return Some(Cqe::error(
+                        cid,
+                        0,
+                        sq_head,
+                        phase,
+                        sc::FORMAT_IN_PROGRESS,
+                        0,
+                    ));
                 }
                 if ses == 1 || ses == 2 {
                     // SES=1 User Data Erase / SES=2 Cryptographic Erase。
@@ -752,7 +759,14 @@ impl NvmeController {
                         if self.self_test_in_progress.is_some() {
                             // Spec：已在进行 → 0x1d Self-Test In Progress
                             tracing::warn!(stc, "Self-Test rejected: already in progress");
-                            return Some(Cqe::error(cid, 0, sq_head, phase, 0x1d, 0));
+                            return Some(Cqe::error(
+                                cid,
+                                0,
+                                sq_head,
+                                phase,
+                                sc::SELF_TEST_IN_PROGRESS,
+                                0,
+                            ));
                         }
                         let total = if stc == 0x1 { 5 } else { 20 };
                         self.self_test_in_progress = Some(crate::controller::SelfTestInProgress {
@@ -807,7 +821,28 @@ impl NvmeController {
                         if nsid == 0 || nsid == 0xFFFF_FFFF {
                             return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                         }
-                        if self.namespaces.remove(&nsid).is_none() {
+                        // **reviewer H1 修复** — Delete 时若有 in-flight IO
+                        // 关联该 NSID，必须拒绝。否则完成回调找不到 NS 误
+                        // post DATA_TRANSFER_ERROR 而非 INVALID_NAMESPACE，
+                        // NvmReadDmaWrite 路径根本不查 NSID → host 已传
+                        // stale data 给 driver。
+                        let busy = self.pending_ios.values().any(|p| p.nsid == nsid)
+                            || self.dual_prp_writes.values().any(|w| w.nsid == nsid)
+                            || self.prp_list_ops.values().any(|o| o.nsid == nsid)
+                            || self.compare_ops.values().any(|o| o.nsid == nsid);
+                        if busy {
+                            tracing::warn!(nsid, "NS Mgmt Delete rejected: IO in flight");
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                        }
+                        // **reviewer M2** — 删 backing temp file 不泄漏
+                        if let Some(ns) = self.namespaces.remove(&nsid) {
+                            let _ = std::fs::remove_file(&ns.path);
+                            tracing::info!(
+                                nsid,
+                                path = %ns.path,
+                                "NS Mgmt Delete OK + temp file unlink"
+                            );
+                        } else {
                             return Some(Cqe::error(
                                 cid,
                                 0,
@@ -817,7 +852,6 @@ impl NvmeController {
                                 0,
                             ));
                         }
-                        tracing::info!(nsid, "NS Mgmt Delete OK");
                         Some(Cqe::success(cid, 0, sq_head, phase))
                     }
                     _ => Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0)),
@@ -830,36 +864,31 @@ impl NvmeController {
                 Some(Cqe::success(cid, 0, sq_head, phase))
             }
             admin_opc::SECURITY_SEND => {
-                // **Phase L5** — NVMe spec § 5.27 Security Send。TCG OPAL /
-                // NVMe Security Protocols 通过此命令传 SP-specific 命令。
-                // 我们不实现 TCG 状态机：CDW10 bits 23:16 = SECP (security
-                // protocol)；对 SECP=0x00 (Information) accept；其他返
-                // INVALID_FIELD。
+                // **Phase L5 + O reviewer M5 修复** — spec § 5.27 Security Send。
+                // SECP=0 (Info) 在 Spec 中无 Send operation 定义（spec 表
+                // 5-19 Info protocol 仅供 Receive 使用），改返 INVALID_FIELD。
+                // 其它 SECP 我们都没真实现 → 一律 INVALID_FIELD。
                 let secp = ((sqe.cdw10 >> 16) & 0xff) as u8;
-                tracing::debug!(secp, "Security Send (educational stub)");
-                if secp == 0 {
-                    Some(Cqe::success(cid, 0, sq_head, phase))
-                } else {
-                    Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0))
-                }
+                tracing::debug!(secp, "Security Send (INVALID_FIELD; no SP impl)");
+                Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0))
             }
             admin_opc::SECURITY_RECEIVE => {
-                // **Phase L5** — spec § 5.28 Security Receive。SECP=0x00 时
-                // 返 Security Protocol List：3 byte header + N byte protocol
-                // IDs。我们仅声明 0x00 (Info) + 0xEF (TCG 占位 / 实际不实现)。
+                // **Phase L5 + O reviewer M4 修复** — spec § 5.28 Security
+                // Receive。SECP=0 (Info) 返 Security Protocol List。
+                // 之前声明 TCG OPAL (0xEF) 但实现没有任何 0xEF Send 路径
+                // → 改只声明 SECP=0 Info（list 长度 = 1）。
                 let secp = ((sqe.cdw10 >> 16) & 0xff) as u8;
                 let alloc = (sqe.cdw11 & 0xffff) as usize;
-                let bytes = alloc.max(8);
+                let bytes = alloc.max(16);
                 if secp == 0 {
                     let mut buf = vec![0u8; bytes];
                     // bytes 0..6 reserved
-                    // bytes 6..8 = LIST LENGTH (big endian) = 2 (number of bytes following)
+                    // bytes 6..8 = LIST LENGTH (big endian) = 1 protocol
                     buf[6] = 0;
-                    buf[7] = 2;
-                    // bytes 8..N = supported protocol IDs
-                    if bytes > 9 {
-                        buf[8] = 0x00; // Info
-                        buf[9] = 0xEF; // TCG OPAL (declared, not really impl)
+                    buf[7] = 1;
+                    // bytes 8..N = supported protocol IDs (just 0x00 Info)
+                    if bytes > 8 {
+                        buf[8] = 0x00;
                     }
                     self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, 0, sq_head, cq_id);
                     None
@@ -923,7 +952,14 @@ impl NvmeController {
                 }
                 // 已在进行 → spec § 5.26 'Sanitize In Progress' (SC 0x12)
                 if self.sanitize.is_some() {
-                    return Some(Cqe::error(cid, 0, sq_head, phase, 0x12, 0));
+                    return Some(Cqe::error(
+                        cid,
+                        0,
+                        sq_head,
+                        phase,
+                        sc::SANITIZE_IN_PROGRESS,
+                        0,
+                    ));
                 }
                 self.sanitize = Some(crate::controller::SanitizeState {
                     started_at: std::time::Instant::now(),

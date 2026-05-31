@@ -182,6 +182,11 @@ pub mod sc {
     pub const INTERNAL_ERROR: u8 = 0x06;
     /// LBA Out of Range (NVM CSD)
     pub const LBA_OUT_OF_RANGE: u8 = 0x80;
+    /// **Phase O** — 命名常量供 grep（之前 magic 0x12/0x1d/0x84 散落）。
+    /// Spec § 4.6.1.2 generic status codes：
+    pub const SANITIZE_IN_PROGRESS: u8 = 0x12;
+    pub const SELF_TEST_IN_PROGRESS: u8 = 0x1d;
+    pub const FORMAT_IN_PROGRESS: u8 = 0x84;
     /// Phase H3：Compare Failure — Media/Data Integrity 类 (SCT=0x02)。
     /// NVM CS spec § 4.1。CQE 的 Status Field 编码：bits 15:1 包括
     /// `SCT(11:9) | SC(8:1)`；本常量是 SC byte，SCT 在 Cqe::error 还需
@@ -412,6 +417,11 @@ impl IdentifyController {
         // PSD[0..7] in spec @ offset 2048+N*32 — 我们让 zero-init buffer
         // 默认（教学 OK；真硬件 PSD 含 MP/MPS/NOPS/ENLAT 等）。
         id.npss = 7;
+        // **Phase O 修复 H4** — CTRATT bit 0 = 128-bit Host Identifier
+        // 必须为 1 才让 driver 用 Set Features 0x81 EXHID=1（Phase K9）。
+        // 其它常见 bit：bit 6 = Predictable Latency, bit 7 = Traffic-Based
+        // Keep Alive, bit 10 = Endurance Groups。我们只声明 HOSTID 支持。
+        id.ctratt = 0x0000_0001;
         // SQES/CQES：NVMe spec 固定 SQE=64B (2^6) / CQE=16B (2^4)。
         id.sqes = nvme_spec::QueueEntrySize::new().with_min(6).with_max(6);
         id.cqes = nvme_spec::QueueEntrySize::new().with_min(4).with_max(4);

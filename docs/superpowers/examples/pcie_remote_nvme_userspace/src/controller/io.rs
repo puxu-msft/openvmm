@@ -31,6 +31,20 @@ impl NvmeController {
         cq_id: u16,
     ) -> Option<Cqe> {
         let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+        // **reviewer H2 修复** — NVMe spec § 5.26：Sanitize in-progress
+        // 时所有 IO（除 Sanitize Status / AER）必须 abort with SC 0x12
+        // 'Sanitize In Progress'。Driver 会等 Sanitize 完成再重试。
+        if self.sanitize.is_some() {
+            tracing::warn!(opc = sqe.opcode(), "IO rejected: Sanitize in progress");
+            return Some(Cqe::error(
+                cid,
+                sq_id,
+                sq_head,
+                phase,
+                sc::SANITIZE_IN_PROGRESS,
+                0,
+            ));
+        }
         match sqe.opcode() {
             nvm_opc::READ => {
                 let cdw10 = sqe.cdw10;
@@ -802,11 +816,18 @@ impl NvmeController {
                 )
             }
             nvm_opc::RESERVATION_REPORT => {
-                // **Phase H6** — spec § 6.14。返回 Reservation Status Data
-                // Structure（spec § 6.14 Figure 197）— 64-byte header +
-                // 24-byte * 每 registrant。CDW10 = NUMD (dwords - 1)。
+                // **Phase H6 + O 修复 H3** — spec § 6.14 Reservation Report。
+                // CDW10 = NUMD (dwords - 1)，CDW11 bit 0 = EDS (Extended
+                // Data Structure)。EDS=1 → per-registrant 64 byte (含 16
+                // byte HOSTID) 而非 24 byte；目前未实现 EDS=1 layout，
+                // reject INVALID_FIELD 比静默返错 layout 安全。
                 let nsid = sqe.nsid;
                 let numd = sqe.cdw10 + 1;
+                let eds = sqe.cdw11 & 0x1 != 0;
+                if eds {
+                    tracing::warn!(nsid, "Reservation Report EDS=1 not yet supported");
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
                 let bytes = numd as usize * 4;
                 let Some(ns) = self.ns(nsid) else {
                     return Some(Cqe::error(
