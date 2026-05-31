@@ -409,6 +409,22 @@ impl NvmeController {
                 // NVMe NVM CS Spec § 3.3.4 Write Zeroes — 把 [SLBA, SLBA+NLB)
                 // 范围内的 LBA 全清零。CDW10/11 = SLBA，CDW12 bits 15:0 = NLB
                 // (zero-based)。无 DMA，无 MDTS 限制（spec 允许整盘 nlb）。
+                //
+                // **reviewer H4 修复**：与 Format 同样：若 in-flight Write
+                // 与 Zeroes 范围 overlap，sync-Zeroes 完成后异步 Write 完
+                // 成会覆盖，driver 视角 LBA 内容不可预测。简化：拒绝任何
+                // 有 IO in-flight 时的 Zeroes（spec 0x84 'Format/Sanitize
+                // In Progress' 也可类比此场景，但 NVMe 没专门 SC）。
+                if !self.pending_ios.is_empty()
+                    || !self.dual_prp_writes.is_empty()
+                    || !self.prp_list_ops.is_empty()
+                {
+                    tracing::warn!(
+                        pending_ios = self.pending_ios.len(),
+                        "WRITE ZEROES rejected: IO in flight (ordering hazard)"
+                    );
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
                 let nsid = sqe.nsid;
                 let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
                 let nlb = (sqe.cdw12 & 0xffff) as u32 + 1;
@@ -530,11 +546,15 @@ impl NvmeController {
                     }
                 }
                 if bytes > NVME_PAGE_SIZE {
+                    // **reviewer H3 修复**：之前返 success placeholder ——
+                    // 严重数据完整性 bug：driver 跑数据校验时会拿到假阳性
+                    // 'match'，掩盖真实损坏。改返 INVALID_FIELD 让 driver
+                    // 走 chunked 重试或感知 controller capability 不足。
                     tracing::warn!(
                         bytes,
-                        "Compare > 4 KiB not yet implemented; returning success (placeholder)"
+                        "Compare > 4 KiB not implemented; rejecting (INVALID_FIELD)"
                     );
-                    return Some(Cqe::success(cid, sq_id, sq_head, phase));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
                 let tok = ctx.dma_read(prp1, bytes as u32);
                 self.pending_ios.insert(

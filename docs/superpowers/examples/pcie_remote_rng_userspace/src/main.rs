@@ -13,18 +13,26 @@
 //!
 //! ## BAR0 寄存器 (MMIO, 64 KiB)
 //!
-//! | Offset | 大小 | RW | 含义                                   |
-//! |--------|------|----|----------------------------------------|
-//! | 0x00   | 4    | RO | STATUS：bit 0 = ready (始终 1)         |
-//! | 0x04   | 4    | RO | VERSION：固定 0x0000_0001              |
-//! | 0x08   | 8    | RW | DEST_GPA：DMA 目标 guest 物理地址      |
-//! | 0x10   | 4    | RW | LEN_BYTES：要生成多少字节（≤ 64 KiB）  |
-//! | 0x14   | 4    | RW | DOORBELL：写 1 触发 DMA + 中断          |
-//! | 0x18   | 8    | RO | STATS_GENERATED：总生成字节数（累计）  |
+//! | Offset | 大小 | RW | 含义                                                  |
+//! |--------|------|----|-------------------------------------------------------|
+//! | 0x00   | 4    | RO | STATUS：bit 0=ready (always 1), bit 1=LAST_DMA_OK     |
+//! | 0x04   | 4    | RO | VERSION：bits 7:0=ver=1, bit 31=NOT_CRYPTO 标志       |
+//! | 0x08   | 8    | RW | DEST_GPA：DMA 目标 guest 物理地址                     |
+//! | 0x10   | 4    | RW | LEN_BYTES：要生成多少字节（≤ 64 KiB，超被 clamp+warn）|
+//! | 0x14   | 4    | RW | DOORBELL：写 1 触发 DMA + 中断（成败都 fire）          |
+//! | 0x18   | 8    | RO | STATS_GENERATED：成功传出字节数（DMA 失败不计）        |
 //!
 //! ## MSI-X
 //!
-//! 单 vector (index 0)：DMA 完成时 fire。
+//! 单 vector (index 0)：DMA 完成时 fire（无论 ok=true/false）。Driver
+//! 必须读 STATUS bit 1 LAST_DMA_OK 来区分成功与失败。
+//!
+//! ## ⚠ 密码学安全警告
+//!
+//! 本设备用 splitmix64 LCG 生成 deterministic 伪随机数（`--seed` 可复现）。
+//! **绝不可**用作密码学密钥 / IV / nonce / TLS PRNG。仅供教学演示。
+//! VERSION 寄存器 bit 31 = NOT_CRYPTO 标志，driver 应据此判断不使用。
+//! 真硬件 RNG 应基于 entropy source（热噪 / 振荡器抖动 / quantum）。
 //!
 //! ## PCI ID
 //!
@@ -128,6 +136,13 @@ struct RngDevice {
     len_bytes: u32,
     stats_generated: u64,
     rng: Lcg64,
+    /// **reviewer M1 修复** — 跟踪 in-flight DMA token → 字节数。
+    /// 完成时按 token 累加 stats_generated，避免 dispatch-time 计数
+    /// 在 DMA 失败时多计。
+    in_flight: std::collections::HashMap<u64, u32>,
+    /// **reviewer M3 修复** — STATUS bit 1 = LAST_DMA_OK。driver 读
+    /// STATUS 可知最近一次 DMA 是否成功。reset 不清（sticky 直到下次 DMA）。
+    last_dma_ok: bool,
 }
 
 impl RngDevice {
@@ -137,6 +152,8 @@ impl RngDevice {
             len_bytes: 0,
             stats_generated: 0,
             rng: Lcg64::new(seed),
+            in_flight: std::collections::HashMap::new(),
+            last_dma_ok: true,
         }
     }
 }
@@ -165,8 +182,20 @@ impl PcieDevice for RngDevice {
     fn mmio_read(&mut self, bar: u32, offset: u64, size: u32) -> u64 {
         let _ = (bar, size);
         match offset {
-            REG_STATUS => 0x1, // ready
-            REG_VERSION => 0x0000_0001,
+            REG_STATUS => {
+                // bit 0 = ready (always 1), bit 1 = LAST_DMA_OK
+                let mut s = 0x1u64;
+                if self.last_dma_ok {
+                    s |= 0x2;
+                }
+                s
+            }
+            REG_VERSION => {
+                // bits 7:0 = version 1
+                // bit 31 = NOT_CRYPTO: 这是 deterministic LCG，**绝不可**
+                // 用作密码学随机源（reviewer M7）
+                0x8000_0001
+            }
             REG_DEST_GPA => self.dest_gpa,
             REG_LEN_BYTES => self.len_bytes as u64,
             REG_DOORBELL => 0, // 写触发，读总返 0
@@ -201,23 +230,43 @@ impl PcieDevice for RngDevice {
                 if value & 0x1 == 0 {
                     return; // 兼容 driver 写 0 不触发
                 }
-                let n = self.len_bytes.min(RNG_MAX_BYTES);
+                // **reviewer M2 修复** — dest_gpa=0 是 driver bug；之前会
+                // 把 DMA 发到 GPA=0，hypervisor 失败但 driver 见不到。
+                if self.dest_gpa == 0 {
+                    tracing::warn!("RNG: DOORBELL with DEST_GPA=0; rejecting");
+                    self.last_dma_ok = false;
+                    ctx.fire_interrupt(RNG_DONE_VECTOR);
+                    return;
+                }
+                let req = self.len_bytes;
+                let n = req.min(RNG_MAX_BYTES);
+                if n != req {
+                    // **reviewer M4** — silent clamp 太危险，driver 会以为
+                    // 后半段是随机数，实际是其旧内容。明显 warn 让用户
+                    // 看到。
+                    tracing::warn!(
+                        requested = req,
+                        truncated = n,
+                        "RNG: LEN_BYTES > 64 KiB capped"
+                    );
+                }
                 if n == 0 {
                     tracing::warn!("RNG: doorbell with len=0, fire interrupt directly");
+                    self.last_dma_ok = true;
                     ctx.fire_interrupt(RNG_DONE_VECTOR);
                     return;
                 }
                 let mut buf = vec![0u8; n as usize];
                 self.rng.fill(&mut buf);
-                self.stats_generated += n as u64;
                 tracing::debug!(
                     n,
                     gpa = format_args!("{:#x}", self.dest_gpa),
                     "RNG: dispatch DMA"
                 );
-                let _tok = ctx.dma_write(self.dest_gpa, buf);
-                // 完成在 on_dma_complete 中 fire_interrupt（spec-style：
-                // 数据到 guest memory 才中断告完成）。
+                // **reviewer M1 修复** — 用 token 关联 in-flight 字节数；
+                // 完成回调按成功才累加 stats_generated。
+                let tok = ctx.dma_write(self.dest_gpa, buf);
+                self.in_flight.insert(tok, n);
             }
             REG_STATUS | REG_VERSION | REG_STATS_GENERATED => {
                 tracing::debug!(offset, "MMIO write to RO reg ignored");
@@ -235,20 +284,31 @@ impl PcieDevice for RngDevice {
         ok: bool,
         data: Vec<u8>,
     ) {
-        let _ = (token, data);
+        let _ = data;
+        // **reviewer M1 修复** — 按 token 取 in-flight 字节数；ok 才计数。
+        let n = self.in_flight.remove(&token).unwrap_or(0);
         if ok {
-            ctx.fire_interrupt(RNG_DONE_VECTOR);
+            self.stats_generated = self.stats_generated.saturating_add(n as u64);
+            self.last_dma_ok = true;
         } else {
-            tracing::warn!("RNG: DMA write failed; not firing completion interrupt");
+            tracing::warn!(token, n, "RNG: DMA write failed");
+            self.last_dma_ok = false;
         }
+        // **reviewer M3 修复** — 无论成功失败都 fire 中断，driver 读
+        // STATUS bit 1 判 LAST_DMA_OK。避免之前 fail 时静默不发中断
+        // 导致 driver 永远等待。
+        ctx.fire_interrupt(RNG_DONE_VECTOR);
     }
 
     fn reset(&mut self, kind: u32) {
-        tracing::info!(kind, "RNG: reset — clearing GPA/len");
+        tracing::info!(kind, "RNG: reset — clearing GPA/len/in_flight");
         self.dest_gpa = 0;
         self.len_bytes = 0;
-        // 统计 / RNG 状态跨 reset 不清（教学：与真硬件一致 — counter
-        // 通常 sticky；rng 种子持续演化）
+        // reviewer M8：清 in_flight 避免 stale token 累计旧 op
+        self.in_flight.clear();
+        // 统计 / RNG 状态 / last_dma_ok 跨 reset 不清（教学：与真硬件一
+        // 致 — counter 通常 sticky；rng 种子持续演化；LAST_DMA_OK 反映
+        // 最近一次 DMA 历史，driver 应在重启后主动重置 expectation）
     }
 
     fn tick(&mut self, _ctx: &mut DeviceCtx<'_>) {

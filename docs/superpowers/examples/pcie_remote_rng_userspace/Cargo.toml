@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 description = "Minimal PCIe RNG (random number generator) device via pcie_remote SDK; second example showing SDK universality beyond NVMe."
 
+# 显式不属于父 workspace —— 与父 Cargo.toml exclude 互为保险。
+[workspace]
+
 [[bin]]
 name = "pcie_remote_rng_userspace"
 path = "src/main.rs"

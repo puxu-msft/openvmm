@@ -376,11 +376,23 @@ impl NvmeController {
                 let pil = ((sqe.cdw10 >> 8) & 0x1) as u8;
                 let ses = ((sqe.cdw10 >> 9) & 0x7) as u8;
                 tracing::info!(lbafl, mset, pi, pil, ses, "Format NVM");
-                if !(lbafl == 0 || lbafl == 1) || pi > 1 || mset != 0 {
-                    // **Phase H7** — 接受 LBAF[0] (512B no-meta) 或 LBAF[1]
-                    // (4096B+8B meta)；PI Type 0 (none) 或 1 (T10 DIF)。
-                    // 其余拒绝。注：我们当前不真做 CRC/RefTag 校验 (见
-                    // io.rs PRACT 处理)，但接受 Format 让 driver 完成探测。
+                if lbafl != 0 || pi != 0 || mset != 0 {
+                    // **Phase H7 reviewer C3 修复** — 完整 PI 路径未实现：
+                    // SECTOR_SIZE 在 mod.rs 是 const 512，IO pipeline 用
+                    // 512 算 offset。若接受 LBAF[1] (4 KiB) 但 IO 仍按
+                    // 512B sector → 8x address 错位 → 87.5% 数据静默损坏。
+                    //
+                    // 在 SECTOR_SIZE 改为 per-NS + PI CRC 引擎落地前，
+                    // Format 必须拒绝 lbafl != 0 / pi != 0。Identify NS
+                    // 仍声明 DPC 能力（spec § 8.3 允许 capability 暴露
+                    // 但 disabled）；driver 看到 LBAF[1] 也行，但 Format
+                    // 选它会被这里拒绝。
+                    tracing::warn!(
+                        lbafl,
+                        pi,
+                        mset,
+                        "Format rejected: only LBAF[0]+PI=0 supported (SECTOR_SIZE/PI未真实现)"
+                    );
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
                 // **C1 修复**：FORMAT 不能在有 in-flight IO 时执行。否则
@@ -530,28 +542,43 @@ impl NvmeController {
                 // CDW10 = NUMD (dwords - 1)；CDW11 = OFFSET (dwords)。Data
                 // 通过 PRP1 提供。我们 DMA-read PRP1 到 fw_download_buf
                 // 对应 offset，完成后构造 success CQE。
-                let numd = sqe.cdw10 + 1; // dwords (4 byte units)
-                let offset_dwords = sqe.cdw11;
-                let bytes_count = numd * 4;
-                let offset_bytes = offset_dwords * 4;
+                //
+                // **reviewer H5 修复**：用 checked_add 避 u32 wrap：cdw11
+                // = 0xffff_ffff 时 +1 wrap 到 0；offset+bytes 累加可能 wrap。
+                // 全部用 u64 计算 + checked 边界，超 FW_MAX (8 MiB) → reject。
+                let numd = match (sqe.cdw10 as u64).checked_add(1) {
+                    Some(n) => n, // dwords (4 byte units)
+                    None => {
+                        return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                    }
+                };
+                let offset_dwords = sqe.cdw11 as u64;
+                let bytes_count_u64 = numd.saturating_mul(4);
+                let offset_bytes_u64 = offset_dwords.saturating_mul(4);
                 let prp1 = sqe.prp1;
                 tracing::info!(
-                    bytes = bytes_count,
-                    offset = offset_bytes,
+                    bytes = bytes_count_u64,
+                    offset = offset_bytes_u64,
                     "FW Image Download chunk"
                 );
-                // sanity：cap 8 MiB 避免无限分配
-                const FW_MAX: usize = 8 * 1024 * 1024;
-                let need_total = (offset_bytes + bytes_count) as usize;
-                if need_total > FW_MAX {
-                    tracing::warn!(need_total, "FW Download exceeds 8 MiB cap");
+                const FW_MAX: u64 = 8 * 1024 * 1024;
+                let need_total = match offset_bytes_u64.checked_add(bytes_count_u64) {
+                    Some(t) => t,
+                    None => {
+                        tracing::warn!("FW Download offset+bytes overflow");
+                        return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                    }
+                };
+                if need_total > FW_MAX || bytes_count_u64 == 0 || bytes_count_u64 > u32::MAX as u64
+                {
+                    tracing::warn!(need_total, "FW Download invalid size");
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
-                if self.fw_download_buf.len() < need_total {
-                    self.fw_download_buf.resize(need_total, 0);
+                if self.fw_download_buf.len() < need_total as usize {
+                    self.fw_download_buf.resize(need_total as usize, 0);
                 }
                 // DMA-read PRP1 → 完成回调 AdminFwDownloadChunk
-                let tok = ctx.dma_read(prp1, bytes_count);
+                let tok = ctx.dma_read(prp1, bytes_count_u64 as u32);
                 self.pending_ios.insert(
                     tok,
                     crate::controller::PendingIo {
@@ -560,7 +587,9 @@ impl NvmeController {
                         sq_head,
                         cq_id,
                         nsid: 0,
-                        op: crate::controller::PendingOp::AdminFwDownloadChunk { offset_bytes },
+                        op: crate::controller::PendingOp::AdminFwDownloadChunk {
+                            offset_bytes: offset_bytes_u64 as u32,
+                        },
                     },
                 );
                 None

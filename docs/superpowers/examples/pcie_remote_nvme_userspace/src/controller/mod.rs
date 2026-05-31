@@ -517,6 +517,12 @@ impl NvmeController {
         // 简化：不等 outstanding DMA flush（容易 dead-lock），直接清状态。
         // 真 NVMe driver 在 disable 前会 set CSTS.SHST→shutdown sequence,
         // 但 v1 简化处理：driver 通常容忍立即重置。
+        //
+        // **reviewer C2 mitigation**：清后 SDK in-flight DMA 完成时找不到
+        // token → unknown-token warn 路径（mod.rs ok=true 分支末尾）。
+        // op_id 单调递增 (next_op_id 跨 reset 不重置)，新 op 不会与旧
+        // 完成回调撞 token / op_id；下面 debug_assert 让任何意外残留
+        // 在 test mode 立即响。
         self.sqs.clear();
         self.cqs.clear();
         self.pending_fetches.clear();
@@ -524,6 +530,9 @@ impl NvmeController {
         self.dual_prp_writes.clear();
         self.prp_list_ops.clear();
         self.sqe_inbox.clear();
+        debug_assert!(self.pending_ios.is_empty());
+        debug_assert!(self.dual_prp_writes.is_empty());
+        debug_assert!(self.prp_list_ops.is_empty());
         // AEN queue 跨 reset 不保留 (NVMe spec § 5.2 "Implicit Aborts on Reset")
         self.aen_pending.clear();
         self.aen_last_err_count = self.stat_num_err_log_entries;
@@ -754,6 +763,25 @@ impl NvmeController {
                     }
                     2 => {
                         // Replace: 把 crkey 替换为 nrkey
+                        // **reviewer H1 修复**：nrkey 不能与现有 registrant
+                        // 冲突，否则 Vec 中出现重复 → Register 后续 contains
+                        // check 失真。spec § 6.13: "If the New Reservation Key
+                        // equals an existing key, the action shall fail."
+                        if ns.registrants.contains(&nrkey) && nrkey != crkey {
+                            tracing::warn!(
+                                nsid,
+                                nrkey,
+                                "Reservation Replace: nrkey conflicts existing registrant"
+                            );
+                            return Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::RESERVATION_CONFLICT,
+                                0,
+                            );
+                        }
                         if let Some(pos) = ns.registrants.iter().position(|&k| k == crkey) {
                             ns.registrants[pos] = nrkey;
                             if let Some((holder, t)) = ns.reservation
@@ -833,11 +861,30 @@ impl NvmeController {
                 let crkey = read_u64(data, 0);
                 match action {
                     0 => {
-                        // Release：仅当本 host 持有时清
+                        // Release：仅当本 host 持有时清。
+                        // **reviewer H2 修复**：区分 holder 不匹配（CONFLICT）
+                        // vs rtype 不匹配（INVALID_FIELD）。spec § 6.15。
                         match ns.reservation {
                             Some((holder, t)) if holder == crkey && t == rtype => {
                                 ns.reservation = None;
                                 tracing::info!(nsid, crkey, "Reservation Release OK");
+                            }
+                            Some((holder, t)) if holder == crkey && t != rtype => {
+                                tracing::warn!(
+                                    nsid,
+                                    crkey,
+                                    holder_type = t,
+                                    requested = rtype,
+                                    "Release rtype mismatch (INVALID_FIELD)"
+                                );
+                                return Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::INVALID_FIELD,
+                                    0,
+                                );
                             }
                             _ => {
                                 return Cqe::error(
