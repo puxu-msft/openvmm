@@ -66,6 +66,23 @@ fn build_zns_ns_identify(zns: &ZnsState) -> Vec<u8> {
     buf
 }
 
+/// **Phase L1d** — 构造 CNS 0x06 (I/O Command Set Independent Identify NS)。
+/// 抽成纯函数便于 unit test 字段 offset 和 RESCAP 与 CNS 0x00 的 spec
+/// 一致性约束。spec 见 NVMe 2.0 § 5.17.2.6 Figure 281。
+pub(crate) fn build_cs_indep_ns_identify() -> Vec<u8> {
+    let mut buf = vec![0u8; 4096];
+    buf[0] = 0x00; // NSFEAT
+    buf[1] = 0x00; // NMIC
+    buf[2] = 0x1E; // RESCAP **必须 == CNS 0x00 RESCAP** (spec § 5.17.2.6)
+    buf[3] = 0x00; // FPI = 0 (format complete)
+    // ANAGRPID @ 4..8 = 0
+    // NSATTR @ 8 = 0
+    // NVMSETID @ 9..11 = 0
+    // ENDGID @ 11..13 = 0
+    buf[13] = 0x00; // NSTAT bit 0 NRDY = 0 (ready)
+    buf
+}
+
 /// Test-only wrapper for `build_zns_ns_identify`。
 #[cfg(test)]
 pub(crate) fn __test_build_zns_ns_identify(zns: &ZnsState) -> Vec<u8> {
@@ -174,13 +191,11 @@ impl NvmeController {
                         }
                     }
                     0x06 => {
-                        // **Phase L1d** — Identify Namespace I/O Command Set
-                        // Independent Identify (spec NVMe 2.0 § 5.17.2.6)。
-                        // 4 KiB；驱动用它感知 NS 的 NSFEAT/NMIC/RESCAP 等
-                        // command-set-agnostic 属性。最关键的是字节 9 = NSTAT
-                        // 中 bit 0 = NRDY (NS Ready)；我们的 NS 总是 Ready。
-                        let Some(ns) = self.ns(nsid) else {
-                            // 0xFFFFFFFF broadcast / 未知 NSID → 零 buffer
+                        // **Phase L1d + reviewer H-L1d-1/2** — Identify Namespace
+                        // I/O Command Set Independent (spec NVMe 2.0 § 5.17.2.6
+                        // Figure 281)。委托 build_cs_indep_ns_identify 纯函数
+                        // (单测覆盖字段 offset + RESCAP cross-CNS 一致性)。
+                        if self.ns(nsid).is_none() {
                             return Some(Cqe::error(
                                 cid,
                                 0,
@@ -189,30 +204,8 @@ impl NvmeController {
                                 sc::INVALID_NAMESPACE,
                                 0,
                             ));
-                        };
-                        let mut buf = vec![0u8; 4096];
-                        // NSFEAT @ off 0 — bit 0 = THINP (thin provisioning)，
-                        // bit 1 = NSABP (deallocate after format) — 都 0
-                        buf[0] = 0x00;
-                        // NMIC @ off 1 — bit 0 = shared NS（不 share）
-                        buf[1] = 0x00;
-                        // RESCAP @ off 2 — Reservation Capabilities；
-                        // 与 Identify NS (CNS 0x00) RESCAP 字段保持一致。
-                        // 我们支持 Write/Exclusive Access 等 → bit 0..6 = 1
-                        // (spec § 5.17.2.1 RESCAP layout)
-                        buf[2] = 0x7F;
-                        // FPI @ off 3 — Format Progress Indicator；0 = 完成
-                        buf[3] = 0x00;
-                        // ANAGRPID @ off 4..8 — Asymmetric NS Access GID = 0
-                        // NSATTR @ off 9 — bit 0 = WP（write protect）；0
-                        // NVMSETID @ off 10..12 = 0
-                        // ENDGID @ off 12..14 = 0
-                        // NSTAT @ off 14 — bit 0 NRDY (NS Ready) = 1
-                        buf[14] = 0x01;
-                        // 其余 4082 bytes 留 0（教学；real device 还有 KPIOS
-                        // / MAXKT 等 KV-CS 字段）
-                        let _ = ns;
-                        buf
+                        }
+                        build_cs_indep_ns_identify()
                     }
                     0x1c => {
                         // **Phase L1d** — CNS 0x1c = I/O Command Set data

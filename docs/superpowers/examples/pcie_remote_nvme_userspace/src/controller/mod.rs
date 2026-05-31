@@ -1751,6 +1751,27 @@ impl PcieDevice for NvmeController {
                             // Phase F：真 IO 写完成 → 计数。
                             self.stat_host_writes += 1;
                             self.stat_lba_written += num_blocks as u64;
+                            // **Reviewer M-2** — 落到 ZNS NS 时推进 WP +
+                            // 状态 transition（Empty/Closed → ImplicitOpen；
+                            // 到达 capacity → Full）。
+                            if let Some(ns) = self.namespaces.get_mut(&p.nsid)
+                                && let Some(zns) = ns.zns.as_mut()
+                            {
+                                let zone_size = zns.zone_size;
+                                let capacity = zns.zone_capacity;
+                                let zone_idx = (lba / zone_size) as usize;
+                                if let Some(zone) = zns.zones.get_mut(zone_idx) {
+                                    zone.write_pointer += num_blocks as u64;
+                                    if zone.write_pointer >= capacity {
+                                        zone.state = ZoneState::Full;
+                                    } else if matches!(
+                                        zone.state,
+                                        ZoneState::Empty | ZoneState::Closed
+                                    ) {
+                                        zone.state = ZoneState::ImplicitOpen;
+                                    }
+                                }
+                            }
                             Cqe::success(p.cid, p.sq_id, p.sq_head, phase)
                         }
                         Err(e) => {
@@ -3224,5 +3245,28 @@ mod tests {
             u32::from_le_bytes(buf[8..12].try_into().unwrap()),
             0xFFFF_FFFF
         );
+    }
+
+    /// **Reviewer H-L1d-1/2** — CNS 0x06 I/O CS Independent NS Identify 字段
+    /// offset 与 RESCAP cross-CNS 一致性。
+    #[test]
+    fn cs_indep_ns_identify_layout_and_rescap_consistency() {
+        use crate::controller::admin::build_cs_indep_ns_identify;
+        let buf = build_cs_indep_ns_identify();
+        assert_eq!(buf.len(), 4096);
+        // NSFEAT @ 0 = 0
+        assert_eq!(buf[0], 0x00);
+        // NMIC @ 1 = 0
+        assert_eq!(buf[1], 0x00);
+        // RESCAP @ 2 必须 = CNS 0x00 RESCAP (cmd.rs:553 = 0x1E)。spec § 5.17.2.6
+        // 强制 cross-CNS 一致。
+        assert_eq!(buf[2], 0x1E);
+        // FPI @ 3 = 0 (format complete)
+        assert_eq!(buf[3], 0x00);
+        // NSTAT @ 13 — bit 0 NRDY 'Not Ready' = 0 表示 ready。**之前 commit
+        // 错写 buf[14]=1 + 把 NRDY 取反**，本测试锁定修复后的 layout：
+        assert_eq!(buf[13], 0x00, "NSTAT @ offset 13, NRDY=0 means ready");
+        // byte 14 是 NVMe 2.0 reserved，必须 0
+        assert_eq!(buf[14], 0x00, "byte 14 is reserved per NVMe 2.0");
     }
 }

@@ -582,6 +582,74 @@ impl NvmeController {
                         ));
                     }
                 }
+                // **Reviewer M-2** — 普通 NVM WRITE 落到 ZNS NS 时必须强制
+                // SWR (Sequential Write Required) + 状态 / 边界检查。
+                // 否则 driver 能用 plain WRITE 绕过 ZONE_APPEND，向 Full/
+                // ReadOnly/Offline zone 写、或乱序写破坏 SWR 语义。
+                if let Some(zns) = ns.zns.as_ref() {
+                    let zone_idx = (slba / zns.zone_size) as usize;
+                    if let Some(zone) = zns.zones.get(zone_idx) {
+                        // 边界：write 不能跨 zone（SWR 要求 single-zone）
+                        let zone_end = (zone_idx as u64 + 1) * zns.zone_size;
+                        if slba + nlb as u64 > zone_end {
+                            return Some(Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::ZONE_BOUNDARY_ERR,
+                                sc::SCT_COMMAND_SPECIFIC,
+                            ));
+                        }
+                        // 状态：ReadOnly/Offline/Full 拒绝
+                        match zone.state {
+                            ZoneState::ReadOnly => {
+                                return Some(Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::ZONE_IS_READ_ONLY,
+                                    sc::SCT_COMMAND_SPECIFIC,
+                                ));
+                            }
+                            ZoneState::Offline => {
+                                return Some(Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::ZONE_IS_OFFLINE,
+                                    sc::SCT_COMMAND_SPECIFIC,
+                                ));
+                            }
+                            ZoneState::Full => {
+                                return Some(Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::ZONE_IS_FULL,
+                                    sc::SCT_COMMAND_SPECIFIC,
+                                ));
+                            }
+                            _ => {}
+                        }
+                        // SWR：SLBA 必须 = zone_start + WP（顺序写）
+                        let zone_start = zone_idx as u64 * zns.zone_size;
+                        let expected_lba = zone_start + zone.write_pointer;
+                        if slba != expected_lba {
+                            return Some(Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::ZONE_INVALID_WRITE,
+                                sc::SCT_COMMAND_SPECIFIC,
+                            ));
+                        }
+                    }
+                }
                 // 三档 PRP 分流（同 READ 路径）：≤1page / ≤2page / PRP list。
                 if bytes <= NVME_PAGE_SIZE {
                     let tok = ctx.dma_read(prp1, bytes as u32);
