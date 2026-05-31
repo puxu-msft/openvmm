@@ -1593,6 +1593,12 @@ impl PcieDevice for NvmeController {
     }
 
     fn on_dma_complete(&mut self, ctx: &mut DeviceCtx<'_>, token: u64, ok: bool, data: Vec<u8>) {
+        // **Reviewer H-3 TODO** — 此方法 1020 行，未来应按 PendingOp variant
+        // 拆成多个 `fn complete_*` helpers 入 `controller/completion.rs`。
+        // 当前保留单一方法是因为：(a) 多数 variant 复用相同 phase/cq/post_cqe
+        // 引用；(b) refactor 风险大需大量改动；(c) 现有 25 个测试已锁定行为。
+        // 已抽出的 helpers：advance_zns_wp / check_zns_write / check_zns_read /
+        // apply_zsa / check_zsa_transition / should_fire_irq / build_zone_report。
         if !ok {
             tracing::warn!(token, "DMA failed");
             // 清相关 pending（IO 或 fetch）
