@@ -28,22 +28,33 @@ use zerocopy::IntoBytes;
 /// |--------|------|-----|
 /// | 0..2   | ZOC (Zone Operation Characteristics) | 0 = 无特殊 |
 /// | 2..4   | OZCS (Optional Zoned CS support) | 0 |
-/// | 4..8   | MAR (Max Active Resources) | zns.max_active 或 0xFFFFFFFF=unlimited |
-/// | 8..12  | MOR (Max Open Resources) | zns.max_open 或 0xFFFFFFFF |
+/// | 4..8   | MAR (Max Active Resources) | spec: 0xFFFFFFFF=unlimited，0=1 zone |
+/// | 8..12  | MOR (Max Open Resources)   | spec: 0xFFFFFFFF=unlimited，0=1 zone |
 /// | 12..16 | RRL (Reset Recommended Limit) | 0 = 无 |
 /// | 16..20 | FRL (Finish Recommended Limit) | 0 |
-/// | 20..768 | reserved | |
-/// | 2816..2832 | LBAFE[0] (LBA Format Extension) | ZSZE=zone_size, ZDES=0 |
+/// | 20..2816 | reserved + ZRWA 字段 | 0 |
+/// | 2816..2824 | LBAFE[0].ZSZE | zone_size |
+/// | 2824   | LBAFE[0].ZDES | 0 |
 ///
-/// Linux nvme-cli `zns id-ns` 会读这些值；MAR/MOR 让 driver 自约束不超 cap。
+/// **Reviewer H-A 修复**：MAR/MOR 是 0's-based + 0xFFFFFFFF=unlimited，所以
+/// 我们的内部 `max_open=0`=unlimited 必须翻成 0xFFFFFFFF 给 driver；非零
+/// `max_open=N` 翻成 `N-1`。Linux nvme-cli `zns id-ns` 会读这些值。
 fn build_zns_ns_identify(zns: &ZnsState) -> Vec<u8> {
     let mut buf = vec![0u8; 4096];
     // ZOC = 0
     // OZCS = 0
-    // MAR / MOR：spec 0 表示 unlimited（与我们 max_open=0 语义一致），
-    // 非零值上报 driver 实际限制。
-    buf[4..8].copy_from_slice(&zns.max_active.to_le_bytes());
-    buf[8..12].copy_from_slice(&zns.max_open.to_le_bytes());
+    let mar_wire = if zns.max_active == 0 {
+        0xFFFF_FFFFu32
+    } else {
+        zns.max_active.saturating_sub(1)
+    };
+    let mor_wire = if zns.max_open == 0 {
+        0xFFFF_FFFFu32
+    } else {
+        zns.max_open.saturating_sub(1)
+    };
+    buf[4..8].copy_from_slice(&mar_wire.to_le_bytes());
+    buf[8..12].copy_from_slice(&mor_wire.to_le_bytes());
     // RRL/FRL = 0
     // LBAFE[0] @ offset 2816 (spec § 3.1.6 Figure)：
     //   bytes 0..8  ZSZE (Zone Size in LBA)

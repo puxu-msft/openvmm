@@ -217,9 +217,8 @@ pub mod sc {
     pub const INVALID_ZONE_STATE_TRANSITION: u8 = 0xBF;
     /// **Reviewer H-6** — Status Code Type values（NVMe spec Figure
     /// "Status Code – Status Code Type Definition"）。`Cqe::error`
-    /// 第二个参数。重要的是 ZNS / Compare / Reservation 等 Command-Specific
-    /// SC 必须配 `SCT_COMMAND_SPECIFIC=0x02`，否则 driver 把它当 Generic
-    /// 解释会失败。
+    /// 第二个参数。重要的是 ZNS / Reservation 等 Command-Specific SC 必须配
+    /// `SCT_COMMAND_SPECIFIC=0x01`，否则 driver 把它当 Generic 解释会失败。
     pub const SCT_GENERIC: u8 = 0x00;
     pub const SCT_COMMAND_SPECIFIC: u8 = 0x01;
     pub const SCT_MEDIA_DATA_INTEGRITY: u8 = 0x02;

@@ -1206,7 +1206,14 @@ impl NvmeController {
                             tracing::trace!(zone_idx = i, ?z.state, zsa, "skip illegal in select-all");
                             continue;
                         }
-                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte, 0));
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc_byte,
+                            sc::SCT_COMMAND_SPECIFIC,
+                        ));
                     }
                     // 资源差额：Open ZSA 把 Closed/Empty 变 ExplicitOpen
                     if zsa == 0x03 && matches!(z.state, ZoneState::Empty | ZoneState::Closed) {

@@ -3190,10 +3190,9 @@ mod tests {
         };
         let buf = __test_build_zns_ns_identify(&zns);
         assert_eq!(buf.len(), 4096);
-        // MAR @ 4..8
-        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 14);
-        // MOR @ 8..12
-        assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()), 7);
+        // **Reviewer H-A**：MAR/MOR 0's-based，所以 max_active=14 → wire=13。
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 13);
+        assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()), 6);
         // ZSZE @ 2816..2824
         assert_eq!(
             u64::from_le_bytes(buf[2816..2824].try_into().unwrap()),
@@ -3201,5 +3200,29 @@ mod tests {
         );
         // ZDES @ 2824 = 0
         assert_eq!(buf[2824], 0);
+    }
+
+    /// **Reviewer H-A** — MAR/MOR=0 (内部=unlimited) → wire = 0xFFFFFFFF。
+    #[test]
+    fn zns_ns_identify_unlimited_translation() {
+        use crate::controller::admin::__test_build_zns_ns_identify;
+        let zns = ZnsState {
+            zone_size: 1024,
+            zone_capacity: 1024,
+            max_open: 0,   // unlimited
+            max_active: 0, // unlimited
+            zones: vec![],
+        };
+        let buf = __test_build_zns_ns_identify(&zns);
+        // MAR = unlimited → 0xFFFFFFFF
+        assert_eq!(
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            0xFFFF_FFFF
+        );
+        // MOR = unlimited → 0xFFFFFFFF
+        assert_eq!(
+            u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            0xFFFF_FFFF
+        );
     }
 }
