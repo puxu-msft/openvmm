@@ -212,8 +212,17 @@ pub mod sc {
     /// Driver 看到此 SC 知道是 PI 不支持，而不是误判 driver bug。
     pub const INVALID_PROTECTION_INFO: u8 = 0x81;
     /// **Reviewer H2** — ZNS Invalid Zone State Transition (spec ZNS § 5)。
-    /// Zone Mgmt Send 在非法 source state 上请求 transition 时返。
+    /// Zone Mgmt Send 在非法 source state 上请求 transition 时返；
+    /// 配 SCT_COMMAND_SPECIFIC 使用。
     pub const INVALID_ZONE_STATE_TRANSITION: u8 = 0xBF;
+    /// **Reviewer H-6** — Status Code Type values（NVMe spec Figure
+    /// "Status Code – Status Code Type Definition"）。`Cqe::error`
+    /// 第二个参数。重要的是 ZNS / Compare / Reservation 等 Command-Specific
+    /// SC 必须配 `SCT_COMMAND_SPECIFIC=0x02`，否则 driver 把它当 Generic
+    /// 解释会失败。
+    pub const SCT_GENERIC: u8 = 0x00;
+    pub const SCT_COMMAND_SPECIFIC: u8 = 0x01;
+    pub const SCT_MEDIA_DATA_INTEGRITY: u8 = 0x02;
 }
 
 /// Submission Queue Entry — 64 bytes 固定。

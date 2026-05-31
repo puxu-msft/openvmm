@@ -104,7 +104,7 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::RESERVATION_CONFLICT,
-                                0,
+                                sc::SCT_COMMAND_SPECIFIC,
                             );
                         }
                         // K9：把 controller 当前 host_id 一起记，若 driver
@@ -146,7 +146,7 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::RESERVATION_CONFLICT,
-                                0,
+                                sc::SCT_COMMAND_SPECIFIC,
                             );
                         }
                         if let Some(pos) = ns.rkey_pos(crkey) {
@@ -165,7 +165,7 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::RESERVATION_CONFLICT,
-                                0,
+                                sc::SCT_COMMAND_SPECIFIC,
                             );
                         }
                         tracing::info!(nsid, crkey, nrkey, "Reservation Replace OK");
@@ -181,7 +181,14 @@ impl NvmeController {
                 let prkey = read_u64(data, 8);
                 if !ns.has_rkey(crkey) {
                     tracing::warn!(nsid, crkey, "Acquire: crkey not registered");
-                    return Cqe::error(cid, sq_id, sq_head, phase, sc::RESERVATION_CONFLICT, 0);
+                    return Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::RESERVATION_CONFLICT,
+                        sc::SCT_COMMAND_SPECIFIC,
+                    );
                 }
                 if !(1..=6).contains(&rtype) {
                     return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
@@ -196,7 +203,7 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::RESERVATION_CONFLICT,
-                                0,
+                                sc::SCT_COMMAND_SPECIFIC,
                             );
                         }
                         ns.reservation = Some((crkey, rtype));
@@ -215,7 +222,7 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::RESERVATION_CONFLICT,
-                                0,
+                                sc::SCT_COMMAND_SPECIFIC,
                             );
                         }
                         ns.reservation = Some((crkey, rtype));
@@ -265,7 +272,7 @@ impl NvmeController {
                                     sq_head,
                                     phase,
                                     sc::RESERVATION_CONFLICT,
-                                    0,
+                                    sc::SCT_COMMAND_SPECIFIC,
                                 );
                             }
                         }
@@ -282,7 +289,7 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::RESERVATION_CONFLICT,
-                                0,
+                                sc::SCT_COMMAND_SPECIFIC,
                             );
                         }
                         if ns.reservation.is_some() {

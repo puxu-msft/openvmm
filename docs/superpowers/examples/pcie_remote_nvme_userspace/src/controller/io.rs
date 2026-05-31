@@ -136,6 +136,43 @@ pub(crate) fn __test_build_zone_report(
     build_zone_report(zns, start_zone_idx, bytes)
 }
 
+/// **Reviewer H-1** — Apply a single ZSA action to a zone in-place，仅在合法
+/// (check_zsa_transition 返 None) 且 non-no-op 时变更。返回 `true` 表示发生
+/// 状态变更。抽成纯函数便于单元测试 apply 路径的副作用（spec 表中标 `-`
+/// 的 no-op 不应有副作用 — 之前 commit 误改写）。
+pub(crate) fn apply_zsa(zone: &mut crate::controller::Zone, zsa: u8, zone_capacity: u64) -> bool {
+    if check_zsa_transition(zone.state, zsa).is_some() {
+        return false;
+    }
+    let is_noop = matches!(
+        (zone.state, zsa),
+        (ZoneState::Empty, 0x01)
+            | (ZoneState::Full, 0x01)
+            | (ZoneState::Full, 0x02)
+            | (ZoneState::ExplicitOpen, 0x03)
+            | (ZoneState::Closed, 0x01)
+            | (ZoneState::Offline, 0x05)
+    );
+    if is_noop {
+        return false;
+    }
+    match zsa {
+        0x01 => zone.state = ZoneState::Closed,
+        0x02 => {
+            zone.state = ZoneState::Full;
+            zone.write_pointer = zone_capacity;
+        }
+        0x03 => zone.state = ZoneState::ExplicitOpen,
+        0x04 => {
+            zone.state = ZoneState::Empty;
+            zone.write_pointer = 0;
+        }
+        0x05 => zone.state = ZoneState::Offline,
+        _ => unreachable!("check_zsa_transition gates unknown ZSA"),
+    }
+    true
+}
+
 impl NvmeController {
     /// IO command dispatch。Read/Write 走 DMA。
     pub(super) fn dispatch_io(
@@ -172,15 +209,21 @@ impl NvmeController {
                 let nsid = sqe.nsid;
                 let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
                 let nlb = (cdw12 & 0xffff) as u32 + 1;
-                // **Phase H7** — PRACT (Protection Information Action) bit 29
-                // 表示 driver 期望 controller 自动校验/生成 PI tuple。我们
-                // 没真实现 CRC/RefTag 引擎；driver 若发 PRACT=1 我们 reject
-                // 让其 fallback 到 PI=0 path（spec § 8.3：controller 可返
-                // INVALID_PROTECTION_INFO = SC 0x81，但 INVALID_FIELD 也
-                // 让 driver 知道）。
+                // **Phase H7 + reviewer H-5** — PRACT (Protection Information
+                // Action) bit 29 表示 driver 期望 controller 自动校验/生成 PI
+                // tuple。我们没真实现 CRC/RefTag 引擎；driver 若发 PRACT=1
+                // 返 INVALID_PROTECTION_INFO（SC 0x81）让 driver 明确是 PI
+                // 不支持而非 command bug。
                 if (cdw12 >> 29) & 0x1 != 0 {
                     tracing::warn!(nsid, "NVM READ with PRACT=1 not supported");
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_PROTECTION_INFO,
+                        0,
+                    ));
                 }
                 let bytes = nlb as u64 * SECTOR_SIZE;
                 tracing::debug!(
@@ -435,8 +478,16 @@ impl NvmeController {
                 let nlb = (cdw12 & 0xffff) as u32 + 1;
                 // Phase H7：PRACT bit 29，参 READ 注释
                 if (cdw12 >> 29) & 0x1 != 0 {
+                    // **Reviewer H-5** — INVALID_PROTECTION_INFO 与 READ 路径一致
                     tracing::warn!(nsid, "NVM WRITE with PRACT=1 not supported");
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_PROTECTION_INFO,
+                        0,
+                    ));
                 }
                 let bytes = nlb as u64 * SECTOR_SIZE;
                 tracing::debug!(
@@ -478,8 +529,7 @@ impl NvmeController {
                         // **Reviewer H5** — 多 LBA PI Write 未实现（K4c TODO）。
                         // INVALID_PROTECTION_INFO 让 driver 知道是 PI 限制而非
                         // command bug；driver 可降级回 LBAF[0]+DPS=0 重试。
-                        tracing::error!(nsid, slba, nlb,
-                            "multi-LBA PI Write rejected (K4c TODO)");
+                        tracing::error!(nsid, slba, nlb, "multi-LBA PI Write rejected (K4c TODO)");
                         return Some(Cqe::error(
                             cid,
                             sq_id,
@@ -1175,7 +1225,7 @@ impl NvmeController {
                             sq_head,
                             phase,
                             sc::TOO_MANY_OPEN_ZONES,
-                            0,
+                            sc::SCT_COMMAND_SPECIFIC,
                         ));
                     }
                     if max_active > 0 && cur_active + new_active > max_active {
@@ -1185,32 +1235,16 @@ impl NvmeController {
                             sq_head,
                             phase,
                             sc::TOO_MANY_ACTIVE_ZONES,
-                            0,
+                            sc::SCT_COMMAND_SPECIFIC,
                         ));
                     }
                 }
-                // 第二遍：apply transitions
+                // 第二遍：apply transitions — 委托 apply_zsa 纯函数（H-1 修复
+                // 后逻辑唯一来源，spec 表中 `-` no-op 不改写）。
                 let zone_capacity = zns.zone_capacity;
                 for i in zone_indices {
-                    // 二次校验（应已通过；select-all 时跳过非法）
                     let zone = &mut zns.zones[i];
-                    if check_zsa_transition(zone.state, zsa).is_some() {
-                        continue;
-                    }
-                    match zsa {
-                        0x01 => zone.state = ZoneState::Closed,
-                        0x02 => {
-                            zone.state = ZoneState::Full;
-                            zone.write_pointer = zone_capacity;
-                        }
-                        0x03 => zone.state = ZoneState::ExplicitOpen,
-                        0x04 => {
-                            zone.state = ZoneState::Empty;
-                            zone.write_pointer = 0;
-                        }
-                        0x05 => zone.state = ZoneState::Offline,
-                        _ => unreachable!("check_zsa_transition gates unknown ZSA"),
-                    }
+                    apply_zsa(zone, zsa, zone_capacity);
                 }
                 tracing::info!(nsid, zsa, select_all, "Zone Mgmt Send OK");
                 Some(Cqe::success(cid, sq_id, sq_head, phase))
@@ -1281,7 +1315,10 @@ impl NvmeController {
                 // 拒绝避免静默落 4 KiB 到本应 4104 块对齐的位置导致后续
                 // PI Read 全 GuardFail。
                 if ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled() {
-                    tracing::warn!(nsid, "ZONE_APPEND on PI NS rejected (K4c-ZNS unimplemented)");
+                    tracing::warn!(
+                        nsid,
+                        "ZONE_APPEND on PI NS rejected (K4c-ZNS unimplemented)"
+                    );
                     return Some(Cqe::error(
                         cid,
                         sq_id,
@@ -1324,14 +1361,28 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::ZONE_IS_READ_ONLY,
-                        0,
+                        sc::SCT_COMMAND_SPECIFIC,
                     ));
                 }
                 if matches!(zone.state, ZoneState::Offline) {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::ZONE_IS_OFFLINE, 0));
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::ZONE_IS_OFFLINE,
+                        sc::SCT_COMMAND_SPECIFIC,
+                    ));
                 }
                 if matches!(zone.state, ZoneState::Full) {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::ZONE_IS_FULL, 0));
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::ZONE_IS_FULL,
+                        sc::SCT_COMMAND_SPECIFIC,
+                    ));
                 }
                 if zone.write_pointer + nlb as u64 > zns.zone_capacity {
                     return Some(Cqe::error(
@@ -1340,7 +1391,7 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::ZONE_BOUNDARY_ERR,
-                        0,
+                        sc::SCT_COMMAND_SPECIFIC,
                     ));
                 }
                 // **Reviewer H2** — 隐式 Open 也要受 MAR/MOR 约束（spec ZNS § 2.2）
@@ -1351,10 +1402,7 @@ impl NvmeController {
                         .zones
                         .iter()
                         .filter(|z| {
-                            matches!(
-                                z.state,
-                                ZoneState::ImplicitOpen | ZoneState::ExplicitOpen
-                            )
+                            matches!(z.state, ZoneState::ImplicitOpen | ZoneState::ExplicitOpen)
                         })
                         .count();
                     let cur_active = zns
@@ -1376,7 +1424,7 @@ impl NvmeController {
                             sq_head,
                             phase,
                             sc::TOO_MANY_OPEN_ZONES,
-                            0,
+                            sc::SCT_COMMAND_SPECIFIC,
                         ));
                     }
                     if matches!(zone.state, ZoneState::Empty)
@@ -1389,7 +1437,7 @@ impl NvmeController {
                             sq_head,
                             phase,
                             sc::TOO_MANY_ACTIVE_ZONES,
-                            0,
+                            sc::SCT_COMMAND_SPECIFIC,
                         ));
                     }
                 }

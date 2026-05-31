@@ -224,26 +224,25 @@ impl NvmeController {
                         tracing::info!(ps, "Set Features Power Management");
                     }
                     cmd::fid::INTERRUPT_COALESCING => {
-                        // **Phase M1 + reviewer H6** — spec § 5.21.1.8。
+                        // **Phase M1 + reviewer H6/H-4** — spec § 5.21.1.8。
                         // cdw11 bits 7:0 = AGGR_THR (0-based)，
                         // bits 15:8 = AGGR_TIME (100 us 单位)。
                         //
                         // 教学 host 主循环 tick 周期 100 ms = 1000×100 us，
-                        // 实际能保证的 time-flush 上限 ≈ 100 ms。若 driver
-                        // 请求更细粒度（time < 1000 = 100 ms），我们诚实拒绝
-                        // 让 driver 知道而不是静默劣化 3 数量级。time=0 (关闭
-                        // time 维度) 与 time ≥ 1000 都接受。
+                        // 所以 AGGR_TIME 的实际时间下限是 100 ms 而非 spec
+                        // 的 100 us。我们 **接受** driver 的设置 + 发 warn 让
+                        // driver 通过日志感知粒度损失；不返 INVALID_FIELD
+                        // 是因为 spec 不允许 controller 拒绝合法的 cdw11，
+                        // 拒绝会让 driver 死循环（Linux nvme_set_features
+                        // 会 panic）。教学诚实 = 接受 + 显式 warn。
                         let aggr_thr = (cdw11 & 0xff) as u8;
                         let aggr_time = ((cdw11 >> 8) & 0xff) as u8;
-                        // 100 ms = 1000 × 100 us > u8::MAX (255)。所以任何
-                        // 非零 AGGR_TIME 都会被 tick 抹粗到 ≥ 100 ms。
-                        // 我们告知 driver 而非假装支持 100 us。
                         if aggr_time != 0 {
                             tracing::warn!(
-                                aggr_time,
+                                aggr_time_100us = aggr_time,
                                 tick_ms = 100,
-                                "Set Features INTERRUPT_COALESCING: AGGR_TIME finer than tick; \
-                                 actual time flush is bounded by tick (~100 ms)"
+                                "INTERRUPT_COALESCING AGGR_TIME finer than tick; \
+                                 actual time flush bounded by tick (~100 ms)"
                             );
                         }
                         self.irq_aggr_threshold = aggr_thr;

@@ -301,8 +301,9 @@ pub(super) struct ZnsState {
     /// 单 zone 可写 LBA 数（≤ zone_size；spec 留 capacity 给 metadata）。
     pub(super) zone_capacity: u64,
     /// Max Active Zones / Max Open Zones 限制（0 = 无限）。
-    /// **Reviewer H2 修复** — Zone Mgmt Send Open 现在真 enforce 这些限制
-    /// (spec ZNS § 2.2)。Identify NS ZNS 字段 MAR/MOR 会上报本值。
+    /// **Reviewer H2 修复** — Zone Mgmt Send Open + Append (隐式 Open) 现在
+    /// 真 enforce 这些限制 (spec ZNS § 2.2)。当前 default = 0 (无限)；未来
+    /// 接入 Identify NS ZNS-CS 字段 MAR/MOR 上报本值给 driver（TODO L1c）。
     pub(super) max_open: u32,
     pub(super) max_active: u32,
     /// per-zone 状态。zones[i] 对应 LBA 范围 [i*zone_size, (i+1)*zone_size)。
@@ -1242,7 +1243,14 @@ impl NvmeController {
                     );
                     self.stat_num_err_log_entries += 1;
                     self.push_error_log(sq_id, cid, (sc::COMPARE_FAILURE as u16) << 1, lba, nsid);
-                    Cqe::error(cid, sq_id, sq_head, phase, sc::COMPARE_FAILURE, 0)
+                    Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::COMPARE_FAILURE,
+                        sc::SCT_MEDIA_DATA_INTEGRITY,
+                    )
                 }
             }
             Err(e) => {
@@ -1562,8 +1570,7 @@ impl PcieDevice for NvmeController {
         // AGGR_TIME 单位 100 us；0 = 关闭时间维度，仅按 threshold 触发。
         let aggr_time_100us = self.irq_aggr_time;
         if aggr_time_100us > 0 {
-            let timeout =
-                std::time::Duration::from_micros(aggr_time_100us as u64 * 100);
+            let timeout = std::time::Duration::from_micros(aggr_time_100us as u64 * 100);
             let now = std::time::Instant::now();
             // 先收集 (cq_id, iv) 避免 borrow 冲突
             let mut to_fire: Vec<(u16, u16)> = Vec::new();
@@ -1645,16 +1652,31 @@ impl PcieDevice for NvmeController {
                         zone_idx,
                         prev_wp,
                         prev_state,
+                        num_blocks,
                         ..
                     } => {
-                        // **Reviewer H1** — Append DMA-fail：回滚预占的 WP/state。
-                        // 不回滚 zone 会永久错位（下次 Append 写到 hole 后面）。
+                        // **Reviewer H1 + M-1** — Append DMA-fail：尝试回滚预占
+                        // 的 WP/state。只在 WP 尚未被更新 Append 覆盖时回滚（即
+                        // 当前 WP 恰好 = prev_wp + num_blocks）。否则更晚的
+                        // Append 已预占，rollback 会破坏其 assigned_lba —
+                        // 这种情况留 hole（spec 允许 zone gap，driver 通过
+                        // Read SLBA 看到 zero data 推断）。
                         if let Some(ns) = self.namespaces.get_mut(&p.nsid)
                             && let Some(zns) = ns.zns.as_mut()
                             && let Some(zone) = zns.zones.get_mut(zone_idx)
                         {
-                            zone.write_pointer = prev_wp;
-                            zone.state = prev_state;
+                            let expected_wp = prev_wp + num_blocks as u64;
+                            if zone.write_pointer == expected_wp {
+                                zone.write_pointer = prev_wp;
+                                zone.state = prev_state;
+                            } else {
+                                tracing::warn!(
+                                    zone_idx,
+                                    cur_wp = zone.write_pointer,
+                                    expected = expected_wp,
+                                    "Append DMA-fail: newer reservation present, leaving hole"
+                                );
+                            }
                         }
                     }
                     _ => {}
@@ -1895,13 +1917,25 @@ impl PcieDevice for NvmeController {
                         Err(e) => {
                             tracing::warn!(error = %e, nsid, zone_idx, assigned_lba,
                                 "Zone Append backing failed; rolling back WP/state");
-                            // Rollback WP + state（避免下次 Append 落到错位）
+                            // **Reviewer M-1** — 同上 DMA-fail 路径：仅在
+                            // 当前 WP 仍 = prev_wp + num_blocks 时回滚，否则
+                            // 留 hole 避免破坏更晚 reservation 的 assigned_lba。
                             if let Some(ns) = self.namespaces.get_mut(&nsid)
                                 && let Some(zns) = ns.zns.as_mut()
                                 && let Some(zone) = zns.zones.get_mut(zone_idx)
                             {
-                                zone.write_pointer = prev_wp;
-                                zone.state = prev_state;
+                                let expected_wp = prev_wp + num_blocks as u64;
+                                if zone.write_pointer == expected_wp {
+                                    zone.write_pointer = prev_wp;
+                                    zone.state = prev_state;
+                                } else {
+                                    tracing::warn!(
+                                        zone_idx,
+                                        cur_wp = zone.write_pointer,
+                                        expected = expected_wp,
+                                        "leaving hole (newer reservation present)"
+                                    );
+                                }
                             }
                             self.stat_num_err_log_entries += 1;
                             self.push_error_log(
@@ -1911,14 +1945,7 @@ impl PcieDevice for NvmeController {
                                 assigned_lba,
                                 nsid,
                             );
-                            Cqe::error(
-                                p.cid,
-                                p.sq_id,
-                                p.sq_head,
-                                phase,
-                                sc::DATA_TRANSFER_ERROR,
-                                0,
-                            )
+                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR, 0)
                         }
                     };
                     self.post_cqe(ctx, p.cq_id, cqe);
@@ -2229,7 +2256,7 @@ impl PcieDevice for NvmeController {
                                         p.sq_head,
                                         phase,
                                         sc::COMPARE_FAILURE,
-                                        0,
+                                        sc::SCT_MEDIA_DATA_INTEGRITY,
                                     )
                                 }
                             }
@@ -3016,6 +3043,93 @@ mod tests {
         // Unknown ZSA
         assert_eq!(check_zsa_transition(Empty, 0xAA), Some(sc::INVALID_FIELD));
         assert_eq!(check_zsa_transition(Full, 0x00), Some(sc::INVALID_FIELD));
+    }
+
+    /// **Reviewer H-1 (2nd round)** — apply_zsa 必须保留 spec 表中 `-` 的
+    /// no-op 不改写 source state。之前 commit 错误地把 Close on Empty/Full
+    /// 等都改写到了 Closed。
+    #[test]
+    fn zns_apply_noop_preserves_state() {
+        use crate::controller::io::apply_zsa;
+        let mk = |s: ZoneState, wp: u64| Zone {
+            write_pointer: wp,
+            state: s,
+        };
+        // Close on Empty/Full/Closed → no change，返回 false
+        let mut z = mk(ZoneState::Empty, 0);
+        assert!(!apply_zsa(&mut z, 0x01, 1024));
+        assert_eq!(z.state, ZoneState::Empty);
+        let mut z = mk(ZoneState::Full, 1024);
+        assert!(!apply_zsa(&mut z, 0x01, 1024));
+        assert_eq!(z.state, ZoneState::Full);
+        assert_eq!(z.write_pointer, 1024);
+        let mut z = mk(ZoneState::Closed, 500);
+        assert!(!apply_zsa(&mut z, 0x01, 1024));
+        assert_eq!(z.state, ZoneState::Closed);
+        // Finish on Full → no change
+        let mut z = mk(ZoneState::Full, 1024);
+        assert!(!apply_zsa(&mut z, 0x02, 1024));
+        assert_eq!(z.state, ZoneState::Full);
+        // Open on ExplicitOpen → no change
+        let mut z = mk(ZoneState::ExplicitOpen, 100);
+        assert!(!apply_zsa(&mut z, 0x03, 1024));
+        assert_eq!(z.state, ZoneState::ExplicitOpen);
+        // Offline on Offline → no change
+        let mut z = mk(ZoneState::Offline, 0);
+        assert!(!apply_zsa(&mut z, 0x05, 1024));
+        assert_eq!(z.state, ZoneState::Offline);
+    }
+
+    /// **Reviewer H-1** — apply_zsa 真改写 + 正确 WP transitions。
+    #[test]
+    fn zns_apply_real_transitions() {
+        use crate::controller::io::apply_zsa;
+        // Close on ImplicitOpen → Closed
+        let mut z = Zone {
+            write_pointer: 200,
+            state: ZoneState::ImplicitOpen,
+        };
+        assert!(apply_zsa(&mut z, 0x01, 1024));
+        assert_eq!(z.state, ZoneState::Closed);
+        assert_eq!(z.write_pointer, 200); // WP unchanged
+        // Finish on Empty → Full + WP = capacity
+        let mut z = Zone {
+            write_pointer: 0,
+            state: ZoneState::Empty,
+        };
+        assert!(apply_zsa(&mut z, 0x02, 1024));
+        assert_eq!(z.state, ZoneState::Full);
+        assert_eq!(z.write_pointer, 1024);
+        // Open on Empty → ExplicitOpen
+        let mut z = Zone {
+            write_pointer: 0,
+            state: ZoneState::Empty,
+        };
+        assert!(apply_zsa(&mut z, 0x03, 1024));
+        assert_eq!(z.state, ZoneState::ExplicitOpen);
+        // Reset on Full → Empty + WP = 0
+        let mut z = Zone {
+            write_pointer: 1024,
+            state: ZoneState::Full,
+        };
+        assert!(apply_zsa(&mut z, 0x04, 1024));
+        assert_eq!(z.state, ZoneState::Empty);
+        assert_eq!(z.write_pointer, 0);
+        // Offline on Full → Offline
+        let mut z = Zone {
+            write_pointer: 1024,
+            state: ZoneState::Full,
+        };
+        assert!(apply_zsa(&mut z, 0x05, 1024));
+        assert_eq!(z.state, ZoneState::Offline);
+        // Illegal: Open on Full → no change，返回 false（check_zsa_transition
+        // gates 它）
+        let mut z = Zone {
+            write_pointer: 1024,
+            state: ZoneState::Full,
+        };
+        assert!(!apply_zsa(&mut z, 0x03, 1024));
+        assert_eq!(z.state, ZoneState::Full);
     }
 
     /// **Reviewer M1** — Zone Report 边界 buffer：< 64 byte 不丢 header；
