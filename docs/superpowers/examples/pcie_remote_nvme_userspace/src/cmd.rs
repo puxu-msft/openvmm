@@ -164,6 +164,12 @@ pub mod nvm_opc {
     pub const RESERVATION_ACQUIRE: u8 = 0x11;
     /// Reservation Release (spec § 6.15)。
     pub const RESERVATION_RELEASE: u8 = 0x15;
+    /// **Phase L1** — Zone Management Send (ZNS CS § 4.4)。
+    pub const ZONE_MGMT_SEND: u8 = 0x79;
+    /// **Phase L1** — Zone Management Receive (ZNS CS § 4.5)。
+    pub const ZONE_MGMT_RECEIVE: u8 = 0x7a;
+    /// **Phase L1** — Zone Append (ZNS CS § 4.3)。
+    pub const ZONE_APPEND: u8 = 0x7d;
 }
 
 /// CQE.SC (Status Code) — Generic Command Status (NVMe spec 1.4 § 4.6.1.2.1).

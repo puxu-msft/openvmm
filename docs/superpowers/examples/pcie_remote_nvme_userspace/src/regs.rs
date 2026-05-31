@@ -45,6 +45,18 @@ pub enum Reg {
     Aqa = 0x24, // 4 bytes
     Asq = 0x28,   // 8 bytes
     Acq = 0x30,   // 8 bytes
+    /// **Phase L3** — Controller Memory Buffer Location (spec § 3.1.13)
+    Cmbloc = 0x38, // 4 bytes — RO, 0 = no CMB
+    /// **Phase L3** — CMB Size (spec § 3.1.14)
+    Cmbsz = 0x3c, // 4 bytes — RO, 0 = no CMB
+    /// **Phase L3** — Boot Partition Information (spec § 3.1.15)
+    Bpinfo = 0x40, // 4 bytes — RO, 0 = no boot partition
+    /// **Phase L3** — Persistent Memory Region Capabilities (spec § 3.1.27)
+    Pmrcap = 0xe00, // 4 bytes — RO, 0 = no PMR
+    /// **Phase L3** — PMR Control
+    Pmrctl = 0xe04, // 4 bytes — RW (writes ignored when PMR=0)
+    /// **Phase L3** — PMR Status
+    Pmrsts = 0xe08, // 4 bytes — RO, 0 = no error
 }
 
 /// CC (Controller Configuration) bit layout。

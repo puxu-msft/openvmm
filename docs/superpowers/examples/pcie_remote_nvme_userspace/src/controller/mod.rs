@@ -15,6 +15,27 @@
 //! WriteData/WriteCqe），低 56 bits = 上下文（SQ ID + slot index）。
 //! 用 token 直接路由 `on_dma_complete` 回到对应处理函数，避免 host 端
 //! 维护 token → context map（O(1) match）。
+//!
+//! ## Phase M3 — Multi-queue 并发模型
+//!
+//! Phase H2 暴露了 4 个 IO queue (IO_QUEUE_CAP)；当前 dispatch 模型是
+//! **per-controller 单 worker 线程**串行处理所有 SQE：
+//! - SDK 的 `run` loop 单线程 select transport / tick
+//! - 每个 SQyTDBL 写入触发独立的 DMA-read，多 queue 的 fetches 可
+//!   并发在 wire (vsock) 上飞行；但完成时 `on_dma_complete` 仍单线程
+//!   处理 → SQE dispatch 是串行
+//! - 真并发收益只在 backing file IO 的并发性（多文件并行 read/write
+//!   是 OS-level 并发）
+//!
+//! **真正并发需要的改造**（留 future）：
+//! - 把 dispatch_sqe 改成 enqueue 到 per-SQ inbox + spawn N worker future
+//! - backing file IO 改 async (tokio::fs)，让 file op 并行 await
+//! - completion 回调 cross-thread → 需要 Mutex/atomic / channel 通信
+//! - 性能换复杂度比换 ~10x 教学清晰度，目前 trade-off 保单线程；真要
+//!   benchmark 可对比独立的 'multi-thread fork'。
+//!
+//! 教学：当前模型已足以展示 NVMe 协议正确性 + spec 全部命令。多 queue
+//! 体现在 driver 视角（4 SQ 可独立投 cmd，不互相 stall 等待 CQE）。
 
 mod admin;
 mod io;
@@ -1174,6 +1195,14 @@ impl PcieDevice for NvmeController {
             (0x30, 8) => self.acq,
             (0x30, 4) => self.acq & 0xffff_ffff,
             (0x34, 4) => self.acq >> 32,
+            // **Phase L3** — CMB / BPINFO / PMR 寄存器 RO 全 0 (capability
+            // 已声明不支持；driver 读到 0 知道不可用，spec-conformant 行为)
+            (0x38, _) => 0,             // CMBLOC
+            (0x3c, _) => 0,             // CMBSZ
+            (0x40, _) => 0,             // BPINFO
+            (0xe00, _) => 0,            // PMRCAP
+            (0xe04, _) => 0,            // PMRCTL
+            (0xe08, _) => 0,            // PMRSTS
             (o, _) if o >= 0x1000 => 0, // doorbell reads return 0 (write-only)
             _ => {
                 tracing::debug!(offset, size, "MMIO read: unknown offset");

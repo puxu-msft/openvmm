@@ -75,8 +75,8 @@ impl NvmeController {
                     ));
                 };
                 // **Phase K1** — IO 路径只走 LBAF[0] (512B no-meta no-PI)；
-                // 真 PI/4K 路径留 K4 完整实现。当前 lbaf 切了但 IO 不支持
-                // 时返 INVALID_FIELD 让 driver 走 PRACT=0 fallback。
+                // 真 PI/4K 路径见 K4_DESIGN.md (deferred)。当前 lbaf 切了
+                // 但 IO 不支持时返 INVALID_FIELD 让 driver 走 PRACT=0 fallback。
                 if ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled() {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
@@ -716,6 +716,24 @@ impl NvmeController {
                     }
                 }
                 Some(Cqe::success(cid, sq_id, sq_head, phase))
+            }
+            nvm_opc::ZONE_MGMT_SEND | nvm_opc::ZONE_MGMT_RECEIVE | nvm_opc::ZONE_APPEND => {
+                // **Phase L1** — ZNS opcodes 已识别。我们 NS 全是 NVM 命名
+                // 空间（CSI=0），无 ZNS NS → 返 SC=0x2A 'Zone Boundary Error'
+                // 简化版（spec 真应该返 SC=0xBE 'I/O Command Set Not Supported'
+                // for non-ZNS NS）。完整 ZNS 实现见 ZNS_DESIGN.md，需独立
+                // example 或大重构。
+                let opc = sqe.opcode();
+                let nsid = sqe.nsid;
+                tracing::debug!(opc, nsid, "ZNS opcode (no ZNS NS)");
+                Some(Cqe::error(
+                    cid,
+                    sq_id,
+                    sq_head,
+                    phase,
+                    sc::INVALID_OPCODE,
+                    0,
+                ))
             }
             nvm_opc::WRITE_UNCORRECTABLE => {
                 // NVMe NVM CS Spec § 3.3.6 Write Uncorrectable — 在指定
