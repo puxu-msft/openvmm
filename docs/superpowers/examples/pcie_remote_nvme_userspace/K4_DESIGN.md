@@ -1,4 +1,9 @@
-# Phase K4 — Real PI interleaved IO (deferred to micro-Phase K4b)
+# Phase K4 — Real PI interleaved IO (K4a/b/c ✅ 已完成 ≤ 2 page)
+
+> **Status**: K4a Write single-LBA + K4b Read single-LBA + K4c multi-LBA
+> Write/Read（dual-PRP ≤ 2 page）+ Write Zeroes / Verify all done.
+> PRP-list (> 2 page) PI 路径仍返 INVALID_PROTECTION_INFO，留作后续扩展。
+> ZNS+PI 组合仍拒绝（H8 守卫）。
 
 ## 概述
 

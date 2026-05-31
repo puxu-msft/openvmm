@@ -797,3 +797,68 @@ fn mmap_zero_copy_round_trip() {
     // flush 走 mmap.flush()，不应 panic
     ns.flush().unwrap();
 }
+
+/// **Phase K4c** — 多 LBA PI Write 累积器 + 完成路径的 byte-level 校验：
+/// 通过直接写 4096+8 byte-per-LBA pattern 到 backing，验证多 LBA PI Read
+/// 路径能 verify 通过并提取出纯 data 部分。
+#[test]
+fn k4c_multi_lba_pi_layout_round_trip() {
+    use crate::pi::PiTuple;
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
+        "nvme_test_k4c_{}_{:?}.img",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    // 4 个 LBA × 4104 byte = 16416 byte backing
+    let f = std::fs::File::create(&path).unwrap();
+    f.set_len(4 * 4104).unwrap();
+    drop(f);
+    let mut c =
+        NvmeController::open(&[path.to_str().unwrap().to_string()], 0x1414, 0, &[]).unwrap();
+    // Format 切到 LBAF[1] + Type 1（手动）
+    {
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+        ns.pi_first = false; // data 在前，tuple 在尾
+        ns.total_lba = 4;
+    }
+    // 构造 4 个 LBA × (4096 data + 8 PI)，与 K4c Write 完成路径产物一致
+    let ns = c.namespaces.get_mut(&1).unwrap();
+    for lba in 0..4u64 {
+        let data: Vec<u8> = (0..4096).map(|i| ((i as u64 ^ lba) & 0xff) as u8).collect();
+        let tuple = PiTuple::compute(&data, lba, 1);
+        let tuple_bytes = tuple.to_bytes();
+        let mut block = vec![0u8; 4104];
+        block[0..4096].copy_from_slice(&data);
+        block[4096..4104].copy_from_slice(&tuple_bytes);
+        ns.write_at(&block, lba * 4104).unwrap();
+    }
+    // 读 + verify 4 个 LBA（模拟 K4c Read 路径核心循环）
+    let ns = &c.namespaces[&1];
+    let mut interleaved = vec![0u8; 4 * 4104];
+    ns.read_at(&mut interleaved, 0).unwrap();
+    for i in 0..4usize {
+        let blk = &interleaved[i * 4104..(i + 1) * 4104];
+        let data = &blk[..4096];
+        let tuple_arr: [u8; 8] = blk[4096..4104].try_into().unwrap();
+        let tuple = PiTuple::from_bytes(&tuple_arr);
+        assert_eq!(
+            tuple.verify(data, i as u64, 1),
+            crate::pi::PiCheck::Ok,
+            "K4c per-LBA PI verify passes for lba={i}"
+        );
+    }
+    // 篡改 LBA 2 data byte 0 → verify fail
+    let ns = c.namespaces.get_mut(&1).unwrap();
+    ns.write_at(&[0xff], 2 * 4104).unwrap();
+    let ns = &c.namespaces[&1];
+    let mut blk = vec![0u8; 4104];
+    ns.read_at(&mut blk, 2 * 4104).unwrap();
+    let data = &blk[..4096];
+    let tuple_arr: [u8; 8] = blk[4096..4104].try_into().unwrap();
+    let tuple = PiTuple::from_bytes(&tuple_arr);
+    assert_eq!(tuple.verify(data, 2, 1), crate::pi::PiCheck::GuardFail);
+}

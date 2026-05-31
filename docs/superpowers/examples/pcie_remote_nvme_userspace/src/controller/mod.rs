@@ -168,6 +168,29 @@ pub(super) enum PendingOp {
         prev_state: ZoneState,
         num_blocks: u32,
     },
+    /// **Phase K4c** — 多 LBA PI Write 数据段。op_id 索引 `pi_writes`
+    /// 累积器；page_idx = 本回调对应 `received[page_idx*4096..]`
+    /// （单 PRP=0；dual-PRP 0/1；PRP-list 0/1/2/.../N-1）。
+    NvmWritePiMulti { op_id: u64, page_idx: u32 },
+}
+
+/// **Phase K4c** — 多 LBA PI Write 累积器。每个 DMA-read 完成填一段
+/// `received`；`pages_done == pages_total` 时按 LBA 切 4096-byte data，
+/// per-LBA compute PiTuple + interleave 4104-byte blocks 写到 backing。
+pub(super) struct PiWriteAccum {
+    pub(super) nsid: u32,
+    pub(super) slba: u64,
+    pub(super) num_blocks: u32,
+    #[allow(dead_code)] // useful for diagnostics; received.len() 同义
+    pub(super) data_bytes_total: usize,
+    /// 全 LBA data，已按 page_idx 顺序填入。
+    pub(super) received: Vec<u8>,
+    pub(super) pages_done: u32,
+    pub(super) pages_total: u32,
+    pub(super) sq_id: u16,
+    pub(super) cid: u16,
+    pub(super) sq_head: u16,
+    pub(super) cq_id: u16,
 }
 
 /// 双 PRP Write 累积：两段 DMA-read 任一先到都填到 prp1_data/prp2_data；
@@ -532,6 +555,8 @@ pub struct NvmeController {
     pub(super) prp_list_ops: HashMap<u64, PrpListOp>,
     /// **Phase K2** — Compare > 1 page 累积（dual PRP / PRP list）。
     pub(super) compare_ops: HashMap<u64, CompareAccum>,
+    /// **Phase K4c** — 多 LBA PI Write 累积。op_id → 全 data + 完成进度。
+    pub(super) pi_writes: HashMap<u64, PiWriteAccum>,
     /// 待 dispatch 的 SQE 队列（按 FIFO 顺序），dispatch 是 sync 逻辑但
     /// 触发 DMA 后异步完成。
     sqe_inbox: Vec<(u16, u16, Sqe)>, // (sq_id, sq_head_after_fetch, sqe)
@@ -862,6 +887,7 @@ impl NvmeController {
             next_op_id: 1,
             prp_list_ops: HashMap::new(),
             compare_ops: HashMap::new(),
+            pi_writes: HashMap::new(),
             sqe_inbox: Vec::new(),
             stat_host_reads: 0,
             stat_host_writes: 0,
@@ -970,11 +996,13 @@ impl NvmeController {
         self.dual_prp_writes.clear();
         self.prp_list_ops.clear();
         self.compare_ops.clear();
+        self.pi_writes.clear();
         self.sqe_inbox.clear();
         debug_assert!(self.pending_ios.is_empty());
         debug_assert!(self.dual_prp_writes.is_empty());
         debug_assert!(self.prp_list_ops.is_empty());
         debug_assert!(self.compare_ops.is_empty());
+        debug_assert!(self.pi_writes.is_empty());
         // AEN queue 跨 reset 不保留 (NVMe spec § 5.2 "Implicit Aborts on Reset")
         self.aen_pending.clear();
         self.aen_last_err_count = self.stat_num_err_log_entries;
@@ -1714,6 +1742,14 @@ impl PcieDevice for NvmeController {
                         });
                         self.compare_ops.remove(&op_id);
                     }
+                    PendingOp::NvmWritePiMulti { op_id, .. } => {
+                        // **Phase K4c** — 多 LBA PI Write sibling cleanup
+                        self.pending_ios.retain(|_, q| {
+                            !matches!(q.op,
+                                PendingOp::NvmWritePiMulti { op_id: o, .. } if o == op_id)
+                        });
+                        self.pi_writes.remove(&op_id);
+                    }
                     PendingOp::NvmReadDualPrpSiblingHalf => {
                         // sibling tok2 (NvmReadDmaWrite) 还在 pending_ios 中；
                         // 移除避免它后续到达时给 driver post success CQE
@@ -2028,6 +2064,95 @@ impl PcieDevice for NvmeController {
                         }
                     };
                     self.post_cqe(ctx, p.cq_id, cqe);
+                }
+                PendingOp::NvmWritePiMulti { op_id, page_idx } => {
+                    // **Phase K4c** — 多 LBA PI Write 数据段到达。把数据
+                    // copy 到 accumulator.received 中对应 page；所有 page
+                    // 到齐时按 LBA 切 4096 + compute PI + interleave 写文件。
+                    let Some(accum) = self.pi_writes.get_mut(&op_id) else {
+                        tracing::warn!(op_id, "NvmWritePiMulti: unknown op_id");
+                        return;
+                    };
+                    let off = page_idx as usize * NVME_PAGE_SIZE as usize;
+                    let end = (off + data.len()).min(accum.received.len());
+                    accum.received[off..end].copy_from_slice(&data[..end - off]);
+                    accum.pages_done += 1;
+                    if accum.pages_done < accum.pages_total {
+                        return; // 还有 page 未到，等下一次完成
+                    }
+                    // 所有 page 到齐 — 拿 accumulator 出来处理
+                    let accum = self.pi_writes.remove(&op_id).unwrap();
+                    let nsid = accum.nsid;
+                    let cq_id = accum.cq_id;
+                    let cq = self.cqs.get(&cq_id);
+                    let phase = cq.map(|c| c.phase).unwrap_or(1);
+                    let cqe = if let Some(ns) = self.namespaces.get_mut(&nsid) {
+                        let pi_type = ns.pi_type;
+                        let pi_first = ns.pi_first;
+                        let block_bytes = ns.block_bytes() as usize;
+                        let data_bytes = ns.data_bytes() as usize;
+                        let mut ok = true;
+                        let mut last_err: Option<std::io::Error> = None;
+                        for i in 0..accum.num_blocks as usize {
+                            let lba = accum.slba + i as u64;
+                            let data_chunk = &accum.received[i * data_bytes..(i + 1) * data_bytes];
+                            let tuple = crate::pi::PiTuple::compute(data_chunk, lba, pi_type);
+                            let tuple_bytes = tuple.to_bytes();
+                            let mut block = vec![0u8; block_bytes];
+                            if pi_first {
+                                block[0..8].copy_from_slice(&tuple_bytes);
+                                block[8..8 + data_bytes].copy_from_slice(data_chunk);
+                            } else {
+                                block[0..data_bytes].copy_from_slice(data_chunk);
+                                block[data_bytes..data_bytes + 8].copy_from_slice(&tuple_bytes);
+                            }
+                            if let Err(e) = ns.write_at(&block, lba * block_bytes as u64) {
+                                ok = false;
+                                last_err = Some(e);
+                                break;
+                            }
+                        }
+                        if ok {
+                            self.stat_host_writes += 1;
+                            self.stat_lba_written += accum.num_blocks as u64;
+                            tracing::debug!(
+                                nsid,
+                                slba = accum.slba,
+                                num_blocks = accum.num_blocks,
+                                "K4c multi-LBA PI Write OK"
+                            );
+                            Cqe::success(accum.cid, accum.sq_id, accum.sq_head, phase)
+                        } else {
+                            let e = last_err.unwrap();
+                            tracing::warn!(error = %e, nsid, slba = accum.slba, "K4c PI Write fail");
+                            self.stat_num_err_log_entries += 1;
+                            self.push_error_log(
+                                accum.sq_id,
+                                accum.cid,
+                                (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                                accum.slba,
+                                nsid,
+                            );
+                            Cqe::error(
+                                accum.cid,
+                                accum.sq_id,
+                                accum.sq_head,
+                                phase,
+                                sc::DATA_TRANSFER_ERROR,
+                                0,
+                            )
+                        }
+                    } else {
+                        Cqe::error(
+                            accum.cid,
+                            accum.sq_id,
+                            accum.sq_head,
+                            phase,
+                            sc::INVALID_NAMESPACE,
+                            0,
+                        )
+                    };
+                    self.post_cqe(ctx, cq_id, cqe);
                 }
                 PendingOp::AdminSetHostIdentifier { exhid } => {
                     // **Phase K9** — host_id DMA-read 完成，存到 controller。

@@ -11,6 +11,7 @@ use crate::cmd::*;
 use crate::controller::NvmeController;
 use crate::controller::PendingIo;
 use crate::controller::PendingOp;
+use crate::controller::PiWriteAccum;
 use crate::controller::SECTOR_SIZE;
 use crate::controller::WriteAccum;
 use crate::controller::ZnsState;
@@ -399,23 +400,143 @@ impl NvmeController {
                     ));
                 }
                 if is_pi_path && nlb != 1 {
-                    // K4a/b 单 LBA only；多 LBA 路径 (K4c) 限定 ≤ 1 page 因
-                    // 单 4 KiB 只能装 1 个 LBA，driver 用多 LBA 必发 ≥ 2 page
-                    // = dual-PRP / PRP-list 路径才能传完整 data；这里
-                    // single-PRP entry 已最大 1 LBA。
-                    tracing::error!(
-                        nsid,
-                        nlb,
-                        "multi-LBA PI Read rejected (K4c TODO; use INVALID_PROTECTION_INFO)"
-                    );
-                    return Some(Cqe::error(
-                        cid,
-                        sq_id,
-                        sq_head,
-                        phase,
-                        sc::INVALID_PROTECTION_INFO,
-                        0,
-                    ));
+                    // **Phase K4c** — 多 LBA PI Read：从 backing file 读
+                    // nlb*4104 字节 → per-LBA verify PI → dma_write 仅 data
+                    // 部分到 host（nlb*4096，按 PRP 三档分流）。
+                    let pi_type = ns.pi_type;
+                    let pi_first = ns.pi_first;
+                    let block_bytes = ns.block_bytes() as usize; // 4104
+                    let data_bytes = ns.data_bytes() as usize; // 4096
+                    let total_lba = ns.total_lba;
+                    match slba.checked_add(nlb as u64) {
+                        Some(end) if end <= total_lba => {}
+                        _ => {
+                            return Some(Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::LBA_OUT_OF_RANGE,
+                                0,
+                            ));
+                        }
+                    }
+                    if (data_bytes as u64 * nlb as u64) > MDTS_MAX_BYTES {
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    }
+                    let mut interleaved = vec![0u8; block_bytes * nlb as usize];
+                    let ns_mut = self.ns_mut(nsid).unwrap();
+                    if let Err(e) = ns_mut.read_at(&mut interleaved, slba * block_bytes as u64) {
+                        tracing::warn!(error = %e, nsid, slba, nlb, "K4c PI READ backing fail");
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::DATA_TRANSFER_ERROR,
+                            0,
+                        ));
+                    }
+                    // Verify per-LBA + 抽出纯 data 部分
+                    let mut data_only = Vec::with_capacity(data_bytes * nlb as usize);
+                    for i in 0..nlb as usize {
+                        let lba_i = slba + i as u64;
+                        let blk = &interleaved[i * block_bytes..(i + 1) * block_bytes];
+                        let (data_slice, tuple_slice) = if pi_first {
+                            (&blk[8..8 + data_bytes], &blk[0..8])
+                        } else {
+                            (&blk[0..data_bytes], &blk[data_bytes..data_bytes + 8])
+                        };
+                        let tuple_arr: [u8; 8] = tuple_slice.try_into().unwrap();
+                        let pi = crate::pi::PiTuple::from_bytes(&tuple_arr);
+                        let check = pi.verify(data_slice, lba_i, pi_type);
+                        if let Some(sc_byte) = check.to_sc() {
+                            tracing::warn!(
+                                nsid,
+                                lba = lba_i,
+                                ?check,
+                                "K4c multi-LBA PI verify FAIL"
+                            );
+                            self.stat_num_err_log_entries += 1;
+                            self.push_error_log(sq_id, cid, (sc_byte as u16) << 1, lba_i, nsid);
+                            return Some(Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc_byte,
+                                sc::SCT_MEDIA_DATA_INTEGRITY,
+                            ));
+                        }
+                        data_only.extend_from_slice(data_slice);
+                    }
+                    // 三档 DMA-write 到 host PRP（与 plain READ 同分流）
+                    let payload_bytes = data_only.len() as u64;
+                    if payload_bytes <= NVME_PAGE_SIZE {
+                        let tok = ctx.dma_write(prp1, data_only);
+                        self.pending_ios.insert(
+                            tok,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmReadPiDmaWrite { num_blocks: nlb },
+                            },
+                        );
+                    } else if payload_bytes <= 2 * NVME_PAGE_SIZE {
+                        let split = NVME_PAGE_SIZE as usize;
+                        let part1 = data_only[..split].to_vec();
+                        let part2 = data_only[split..].to_vec();
+                        let tok1 = ctx.dma_write(prp1, part1);
+                        let tok2 = ctx.dma_write(prp2, part2);
+                        // tok1 dispatch sibling-half placeholder；tok2 处理
+                        // success CQE + counter（与 plain dual-PRP Read 一致）
+                        self.pending_ios.insert(
+                            tok1,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmReadDualPrpSiblingHalf,
+                            },
+                        );
+                        self.pending_ios.insert(
+                            tok2,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmReadPiDmaWrite { num_blocks: nlb },
+                            },
+                        );
+                    } else {
+                        // PRP list 路径：fetch list 页 + 按 page_idx dma_write
+                        // 借 prp_list_ops accumulator，但 data 已在 host 端
+                        // pre-built。简化教学版：本路径限 ≤ 2 page (K4c-list
+                        // 留后续；driver 端 NVMe 通常用 PRP list 才到 ≥ 3 page，
+                        // 教学小 LBA 用例罕见)。
+                        tracing::error!(
+                            nsid,
+                            nlb,
+                            payload_bytes,
+                            "K4c PI Read > 2 page not yet supported (PRP-list TODO)"
+                        );
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::INVALID_PROTECTION_INFO,
+                            0,
+                        ));
+                    }
+                    return None;
                 }
                 let total_lba = ns.total_lba;
                 // H4：checked_add 防 slba + nlb 溢出（driver bug / 恶意输入）。
@@ -655,18 +776,117 @@ impl NvmeController {
                         ));
                     }
                     if nlb != 1 {
-                        // **Reviewer H5** — 多 LBA PI Write 未实现（K4c TODO）。
-                        // INVALID_PROTECTION_INFO 让 driver 知道是 PI 限制而非
-                        // command bug；driver 可降级回 LBAF[0]+DPS=0 重试。
-                        tracing::error!(nsid, slba, nlb, "multi-LBA PI Write rejected (K4c TODO)");
-                        return Some(Cqe::error(
-                            cid,
-                            sq_id,
-                            sq_head,
-                            phase,
-                            sc::INVALID_PROTECTION_INFO,
-                            0,
-                        ));
+                        // **Phase K4c** — 多 LBA PI Write：data 体积
+                        // nlb * 4096，可能跨多个 PRP 页。简化教学路径：
+                        // 复用 plain Write 三档 PRP 机制（dual-PRP / PRP-list）
+                        // 读 host data 到 raw_data 累积器；完成时按 LBA 切片
+                        // compute PI tuple + interleave 写到 backing
+                        // （每 LBA 占 4104 字节）。
+                        let total_lba = ns.total_lba;
+                        match slba.checked_add(nlb as u64) {
+                            Some(end) if end <= total_lba => {}
+                            _ => {
+                                return Some(Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::LBA_OUT_OF_RANGE,
+                                    0,
+                                ));
+                            }
+                        }
+                        let data_bytes_total = ns.data_bytes() as u64 * nlb as u64;
+                        if data_bytes_total > MDTS_MAX_BYTES {
+                            return Some(Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::INVALID_FIELD,
+                                0,
+                            ));
+                        }
+                        let op_id = self.alloc_op_id();
+                        self.pi_writes.insert(
+                            op_id,
+                            PiWriteAccum {
+                                nsid,
+                                slba,
+                                num_blocks: nlb,
+                                data_bytes_total: data_bytes_total as usize,
+                                received: vec![0u8; data_bytes_total as usize],
+                                pages_done: 0,
+                                pages_total: data_bytes_total.div_ceil(NVME_PAGE_SIZE) as u32,
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                            },
+                        );
+                        // 三档：单 PRP / dual-PRP / PRP-list
+                        if data_bytes_total <= NVME_PAGE_SIZE {
+                            let tok = ctx.dma_read(prp1, data_bytes_total as u32);
+                            self.pending_ios.insert(
+                                tok,
+                                PendingIo {
+                                    sq_id,
+                                    cid,
+                                    sq_head,
+                                    cq_id,
+                                    nsid,
+                                    op: PendingOp::NvmWritePiMulti { op_id, page_idx: 0 },
+                                },
+                            );
+                        } else if data_bytes_total <= 2 * NVME_PAGE_SIZE {
+                            let part1 = NVME_PAGE_SIZE as u32;
+                            let part2 = (data_bytes_total - NVME_PAGE_SIZE) as u32;
+                            let tok1 = ctx.dma_read(prp1, part1);
+                            let tok2 = ctx.dma_read(prp2, part2);
+                            self.pending_ios.insert(
+                                tok1,
+                                PendingIo {
+                                    sq_id,
+                                    cid,
+                                    sq_head,
+                                    cq_id,
+                                    nsid,
+                                    op: PendingOp::NvmWritePiMulti { op_id, page_idx: 0 },
+                                },
+                            );
+                            self.pending_ios.insert(
+                                tok2,
+                                PendingIo {
+                                    sq_id,
+                                    cid,
+                                    sq_head,
+                                    cq_id,
+                                    nsid,
+                                    op: PendingOp::NvmWritePiMulti { op_id, page_idx: 1 },
+                                },
+                            );
+                        } else {
+                            // PRP-list：先 fetch list 页 + 后续 per-page DMA-read
+                            // 简化：本路径暂未在 PendingOp 加 PRP-list 变体，
+                            // 留为后续 K4c-list 扩展。当前 ≤ 2 page 已覆盖
+                            // ≤ 8 KiB = 2 个 4KiB-PI-LBA，足够 demo。
+                            self.pi_writes.remove(&op_id);
+                            tracing::error!(
+                                nsid,
+                                nlb,
+                                data_bytes_total,
+                                "K4c PI Write > 2 page (PRP-list TODO)"
+                            );
+                            return Some(Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::INVALID_PROTECTION_INFO,
+                                0,
+                            ));
+                        }
+                        return None;
                     }
                     let total_lba = ns.total_lba;
                     if slba >= total_lba {
