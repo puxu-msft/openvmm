@@ -143,4 +143,9 @@ pub struct CompletionQueue {
     pub interrupt_vector: u16,
     /// IV 中断是否使能（Create IO CQ 的 IEN bit）。
     pub interrupt_enabled: bool,
+    /// **Phase M1b** — 自上次 fire interrupt 起累积的未通知 CQE 数；当
+    /// 达到 controller-wide AGGR_THR + 1 时立即 fire；否则 tick 检 time。
+    pub pending_completions: u32,
+    /// 上次 fire interrupt 的时刻（None = 从未 fire 或刚 fire）。
+    pub last_fire: Option<std::time::Instant>,
 }

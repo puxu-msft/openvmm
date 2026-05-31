@@ -139,6 +139,8 @@ impl NvmeController {
                         head: 0,
                         interrupt_vector: iv,
                         interrupt_enabled: ien,
+                        pending_completions: 0,
+                        last_fire: None,
                     },
                 );
                 Some(Cqe::success(cid, 0, sq_head, phase))

@@ -132,7 +132,12 @@ fn run_main(args: Args) -> Result<()> {
             let device =
                 NvmeController::open(&args.backing_files, args.vid, args.ssvid, &args.zns_nsids)?;
             let opts = RunOptions {
-                tick_interval: Duration::from_secs(60),
+                // tick 用于：① Sanitize / Self-Test 进度推进 ② AEN 派发
+                // ③ **Phase M1b** Interrupt Coalescing time flush。原 60s
+                // 对前两个够用，但 IRQ coalescing 时间维度需更细——降到
+                // 100 ms（每秒 10 次，开销可忽略；driver 设的 AGGR_TIME
+                // 最小 100us 实际仍会被 tick 抹粗到 100ms，足够教学）。
+                tick_interval: Duration::from_millis(100),
                 read_timeout: Duration::from_secs(60),
             };
             match run(&driver, transport, device, opts).await {

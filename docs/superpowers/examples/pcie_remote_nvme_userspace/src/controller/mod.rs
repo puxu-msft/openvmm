@@ -583,6 +583,30 @@ pub(super) struct ErrorLogEntry {
     pub(super) nsid: u32,
 }
 
+/// **Phase M1b** — Interrupt Coalescing 决策（spec § 5.21.1.8）。
+///
+/// 返回 `true` 表示本次 CQE 应立即 fire MSI-X；`false` 表示先 batch，等
+/// 后续 CQE 凑齐 threshold 或 tick 路径检测到 AGGR_TIME 超时再 fire。
+///
+/// 抽成纯函数便于 unit test（避免 mock DeviceCtx）。
+///
+/// 规则（按 spec AGGR_THR/AGGR_TIME 0's-based 语义）：
+/// 1. Admin CQ (id=0) 永远立即 fire — spec 要求 admin 延迟最小
+/// 2. `pending >= AGGR_THR + 1`（0's-based：thr=0 → 阈值=1，立即；thr=3 → 4 触发）
+///
+/// AGGR_TIME 在 batch path 由 tick 单独处理（time flush）。
+pub(crate) fn should_fire_irq(
+    cq_id: u16,
+    pending: u32,
+    aggr_thr: u8,
+    _aggr_time_100us: u8,
+) -> bool {
+    if cq_id == 0 {
+        return true;
+    }
+    pending >= (aggr_thr as u32 + 1)
+}
+
 impl NvmeController {
     /// `backing_files`：每个文件成为一个 namespace（NSID 1, 2, ...）。
     /// 文件大小决定该 NS 容量（÷ 512 round down 到 LBA 数）。
@@ -763,6 +787,8 @@ impl NvmeController {
                 head: 0,
                 interrupt_vector: 0,
                 interrupt_enabled: true,
+                pending_completions: 0,
+                last_fire: None,
             },
         );
         self.state = CtrlState::Ready;
@@ -1172,8 +1198,17 @@ impl NvmeController {
         );
     }
 
-    /// 把 CQE 写入指定 CQ：DMA-write 16 字节 → fire interrupt。
+    /// 把 CQE 写入指定 CQ：DMA-write 16 字节 → fire interrupt（或 batch）。
+    ///
+    /// **Phase M1b** — Interrupt Coalescing (spec § 5.21.1.8)：
+    /// - AGGR_THR (0-based) → 每 (thr+1) 个 CQE 累积 fire 一次
+    /// - AGGR_TIME (100 us 单位) → 距 last_fire 超时强制 fire
+    /// 若 driver Set Features 0x08 时 thr=0 + time=0 → 退化为
+    /// "fire-on-every-CQE"（原行为）。Admin CQ (cq_id=0) 不参与
+    /// coalescing — spec 要求 admin 延迟最小。
     fn post_cqe(&mut self, ctx: &mut DeviceCtx<'_>, cq_id: u16, cqe: Cqe) {
+        let aggr_thr = self.irq_aggr_threshold;
+        let aggr_time_100us = self.irq_aggr_time;
         let Some(cq) = self.cqs.get_mut(&cq_id) else {
             tracing::warn!(cq_id, "post_cqe: unknown CQ");
             return;
@@ -1188,10 +1223,21 @@ impl NvmeController {
         if cq.tail == 0 {
             cq.phase ^= 1;
         }
+        // 累计未通知 CQE
+        cq.pending_completions = cq.pending_completions.saturating_add(1);
         tracing::debug!(cq_id, slot, gpa = format_args!("{:#x}", gpa), "post CQE");
         ctx.dma_write_fire_and_forget(gpa, bytes);
-        if iv_enabled {
+        if !iv_enabled {
+            return;
+        }
+        let must_fire = should_fire_irq(cq_id, cq.pending_completions, aggr_thr, aggr_time_100us);
+        if must_fire {
+            cq.pending_completions = 0;
+            cq.last_fire = Some(std::time::Instant::now());
             ctx.fire_interrupt(iv as u32);
+        } else if cq.last_fire.is_none() {
+            // 第一条 pending：记 timestamp 供 tick 检超时
+            cq.last_fire = Some(std::time::Instant::now());
         }
     }
 
@@ -1425,6 +1471,33 @@ impl PcieDevice for NvmeController {
                 // AEN Notice (type=0x02) info=0x05 'Sanitize Completed'
                 // log_id=0x81 Sanitize Status Log（spec § 5.2 Figure 174）。
                 let _ = self.fire_aen(ctx, 0x02, 0x05, 0x81);
+            }
+        }
+        // **Phase M1b** — Interrupt Coalescing 超时 flush
+        // (spec § 5.21.1.8 Interrupt Coalescing)：若 driver 设置 AGGR_TIME
+        // 且当前有 pending CQE 已超时未 fire → 强制 fire。
+        // AGGR_TIME 单位 100 us；0 = 关闭时间维度，仅按 threshold 触发。
+        let aggr_time_100us = self.irq_aggr_time;
+        if aggr_time_100us > 0 {
+            let timeout =
+                std::time::Duration::from_micros(aggr_time_100us as u64 * 100);
+            let now = std::time::Instant::now();
+            // 先收集 (cq_id, iv) 避免 borrow 冲突
+            let mut to_fire: Vec<(u16, u16)> = Vec::new();
+            for (&cq_id, cq) in self.cqs.iter_mut() {
+                if cq_id == 0 || !cq.interrupt_enabled || cq.pending_completions == 0 {
+                    continue;
+                }
+                let Some(last) = cq.last_fire else { continue };
+                if now.duration_since(last) >= timeout {
+                    to_fire.push((cq_id, cq.interrupt_vector));
+                    cq.pending_completions = 0;
+                    cq.last_fire = Some(now);
+                }
+            }
+            for (cq_id, iv) in to_fire {
+                tracing::trace!(cq_id, iv, "IRQ coalesce: time flush");
+                ctx.fire_interrupt(iv as u32);
             }
         }
     }
@@ -2682,5 +2755,24 @@ mod tests {
         assert_eq!(zns.zone_capacity, 2048);
         assert!(zns.zones.iter().all(|z| z.state == ZoneState::Empty));
         assert!(zns.zones.iter().all(|z| z.write_pointer == 0));
+    }
+
+    /// Phase M1b：Interrupt Coalescing 决策。
+    #[test]
+    fn irq_coalesce_decision() {
+        // Admin CQ 永远立即 fire
+        assert!(should_fire_irq(0, 1, 100, 100));
+        // 默认（thr=0）退化为 fire-on-every（0's-based：阈值=1）
+        assert!(should_fire_irq(1, 1, 0, 0));
+        assert!(should_fire_irq(1, 1, 0, 50));
+        // thr=3 (0-based → 需 4 个 pending) — 前 3 个 batch
+        assert!(!should_fire_irq(1, 1, 3, 0));
+        assert!(!should_fire_irq(1, 2, 3, 0));
+        assert!(!should_fire_irq(1, 3, 3, 0));
+        assert!(should_fire_irq(1, 4, 3, 0));
+        assert!(should_fire_irq(1, 5, 3, 0));
+        // thr=1 → 阈值=2，第 2 条 fire
+        assert!(!should_fire_irq(1, 1, 1, 0));
+        assert!(should_fire_irq(1, 2, 1, 0));
     }
 }
