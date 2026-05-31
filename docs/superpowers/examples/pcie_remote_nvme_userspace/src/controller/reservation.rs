@@ -40,6 +40,14 @@ impl Namespace {
     fn bump_gen(&mut self) {
         self.reservation_gen = self.reservation_gen.wrapping_add(1);
     }
+    /// **K9** — 按 rkey 找 registrant index。
+    fn rkey_pos(&self, k: u64) -> Option<usize> {
+        self.registrants.iter().position(|&(rk, _, _)| rk == k)
+    }
+    /// **K9** — 按 rkey 检查是否已注册。
+    fn has_rkey(&self, k: u64) -> bool {
+        self.rkey_pos(k).is_some()
+    }
 }
 
 impl NvmeController {
@@ -62,6 +70,9 @@ impl NvmeController {
         sq_head: u16,
         phase: u8,
     ) -> Cqe {
+        // K9：取 controller-level host_id 快照（在借 ns 前）。
+        let c_host_id_lo = self.host_id_lo;
+        let c_host_id_hi = self.host_id_hi;
         let Some(ns) = self.namespaces.get_mut(&nsid) else {
             return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_NAMESPACE, 0);
         };
@@ -81,7 +92,7 @@ impl NvmeController {
                     0 => {
                         // Register: 注册 nrkey 为本 host 的 key。要求 host 之前
                         // 未注册（避免重复）。
-                        if ns.registrants.contains(&nrkey) {
+                        if ns.has_rkey(nrkey) {
                             tracing::warn!(
                                 nsid,
                                 nrkey,
@@ -96,15 +107,17 @@ impl NvmeController {
                                 0,
                             );
                         }
-                        ns.registrants.push(nrkey);
+                        // K9：把 controller 当前 host_id 一起记，若 driver
+                        // 未 Set Features 0x81 设过则 (0, 0)，等价 anonymous。
+                        ns.registrants.push((nrkey, c_host_id_lo, c_host_id_hi));
                         ns.bump_gen();
                         tracing::info!(nsid, nrkey, "Reservation Register OK");
                     }
                     1 => {
                         // Unregister: 移除 crkey（若 crkey 还持有 reservation
                         // 也一并清）。
-                        let was_present = ns.registrants.contains(&crkey);
-                        ns.registrants.retain(|&k| k != crkey);
+                        let was_present = ns.has_rkey(crkey);
+                        ns.registrants.retain(|&(rk, _, _)| rk != crkey);
                         if let Some((holder, _)) = ns.reservation
                             && holder == crkey
                         {
@@ -121,7 +134,7 @@ impl NvmeController {
                         // 冲突，否则 Vec 中出现重复 → Register 后续 contains
                         // check 失真。spec § 6.13: "If the New Reservation Key
                         // equals an existing key, the action shall fail."
-                        if ns.registrants.contains(&nrkey) && nrkey != crkey {
+                        if ns.has_rkey(nrkey) && nrkey != crkey {
                             tracing::warn!(
                                 nsid,
                                 nrkey,
@@ -136,8 +149,9 @@ impl NvmeController {
                                 0,
                             );
                         }
-                        if let Some(pos) = ns.registrants.iter().position(|&k| k == crkey) {
-                            ns.registrants[pos] = nrkey;
+                        if let Some(pos) = ns.rkey_pos(crkey) {
+                            let (_, hid_lo, hid_hi) = ns.registrants[pos];
+                            ns.registrants[pos] = (nrkey, hid_lo, hid_hi);
                             if let Some((holder, t)) = ns.reservation
                                 && holder == crkey
                             {
@@ -165,7 +179,7 @@ impl NvmeController {
                 }
                 let crkey = read_u64(data, 0);
                 let prkey = read_u64(data, 8);
-                if !ns.registrants.contains(&crkey) {
+                if !ns.has_rkey(crkey) {
                     tracing::warn!(nsid, crkey, "Acquire: crkey not registered");
                     return Cqe::error(cid, sq_id, sq_head, phase, sc::RESERVATION_CONFLICT, 0);
                 }
@@ -299,7 +313,7 @@ pub(super) fn build_reservation_report(ns: &Namespace, bytes: usize) -> Vec<u8> 
     // REGCTL @ 5..7
     buf[5..7].copy_from_slice(&n_reg.to_le_bytes());
     // 每 registrant @ 64 + i*24
-    for (i, &rkey) in ns.registrants.iter().enumerate() {
+    for (i, &(rkey, hid_lo, _hid_hi)) in ns.registrants.iter().enumerate() {
         let off = 64 + i * 24;
         if off + 24 > buf.len() {
             break;
@@ -311,8 +325,9 @@ pub(super) fn build_reservation_report(ns: &Namespace, bytes: usize) -> Vec<u8> 
             .reservation
             .is_some_and(|(holder_key, _)| holder_key == rkey);
         buf[off + 2] = if holds { 0x01 } else { 0x00 };
-        // HOSTID (8) @ off+8 — 简化用 rkey 复用
-        buf[off + 8..off + 16].copy_from_slice(&rkey.to_le_bytes());
+        // HOSTID (8) @ off+8 — K9：真 HOSTID lo 64-bit；未设置时用 rkey 复用
+        let hostid = if hid_lo != 0 { hid_lo } else { rkey };
+        buf[off + 8..off + 16].copy_from_slice(&hostid.to_le_bytes());
         // RKEY (8) @ off+16
         buf[off + 16..off + 24].copy_from_slice(&rkey.to_le_bytes());
     }

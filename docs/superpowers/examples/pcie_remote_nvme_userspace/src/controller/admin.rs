@@ -240,6 +240,26 @@ impl NvmeController {
                         self.features.insert(fid, cdw11);
                         tracing::debug!(cdw11, "Set Features Interrupt Vector Config");
                     }
+                    cmd::fid::HOST_IDENTIFIER => {
+                        // **Phase K9** — spec § 5.21.1.27 Host Identifier。
+                        // cdw11 bit 0 = EXHID（0=8byte, 1=16byte）；PRP1
+                        // 指向 buffer。DMA-read 完成后存到 host_id_lo/hi。
+                        let exhid = cdw11 & 0x1 != 0;
+                        let bytes = if exhid { 16 } else { 8 };
+                        let tok = ctx.dma_read(sqe.prp1, bytes);
+                        self.pending_ios.insert(
+                            tok,
+                            crate::controller::PendingIo {
+                                sq_id: 0,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid: 0,
+                                op: crate::controller::PendingOp::AdminSetHostIdentifier { exhid },
+                            },
+                        );
+                        return None;
+                    }
                     cmd::fid::VOLATILE_WRITE_CACHE => {
                         // VWC bit 0 = WCE (Write Cache Enable)。我们 backing
                         // file 始终有 host page cache → WCE 实际不可关；
@@ -291,6 +311,18 @@ impl NvmeController {
                     cmd::fid::POWER_MANAGEMENT => {
                         // Phase K8：返实时 current_ps（不从 features map）
                         self.current_ps as u32
+                    }
+                    cmd::fid::HOST_IDENTIFIER => {
+                        // **K9** — Get Features 0x81 返 HOSTID 通过 PRP1，
+                        // CDW0 仅设 EXHID bit。我们 DMA-write 8 或 16 byte。
+                        let exhid = sqe.cdw11 & 0x1 != 0;
+                        let mut buf = vec![0u8; if exhid { 16 } else { 8 }];
+                        buf[0..8].copy_from_slice(&self.host_id_lo.to_le_bytes());
+                        if exhid {
+                            buf[8..16].copy_from_slice(&self.host_id_hi.to_le_bytes());
+                        }
+                        self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, 0, sq_head, cq_id);
+                        return None;
                     }
                     _ => {
                         // 其它：未 Set 过返 0 = spec 默认（多数 fid 默认 0

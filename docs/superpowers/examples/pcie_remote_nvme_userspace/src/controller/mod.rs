@@ -117,6 +117,9 @@ pub(super) enum PendingOp {
     NvmComparePrpListFetch { op_id: u64 },
     /// **Phase K2** — Compare PRP list per-page data DMA-read。
     NvmComparePrpListData { op_id: u64, page_idx: u32 },
+    /// **Phase K9** — Set Features 0x81 Host Identifier DMA-read 完成。
+    /// cdw11 bit 0 EXHID = 1 → 16 byte HOSTID；= 0 → 8 byte。
+    AdminSetHostIdentifier { exhid: bool },
 }
 
 /// 双 PRP Write 累积：两段 DMA-read 任一先到都填到 prp1_data/prp2_data；
@@ -222,11 +225,15 @@ pub(super) struct Namespace {
     /// **Phase K1** — PI in first 8 bytes of metadata (DPS bit 3)。
     /// true = first，false = last。spec § 5.17.2.1。
     pub(super) pi_first: bool,
-    /// **Phase H6** — 已注册的 host (HOSTID + RKEY)。
-    /// 简化：单 controller 模型下 host 由 64-bit reservation key 唯一标识。
-    /// 真硬件 multi-host 用 HOSTID（NVMe 2.0 spec § 6.13 推荐 16-byte）。
-    pub(super) registrants: Vec<u64>,
-    /// 当前 reservation 持有者的 key + type。None = unowned。
+    /// **Phase H6 + K9** — 已注册的 host 列表。每 entry =
+    /// (rkey, hostid_lo, hostid_hi) — 完整 16-byte HOSTID (spec § 5.21.1.27
+    /// Set Features 0x81 Host Identifier；driver 用 Get Features 0x81
+    /// 读出 controller 自己生成的 ID 或 driver 给出 ID)。
+    /// 我们简化：(hostid_lo=0, hostid_hi=0) 默认 = "anonymous host"，仅
+    /// 用 rkey 区分；K9 driver 若调 Set Features 0x81 设置真 HOSTID 我们
+    /// 把它和 rkey 一起记。
+    pub(super) registrants: Vec<(u64, u64, u64)>,
+    /// 当前 reservation 持有者的 key + type。
     pub(super) reservation: Option<(u64, u8)>,
     /// **Phase J reviewer M3 修复** — Reservation Status 'GEN' 字段，
     /// 单调递增（即使 unregister 也 +1），driver 用此感知 state 变化。
@@ -394,6 +401,13 @@ pub struct NvmeController {
     pub(super) irq_aggr_time: u8,
     /// AGGR_THR (8 bit) — Aggregation Threshold (0-based, 实际 = 值 + 1)。
     pub(super) irq_aggr_threshold: u8,
+
+    // ----- Phase K9: Host Identifier (spec § 5.21.1.27) -----
+    /// driver 通过 Set Features 0x81 提供的 host ID。EXHID=0 → 8 byte，
+    /// 高 64-bit = 0；EXHID=1 → 完整 16 byte。Get Features 0x81 回这两个。
+    /// 新 Register 时若设置过则填到 Namespace.registrants[].hid_lo/hi。
+    pub(super) host_id_lo: u64,
+    pub(super) host_id_hi: u64,
 
     // ----- 配置 -----
     vid: u16,
@@ -593,6 +607,8 @@ impl NvmeController {
             current_ps: 0,
             irq_aggr_time: 0,
             irq_aggr_threshold: 0,
+            host_id_lo: 0,
+            host_id_hi: 0,
             vid,
             ssvid,
             msix_count: 4, // admin (vec 0) + IO (vec 1) + 2 spare
@@ -1458,6 +1474,27 @@ impl PcieDevice for NvmeController {
                     // 让生命周期闭合。失败路径在 on_dma_complete 顶部 ok==
                     // false 分支统一 post error CQE（参 mod.rs DMA fail）。
                     tracing::trace!(token, "dual-PRP Read sibling half ok (no-op)");
+                }
+                PendingOp::AdminSetHostIdentifier { exhid } => {
+                    // **Phase K9** — host_id DMA-read 完成，存到 controller。
+                    if data.len() >= 8 {
+                        self.host_id_lo = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                    }
+                    if exhid && data.len() >= 16 {
+                        self.host_id_hi = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                    } else if !exhid {
+                        self.host_id_hi = 0;
+                    }
+                    tracing::info!(
+                        exhid,
+                        lo = format_args!("{:#x}", self.host_id_lo),
+                        hi = format_args!("{:#x}", self.host_id_hi),
+                        "Set Features Host Identifier"
+                    );
+                    let cq = self.cqs.get(&p.cq_id);
+                    let phase = cq.map(|c| c.phase).unwrap_or(1);
+                    let cqe = Cqe::success(p.cid, p.sq_id, p.sq_head, phase);
+                    self.post_cqe(ctx, p.cq_id, cqe);
                 }
                 PendingOp::AdminFwDownloadChunk { offset_bytes } => {
                     // **Phase H5** — FW chunk DMA-read 完成，写入累积 buffer
@@ -2348,7 +2385,7 @@ mod tests {
         buf[8..16].copy_from_slice(&0x1001u64.to_le_bytes()); // NRKEY
         let cqe = c.apply_reservation_cmd(nsid, ReservationKind::Register, 0, 0, &buf, 0, 0, 0, 1);
         assert_eq!(sc(&cqe), 0, "Register OK");
-        assert_eq!(c.namespaces[&nsid].registrants, vec![0x1001]);
+        assert_eq!(c.namespaces[&nsid].registrants, vec![(0x1001, 0, 0)]);
         // Acquire WriteExclusive (type=1)
         let mut buf = vec![0u8; 16];
         buf[0..8].copy_from_slice(&0x1001u64.to_le_bytes()); // CRKEY
