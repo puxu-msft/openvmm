@@ -301,8 +301,10 @@ bash docs/superpowers/scripts/build-windows-cross.sh
 - **Phase K1** — T10 DIF CRC16 engine（spec § 8.3，table-free 教学版）
 - **Phase K2** — Compare dual-PRP + PRP list 路径（与 Write 三档分流对齐）
 - **Phase K3** — NS Management Create/Delete + 临时 backing
-- **Phase K4a/b/c** — 真 PI Write/Read/Verify/WriteZeroes（单 LBA，
+- **Phase K4a/b** — 真 PI Write/Read/Verify/WriteZeroes（单 LBA，
   block_bytes=4104 interleave，positional IO 防 cursor race）
+- **Phase K4c** — 多 LBA PI Write/Read 真实现（dual-PRP ≤ 2 page，
+  PiWriteAccum 累积器 + per-LBA verify）
 - **Phase K5** — Sanitize 5 action state machine + IO quiesce
 - **Phase K6** — Doorbell Buffer Config（fast doorbell skip vsock round-trip）
 - **Phase K9** — Reservation full HOSTID 16-byte + monotonic GEN
@@ -310,20 +312,29 @@ bash docs/superpowers/scripts/build-windows-cross.sh
   Zone Mgmt Send/Receive/Append + 完整 state machine）
 - **Phase L1c** — Identify NS CNS 0x05 (ZNS) 上报 MAR/MOR/ZSZE
   （0-based + 0xFFFFFFFF=unlimited 翻译正确）
-- **Phase L1d** — Identify NS CNS 0x06 (I/O CS Indep) + CNS 0x1c
-  (I/O Command Sets bitmap) 让 driver 看到 NVM|ZNS 支持
+- **Phase L1d** — Identify CNS 0x06 (Specific Controller-for-CSI) +
+  CNS 0x08 (I/O CS Independent NS Identify) + CNS 0x1c (I/O Command Sets
+  bitmap = NVM|ZNS)
 - **Phase L2** — Reservation Notification Log (0x80)
 - **Phase L4** — Directive Send/Receive (Streams)
 - **Phase L5** — Security Send/Receive + Virtualization Mgmt + Get LBA Status
 - **Phase M1** — Set Features Interrupt Coalescing（cdw11 解析）
 - **Phase M1b** — 真 Interrupt Coalescing batch + tick-driven time flush
   （spec § 5.21.1.8，should_fire_irq 纯函数 + 单测）
-- **Phase M-2 (reviewer)** — plain NVM_WRITE 落到 ZNS NS 也强制 SWR +
-  zone state + 边界 + WP 推进
+- **Phase M-2** — plain NVM_WRITE / WRITE_ZEROES / READ 在 ZNS NS 上强制
+  SWR + zone state + 边界 + WP 推进（reviewer 修复）
+- **Phase M2** — mmap zero-copy backing（Namespace.mmap +
+  Unix mmap/Windows CreateFileMapping，hot-path 抹掉 kernel buf 拷贝）
 - **Phase N1** — SDK DeviceCtx outbound 单测
 - **Phase N1b** — SDK dispatch_inbound 路由测试 + CaptureDevice fixture
   （让 CI 不需要 live vsock 就能验证 protocol 路径）
 - **Phase N2** — NVMe 12-step 生命周期教学文档（docs/NVME_LIFECYCLE.md）
+- **Phase O1** — Simple Copy (0x19) — controller-side data movement
+  （driver 提供 source range list，controller 自己读 backing + 写 sdlba）
+- **Phase O2** — Fused Compare-and-Write dispatcher 检测（fuse=01/10 协议
+  pair 识别）；spec atomicity 真实现留 O3，所以 IdentifyController.fuses=0
+  暂不 advertise，避免 driver 误用做 distributed CAS。
 
-每 Phase 都过 rust-reviewer + 多数有 CRITICAL/HIGH 修复。当前总单测：
-NVMe controller 25 + SDK 13 = 38。
+每 Phase 都过 rust-reviewer + 多数有 CRITICAL/HIGH 修复。**8 轮 reviewer
+后 0 CRITICAL / 0 HIGH / 0 MEDIUM**：当前总单测 **NVMe controller 36 +
+SDK 13 = 49**。Production-ready as teaching example。

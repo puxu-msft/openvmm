@@ -2250,9 +2250,35 @@ impl PcieDevice for NvmeController {
                         return;
                     };
                     let off = page_idx as usize * NVME_PAGE_SIZE as usize;
-                    // Bounds-check defensively：page_idx 越界 / data 长度异常
-                    // 都立即 abort 整个 op，避免 silent corruption
-                    if off >= accum.received.len() || off + data.len() > accum.received.len() {
+                    // Bounds-check defensively（Reviewer LOW 1 后跟进）：
+                    // 用 checked_add 防 off + data.len() 理论 usize 溢出
+                    // （32-bit 平台上 page_idx u32 × 4096 + data.len() 4096
+                    // 仍 < usize::MAX，但 checked_add 是 defense-in-depth）。
+                    let Some(end_off) = off.checked_add(data.len()) else {
+                        tracing::error!(
+                            op_id,
+                            page_idx,
+                            data_len = data.len(),
+                            "K4c PI Write: page off+len overflow; aborting"
+                        );
+                        let accum = self.pi_writes.remove(&op_id).unwrap();
+                        let phase = self.cqs.get(&accum.cq_id).map(|c| c.phase).unwrap_or(1);
+                        let cqe = Cqe::error(
+                            accum.cid,
+                            accum.sq_id,
+                            accum.sq_head,
+                            phase,
+                            sc::DATA_TRANSFER_ERROR,
+                            0,
+                        );
+                        self.post_cqe(ctx, accum.cq_id, cqe);
+                        self.pending_ios.retain(|_, q| {
+                            !matches!(q.op,
+                                PendingOp::NvmWritePiMulti { op_id: o, .. } if o == op_id)
+                        });
+                        return;
+                    };
+                    if off >= accum.received.len() || end_off > accum.received.len() {
                         tracing::error!(
                             op_id,
                             page_idx,
