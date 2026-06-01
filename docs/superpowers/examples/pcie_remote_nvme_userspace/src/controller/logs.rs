@@ -119,14 +119,34 @@ pub(super) fn build_self_test(c: &NvmeController, bytes: usize) -> Vec<u8> {
     buf
 }
 
-/// **Log Page 0x80** — Reservation Notification (spec § 5.16.1.15)。
+/// **Phase H6 + S6** — Log Page 0x80 Reservation Notification (spec § 5.16.1.20)。
 ///
-/// 64 字节固定占位；ONCS.reservations 在 Phase H6 后 = 1，driver 可能真
-/// 拉这个 log。结构详见 spec：8 byte log_page_count + 1 byte
-/// log_page_type + 1 byte available_count + 2 reserved + 4 byte nsid +
-/// 48 reserved。我们目前不真追踪通知队列，全 0 = "no notifications pending"。
-pub(super) fn build_reservation_notification(_c: &NvmeController, bytes: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; bytes.max(64)];
+/// 64-byte entry：
+///   bytes 0..8   log_page_count (u64 LE) — 该 ctrl 全局递增计数（重启不归 0）
+///   bytes 8..9   log_page_type — 0 Empty / 1 Preempted / 2 Released /
+///                              3 Registration Preempted
+///   bytes 9..10  num_available — 同一 instant 还有几条未读
+///   bytes 10..12 reserved
+///   bytes 12..16 nsid
+///   bytes 16..64 reserved
+///
+/// 返回包含所有 queued entries 的 buffer；读后清空 queue 模拟 "consumed"。
+/// 教学：spec 允许 controller 自定 retention policy；我们用 read-then-clear。
+pub(super) fn build_reservation_notification(c: &NvmeController, bytes: usize) -> Vec<u8> {
+    let n_entries = c.reservation_notification_log.len();
+    let need = (n_entries * 64).max(64);
+    let mut buf = vec![0u8; bytes.max(need)];
+    for (i, e) in c.reservation_notification_log.iter().enumerate() {
+        let off = i * 64;
+        if off + 16 > buf.len() {
+            break;
+        }
+        buf[off..off + 8].copy_from_slice(&e.log_page_count.to_le_bytes());
+        buf[off + 8] = e.log_page_type;
+        // num_available = 剩余（自本 entry 起）
+        buf[off + 9] = (n_entries - i - 1).min(255) as u8;
+        buf[off + 12..off + 16].copy_from_slice(&e.nsid.to_le_bytes());
+    }
     buf.truncate(bytes);
     buf
 }

@@ -77,6 +77,9 @@ impl NvmeController {
         let Some(ns) = self.namespaces.get_mut(&nsid) else {
             return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_NAMESPACE, 0);
         };
+        // **Phase S6** — 累积本 cmd 触发的 notification type，match 结束后
+        // 借 &mut self push（避免与 `ns: &mut Namespace` 借用冲突）。
+        let mut notify_types: Vec<u8> = Vec::new();
         let read_u64 = |buf: &[u8], off: usize| {
             let mut a = [0u8; 8];
             a.copy_from_slice(&buf[off..off + 8]);
@@ -255,8 +258,13 @@ impl NvmeController {
                                 sc::SCT_COMMAND_SPECIFIC,
                             );
                         }
+                        let had_prior = ns.reservation.is_some();
                         ns.reservation = Some((crkey, rtype));
                         ns.bump_gen();
+                        // **Phase S6** — 之前有 holder 被抢占 → log type=1
+                        if had_prior {
+                            notify_types.push(1);
+                        }
                         tracing::info!(nsid, crkey, prkey, rtype, "Reservation Preempt OK");
                     }
                     _ => return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0),
@@ -276,6 +284,8 @@ impl NvmeController {
                             Some((holder, t)) if holder == crkey && t == rtype => {
                                 ns.reservation = None;
                                 ns.bump_gen();
+                                // **Phase S6** — Released → log type=2
+                                notify_types.push(2);
                                 tracing::info!(nsid, crkey, "Reservation Release OK");
                             }
                             Some((holder, t)) if holder == crkey && t != rtype => {
@@ -325,12 +335,18 @@ impl NvmeController {
                         if ns.reservation.is_some() {
                             ns.reservation = None;
                             ns.bump_gen();
+                            // **Phase S6** — Clear 等价 Released → log type=2
+                            notify_types.push(2);
                         }
                         tracing::info!(nsid, "Reservation Clear OK");
                     }
                     _ => return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0),
                 }
             }
+        }
+        // **Phase S6** — drain 累积的 notification（&mut ns 已释放）
+        for t in notify_types {
+            self.push_reservation_notification(t, nsid);
         }
         Cqe::success(cid, sq_id, sq_head, phase)
     }

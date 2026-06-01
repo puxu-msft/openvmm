@@ -1746,3 +1746,68 @@ fn identify_controller_list_cns_0x12_0x13() {
     let buf = extract_last_write(&outbound);
     assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 0, "detached → 0");
 }
+
+/// **Phase S6** — Reservation Release / Clear / Preempt 都应 push 一条
+/// Reservation Notification log entry。读 Log 0x80 时返 entries。
+#[test]
+fn reservation_notification_log_records_events() {
+    use crate::controller::ReservationKind;
+    let mut c = make_ctrl_with_tmp("resvnotif");
+    // 先 Register + Acquire 建立 holder
+    let nsid = 1u32;
+    let mut buf = vec![0u8; 16];
+    buf[8..16].copy_from_slice(&0xDEAD_BEEFu64.to_le_bytes()); // nrkey
+    let cqe = c.apply_reservation_cmd(
+        nsid,
+        ReservationKind::Register,
+        0,
+        0,
+        0,
+        &buf,
+        0,
+        0,
+        0,
+        1,
+    );
+    assert_eq!((cqe.dw3 >> 17) as u8, 0, "Register OK");
+    let mut buf = vec![0u8; 16];
+    buf[0..8].copy_from_slice(&0xDEAD_BEEFu64.to_le_bytes()); // crkey
+    let cqe = c.apply_reservation_cmd(
+        nsid,
+        ReservationKind::Acquire,
+        0,
+        1,
+        0,
+        &buf,
+        0,
+        0,
+        0,
+        1,
+    );
+    assert_eq!((cqe.dw3 >> 17) as u8, 0, "Acquire OK");
+    // 这两条不应 push notification
+    assert_eq!(c.reservation_notification_log.len(), 0);
+    // Release 触发 type=2
+    let cqe = c.apply_reservation_cmd(
+        nsid,
+        ReservationKind::Release,
+        0,
+        1,
+        0,
+        &buf,
+        0,
+        0,
+        0,
+        1,
+    );
+    assert_eq!((cqe.dw3 >> 17) as u8, 0, "Release OK");
+    assert_eq!(c.reservation_notification_log.len(), 1);
+    assert_eq!(c.reservation_notification_log[0].log_page_type, 2);
+    assert_eq!(c.reservation_notification_log[0].nsid, 1);
+    assert_eq!(c.reservation_notification_log[0].log_page_count, 1);
+    // Log Page 0x80 渲染
+    let log = crate::controller::logs::build_reservation_notification(&c, 64);
+    assert_eq!(u64::from_le_bytes(log[0..8].try_into().unwrap()), 1);
+    assert_eq!(log[8], 2, "log_page_type=Released");
+    assert_eq!(u32::from_le_bytes(log[12..16].try_into().unwrap()), 1);
+}

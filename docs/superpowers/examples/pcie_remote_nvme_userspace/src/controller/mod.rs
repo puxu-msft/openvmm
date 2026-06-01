@@ -68,6 +68,48 @@ pub(super) const IO_QUEUE_CAP: u16 = 4;
 // 不再做 token 高位 tagging（早期设计想用 tag 标 op 类别，实测 raw token
 // 已唯一，多此一举）。
 
+/// **Phase S6** — Reservation Notification Log entry (NVMe spec § 5.16.1.20)。
+///
+/// log_page_type 取值（spec Figure 162）：
+///   0 = Empty log page
+///   1 = Reservation Preempted
+///   2 = Reservation Released
+///   3 = Reservation Registration Preempted
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ReservationNotification {
+    pub log_page_count: u64,
+    pub log_page_type: u8,
+    pub nsid: u32,
+}
+
+impl NvmeController {
+    /// **Phase S6** — push 一条 Reservation Notification 到 ring buffer。
+    /// 保留末 32 条；log_page_count 单调递增。
+    pub(super) fn push_reservation_notification(
+        &mut self,
+        log_page_type: u8,
+        nsid: u32,
+    ) {
+        self.reservation_notification_count =
+            self.reservation_notification_count.wrapping_add(1);
+        let entry = ReservationNotification {
+            log_page_count: self.reservation_notification_count,
+            log_page_type,
+            nsid,
+        };
+        if self.reservation_notification_log.len() >= 32 {
+            self.reservation_notification_log.pop_front();
+        }
+        self.reservation_notification_log.push_back(entry);
+        tracing::debug!(
+            log_page_type,
+            nsid,
+            count = self.reservation_notification_count,
+            "Reservation Notification queued"
+        );
+    }
+}
+
 /// Pending IO command 等 DMA 完成。
 pub(super) struct PendingIo {
     sq_id: u16,
@@ -745,6 +787,15 @@ pub struct NvmeController {
     /// log / FW 状态读 generation 变化感知 erase 发生。
     pub(super) crypto_gen: u32,
 
+    /// **Phase S6** — Reservation Notification Log (Log Page 0x80, spec §
+    /// 5.16.1.20)。每条 record：log page count (u64) + log_page_type (u8) +
+    /// available_log_pages (u8) + reserved + nsid (u32) + reserved 48 byte
+    /// = 64 byte。我们 keep 末 32 条作 ring buffer。
+    /// 资源 release / preemption / regstration preempted 事件 push 一条。
+    pub(super) reservation_notification_log: std::collections::VecDeque<crate::controller::ReservationNotification>,
+    /// 自启动累积的 reservation notification 总数（也写入 log page count 字段）。
+    pub(super) reservation_notification_count: u64,
+
     // ----- Phase K8: Power States -----
     /// 当前 power state index (0..31)。Set Features 0x02 Power Management
     /// 修改；Identify Controller .psd[N] 描述每个 state（spec § 5.17.2.2）。
@@ -1044,6 +1095,8 @@ impl NvmeController {
             doorbell_event_idx_gpa: 0,
             locked_admin_opcodes: std::collections::HashSet::new(),
             crypto_gen: 0,
+            reservation_notification_log: std::collections::VecDeque::new(),
+            reservation_notification_count: 0,
             current_ps: 0,
             irq_aggr_time: 0,
             irq_aggr_threshold: 0,
