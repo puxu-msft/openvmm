@@ -696,6 +696,20 @@ impl IdentifyNamespace {
         ns.dpc = 0b0000_1001;
         // DPS — current PI settings (bits 2:0 type + bit 3 first/last)
         ns.dps = (pi_type & 0x7) | if pi_first { 0x8 } else { 0x0 };
+        // **Phase S3** — NS-level atomic & granularity hints (NVMe NVM CS
+        // § 5.17.2.1)。0-based 字段，0 → "same as controller-level"。
+        // 教学：跟 controller AWUN/AWUPF/ACWU 对齐 (255/255/0)；NOIOB 设 0
+        // 表示无 optimal IO boundary；NPWG/NPWA = 0 表示 1 LBA write
+        // granularity / alignment（最严格），driver 不会按 super-page 对齐。
+        // NPDG/NPDA 同理（deallocate 1 LBA granularity）。
+        ns.nawun = 255;
+        ns.nawupf = 255;
+        ns.nacwu = 0;
+        ns.noiob = 0;
+        ns.npwg = 0;
+        ns.npwa = 0;
+        ns.npdg = 0;
+        ns.npda = 0;
         // 静默 unused warning（meta_size 通过 lbaf[1].ms 暴露）
         let _ = meta_size;
         ns.as_bytes().to_vec()

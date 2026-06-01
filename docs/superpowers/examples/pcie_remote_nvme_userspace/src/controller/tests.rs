@@ -1522,3 +1522,30 @@ fn identify_controller_advertises_awun() {
     assert_eq!(awupf, 255, "AWUPF 0-based 255 → 256 LBA atomic");
     assert_eq!(acwu, 0, "ACWU 0-based 0 → 1 LBA atomic (K4 Compare-Write)");
 }
+
+/// **Phase S3** — Identify Namespace 公布 NAWUN/NAWUPF/NOIOB/NPWG/NPWA/
+/// NPDG/NPDA (NVMe NVM CS § 5.17.2.1)。Driver 用来决定 alignment/granularity。
+#[test]
+fn identify_namespace_advertises_atomic_granularity() {
+    let buf = IdentifyNamespace::build_v2_bytes(2097152, 9, 0, 0, true);
+    // SpecIdentifyNamespace 字段顺序：nsze@0 ncap@8 nuse@16 nsfeat@24
+    //   nlbaf@25 flbas@26 mc@27 dpc@28 dps@29 nmic@30 rescap@31 fpi@32
+    //   dlfeat@33 nawun@34 nawupf@36 nacwu@38 nabsn@40 nabo@42 nabspf@44
+    //   noiob@46 nvmcap@48..64 npwg@64 npwa@66 npdg@68 npda@70
+    let nawun = u16::from_le_bytes(buf[34..36].try_into().unwrap());
+    let nawupf = u16::from_le_bytes(buf[36..38].try_into().unwrap());
+    let nacwu = u16::from_le_bytes(buf[38..40].try_into().unwrap());
+    let noiob = u16::from_le_bytes(buf[46..48].try_into().unwrap());
+    let npwg = u16::from_le_bytes(buf[64..66].try_into().unwrap());
+    let npwa = u16::from_le_bytes(buf[66..68].try_into().unwrap());
+    let npdg = u16::from_le_bytes(buf[68..70].try_into().unwrap());
+    let npda = u16::from_le_bytes(buf[70..72].try_into().unwrap());
+    assert_eq!(nawun, 255);
+    assert_eq!(nawupf, 255);
+    assert_eq!(nacwu, 0);
+    assert_eq!(noiob, 0);
+    assert_eq!(npwg, 0);
+    assert_eq!(npwa, 0);
+    assert_eq!(npdg, 0);
+    assert_eq!(npda, 0);
+}
