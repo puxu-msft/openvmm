@@ -107,6 +107,23 @@ impl NvmeController {
         cq_id: u16,
     ) -> Option<Cqe> {
         let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+        let opc = sqe.opcode();
+        // **Phase Q7** — Lockdown 在 dispatch 前优先校验。LOCKDOWN 本身
+        // 永远不被 lock（否则 driver 无法 unlock 任何 opcode）。
+        if opc != admin_opc::LOCKDOWN && self.locked_admin_opcodes.contains(&opc) {
+            tracing::warn!(
+                opc = format_args!("{:#x}", opc),
+                "admin opcode locked by Lockdown → COMMAND_PROHIBITED_BY_LOCKDOWN"
+            );
+            return Some(Cqe::error(
+                cid,
+                0,
+                sq_head,
+                phase,
+                sc::COMMAND_PROHIBITED_BY_LOCKDOWN,
+                sc::SCT_COMMAND_SPECIFIC,
+            ));
+        }
         match sqe.opcode() {
             admin_opc::IDENTIFY => {
                 // CDW10 bits 7:0 = CNS (Controller or Namespace Structure)
@@ -711,13 +728,25 @@ impl NvmeController {
                 }
                 if ses == 1 || ses == 2 {
                     // SES=1 User Data Erase / SES=2 Cryptographic Erase。
-                    // **教学说明**：这里用 `set_len(0) + set_len(size)` 创
-                    // 建 sparse hole — host filesystem 看 hole 区域返零，
-                    // 但底层物理扇区**未真写零**（不是 SCSI BLKZEROOUT /
-                    // ATA TRIM 那种擦除）。真安全擦除需 write 全零 + fsync
-                    // 或调 fallocate(FALLOC_FL_ZERO_RANGE)。本 example 教学
-                    // 用，sparse hole 行为对 guest 而言等价 "全零盘"。SES=2
-                    // 没有加密 key 销毁概念，因为我们没加密；行为等价 SES=1。
+                    // **教学说明**：用 `set_len(0) + set_len(size)` 创建 sparse
+                    // hole — host filesystem 看 hole 区域返零，但底层物理扇区
+                    // **未真写零**（不是 SCSI BLKZEROOUT / ATA TRIM 那种擦除）。
+                    // 真安全擦除需 write 全零 + fsync 或调 fallocate(
+                    // FALLOC_FL_ZERO_RANGE)。本 example 教学用，sparse hole
+                    // 行为对 guest 而言等价 "全零盘"。
+                    //
+                    // **Phase Q8** — SES=2 Cryptographic Erase：真硬件
+                    // 销毁 NS 加密 key + KEK，盘上 data 立即变 garbage。
+                    // 我们没真加密，但**bump `crypto_gen` counter**
+                    // 模拟 key 生成代际；driver 拿 Identify NS DPS / SMART
+                    // 看 key generation 变化能感知 erase 发生。
+                    if ses == 2 {
+                        self.crypto_gen = self.crypto_gen.wrapping_add(1);
+                        tracing::info!(
+                            crypto_gen = self.crypto_gen,
+                            "Format SES=2 Cryptographic Erase: key generation bumped"
+                        );
+                    }
                     //
                     // **Phase H4**：sqe.nsid 0xFFFF_FFFF = broadcast，format
                     // 所有 NS；具体 NSID 仅 format 该 NS。
@@ -1205,6 +1234,38 @@ impl NvmeController {
                     event_idx = format_args!("{:#x}", prp2),
                     "Doorbell Buffer Config (stored, not actively polled)"
                 );
+                Some(Cqe::success(cid, 0, sq_head, phase))
+            }
+            admin_opc::LOCKDOWN => {
+                // **Phase Q7** — Lockdown (NVMe 2.0 § 5.18)。Driver 控制
+                // controller 禁用/启用 specific admin commands by opcode。
+                //
+                // CDW10:
+                //   bits 7:0   OFI — Opcode/Feature Identifier
+                //   bit  8     IFC — 0=Admin commands, 1=Set Features
+                //   bits 18:16 SCP — Scope (0=current ctrl, 1=NVM Subsystem)
+                //   bit 30     OPC — Opcode (0=ignore IFC, 1=use IFC)
+                //   bit 31     LCKDWN — 0=unlock / 1=lock
+                //
+                // 教学 controller 实现 in-memory lockdown set：lock opcode →
+                // 加入 HashSet，下次 dispatch_admin 进入前查 set 拒
+                // COMMAND_PROHIBITED_BY_COMMAND_AND_FEATURE_LOCKDOWN (SC 0x23)。
+                // 单 controller scope only。
+                let ofi = (sqe.cdw10 & 0xff) as u8;
+                let lock = (sqe.cdw10 >> 31) & 0x1 != 0;
+                if lock {
+                    self.locked_admin_opcodes.insert(ofi);
+                    tracing::info!(
+                        opc = format_args!("{:#x}", ofi),
+                        "Lockdown: admin opcode locked"
+                    );
+                } else {
+                    self.locked_admin_opcodes.remove(&ofi);
+                    tracing::info!(
+                        opc = format_args!("{:#x}", ofi),
+                        "Lockdown: admin opcode unlocked"
+                    );
+                }
                 Some(Cqe::success(cid, 0, sq_head, phase))
             }
             opc => {

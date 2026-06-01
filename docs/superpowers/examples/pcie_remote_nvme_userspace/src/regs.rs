@@ -50,7 +50,11 @@ pub enum Reg {
     /// **Phase L3** — CMB Size (spec § 3.1.14)
     Cmbsz = 0x3c, // 4 bytes — RO, 0 = no CMB
     /// **Phase L3** — Boot Partition Information (spec § 3.1.15)
-    Bpinfo = 0x40, // 4 bytes — RO, 0 = no boot partition
+    Bpinfo = 0x40, // 4 bytes — RO，bits 14:0 = BPSZ (boot partition size in 128 KiB)，bit 15..23 reserved, bits 25:24 = BRS (Read Status)，bits 31:26 = ABPID
+    /// **Phase Q5** — Boot Partition Read Select (spec § 3.1.16)
+    Bprsel = 0x44, // 4 bytes — RW: BPRSZ + BPROF + BPID 选 active boot partition 读
+    /// **Phase Q5** — Boot Partition Memory Buffer Location (spec § 3.1.17)
+    Bpmbl = 0x48, // 8 bytes — RW: 64-bit guest memory address driver 提供给 controller 写 boot partition content
     /// **Phase L3** — Persistent Memory Region Capabilities (spec § 3.1.27)
     Pmrcap = 0xe00, // 4 bytes — RO, 0 = no PMR
     /// **Phase L3** — PMR Control

@@ -89,6 +89,11 @@ pub mod admin_opc {
     /// 真做 polling（vsock 模型用 MMIO 已 OK），返 success 让 driver
     /// 满意。
     pub const DOORBELL_BUFFER_CONFIG: u8 = 0x7c;
+    /// **Phase Q7** — Lockdown (NVMe 2.0 § 5.18)。Driver 禁用 / 启用 specific
+    /// admin commands by opcode。CDW10 bits 7:0 = OFI (Opcode/Feature Identifier),
+    /// bit 8 = IFC (Interface Capability)，bits 18:16 = SCP (Scope),
+    /// bit 30 = OPC，bit 31 = LCKDWN (1=lock, 0=unlock)。
+    pub const LOCKDOWN: u8 = 0x24;
     /// **Phase L4** — Directive Send (NVMe 1.3+，spec § 5.10)。Driver
     /// 控制 controller 特定行为（如 Stream Identifier）。
     pub const DIRECTIVE_SEND: u8 = 0x19;
@@ -139,6 +144,15 @@ pub mod fid {
     pub const SW_PROGRESS_MARKER: u8 = 0x80;
     /// 0x81 Host Identifier: 8/16 byte EXHID buffer。
     pub const HOST_IDENTIFIER: u8 = 0x81;
+    /// **Phase Q9** — 0x82 Reservation Notification Mask (spec § 5.21.1.21
+    /// + § 7.6)。cdw11 bits 0/1/2 = mask Registration Preempted / Released /
+    /// Reservation Preempted。bit set = controller **不**发对应 AEN type
+    /// 0x05 给 driver。Get Feature 返当前 mask。
+    pub const RESERVATION_NOTIFICATION_MASK: u8 = 0x82;
+    /// **Phase Q9** — 0x83 Reservation Persistence (spec § 5.21.1.22)。
+    /// per-NS PTPL state（已在 Reservation Register CPTPL 实现；通过此
+    /// FID 也可读写）。cdw11 bit 0 = PTPL enabled。
+    pub const RESERVATION_PERSISTENCE: u8 = 0x83;
 }
 
 /// NVM (IO) command opcodes (NVMe spec 1.4 NVM § 6)。
@@ -227,6 +241,9 @@ pub mod sc {
     pub const SCT_GENERIC: u8 = 0x00;
     pub const SCT_COMMAND_SPECIFIC: u8 = 0x01;
     pub const SCT_MEDIA_DATA_INTEGRITY: u8 = 0x02;
+    /// **Phase Q7** — Command Prohibited by Command and Feature Lockdown
+    /// (spec § 4.6.1.2.1 + § 5.18) — driver 已 lock 此 opcode 时返。
+    pub const COMMAND_PROHIBITED_BY_LOCKDOWN: u8 = 0x23;
 }
 
 /// Submission Queue Entry — 64 bytes 固定。
@@ -483,6 +500,14 @@ impl IdentifyController {
         // 限制：教学路径只支持 ≤ 1 page (8 LBA at 512B) 的 fused C+W；超过
         // dispatcher 返 INVALID_FIELD。
         id.fuses = 0x0001;
+        // **Phase Q4** — CMIC = Controller Multi-Path I/O and NS Sharing
+        // Capabilities (spec § 5.17.2.2 Figure 282)。bit 3 = ANAR (ANA Reporting
+        // supported)。bit 0/1/2 是 multi-host / multi-port，教学版不支持留 0。
+        id.cmic = 0x08;
+        // ANA group / NSID 配置：教学单 ANA group 含全部 NS
+        id.anacap = 0x0F; // optimized + non-opt + inaccessible + persistent loss states 都支持
+        id.anagrpmax = 1; // 最多 1 ANA group
+        id.nanagrpid = 1; // 当前 1 ANA group active
         id.as_bytes().to_vec()
     }
 }

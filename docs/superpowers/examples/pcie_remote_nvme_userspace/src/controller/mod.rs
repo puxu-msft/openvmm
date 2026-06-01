@@ -597,6 +597,14 @@ pub struct NvmeController {
     aqa: u32,
     asq: u64,
     acq: u64,
+    /// **Phase Q5** — Boot Partition Read Select (BPRSEL) RW，driver 写
+    /// 进来选要读的 boot partition + 起始 offset，controller 把对应 boot
+    /// image 内容拷到 BPMBL 指向的 guest memory。
+    pub(super) bprsel: u32,
+    /// **Phase Q5** — Boot Partition Memory Buffer Location (BPMBL)
+    /// 64-bit RW，driver 提供的 guest memory 缓冲区地址（4 KiB 对齐）。
+    /// controller 把 boot image 用 DMA-write 到这里。
+    pub(super) bpmbl: u64,
 
     state: CtrlState,
 
@@ -713,6 +721,13 @@ pub struct NvmeController {
     pub(super) doorbell_shadow_gpa: u64,
     #[allow(dead_code)]
     pub(super) doorbell_event_idx_gpa: u64,
+    /// **Phase Q7** — Lockdown 命令禁用的 admin opcode 集合。
+    /// dispatch_admin 进入前查；命中则返 COMMAND_PROHIBITED_BY_LOCKDOWN。
+    pub(super) locked_admin_opcodes: std::collections::HashSet<u8>,
+    /// **Phase Q8** — Cryptographic Erase generation counter。Format SES=2
+    /// 时 +1，模拟 NS 加密 key 销毁。教学版没真加密；driver 通过 SMART
+    /// log / FW 状态读 generation 变化感知 erase 发生。
+    pub(super) crypto_gen: u32,
 
     // ----- Phase K8: Power States -----
     /// 当前 power state index (0..31)。Set Features 0x02 Power Management
@@ -969,6 +984,8 @@ impl NvmeController {
             aqa: 0,
             asq: 0,
             acq: 0,
+            bprsel: 0,
+            bpmbl: 0,
             state: CtrlState::Disabled,
             sqs: HashMap::new(),
             cqs: HashMap::new(),
@@ -1007,6 +1024,8 @@ impl NvmeController {
             sanitize_last_status: 0,
             doorbell_shadow_gpa: 0,
             doorbell_event_idx_gpa: 0,
+            locked_admin_opcodes: std::collections::HashSet::new(),
+            crypto_gen: 0,
             current_ps: 0,
             irq_aggr_time: 0,
             irq_aggr_threshold: 0,
@@ -1866,15 +1885,19 @@ impl PcieDevice for NvmeController {
             (0x30, 8) => self.acq,
             (0x30, 4) => self.acq & 0xffff_ffff,
             (0x34, 4) => self.acq >> 32,
-            // **Phase L3** — CMB / BPINFO / PMR 寄存器 RO 全 0 (capability
-            // 已声明不支持；driver 读到 0 知道不可用，spec-conformant 行为)
-            (0x38, _) => 0,             // CMBLOC
-            (0x3c, _) => 0,             // CMBSZ
-            (0x40, _) => 0,             // BPINFO
-            (0xe00, _) => 0,            // PMRCAP
-            (0xe04, _) => 0,            // PMRCTL
-            (0xe08, _) => 0,            // PMRSTS
-            (o, _) if o >= 0x1000 => 0, // doorbell reads return 0 (write-only)
+            // **Phase L3 + Q5** — CMB / BPINFO / PMR 寄存器
+            (0x38, _) => 0, // CMBLOC — Q6 (CMB) 仍 0
+            (0x3c, _) => 0, // CMBSZ — Q6 (CMB) 仍 0
+            // BPINFO — Q5：BPSZ = 1 (128 KiB boot partition)，bit 24..25 BRS=0 (idle)
+            (0x40, _) => 0x0000_0001,
+            (0x44, _) => self.bprsel as u64, // BPRSEL — RW，回读上次写值
+            (0x48, 8) => self.bpmbl,         // BPMBL 64-bit
+            (0x48, 4) => self.bpmbl & 0xFFFF_FFFF, // 低 32
+            (0x4c, 4) => self.bpmbl >> 32,   // 高 32
+            (0xe00, _) => 0,                 // PMRCAP — Q6 (PMR) 仍 0
+            (0xe04, _) => 0,                 // PMRCTL
+            (0xe08, _) => 0,                 // PMRSTS
+            (o, _) if o >= 0x1000 => 0,      // doorbell reads return 0 (write-only)
             _ => {
                 tracing::debug!(offset, size, "MMIO read: unknown offset");
                 0
@@ -1923,6 +1946,22 @@ impl PcieDevice for NvmeController {
             }
             0x34 => {
                 self.acq = (self.acq & 0xffff_ffff) | (value << 32);
+            }
+            // **Phase Q5** — Boot Partition control registers
+            0x44 => {
+                // BPRSEL = boot partition read select。bits 9:0 = BPRSZ
+                // (read size 4 KiB units)；bits 31:10 = BPROF (offset 4 KiB units)；
+                // bit 31:30 实际为 BPID (active partition ID)。教学 controller
+                // 无真 boot image，写入立即返；driver 拉 BPINFO.BRS 看完成。
+                self.bprsel = value as u32;
+                tracing::debug!(value, "BPRSEL set (boot partition no-op)");
+            }
+            0x48 => {
+                // BPMBL low 32
+                self.bpmbl = (self.bpmbl & !0xffff_ffff) | (value & 0xffff_ffff);
+            }
+            0x4c => {
+                self.bpmbl = (self.bpmbl & 0xffff_ffff) | (value << 32);
             }
             o if o >= 0x1000 => {
                 // doorbell 写**必须** 4 字节 access；其它尺寸视为 driver bug

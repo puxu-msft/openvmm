@@ -223,32 +223,80 @@ pub(super) fn build_endurance_group_event(_c: &NvmeController, bytes: usize) -> 
     buf
 }
 
-/// **Phase K7** — Log Page 0x07 Telemetry Host-Initiated (spec § 5.16.1.10)。
+/// **Phase K7 + Q3** — Log Page 0x07 Telemetry Host-Initiated (spec § 5.16.1.10)。
 ///
 /// 512 字节 header + per-area data blocks。Telemetry 是 controller 内部
 /// 诊断快照（generation #, data area 1/2/3 offsets, controller-defined
-/// 字节）。教学版返 header-only：仅 LogIdentifier + generation #=1，data
-/// area pointers 全 0 (driver 看到 'no telemetry data'）。
-pub(super) fn build_telemetry_host(_c: &NvmeController, bytes: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; bytes.max(512)];
+/// 字节）。Q3 真填 header + Data Area 1 = 一个 512-byte 数据块（含 host
+/// I/O counters snapshot），让 driver `nvme telemetry-log -d 1 …` 能拿到
+/// 真实诊断数据。
+///
+/// 字段布局（spec Figure 219）:
+///   byte 0       Log Identifier = 0x07
+///   bytes 1..5   reserved
+///   bytes 5..8   IEEE OUI Identifier
+///   bytes 8..10  Telemetry Host-Initiated Data Area 1 Last Block (1-based, 0=no data)
+///   bytes 10..12 Area 2 Last Block
+///   bytes 12..14 Area 3 Last Block
+///   bytes 14..382 reserved
+///   bytes 382..384 Telemetry Controller-Initiated Data Available (=0 host-init)
+///   bytes 384..388 Area 4 Last Block (NVMe 2.0)
+///   byte 388     Telemetry Host-Initiated Generation Number
+///   byte 389     Telemetry Controller-Initiated Generation Number
+///   bytes 390..512 Reason Identifier (vendor-specific)
+pub(super) fn build_telemetry_host(c: &NvmeController, bytes: usize) -> Vec<u8> {
+    // Allocate header + 1 block of Data Area 1 = 1024 byte 总 (512 header + 512 data)
+    let total = (bytes).max(1024);
+    let mut buf = vec![0u8; total];
     buf[0] = 0x07; // Log Identifier
-    // bytes 1..4 reserved；byte 5..8 IEEE OUI 全 0
-    // byte 8..10 = Telemetry Host-Initiated Data Area 1 Last Block (0=no data)
-    // byte 10..12 = Area 2 / 12..14 Area 3 — 全 0 表示 no data
-    // byte 14..382 reserved
-    // byte 382..384 = Telemetry Controller-Initiated Data Available (=0)
-    // byte 384..388 = Telemetry Data Area 4 Last Block
-    buf[388] = 1; // Generation Number = 1（任何 ≥1 即可）
+    // Data Area 1 Last Block = 1 (1-based; 1 block = bytes 512..1024)
+    buf[8..10].copy_from_slice(&1u16.to_le_bytes());
+    buf[388] = 1; // Generation Number = 1
+    // Reason Identifier @ 390..512 — 简化：写 "TEACH-NVME" ASCII
+    let tag = b"TEACH-NVME";
+    let n = tag.len().min(512 - 390);
+    buf[390..390 + n].copy_from_slice(&tag[..n]);
+    // Data Area 1 block @ 512..1024 — 写 host I/O counters snapshot
+    if total >= 1024 {
+        let mut off = 512;
+        let reads = c.stat_host_reads.to_le_bytes();
+        buf[off..off + 8].copy_from_slice(&reads);
+        off += 8;
+        let writes = c.stat_host_writes.to_le_bytes();
+        buf[off..off + 8].copy_from_slice(&writes);
+        off += 8;
+        let lba_read = c.stat_lba_read.to_le_bytes();
+        buf[off..off + 8].copy_from_slice(&lba_read);
+        off += 8;
+        let lba_written = c.stat_lba_written.to_le_bytes();
+        buf[off..off + 8].copy_from_slice(&lba_written);
+        // 剩余 block 字节留 0
+    }
     buf.truncate(bytes);
     buf
 }
 
-/// **Phase K7** — Log Page 0x08 Telemetry Controller-Initiated (同 0x07
+/// **Phase K7 + Q3** — Log Page 0x08 Telemetry Controller-Initiated (同 0x07
 /// 布局，content 由 controller 自主生成而非 driver 触发)。
-pub(super) fn build_telemetry_ctrl(_c: &NvmeController, bytes: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; bytes.max(512)];
+pub(super) fn build_telemetry_ctrl(c: &NvmeController, bytes: usize) -> Vec<u8> {
+    let total = (bytes).max(1024);
+    let mut buf = vec![0u8; total];
     buf[0] = 0x08;
-    buf[388] = 1;
+    // Controller-Initiated Data Area 1 Last Block = 1
+    buf[8..10].copy_from_slice(&1u16.to_le_bytes());
+    // bytes 382..384 = "Telemetry Controller-Initiated Data Available" bit 0
+    buf[382] = 0x01;
+    buf[389] = 1; // Controller-Initiated Generation Number
+    let tag = b"TEACH-NVME-CTRL";
+    let n = tag.len().min(512 - 390);
+    buf[390..390 + n].copy_from_slice(&tag[..n]);
+    // Data Area 1: AEN 状态 + error log entry 数
+    if total >= 1024 {
+        let aen_n = (c.aen_pending.len() as u64).to_le_bytes();
+        buf[512..520].copy_from_slice(&aen_n);
+        let err_n = c.stat_num_err_log_entries.to_le_bytes();
+        buf[520..528].copy_from_slice(&err_n);
+    }
     buf.truncate(bytes);
     buf
 }
