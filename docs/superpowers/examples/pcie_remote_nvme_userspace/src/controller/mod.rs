@@ -158,6 +158,11 @@ pub(super) enum PendingOp {
     /// **Phase K9** — Set Features 0x81 Host Identifier DMA-read 完成。
     /// cdw11 bit 0 EXHID = 1 → 16 byte HOSTID；= 0 → 8 byte。
     AdminSetHostIdentifier { exhid: bool },
+    /// **Phase S4** — NS Attachment SEL Attach/Detach 的 Controller List
+    /// (4 KiB DMA-read) 完成回调。`sel`: 0=Attach 1=Detach。读完后解析
+    /// NumIDs + cntlid 列表，若包含本 controller cntlid (=1)，更新目标
+    /// NSID 的 attached 状态。
+    AdminNsAttachmentList { sel: u8 },
     /// **Phase K4a** — PI Write 完成回调：DMA-read 完成后按 LBA 切 4KiB
     /// data，每 LBA 计算 T10 DIF tuple，interleave 写到 backing file
     /// (data + 8B tuple per LBA)。支持任意 nlb（≤ MDTS）。
@@ -385,6 +390,11 @@ pub(super) struct Namespace {
     /// 0=NoWP / 1=WP / 2=WP-until-power-cycle / 3=Permanent。Set Features
     /// 0x84 写；Format/Write/DSM/Copy 路径检查。Permanent (3) 不可降级。
     pub(super) nswp: u8,
+    /// **Phase S4** — Namespace Attachment state（NVMe spec § 5.20）。
+    /// true = NSID attached 到本 controller (cntlid=1)；false = detached
+    /// (IO 拒 INVALID_NAMESPACE)。NS Attachment opcode 0x15 维护。
+    /// 默认 true：open() 时所有 NS 已 attached。
+    pub(super) attached: bool,
     /// **Phase L1** — Zoned Namespace 状态（None = 普通 NVM NS，Some = ZNS）。
     /// ZNS NS 的 CSI=0x02，Identify NS CNS=0x05 返 ZNS-specific 字段；
     /// Read/Write 必须遵循 SWR（Sequential Write Required）。
@@ -945,6 +955,7 @@ impl NvmeController {
                     reservation_gen: gen_,
                     ptpl,
                     nswp: 0,
+                    attached: true,
                     zns: None,
                 },
             );

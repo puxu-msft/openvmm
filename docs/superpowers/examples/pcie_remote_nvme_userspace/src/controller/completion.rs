@@ -962,6 +962,99 @@ impl NvmeController {
                     let cqe = Cqe::success(p.cid, p.sq_id, p.sq_head, phase);
                     self.post_cqe(ctx, p.cq_id, cqe);
                 }
+                PendingOp::AdminNsAttachmentList { sel } => {
+                    // **Phase S4** — Controller List 4 KiB 已读完。
+                    // 解析 NumIDs + cntlid[]，若包含本 controller cntlid=1
+                    // → 切换 namespaces[p.nsid].attached。
+                    let cq = self.cqs.get(&p.cq_id);
+                    let phase = cq.map(|c| c.phase).unwrap_or(1);
+                    let cqe = if data.len() < 2 {
+                        Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR, 0)
+                    } else {
+                        let num_ids = u16::from_le_bytes([data[0], data[1]]) as usize;
+                        let max_ids = ((data.len() - 2) / 2).min(2047);
+                        let n = num_ids.min(max_ids);
+                        let mut targets_self = false;
+                        for i in 0..n {
+                            let off = 2 + i * 2;
+                            let cntlid = u16::from_le_bytes([data[off], data[off + 1]]);
+                            if cntlid == 1 {
+                                // 本 controller cntlid = 1 (Identify Controller.cntlid)
+                                targets_self = true;
+                            }
+                        }
+                        if !targets_self {
+                            // List 不含本 ctrl → spec § 5.20 "Controller Not Attached" /
+                            // attach 时 "Namespace Not Attached" 等；简化返 success
+                            // (no-op — 不针对本 ctrl)。
+                            tracing::debug!(nsid = p.nsid, sel, "NS Attachment list 不含 cntlid=1，no-op");
+                            Cqe::success(p.cid, p.sq_id, p.sq_head, phase)
+                        } else if let Some(ns) = self.namespaces.get_mut(&p.nsid) {
+                            match sel {
+                                0 => {
+                                    // Attach
+                                    if ns.attached {
+                                        tracing::debug!(
+                                            nsid = p.nsid,
+                                            "NS already attached (SC 0x18)"
+                                        );
+                                        Cqe::error(
+                                            p.cid,
+                                            p.sq_id,
+                                            p.sq_head,
+                                            phase,
+                                            sc::NAMESPACE_ALREADY_ATTACHED,
+                                            sc::SCT_COMMAND_SPECIFIC,
+                                        )
+                                    } else {
+                                        ns.attached = true;
+                                        tracing::info!(nsid = p.nsid, "NS attached");
+                                        Cqe::success(p.cid, p.sq_id, p.sq_head, phase)
+                                    }
+                                }
+                                1 => {
+                                    // Detach
+                                    if !ns.attached {
+                                        tracing::debug!(
+                                            nsid = p.nsid,
+                                            "NS already detached"
+                                        );
+                                        Cqe::error(
+                                            p.cid,
+                                            p.sq_id,
+                                            p.sq_head,
+                                            phase,
+                                            sc::INVALID_FIELD,
+                                            0,
+                                        )
+                                    } else {
+                                        ns.attached = false;
+                                        tracing::info!(nsid = p.nsid, "NS detached");
+                                        Cqe::success(p.cid, p.sq_id, p.sq_head, phase)
+                                    }
+                                }
+                                _ => Cqe::error(
+                                    p.cid,
+                                    p.sq_id,
+                                    p.sq_head,
+                                    phase,
+                                    sc::INVALID_FIELD,
+                                    0,
+                                ),
+                            }
+                        } else {
+                            Cqe::error(
+                                p.cid,
+                                p.sq_id,
+                                p.sq_head,
+                                phase,
+                                sc::INVALID_NAMESPACE,
+                                0,
+                            )
+                        }
+                    };
+                    self.post_cqe(ctx, p.cq_id, cqe);
+                }
                 PendingOp::AdminFwDownloadChunk { offset_bytes } => {
                     // **Phase H5 + Reviewer M-H1 (10轮)** — FW chunk DMA-read
                     // 完成，写入累积 buffer。Bound 总尺寸防 driver 恶意发
@@ -1074,6 +1167,7 @@ impl NvmeController {
                                                 reservation_gen: 0,
                                                 ptpl: false,
                                                 nswp: 0,
+                                                attached: true,
                                                 zns: None,
                                             },
                                         );

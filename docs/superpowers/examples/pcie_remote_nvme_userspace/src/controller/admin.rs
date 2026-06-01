@@ -1208,10 +1208,43 @@ impl NvmeController {
                 }
             }
             admin_opc::NS_ATTACHMENT => {
-                // NVMe spec § 5.20 Namespace Attachment。单 controller 单
-                // namespace 永远 attached；返 success。
-                tracing::debug!(cid, "Namespace Attachment (no-op success)");
-                Some(Cqe::success(cid, 0, sq_head, phase))
+                // **Phase S4** — NVMe spec § 5.20 Namespace Attachment。
+                // CDW10 bits 3:0 = SEL：0 = Attach, 1 = Detach
+                // sqe.nsid = 目标 NSID（必须 ≠ 0 / 非 broadcast）
+                // PRP1 → 4 KiB Controller List：bytes 0..2 = NumIDs (LE u16)，
+                //                              bytes 2..  = u16[NumIDs] CNTLIDs
+                // 教学单 controller cntlid=1：list 必须含 1 才能 act on 本 ctrl。
+                let sel = (sqe.cdw10 & 0xf) as u8;
+                let nsid = sqe.nsid;
+                if nsid == 0 || nsid == 0xFFFF_FFFF {
+                    return Some(Cqe::error(
+                        cid, 0, sq_head, phase, sc::INVALID_FIELD, 0,
+                    ));
+                }
+                if !self.namespaces.contains_key(&nsid) {
+                    return Some(Cqe::error(
+                        cid, 0, sq_head, phase, sc::INVALID_NAMESPACE, 0,
+                    ));
+                }
+                if sel > 1 {
+                    return Some(Cqe::error(
+                        cid, 0, sq_head, phase, sc::INVALID_FIELD, 0,
+                    ));
+                }
+                // PRP1 → controller list 4 KiB DMA read，完成在 on_dma_complete。
+                let tok = ctx.dma_read(sqe.prp1, 4096);
+                self.pending_ios.insert(
+                    tok,
+                    crate::controller::PendingIo {
+                        sq_id: 0,
+                        cid,
+                        sq_head,
+                        cq_id,
+                        nsid,
+                        op: crate::controller::PendingOp::AdminNsAttachmentList { sel },
+                    },
+                );
+                None
             }
             admin_opc::SECURITY_SEND => {
                 // **Phase L5 + O reviewer M5 修复** — spec § 5.27 Security Send。

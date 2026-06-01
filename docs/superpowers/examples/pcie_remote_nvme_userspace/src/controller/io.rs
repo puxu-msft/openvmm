@@ -434,6 +434,17 @@ impl NvmeController {
                 0,
             ));
         }
+        // **Phase S4** — NS Attachment：若 sqe.nsid 已 detached，IO 全拒
+        // INVALID_NAMESPACE (spec § 5.20 detached NS 等同不存在)。
+        let nsid = sqe.nsid;
+        if nsid != 0
+            && nsid != 0xFFFF_FFFF
+            && let Some(ns) = self.namespaces.get(&nsid)
+            && !ns.attached
+        {
+            tracing::debug!(nsid, "IO rejected: NS detached");
+            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_NAMESPACE, 0));
+        }
         match sqe.opcode() {
             nvm_opc::READ => {
                 let cdw10 = sqe.cdw10;
