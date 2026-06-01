@@ -446,16 +446,46 @@ impl NvmeController {
                     prev_state,
                     num_blocks,
                 } => {
-                    // **Phase L1 + reviewer H1 修复** — ZNS Zone Append 完成回调。
-                    // 1. DMA-read 数据落盘到 assigned_lba 处
+                    // **Phase L1 + reviewer H1 + Phase Q2** — ZNS Zone Append
+                    // 完成回调。
+                    // 1. DMA-read 数据落盘到 assigned_lba 处（PI NS 时 per-LBA
+                    //    compute tuple + interleave 4104-byte blocks 写）
                     // 2. 成功 → success CQE 携 assigned_lba（dw0=low32, dw1=hi32）
                     //    （ZNS CS § 3.2.4 要求）
                     // 3. 失败 → 回滚 WP/state 到 prev_wp/prev_state，post error CQE
-                    let bytes = num_blocks as u64 * SECTOR_SIZE;
                     let nsid = p.nsid;
                     let res = if let Some(ns) = self.namespaces.get_mut(&nsid) {
-                        // **Phase M2** — write_at 走 mmap 零拷贝
-                        ns.write_at(&data[..bytes as usize], assigned_lba * SECTOR_SIZE)
+                        let block_bytes = ns.block_bytes() as usize;
+                        let data_bytes = ns.data_bytes() as usize;
+                        let pi_type = ns.pi_type;
+                        let pi_first = ns.pi_first;
+                        let host_bytes = num_blocks as usize * data_bytes;
+                        if ns.pi_enabled() {
+                            // Per-LBA compute PI tuple + interleave 4104-byte 写
+                            let mut all_ok = Ok(());
+                            for i in 0..num_blocks as usize {
+                                let lba_i = assigned_lba + i as u64;
+                                let data_chunk = &data[i * data_bytes..(i + 1) * data_bytes];
+                                let tuple = crate::pi::PiTuple::compute(data_chunk, lba_i, pi_type);
+                                let tuple_bytes = tuple.to_bytes();
+                                let mut block = vec![0u8; block_bytes];
+                                if pi_first {
+                                    block[0..8].copy_from_slice(&tuple_bytes);
+                                    block[8..8 + data_bytes].copy_from_slice(data_chunk);
+                                } else {
+                                    block[0..data_bytes].copy_from_slice(data_chunk);
+                                    block[data_bytes..data_bytes + 8].copy_from_slice(&tuple_bytes);
+                                }
+                                if let Err(e) = ns.write_at(&block, lba_i * block_bytes as u64) {
+                                    all_ok = Err(e);
+                                    break;
+                                }
+                            }
+                            all_ok
+                        } else {
+                            // 非 PI NS：直接写 host_bytes 字节
+                            ns.write_at(&data[..host_bytes], assigned_lba * block_bytes as u64)
+                        }
                     } else {
                         Err(std::io::Error::other(format!("unknown NSID {}", nsid)))
                     };

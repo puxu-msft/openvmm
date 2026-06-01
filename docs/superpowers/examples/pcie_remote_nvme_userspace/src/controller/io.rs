@@ -342,22 +342,16 @@ impl NvmeController {
                 let nsid = sqe.nsid;
                 let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
                 let nlb = (cdw12 & 0xffff) as u32 + 1;
-                // **Phase H7 + reviewer H-5** — PRACT (Protection Information
-                // Action) bit 29 表示 driver 期望 controller 自动校验/生成 PI
-                // tuple。我们没真实现 CRC/RefTag 引擎；driver 若发 PRACT=1
-                // 返 INVALID_PROTECTION_INFO（SC 0x81）让 driver 明确是 PI
-                // 不支持而非 command bug。
-                if (cdw12 >> 29) & 0x1 != 0 {
-                    tracing::warn!(nsid, "NVM READ with PRACT=1 not supported");
-                    return Some(Cqe::error(
-                        cid,
-                        sq_id,
-                        sq_head,
-                        phase,
-                        sc::INVALID_PROTECTION_INFO,
-                        0,
-                    ));
-                }
+                // **Phase Q1** — PRACT (Protection Information Action) bit 29。
+                // spec § 8.3.1.2：PRACT=1 = driver 让 controller 自动 strip
+                // (Read) / insert (Write) PI tuple。我们 K4 路径本来就是
+                // "controller compute tuple on write + verify on read"，
+                // 所以 PRACT=1 在 PI NS 上行为与 PRACT=0 一致（PRACT=0 时
+                // driver 提供 inline tuple；PRACT=1 时 driver 只传 data，
+                // controller 生成。本实现两种都允许并按 driver 期望处理：
+                // PRACT=1 + PI NS = 同 PI K4 path（generate）。PRACT=1 +
+                // 非 PI NS = INVALID_PROTECTION_INFO（spec 要求 PI capable）。
+                let pract = (cdw12 >> 29) & 0x1 != 0;
                 let bytes = nlb as u64 * SECTOR_SIZE;
                 tracing::debug!(
                     nsid,
@@ -388,6 +382,20 @@ impl NvmeController {
                 //   - 其它（如 LBAF[1] 多 LBA、Type 2/3）→ INVALID_FIELD
                 //     直到 K4c 多 LBA 路径完整实现
                 let is_pi_path = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
+                // **Phase Q1** — PRACT=1 必须在 PI-capable NS 上 (driver 用
+                // PRACT=1 显式请求 controller 自动 PI 处理；非 PI NS 上无 PI
+                // 上下文，spec § 8.3.1 INVALID_PROTECTION_INFO)。
+                if pract && !is_pi_path {
+                    tracing::warn!(nsid, "READ PRACT=1 on non-PI NS → INVALID_PROTECTION_INFO");
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_PROTECTION_INFO,
+                        0,
+                    ));
+                }
                 if !is_pi_path && (ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled()) {
                     // **Reviewer H5** — 用 INVALID_PROTECTION_INFO 而非 INVALID_FIELD
                     // 让 driver 区分 "PI 格式不受支持" vs "命令字段错误"。
@@ -764,19 +772,12 @@ impl NvmeController {
                 let nsid = sqe.nsid;
                 let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
                 let nlb = (cdw12 & 0xffff) as u32 + 1;
-                // Phase H7：PRACT bit 29，参 READ 注释
-                if (cdw12 >> 29) & 0x1 != 0 {
-                    // **Reviewer H-5** — INVALID_PROTECTION_INFO 与 READ 路径一致
-                    tracing::warn!(nsid, "NVM WRITE with PRACT=1 not supported");
-                    return Some(Cqe::error(
-                        cid,
-                        sq_id,
-                        sq_head,
-                        phase,
-                        sc::INVALID_PROTECTION_INFO,
-                        0,
-                    ));
-                }
+                // **Phase Q1** — PRACT bit 29，参 READ 注释。PRACT=1 在 PI
+                // NS 上等价 PI K4 path（controller generate tuple on write）。
+                // 非 PI NS 上 PRACT=1 = INVALID_PROTECTION_INFO（NS 校验在
+                // is_pi_path 检查后处理）。这里只 capture flag，下面与 ns
+                // 一起处理。
+                let pract = (cdw12 >> 29) & 0x1 != 0;
                 let bytes = nlb as u64 * SECTOR_SIZE;
                 tracing::debug!(
                     nsid,
@@ -800,6 +801,19 @@ impl NvmeController {
                         0,
                     ));
                 };
+                // **Phase Q1** — PRACT=1 必须在 PI-capable NS（如下面 is_pi_path 检查）。
+                // 非 PI NS 上 PRACT=1 = INVALID_PROTECTION_INFO（spec § 8.3.1）。
+                if pract && !(ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1) {
+                    tracing::warn!(nsid, "WRITE PRACT=1 on non-PI NS → INVALID_PROTECTION_INFO");
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_PROTECTION_INFO,
+                        0,
+                    ));
+                }
                 if ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled() {
                     // **Phase K4a** — PI 单 LBA Write 路径
                     let is_pi_path = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
@@ -1808,15 +1822,20 @@ impl NvmeController {
                 None
             }
             nvm_opc::ZONE_APPEND => {
-                // **Phase L1 + reviewer H1/H8 修复** — Zone Append (ZNS CS § 4.3)。
-                // CDW10/11 = ZSLBA (zone 起点)；driver 不知 WP，controller
-                // 把数据写在当前 WP 处，把实际 LBA 写回 CQE.dw0/dw1。
+                // **Phase L1 + reviewer H1/H8 + Phase Q2** — Zone Append
+                // (ZNS CS § 4.3)。CDW10/11 = ZSLBA (zone 起点)；driver 不知 WP，
+                // controller 把数据写在当前 WP 处，把实际 LBA 写回 CQE.dw0/dw1。
                 // CDW12 bits 15:0 = NLB - 1。
+                //
+                // **Q2 解禁 PI**: 之前 H8 拒 PI NS（因 SECTOR_SIZE 常量限制）。
+                // 现用 ns.data_bytes() (host data 单位) + ns.block_bytes()
+                // (backing 单位含 PI tuple) 自适应；completion 路径按 is_pi
+                // 分支决定是否插入 PI tuple。教学限制仍：单 PRP only
+                // (data_bytes ≤ NVME_PAGE_SIZE)。
                 let nsid = sqe.nsid;
                 let prp1 = sqe.prp1;
                 let zslba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
                 let nlb = (sqe.cdw12 & 0xffff) as u32 + 1;
-                let bytes = nlb as u64 * SECTOR_SIZE;
                 let Some(ns) = self.ns(nsid) else {
                     return Some(Cqe::error(
                         cid,
@@ -1827,29 +1846,10 @@ impl NvmeController {
                         0,
                     ));
                 };
-                // **H8 修复** — PI-enabled NS 上的 ZONE_APPEND 暂未实现
-                // (data 路径 4096 → backing 4104 转换尚未与 ZNS 路径合并)；
-                // 拒绝避免静默落 4 KiB 到本应 4104 块对齐的位置导致后续
-                // PI Read 全 GuardFail。
-                if ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled() {
-                    // **Phase L1f** — ZNS + PI 组合：plain WRITE 已支持
-                    // (走 check_zns_write + advance_zns_wp + PI tuple)。
-                    // ZONE_APPEND 路径仍用 hardcoded SECTOR_SIZE=512 算 offset，
-                    // 不适配 PI block_bytes=4104。教学限制：driver 想在 PI-ZNS
-                    // NS 上用 ZONE_APPEND 仍需 fallback 到 plain WRITE+WP 跟踪。
-                    tracing::warn!(
-                        nsid,
-                        "ZONE_APPEND on PI NS rejected (use plain WRITE for PI+ZNS)"
-                    );
-                    return Some(Cqe::error(
-                        cid,
-                        sq_id,
-                        sq_head,
-                        phase,
-                        sc::INVALID_PROTECTION_INFO,
-                        0,
-                    ));
-                }
+                let is_pi_path = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
+                let bytes_per_lba_host = ns.data_bytes(); // 512 or 4096
+                let bytes_per_lba_backing = ns.block_bytes(); // 512 or 4104
+                let host_bytes = nlb as u64 * bytes_per_lba_host;
                 let Some(zns) = ns.zns.as_ref() else {
                     return Some(Cqe::error(
                         cid,
@@ -1860,7 +1860,7 @@ impl NvmeController {
                         0,
                     ));
                 };
-                if bytes > NVME_PAGE_SIZE {
+                if host_bytes > NVME_PAGE_SIZE {
                     // 单 PRP only for ZNS Append (教学简化)
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
@@ -1979,10 +1979,13 @@ impl NvmeController {
                         zone_mut.state = ZoneState::ImplicitOpen;
                     }
                 }
-                // DMA-read data → 完成回调 NvmZoneAppend 负责：写文件 +
-                // success(CQE dw0/dw1=assigned_lba) 或 failure(rollback +
-                // error CQE)。
-                let tok = ctx.dma_read(prp1, bytes as u32);
+                // DMA-read data (host_bytes = N × data_bytes_per_lba) →
+                // 完成回调 NvmZoneAppend 负责：write_at(assigned_lba * block_bytes)
+                // 写文件（PI NS 时 per-LBA compute tuple + interleave，否则
+                // 直接 write data）+ success(CQE dw0/dw1=assigned_lba) 或
+                // failure(rollback + error CQE)。
+                let tok = ctx.dma_read(prp1, host_bytes as u32);
+                let _ = (is_pi_path, bytes_per_lba_backing); // 给 completion 用，是否 PI 由 ns 字段查
                 self.pending_ios.insert(
                     tok,
                     PendingIo {
