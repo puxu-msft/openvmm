@@ -347,7 +347,34 @@ bash docs/superpowers/scripts/build-windows-cross.sh
 - **H-3** — on_dma_complete 1614 行单方法拆到 controller/completion.rs，
   mod.rs 从 3272 → ~2050 行
 
-每 Phase 都过 rust-reviewer + 多数有 CRITICAL/HIGH 修复。**11 轮 reviewer
-后 0 CRITICAL / 0 HIGH / 0 MEDIUM**：当前总单测 **NVMe controller 44 +
-SDK 13 = 57**。`cargo clippy --all-targets -- -D warnings` 全绿。
+每 Phase 都过 rust-reviewer + 多数有 CRITICAL/HIGH 修复。**12 轮 reviewer
+后 0 CRITICAL / 0 HIGH / 0 MEDIUM**：当前总单测 **NVMe controller 46 +
+SDK 13 = 59**。`cargo clippy --all-targets -- -D warnings` 全绿。
+WSL → Windows MSVC 交叉编译验证可生成 5.4 MiB PE32+ exe。
 Production-ready as teaching example。
+
+## Phase Q 系列追加（NVMe 2.0 spec coverage 完整化）
+
+- **Q1** PRACT=1 真处理（PI NS 上 driver 用 PRACT=1 走 controller 自动
+  generate/strip；PRACT=0 on PI NS 拒绝因不支持 driver-supplied inline
+  tuple；PRACT=1 on non-PI NS 拒绝因无 PI 上下文）
+- **Q2** ZONE_APPEND on PI NS 解禁（per-LBA PI tuple compute + interleave
+  4104-byte block 写 backing；与 plain WRITE PI 行为一致）
+- **Q3** Telemetry Log 0x07/0x08 真填充（header + Data Area 1 含 host
+  I/O counters snapshot 让 `nvme telemetry-log` 能拿到真诊断）
+- **Q4** ANA Identify Controller advertise（CMIC bit 3 ANAR + ANACAP 0x0F
+  + ANAGRPMAX/NANAGRPID=1 让 `nvme ana-show` 能 enumerate）
+- **Q5** Boot Partition register set (BPRSEL/BPMBL RW，BPINFO=0 不
+  advertise；完整 BP image 服务留 future work)
+- **Q7** Lockdown command 0x24 (NVMe 2.0 § 5.18) 真 enforce admin opcode
+  禁用/启用 + SC 0x23 COMMAND_PROHIBITED_BY_LOCKDOWN
+- **Q8** Format SES=2 Cryptographic Erase: crypto_gen counter 暴露到
+  SMART vendor-specific byte 232..236 让 driver 感知 key 销毁
+- **Q9** Reservation Notification Mask 0x82 + Reservation Persistence 0x83
+  通过 features map 自动 Set/Get
+- **Q10** SDK DeviceCtx::for_testing infrastructure，让外部 crate 单测
+  可注入 mock buffer 验 protocol invariant（doc-hidden 避免 production
+  API leak）
+- **Q11** mod.rs 拆 enable.rs + mmio.rs（2102 → 1885 行，单一职责）
+- **Q12** WSL → Windows MSVC 交叉编译脚本支持 standalone example
+  (exclude 列表) — 一行命令 build PE32+ exe
