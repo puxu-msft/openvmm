@@ -591,6 +591,18 @@ impl IdentifyController {
         // 教学：driver Set PSDT=01 后我们走 R1 inline-Data-Block 路径；多
         // fragment / Segment chain 仍返 INVALID 让 driver 拆小 IO 或回 PRP。
         id.sgls = 0x0003_0001;
+        // **Phase S3** — Atomic Write Unit (NVMe spec § 5.15.2.2 + § 4.10)。
+        // AWUN/AWUPF/ACWU 都是 0-based：值 N → N+1 LBAs。
+        //   awun  = 全 NS power-loss safe atomic write 上限
+        //   awupf = fused/non-power-loss safe atomic 上限 (≤ AWUN)
+        //   acwu  = Compare-and-Write 原子上限
+        // 教学：backing 是文件，page-level (4KiB) write 在多数 host fs 上
+        // atomic；超出靠 NVM FLUSH 持久化。声明 AWUN=AWUPF=255 (=256 LBA)
+        // 让 driver 看到合理上限；ACWU=0 (=1 LBA) — Compare-and-Write
+        // 当前只允许 1 LBA，符合 K4 实现 (compare_ops 单条 LBA)。
+        id.awun = 255;
+        id.awupf = 255;
+        id.acwu = 0;
         id.as_bytes().to_vec()
     }
 }

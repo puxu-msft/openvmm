@@ -1486,3 +1486,39 @@ fn ns_write_protection_get_set_round_trip() {
         let _ = std::fs::remove_file(p);
     }
 }
+
+/// **Phase S2** — Simple Copy 范围冲突检测：source 互重叠 / src ↔ dst 重叠
+/// 都返 true → controller 应回 CONFLICTING_ATTRIBUTES (SC 0x80, SCT Cmd-Spec)。
+#[test]
+fn copy_range_conflict_detection() {
+    use crate::controller::completion::check_copy_range_conflict;
+    // 无冲突：source [0,10) [100,110) → dst [200,220)
+    assert!(!check_copy_range_conflict(200, 20, &[(0, 10), (100, 10)]));
+    // 两 source 互重叠：[0,10) 与 [5,15)
+    assert!(check_copy_range_conflict(1000, 20, &[(0, 10), (5, 10)]));
+    // source 与 dst 重叠：source [100,110) → dst [105,115)
+    assert!(check_copy_range_conflict(105, 10, &[(100, 10)]));
+    // source 完全 inside dst
+    assert!(check_copy_range_conflict(0, 100, &[(50, 10)]));
+    // 触碰边界但不重叠
+    assert!(!check_copy_range_conflict(10, 5, &[(0, 10)])); // dst[10..15) src[0..10) 不重叠
+    // 单 range 不重叠自己
+    assert!(!check_copy_range_conflict(100, 10, &[(0, 10)]));
+    // 溢出当冲突
+    assert!(check_copy_range_conflict(u64::MAX - 5, 100, &[(0, 10)]));
+}
+
+/// **Phase S3** — Identify Controller AWUN/AWUPF/ACWU 公布合理 atomic 上限。
+#[test]
+fn identify_controller_advertises_awun() {
+    let buf = IdentifyController::build_v2_bytes(0x1414, 0xc0de, 1);
+    // AWUN @ 526, AWUPF @ 528, ACWU @ 532 (NVMe 2.0 SpecIdentifyController
+    // 字段顺序：maxcmd@514 nn@516 oncs@520 fuses@522 fna@524 vwc@525
+    //   awun@526 awupf@528 icsvscc@530 nwpc@531 acwu@532)
+    let awun = u16::from_le_bytes(buf[526..528].try_into().unwrap());
+    let awupf = u16::from_le_bytes(buf[528..530].try_into().unwrap());
+    let acwu = u16::from_le_bytes(buf[532..534].try_into().unwrap());
+    assert_eq!(awun, 255, "AWUN 0-based 255 → 256 LBA atomic");
+    assert_eq!(awupf, 255, "AWUPF 0-based 255 → 256 LBA atomic");
+    assert_eq!(acwu, 0, "ACWU 0-based 0 → 1 LBA atomic (K4 Compare-Write)");
+}

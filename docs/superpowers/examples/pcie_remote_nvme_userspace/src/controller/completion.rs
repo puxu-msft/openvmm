@@ -28,6 +28,38 @@ use std::io::SeekFrom;
 use std::io::Write;
 use zerocopy::IntoBytes;
 
+/// **Phase S2** — Simple Copy 范围冲突检测 (NVM CS § 3.3.7)。
+///
+/// 给定 destination start LBA `sdlba` + 累计 dst_total LBA + source `ranges`
+/// (slba, nlb) 列表，若任两 source range 互重叠 / source 与 destination
+/// 区间互重叠 → 返 true（应返 SC 0x80 CONFLICTING_ATTRIBUTES）。
+/// 溢出当冲突处理（更保守）。O(n²)，n ≤ 128（range list ≤ 1 page）。
+pub(crate) fn check_copy_range_conflict(
+    sdlba: u64,
+    dst_total: u64,
+    ranges: &[(u64, u32)],
+) -> bool {
+    let dst_end = sdlba.checked_add(dst_total);
+    ranges.iter().enumerate().any(|(i, &(s1, n1))| {
+        let e1 = s1.checked_add(n1 as u64);
+        let src_overlap = ranges.iter().enumerate().any(|(j, &(s2, n2))| {
+            if i == j {
+                return false;
+            }
+            let e2 = s2.checked_add(n2 as u64);
+            match (e1, e2) {
+                (Some(e1), Some(e2)) => s1 < e2 && s2 < e1,
+                _ => true,
+            }
+        });
+        let dst_overlap = match (e1, dst_end) {
+            (Some(e1), Some(de)) => s1 < de && sdlba < e1,
+            _ => true,
+        };
+        src_overlap || dst_overlap
+    })
+}
+
 impl NvmeController {
     pub(super) fn on_dma_complete_impl(
         &mut self,
@@ -819,6 +851,26 @@ impl NvmeController {
                     }
                     let cqe = if let Some(ns) = self.namespaces.get_mut(&nsid) {
                         let sector = SECTOR_SIZE;
+                        // **Phase S2** — CONFLICTING_ATTRIBUTES (SC 0x80, SCT
+                        // Cmd-Spec)：source ranges 互相重叠或与 [sdlba, sdlba+
+                        // dst_total) destination 区间重叠时，spec § 3.3.7 (NVM
+                        // CS) 要求 controller 拒绝。详见 check_copy_range_conflict。
+                        if check_copy_range_conflict(sdlba, dst_total, &ranges) {
+                            tracing::debug!(
+                                nsid,
+                                sdlba,
+                                num_ranges,
+                                "COPY rejected: ranges conflict (S2 SC 0x80)"
+                            );
+                            Cqe::error(
+                                p.cid,
+                                p.sq_id,
+                                p.sq_head,
+                                phase,
+                                sc::CONFLICTING_ATTRIBUTES,
+                                sc::SCT_COMMAND_SPECIFIC,
+                            )
+                        } else {
                         // **Reviewer H-2** — checked_add 防 sdlba/slba 来自
                         // driver / 恶意输入溢出 u64 后绕过 bounds 检查。
                         let ok_bounds = sdlba
@@ -882,6 +934,7 @@ impl NvmeController {
                                 );
                                 Cqe::success(p.cid, p.sq_id, p.sq_head, phase)
                             }
+                        }
                         }
                     } else {
                         Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE, 0)
