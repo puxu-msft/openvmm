@@ -1039,8 +1039,6 @@ impl NvmeController {
         })
     }
 
-    /// CC 写入（每次 EN bit 变化都可能 enable/disable controller）。
-
     /// 计算 doorbell offset 是 SQ 还是 CQ + queue id。
     /// NVMe 1.4 § 3.1.7：doorbell 数组从 BAR0 + 0x1000 起，stride = 2^(2+CAP.DSTRD)。
     /// CAP.DSTRD=0 → stride=4 bytes。

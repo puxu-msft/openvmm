@@ -382,11 +382,28 @@ impl NvmeController {
                 //   - 其它（如 LBAF[1] 多 LBA、Type 2/3）→ INVALID_FIELD
                 //     直到 K4c 多 LBA 路径完整实现
                 let is_pi_path = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
-                // **Phase Q1** — PRACT=1 必须在 PI-capable NS 上 (driver 用
-                // PRACT=1 显式请求 controller 自动 PI 处理；非 PI NS 上无 PI
-                // 上下文，spec § 8.3.1 INVALID_PROTECTION_INFO)。
+                // **Phase Q1 + reviewer 12轮 H-Q1**:
+                // - PRACT=1 + 非 PI NS = INVALID_PROTECTION_INFO（spec § 8.3.1）
+                // - PRACT=0 + PI NS = INVALID_PROTECTION_INFO 因 K4 路径**不支持**
+                //   driver-supplied inline tuple；spec PRACT=0 要求 driver 在 PRP
+                //   传 N×4104 byte，我们 dma_read 只 N×4096 会丢 tuple。
+                //   driver 必须 PRACT=1 (controller 自动 generate/strip)
                 if pract && !is_pi_path {
                     tracing::warn!(nsid, "READ PRACT=1 on non-PI NS → INVALID_PROTECTION_INFO");
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_PROTECTION_INFO,
+                        0,
+                    ));
+                }
+                if !pract && is_pi_path {
+                    tracing::warn!(
+                        nsid,
+                        "READ PRACT=0 on PI NS unsupported (driver must use PRACT=1)"
+                    );
                     return Some(Cqe::error(
                         cid,
                         sq_id,
@@ -801,10 +818,27 @@ impl NvmeController {
                         0,
                     ));
                 };
-                // **Phase Q1** — PRACT=1 必须在 PI-capable NS（如下面 is_pi_path 检查）。
-                // 非 PI NS 上 PRACT=1 = INVALID_PROTECTION_INFO（spec § 8.3.1）。
-                if pract && !(ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1) {
+                // **Phase Q1 + 12轮 H-Q1**:
+                // - PRACT=1 + 非 PI NS = INVALID_PROTECTION_INFO（spec § 8.3.1）
+                // - PRACT=0 + PI NS = INVALID_PROTECTION_INFO（K4 路径不支持
+                //   driver-supplied inline tuple；driver 必须用 PRACT=1）
+                let is_pi_capable = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
+                if pract && !is_pi_capable {
                     tracing::warn!(nsid, "WRITE PRACT=1 on non-PI NS → INVALID_PROTECTION_INFO");
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_PROTECTION_INFO,
+                        0,
+                    ));
+                }
+                if !pract && is_pi_capable {
+                    tracing::warn!(
+                        nsid,
+                        "WRITE PRACT=0 on PI NS unsupported (driver must use PRACT=1)"
+                    );
                     return Some(Cqe::error(
                         cid,
                         sq_id,
@@ -1846,9 +1880,9 @@ impl NvmeController {
                         0,
                     ));
                 };
-                let is_pi_path = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
+                // is_pi_path / block_bytes 在 completion 路径按 ns 字段查；
+                // dispatch 只需 host_bytes (driver PRP data size)。
                 let bytes_per_lba_host = ns.data_bytes(); // 512 or 4096
-                let bytes_per_lba_backing = ns.block_bytes(); // 512 or 4104
                 let host_bytes = nlb as u64 * bytes_per_lba_host;
                 let Some(zns) = ns.zns.as_ref() else {
                     return Some(Cqe::error(
@@ -1985,7 +2019,6 @@ impl NvmeController {
                 // 直接 write data）+ success(CQE dw0/dw1=assigned_lba) 或
                 // failure(rollback + error CQE)。
                 let tok = ctx.dma_read(prp1, host_bytes as u32);
-                let _ = (is_pi_path, bytes_per_lba_backing); // 给 completion 用，是否 PI 由 ns 字段查
                 self.pending_ios.insert(
                     tok,
                     PendingIo {

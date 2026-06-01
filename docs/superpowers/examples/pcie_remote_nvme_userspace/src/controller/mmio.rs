@@ -37,8 +37,12 @@ impl NvmeController {
             // **Phase L3 + Q5** — CMB / BPINFO / PMR 寄存器
             (0x38, _) => 0, // CMBLOC — Q6 (CMB) 仍 0
             (0x3c, _) => 0, // CMBSZ — Q6 (CMB) 仍 0
-            // BPINFO — Q5：BPSZ = 1 (128 KiB boot partition)，bit 24..25 BRS=0 (idle)
-            (0x40, _) => 0x0000_0001,
+            // **Phase L3 + Q5 + 12轮 H-Q5** — BPINFO=0 不 advertise boot partition。
+            // 之前 BPSZ=1 让 driver 看到 1 partition，但我们没 boot image
+            // 服务 → driver 写 BPRSEL 后 poll BRS 永远 0 = hang。BPSZ=0
+            // driver enumerate 即跳过。BPRSEL/BPMBL 仍 RW 保 spec
+            // register layout 完整（教学读 BAR0 时能看见）。
+            (0x40, _) => 0,                  // BPINFO — BPSZ=0 (no BP advertise)
             (0x44, _) => self.bprsel as u64, // BPRSEL — RW，回读上次写值
             (0x48, 8) => self.bpmbl,         // BPMBL 64-bit
             (0x48, 4) => self.bpmbl & 0xFFFF_FFFF, // 低 32

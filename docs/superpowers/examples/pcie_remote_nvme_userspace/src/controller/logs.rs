@@ -63,6 +63,11 @@ pub(super) fn build_smart_health(c: &NvmeController, bytes: usize) -> Vec<u8> {
     buf[128..144].copy_from_slice(&hours.to_le_bytes());
     let nerr = c.stat_num_err_log_entries as u128;
     buf[176..192].copy_from_slice(&nerr.to_le_bytes());
+    // **Phase Q8 + 12轮 L-Q8** — Crypto Erase generation 暴露到 SMART
+    // vendor-specific 区域 (NVMe 2.0 § 5.16.1.2 offset 232..511 reserved/
+    // vendor-specific)。driver 或 OEM 工具读 SMART[232..236] 拿 erase
+    // generation 计数感知 Format SES=2 发生。
+    buf[232..236].copy_from_slice(&c.crypto_gen.to_le_bytes());
     buf.truncate(bytes);
     buf
 }
@@ -257,21 +262,21 @@ pub(super) fn build_telemetry_host(c: &NvmeController, bytes: usize) -> Vec<u8> 
     let n = tag.len().min(512 - 390);
     buf[390..390 + n].copy_from_slice(&tag[..n]);
     // Data Area 1 block @ 512..1024 — 写 host I/O counters snapshot
-    if total >= 1024 {
-        let mut off = 512;
-        let reads = c.stat_host_reads.to_le_bytes();
-        buf[off..off + 8].copy_from_slice(&reads);
-        off += 8;
-        let writes = c.stat_host_writes.to_le_bytes();
-        buf[off..off + 8].copy_from_slice(&writes);
-        off += 8;
-        let lba_read = c.stat_lba_read.to_le_bytes();
-        buf[off..off + 8].copy_from_slice(&lba_read);
-        off += 8;
-        let lba_written = c.stat_lba_written.to_le_bytes();
-        buf[off..off + 8].copy_from_slice(&lba_written);
-        // 剩余 block 字节留 0
-    }
+    // (total = bytes.max(1024) 恒 ≥ 1024，所以 fill 后由 truncate(bytes)
+    // 决定 driver 是否真拿到 — driver 请求 < 1024 时只看到 header)
+    let mut off = 512;
+    let reads = c.stat_host_reads.to_le_bytes();
+    buf[off..off + 8].copy_from_slice(&reads);
+    off += 8;
+    let writes = c.stat_host_writes.to_le_bytes();
+    buf[off..off + 8].copy_from_slice(&writes);
+    off += 8;
+    let lba_read = c.stat_lba_read.to_le_bytes();
+    buf[off..off + 8].copy_from_slice(&lba_read);
+    off += 8;
+    let lba_written = c.stat_lba_written.to_le_bytes();
+    buf[off..off + 8].copy_from_slice(&lba_written);
+    // 剩余 block 字节留 0
     buf.truncate(bytes);
     buf
 }
@@ -291,12 +296,10 @@ pub(super) fn build_telemetry_ctrl(c: &NvmeController, bytes: usize) -> Vec<u8> 
     let n = tag.len().min(512 - 390);
     buf[390..390 + n].copy_from_slice(&tag[..n]);
     // Data Area 1: AEN 状态 + error log entry 数
-    if total >= 1024 {
-        let aen_n = (c.aen_pending.len() as u64).to_le_bytes();
-        buf[512..520].copy_from_slice(&aen_n);
-        let err_n = c.stat_num_err_log_entries.to_le_bytes();
-        buf[520..528].copy_from_slice(&err_n);
-    }
+    let aen_n = (c.aen_pending.len() as u64).to_le_bytes();
+    buf[512..520].copy_from_slice(&aen_n);
+    let err_n = c.stat_num_err_log_entries.to_le_bytes();
+    buf[520..528].copy_from_slice(&err_n);
     buf.truncate(bytes);
     buf
 }

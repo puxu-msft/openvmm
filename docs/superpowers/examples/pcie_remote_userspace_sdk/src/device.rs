@@ -78,12 +78,18 @@ pub struct DeviceCtx<'a> {
 }
 
 impl<'a> DeviceCtx<'a> {
-    /// **Phase Q10** — Test-only constructor。让外部 crate（如 nvme example）
+    /// **Phase Q10 + 12轮 M-Q10** — Test-only constructor。让外部 crate
     /// 的 unit test 能直接构造 DeviceCtx + capture outbound 包做 spec
     /// 一致性 invariant 测试（无需 mock SDK transport / live vsock）。
     ///
+    /// `#[doc(hidden)]` 让此 API 不出现在 cargo doc 公开页（production
+    /// SDK 用户不应直接用）；保 `pub` 以便其他 crate 的 `#[cfg(test)]`
+    /// 模块能访问。真要更严格隔离需 feature flag — 当前 example-only
+    /// 场景 doc-hidden 已足够。
+    ///
     /// 由 caller 提供 `outbound`/`next_seq`/`next_dma_token` 缓冲区，调用
     /// 后通过它们检视 device 产生的 DMA / CQE / interrupt 行为。
+    #[doc(hidden)]
     pub fn for_testing(
         outbound: &'a mut Vec<pcie_remote_protocol::ToOpenhcl>,
         next_seq: &'a mut u64,
