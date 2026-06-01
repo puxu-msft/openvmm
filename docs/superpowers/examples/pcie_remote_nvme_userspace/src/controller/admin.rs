@@ -489,6 +489,54 @@ impl NvmeController {
                         self.features.insert(fid, 0);
                         tracing::debug!("Set Features Timestamp (no-PRP, stored 0)");
                     }
+                    cmd::fid::NS_WRITE_PROTECTION => {
+                        // **Phase S1** — per-NS Write Protection State (spec § 8.19)。
+                        // cdw11 bits 2:0 = WPS：0 NoWP / 1 WP / 2 WP until power
+                        // cycle / 3 Permanent。NSID 必须 ≠ 0 / 非 broadcast。
+                        // Permanent WP (3) 不可降级，再写也保持 3。
+                        let wps = (cdw11 & 0x7) as u8;
+                        let nsid = sqe.nsid;
+                        if nsid == 0 || nsid == 0xFFFF_FFFF {
+                            return Some(Cqe::error(
+                                cid,
+                                0,
+                                sq_head,
+                                phase,
+                                sc::INVALID_FIELD,
+                                0,
+                            ));
+                        }
+                        let Some(ns) = self.namespaces.get_mut(&nsid) else {
+                            return Some(Cqe::error(
+                                cid,
+                                0,
+                                sq_head,
+                                phase,
+                                sc::INVALID_NAMESPACE,
+                                0,
+                            ));
+                        };
+                        if ns.nswp == 3 {
+                            tracing::warn!(
+                                nsid,
+                                "Set Features 0x84 on permanently-write-protected NS rejected"
+                            );
+                            return Some(Cqe::error(
+                                cid,
+                                0,
+                                sq_head,
+                                phase,
+                                sc::INVALID_FIELD,
+                                0,
+                            ));
+                        }
+                        ns.nswp = wps;
+                        // **Phase S1 H2** — 不写 self.features：per-NS 值的
+                        // 真实源头是 ns.nswp，写 features 缓存会让 Get 路径
+                        // 返 controller-global 误导值。Get 路径自己按 nsid
+                        // 读 ns.nswp。
+                        tracing::info!(nsid, wps, "Set Features NS Write Protection");
+                    }
                     _ => {
                         // 其它 fid：原样存 cdw11，Get 回填
                         self.features.insert(fid, cdw11);
@@ -533,6 +581,22 @@ impl NvmeController {
                         }
                         self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, 0, sq_head, cq_id);
                         return None;
+                    }
+                    cmd::fid::NS_WRITE_PROTECTION => {
+                        // **Phase S1 H2** — Feature 0x84 是 per-NS，必须按 sqe.nsid
+                        // 读取目标 NS 的 nswp，而不是回 controller-global 缓存。
+                        let nsid = sqe.nsid;
+                        if nsid == 0 || nsid == 0xFFFF_FFFF {
+                            return Some(Cqe::error(
+                                cid, 0, sq_head, phase, sc::INVALID_FIELD, 0,
+                            ));
+                        }
+                        let Some(ns) = self.namespaces.get(&nsid) else {
+                            return Some(Cqe::error(
+                                cid, 0, sq_head, phase, sc::INVALID_NAMESPACE, 0,
+                            ));
+                        };
+                        ns.nswp as u32
                     }
                     _ => {
                         // 其它：未 Set 过返 0 = spec 默认（多数 fid 默认 0
@@ -758,6 +822,27 @@ impl NvmeController {
                     } else {
                         return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE, 0));
                     };
+                    // **Phase S1 H1** — Format 会清盘，对任何 write-protected NS
+                    // 必须拒绝 (NVMe 2.0 § 8.19 + cmd::fid::NS_WRITE_PROTECTION)。
+                    // broadcast 时只要 *任意* target NS protected 即整批失败。
+                    for target_nsid in &targets {
+                        let ns = &self.namespaces[target_nsid];
+                        if ns.nswp != 0 {
+                            tracing::debug!(
+                                target_nsid,
+                                wps = ns.nswp,
+                                "Format rejected: NS write-protected"
+                            );
+                            return Some(Cqe::error(
+                                cid,
+                                0,
+                                sq_head,
+                                phase,
+                                sc::NAMESPACE_IS_WRITE_PROTECTED,
+                                sc::SCT_COMMAND_SPECIFIC,
+                            ));
+                        }
+                    }
                     for target_nsid in targets {
                         let ns = self.namespaces.get_mut(&target_nsid).unwrap();
                         let size = match ns.file.metadata() {
@@ -821,6 +906,27 @@ impl NvmeController {
                     } else {
                         return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE, 0));
                     };
+                    // **Phase S1 H1** — Format 会清盘，对任何 write-protected NS
+                    // 必须拒绝 (NVMe 2.0 § 8.19 + cmd::fid::NS_WRITE_PROTECTION)。
+                    // broadcast 时只要 *任意* target NS protected 即整批失败。
+                    for target_nsid in &targets {
+                        let ns = &self.namespaces[target_nsid];
+                        if ns.nswp != 0 {
+                            tracing::debug!(
+                                target_nsid,
+                                wps = ns.nswp,
+                                "Format rejected: NS write-protected"
+                            );
+                            return Some(Cqe::error(
+                                cid,
+                                0,
+                                sq_head,
+                                phase,
+                                sc::NAMESPACE_IS_WRITE_PROTECTED,
+                                sc::SCT_COMMAND_SPECIFIC,
+                            ));
+                        }
+                    }
                     for target_nsid in targets {
                         let ns = self.namespaces.get_mut(&target_nsid).unwrap();
                         let size = ns.file.metadata().map(|m| m.len()).unwrap_or(0);
@@ -1210,6 +1316,25 @@ impl NvmeController {
                         sc::SANITIZE_IN_PROGRESS,
                         0,
                     ));
+                }
+                // **Phase S1 H1** — Sanitize 抹整盘，命中任何 protected NS 都
+                // 拒（NVMe 2.0 § 8.19）。Sanitize 是 controller 范围，遍历所有 NS。
+                for (target_nsid, ns) in &self.namespaces {
+                    if ns.nswp != 0 {
+                        tracing::debug!(
+                            target_nsid,
+                            wps = ns.nswp,
+                            "Sanitize rejected: NS write-protected"
+                        );
+                        return Some(Cqe::error(
+                            cid,
+                            0,
+                            sq_head,
+                            phase,
+                            sc::NAMESPACE_IS_WRITE_PROTECTED,
+                            sc::SCT_COMMAND_SPECIFIC,
+                        ));
+                    }
                 }
                 self.sanitize = Some(crate::controller::SanitizeState {
                     started_at: std::time::Instant::now(),

@@ -381,6 +381,10 @@ pub(super) struct Namespace {
     /// 完成都把 registrants + reservation + gen 写到 sidecar `.ptpl` 文件；
     /// open() 时若 sidecar 存在则 reload，模拟 power-loss 恢复。
     pub(super) ptpl: bool,
+    /// **Phase S1** — Namespace Write Protection State (spec § 8.19)。
+    /// 0=NoWP / 1=WP / 2=WP-until-power-cycle / 3=Permanent。Set Features
+    /// 0x84 写；Format/Write/DSM/Copy 路径检查。Permanent (3) 不可降级。
+    pub(super) nswp: u8,
     /// **Phase L1** — Zoned Namespace 状态（None = 普通 NVM NS，Some = ZNS）。
     /// ZNS NS 的 CSI=0x02，Identify NS CNS=0x05 返 ZNS-specific 字段；
     /// Read/Write 必须遵循 SWR（Sequential Write Required）。
@@ -940,6 +944,7 @@ impl NvmeController {
                     reservation,
                     reservation_gen: gen_,
                     ptpl,
+                    nswp: 0,
                     zns: None,
                 },
             );

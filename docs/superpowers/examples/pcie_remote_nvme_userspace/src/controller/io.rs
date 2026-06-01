@@ -381,6 +381,33 @@ pub(crate) fn resolve_data_pointers(sqe: &Sqe) -> Result<(u64, u64), u8> {
     }
 }
 
+/// **Phase S1** — Write-protection guard：所有写类 IO (WRITE/WRITE_ZEROES/
+/// WRITE_UNCORRECTABLE/DSM/COPY/ZONE_APPEND/Zone Mgmt Send) dispatch 入口前
+/// 调用，命中返 Some(cqe with NAMESPACE_IS_WRITE_PROTECTED, SCT=Cmd-Specific)。
+pub(crate) fn check_ns_write_protection(
+    ns: &crate::controller::Namespace,
+    cid: u16,
+    sq_id: u16,
+    sq_head: u16,
+    phase: u8,
+) -> Option<Cqe> {
+    if ns.nswp != 0 {
+        tracing::debug!(
+            wps = ns.nswp,
+            "write rejected: NS Write Protection active"
+        );
+        return Some(Cqe::error(
+            cid,
+            sq_id,
+            sq_head,
+            phase,
+            sc::NAMESPACE_IS_WRITE_PROTECTED,
+            sc::SCT_COMMAND_SPECIFIC,
+        ));
+    }
+    None
+}
+
 impl NvmeController {
     /// IO command dispatch。Read/Write 走 DMA。
     pub(super) fn dispatch_io(
@@ -908,6 +935,10 @@ impl NvmeController {
                         0,
                     ));
                 };
+                // **Phase S1** — Namespace Write Protection 拒写
+                if let Some(cqe) = check_ns_write_protection(ns, cid, sq_id, sq_head, phase) {
+                    return Some(cqe);
+                }
                 // **Phase Q1 + 12轮 H-Q1**:
                 // - PRACT=1 + 非 PI NS = INVALID_PROTECTION_INFO（spec § 8.3.1）
                 // - PRACT=0 + PI NS = INVALID_PROTECTION_INFO（K4 路径不支持
@@ -1343,6 +1374,10 @@ impl NvmeController {
                         0,
                     ));
                 };
+                // **Phase S1** — NS Write Protection gate（WRITE_ZEROES）
+                if let Some(cqe) = check_ns_write_protection(ns, cid, sq_id, sq_head, phase) {
+                    return Some(cqe);
+                }
                 let is_pi_path = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
                 if !is_pi_path && (ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled()) {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
@@ -1442,6 +1477,21 @@ impl NvmeController {
                 // 我们当前不真 TRIM 底层文件（host file system 通常自己处理
                 // sparse hole），返 success 让 driver 信任 deallocate 完成。
                 // 真实现可 punch_hole + fallocate(FALLOC_FL_PUNCH_HOLE)。
+                let nsid = sqe.nsid;
+                let Some(ns) = self.ns(nsid) else {
+                    return Some(Cqe::error(
+                        cid,
+                        sq_id,
+                        sq_head,
+                        phase,
+                        sc::INVALID_NAMESPACE,
+                        0,
+                    ));
+                };
+                // **Phase S1** — NS Write Protection gate（DSM Deallocate 等效 write）
+                if let Some(cqe) = check_ns_write_protection(ns, cid, sq_id, sq_head, phase) {
+                    return Some(cqe);
+                }
                 let nr = (sqe.cdw10 & 0xff) as u32 + 1;
                 let ad = sqe.cdw11 & 0x4 != 0;
                 tracing::debug!(nr, ad, "DSM Dataset Management (no-op success)");
@@ -1482,6 +1532,10 @@ impl NvmeController {
                         0,
                     ));
                 };
+                // **Phase S1** — NS Write Protection gate（COPY 写目的 NS）
+                if let Some(cqe) = check_ns_write_protection(ns, cid, sq_id, sq_head, phase) {
+                    return Some(cqe);
+                }
                 if ns.pi_enabled() {
                     // PI + Copy 组合需要 per-range PI tuple verify/regen，
                     // 教学路径未实现，返 INVALID_PROTECTION_INFO 让 driver 知道。
@@ -1793,6 +1847,12 @@ impl NvmeController {
                         0,
                     ));
                 };
+                // **Phase S1** — NS Write Protection gate（Zone Mgmt Send 含
+                // Reset/Open/Finish/Close/Offline 均改变 zone 状态，对 protect
+                // NS 一律拒绝）
+                if let Some(cqe) = check_ns_write_protection(ns, cid, sq_id, sq_head, phase) {
+                    return Some(cqe);
+                }
                 let Some(zns) = ns.zns.as_mut() else {
                     tracing::warn!(nsid, "Zone Mgmt Send: not a ZNS NS");
                     return Some(Cqe::error(
@@ -1970,6 +2030,10 @@ impl NvmeController {
                         0,
                     ));
                 };
+                // **Phase S1** — NS Write Protection gate（ZONE_APPEND 写入路径）
+                if let Some(cqe) = check_ns_write_protection(ns, cid, sq_id, sq_head, phase) {
+                    return Some(cqe);
+                }
                 // is_pi_path / block_bytes 在 completion 路径按 ns 字段查；
                 // dispatch 只需 host_bytes (driver PRP data size)。
                 let bytes_per_lba_host = ns.data_bytes(); // 512 or 4096

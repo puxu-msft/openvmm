@@ -155,6 +155,20 @@ pub mod fid {
     /// per-NS PTPL state（已在 Reservation Register CPTPL 实现；通过此
     /// FID 也可读写）。cdw11 bit 0 = PTPL enabled。
     pub const RESERVATION_PERSISTENCE: u8 = 0x83;
+    /// **Phase S1** — 0x84 Namespace Write Protection Config (spec §
+    /// 5.21.1.24 + § 8.19)。per-NS write-protect state machine：
+    /// cdw11 bits 2:0 = WPS (Write Protection State):
+    ///   000 = No Write Protect
+    ///   001 = Write Protect
+    ///   010 = Write Protect Until Power Cycle
+    ///   011 = Permanent Write Protect (不可撤销)
+    /// 实际门控的写类 opcode：WRITE / WRITE_ZEROES / DSM / COPY /
+    /// ZONE_APPEND / ZONE_MGMT_SEND / FORMAT_NVM / SANITIZE。
+    /// 注意：WRITE_UNCORRECTABLE 在本 controller 返 INVALID_OPCODE，
+    /// 按 spec § 4.6.1 "unsupported opcode trumps NSWP"，不再走 WP gate。
+    /// 当前 WPS=1/3 不持久化跨 process 重启，沿用与 PTPL 不同的内存语义；
+    /// 真硬件应落 sidecar。详见 io.rs::check_ns_write_protection。
+    pub const NS_WRITE_PROTECTION: u8 = 0x84;
 }
 
 /// NVM (IO) command opcodes (NVMe spec 1.4 NVM § 6)。
@@ -248,6 +262,29 @@ pub mod sc {
     pub const COMMAND_PROHIBITED_BY_LOCKDOWN: u8 = 0x23;
     /// **Phase R1** — SGL_DESCRIPTOR_TYPE_INVALID — driver SGL 解析出未识别
     /// type 时返。spec § 4.6.1.2.1 Generic SC 0x15。
+    /// **Phase S1** — NAMESPACE_IS_WRITE_PROTECTED (spec § 4.6.1.2.1 SC 0x20)。
+    /// Driver 对 write-protected NS 发 Write/Write Zeroes/DSM/Format 等
+    /// 写入命令时返。配合 Feature 0x84 NS Write Protection 使用。
+    pub const NAMESPACE_IS_WRITE_PROTECTED: u8 = 0x20;
+    /// **Phase S2** — NAMESPACE_NOT_READY (spec § 4.6.1.2.1 SC 0x82, Generic)。
+    /// NS 已识别但 controller 暂未 ready 服务（如 Format 进行中、NS Resize）。
+    pub const NAMESPACE_NOT_READY: u8 = 0x82;
+    /// **Phase S2** — ATOMIC_WRITE_UNIT_EXCEEDED (spec § 4.6.1.2.1 SC 0x85, Generic)。
+    /// 单条 Write 超过 Identify Controller.AWUN/AWUPF 声明的原子单位。
+    pub const ATOMIC_WRITE_UNIT_EXCEEDED: u8 = 0x85;
+    /// **Phase S2** — CONFLICTING_ATTRIBUTES (spec § 4.6.1.2.1 SC 0x180)。
+    /// DSM range 互相重叠 / Read 与 DSM 抢同 LBA 等。
+    pub const CONFLICTING_ATTRIBUTES: u8 = 0x80;
+    /// **Phase S2** — ATTEMPTED_WRITE_TO_READ_ONLY_RANGE (spec SC 0x182)。
+    /// DSM AD=1 deallocate 一个被显式标 read-only 的 range。
+    pub const ATTEMPTED_WRITE_TO_READ_ONLY_RANGE: u8 = 0x82;
+    /// **Phase S2** — BOOT_PARTITION_WRITE_PROHIBITED (spec SC 0x11E)。
+    /// FW Image Download with BPID=1 (Boot Partition write) 当 BP 被
+    /// LOCKDOWN 或 read-only 时返。
+    pub const BOOT_PARTITION_WRITE_PROHIBITED: u8 = 0x1E;
+    /// **Phase S2** — NAMESPACE_ALREADY_ATTACHED (spec SC 0x118)。
+    /// NS Attachment SEL=0 (Attach) 时 NS 已 attached 到本 controller。
+    pub const NAMESPACE_ALREADY_ATTACHED: u8 = 0x18;
     pub const SGL_DESCRIPTOR_TYPE_INVALID: u8 = 0x15;
     /// **Phase R1** — INVALID_USE_OF_CONTROLLER_MEMORY_BUFFER — SGL Data Block
     /// 指向无效 GPA / CMB 但 CMB 未启用时返。

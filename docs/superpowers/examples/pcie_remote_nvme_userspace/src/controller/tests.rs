@@ -1354,3 +1354,135 @@ fn identify_controller_advertises_sgl() {
     assert!(sgls & (1 << 16) != 0, "Bit Bucket supported");
     assert!(sgls & (1 << 17) != 0, "Byte-aligned supported");
 }
+
+/// **Phase S1** — `nswp == 0` 默认放行；`nswp != 0` 返
+/// NAMESPACE_IS_WRITE_PROTECTED (SC 0x20, SCT = Command Specific)。
+#[test]
+fn ns_write_protection_blocks_writes() {
+    use crate::controller::io::check_ns_write_protection;
+    let mut c = make_ctrl_with_tmp("nswp_block");
+    // 默认 WPS=0 → 写应 None（放行）
+    assert!(check_ns_write_protection(&c.namespaces[&1], 0x11, 1, 0, 1).is_none());
+    // 切到 WPS=1 (Write Protect) → 拒
+    c.namespaces.get_mut(&1).unwrap().nswp = 1;
+    let cqe = check_ns_write_protection(&c.namespaces[&1], 0x11, 1, 0, 1).unwrap();
+    let sc = (cqe.dw3 >> 17) as u8;
+    let sct = ((cqe.dw3 >> 25) & 0x7) as u8;
+    assert_eq!(sc, sc::NAMESPACE_IS_WRITE_PROTECTED);
+    assert_eq!(sct, sc::SCT_COMMAND_SPECIFIC);
+    // WPS=2 (Write Protect Until Power Cycle) 同样拒
+    c.namespaces.get_mut(&1).unwrap().nswp = 2;
+    assert!(check_ns_write_protection(&c.namespaces[&1], 0x11, 1, 0, 1).is_some());
+    // WPS=3 (Permanent) 也拒
+    c.namespaces.get_mut(&1).unwrap().nswp = 3;
+    assert!(check_ns_write_protection(&c.namespaces[&1], 0x11, 1, 0, 1).is_some());
+}
+
+/// **Phase S1 (H2/L4 round-trip)** — Set Features 0x84 写入 + Get Features 0x84
+/// 按 per-NS NSID 回读；Permanent (WPS=3) 锁定后再 Set 任何值都 INVALID_FIELD。
+#[test]
+fn ns_write_protection_get_set_round_trip() {
+    // 构造两个 NS 验 per-NS 独立
+    let dir = std::env::temp_dir();
+    let path1 = dir.join(format!(
+        "nvme_test_nswp_rt_a_{}_{:?}.img",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let path2 = dir.join(format!(
+        "nvme_test_nswp_rt_b_{}_{:?}.img",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    for p in [&path1, &path2] {
+        let f = std::fs::File::create(p).unwrap();
+        f.set_len(1024 * 1024).unwrap();
+        drop(f);
+    }
+    let mut c = NvmeController::open(
+        &[
+            path1.to_str().unwrap().to_string(),
+            path2.to_str().unwrap().to_string(),
+        ],
+        0x1414,
+        0,
+        &[1, 2],
+    )
+    .unwrap();
+    // 准备 mock DeviceCtx + CQ entry（admin dispatch 需要 phase）
+    let mut outbound: Vec<pcie_remote_userspace_sdk::ToOpenhcl> = Vec::new();
+    let mut seq = 1u64;
+    let mut tok = 1u64;
+    // 准备 admin CQ 才能拿 phase
+    c.cqs.insert(
+        0,
+        crate::regs::CompletionQueue {
+            base_gpa: 0x1000,
+            size: 16,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        },
+    );
+
+    // 构造 Set Features 0x84 cdw11=WPS=1 NSID=1
+    let make_set = |nsid: u32, wps: u32| {
+        let zero = [0u8; 64];
+        let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+        sqe.cdw0 = (crate::cmd::admin_opc::SET_FEATURES as u32) | (0x11 << 16); // CID=0x11
+        sqe.nsid = nsid;
+        sqe.cdw10 = crate::cmd::fid::NS_WRITE_PROTECTION as u32;
+        sqe.cdw11 = wps;
+        sqe
+    };
+    let make_get = |nsid: u32| {
+        let zero = [0u8; 64];
+        let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+        sqe.cdw0 = (crate::cmd::admin_opc::GET_FEATURES as u32) | (0x22 << 16); // CID=0x22
+        sqe.nsid = nsid;
+        sqe.cdw10 = crate::cmd::fid::NS_WRITE_PROTECTION as u32;
+        sqe
+    };
+    let sc_of = |cqe: &Cqe| (cqe.dw3 >> 17) as u8;
+
+    {
+        let mut ctx =
+            pcie_remote_userspace_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
+        // Set NS 1 WPS=1
+        let cqe = c.dispatch_admin(&mut ctx, make_set(1, 1), 0x11, 0, 0).unwrap();
+        assert_eq!(sc_of(&cqe), 0, "Set WPS=1 should succeed");
+        // Get NS 1 → 1
+        let cqe = c.dispatch_admin(&mut ctx, make_get(1), 0x22, 0, 0).unwrap();
+        let cdw0 = cqe.cdw0;
+        assert_eq!(cdw0, 1, "Get NS 1 should return WPS=1");
+        // Get NS 2 → 0 (per-NS 独立)
+        let cqe = c.dispatch_admin(&mut ctx, make_get(2), 0x22, 0, 0).unwrap();
+        let cdw0 = cqe.cdw0;
+        assert_eq!(cdw0, 0, "Get NS 2 should still be 0 (per-NS)");
+        // Set NS 1 WPS=3 (Permanent)
+        let cqe = c.dispatch_admin(&mut ctx, make_set(1, 3), 0x11, 0, 0).unwrap();
+        assert_eq!(sc_of(&cqe), 0, "Set WPS=3 should succeed");
+        // 再 Set WPS=0 必 INVALID_FIELD（permanent lock-in）
+        let cqe = c.dispatch_admin(&mut ctx, make_set(1, 0), 0x11, 0, 0).unwrap();
+        assert_eq!(
+            sc_of(&cqe),
+            sc::INVALID_FIELD,
+            "Permanent (WPS=3) is not downgradeable"
+        );
+        // 直接 ns 字段确认仍是 3
+        assert_eq!(c.namespaces[&1].nswp, 3);
+        // Get on broadcast NSID rejected
+        let cqe = c
+            .dispatch_admin(&mut ctx, make_get(0xFFFF_FFFF), 0x22, 0, 0)
+            .unwrap();
+        assert_eq!(sc_of(&cqe), sc::INVALID_FIELD);
+    }
+    // cleanup
+    for p in [&path1, &path2] {
+        let _ = std::fs::remove_file(p);
+    }
+}

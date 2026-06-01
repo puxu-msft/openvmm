@@ -1020,6 +1020,7 @@ impl NvmeController {
                                                 reservation: None,
                                                 reservation_gen: 0,
                                                 ptpl: false,
+                                                nswp: 0,
                                                 zns: None,
                                             },
                                         );
