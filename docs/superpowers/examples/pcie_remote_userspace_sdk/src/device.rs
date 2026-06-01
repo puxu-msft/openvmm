@@ -78,6 +78,24 @@ pub struct DeviceCtx<'a> {
 }
 
 impl<'a> DeviceCtx<'a> {
+    /// **Phase Q10** — Test-only constructor。让外部 crate（如 nvme example）
+    /// 的 unit test 能直接构造 DeviceCtx + capture outbound 包做 spec
+    /// 一致性 invariant 测试（无需 mock SDK transport / live vsock）。
+    ///
+    /// 由 caller 提供 `outbound`/`next_seq`/`next_dma_token` 缓冲区，调用
+    /// 后通过它们检视 device 产生的 DMA / CQE / interrupt 行为。
+    pub fn for_testing(
+        outbound: &'a mut Vec<pcie_remote_protocol::ToOpenhcl>,
+        next_seq: &'a mut u64,
+        next_dma_token: &'a mut u64,
+    ) -> Self {
+        Self {
+            outbound,
+            next_seq,
+            next_dma_token,
+        }
+    }
+
     /// 给 guest 触发 MSI-X 中断（vector index）。fire-and-forget。
     pub fn fire_interrupt(&mut self, msix_index: u32) {
         use pcie_remote_protocol::InterruptFire;

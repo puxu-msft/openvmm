@@ -145,7 +145,9 @@ pub mod fid {
     /// 0x81 Host Identifier: 8/16 byte EXHID buffer。
     pub const HOST_IDENTIFIER: u8 = 0x81;
     /// **Phase Q9** — 0x82 Reservation Notification Mask (spec § 5.21.1.21
-    /// + § 7.6)。cdw11 bits 0/1/2 = mask Registration Preempted / Released /
+    /// + § 7.6)。
+    ///
+    /// cdw11 bits 0/1/2 = mask Registration Preempted / Released /
     /// Reservation Preempted。bit set = controller **不**发对应 AEN type
     /// 0x05 给 driver。Get Feature 返当前 mask。
     pub const RESERVATION_NOTIFICATION_MASK: u8 = 0x82;

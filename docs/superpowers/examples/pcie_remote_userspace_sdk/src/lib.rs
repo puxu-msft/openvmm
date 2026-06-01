@@ -60,9 +60,13 @@ mod transport;
 
 pub use device::DeviceCtx;
 pub use device::PcieDevice;
+// **Phase Q10** — re-export protocol types so example crates can use them
+// in test fixtures (DeviceCtx::for_testing 输出 outbound 包).
+pub use pcie_remote_protocol;
 pub use pcie_remote_protocol::BarInfo;
 pub use pcie_remote_protocol::CapabilityBlob;
 pub use pcie_remote_protocol::DeviceDescribe;
+pub use pcie_remote_protocol::ToOpenhcl;
 pub use pcie_remote_protocol::bar_info::Kind as BarKind;
 pub use run::RunOptions;
 pub use run::run;
