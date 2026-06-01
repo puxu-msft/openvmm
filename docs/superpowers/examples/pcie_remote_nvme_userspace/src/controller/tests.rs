@@ -1811,3 +1811,55 @@ fn reservation_notification_log_records_events() {
     assert_eq!(log[8], 2, "log_page_type=Released");
     assert_eq!(u32::from_le_bytes(log[12..16].try_into().unwrap()), 1);
 }
+
+/// **Phase S7** — set_ana_state 切到合法新值 → change_count +1 + 发 ANA
+/// Change Notice AEN (type=0x02 info=0x03 log=0x0C)。相同 state 重复设
+/// 返 false，change_count 不动。非法 state 返 false 不动。
+#[test]
+fn ana_state_change_triggers_aen() {
+    let mut c = make_ctrl_with_tmp("ana_aen");
+    // 准备 admin CQ + 投一条 AER（让 fire_aen 能 pop）
+    c.cqs.insert(
+        0,
+        crate::regs::CompletionQueue {
+            base_gpa: 0x1000,
+            size: 16,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        },
+    );
+    c.aen_pending.push_back((0x42, 0, 0));
+    assert_eq!(c.ana_state, 0x01);
+    let initial_change = c.ana_change_count;
+    let mut outbound: Vec<pcie_remote_userspace_sdk::ToOpenhcl> = Vec::new();
+    let mut seq = 1u64;
+    let mut tok = 1u64;
+    {
+        let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::for_testing(
+            &mut outbound,
+            &mut seq,
+            &mut tok,
+        );
+        // 切到 Non-Optimized 0x02
+        assert!(c.set_ana_state(&mut ctx, 0x02));
+        // 重复设同值 → false
+        assert!(!c.set_ana_state(&mut ctx, 0x02));
+        // 非法 state (0x05 reserved) → false
+        assert!(!c.set_ana_state(&mut ctx, 0x05));
+    }
+    assert_eq!(c.ana_state, 0x02);
+    assert_eq!(c.ana_change_count, initial_change + 1);
+    // ANA Log 0x0C 反映新值
+    let log = crate::controller::logs::build_ana_log(&c, 64);
+    assert_eq!(
+        u64::from_le_bytes(log[0..8].try_into().unwrap()),
+        c.ana_change_count,
+        "log header change_count 同步"
+    );
+    assert_eq!(log[16 + 16], 0x02, "ANA state = 0x02 Non-Optimized");
+}

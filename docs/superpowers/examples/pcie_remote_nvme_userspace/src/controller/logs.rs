@@ -214,8 +214,8 @@ pub(super) fn build_ana_log(c: &NvmeController, bytes: usize) -> Vec<u8> {
     let total = 16 + 32 + 4 * (n_nsid as usize);
     let mut buf = vec![0u8; bytes.max(total)];
     // Header
-    // bytes 0..8 = change count (incrementing). 用 1 (stable)
-    buf[0..8].copy_from_slice(&1u64.to_le_bytes());
+    // bytes 0..8 = change count (incrementing per state change)
+    buf[0..8].copy_from_slice(&c.ana_change_count.to_le_bytes());
     // bytes 8..12 = number of ANA Group Descriptors = 1
     buf[8..12].copy_from_slice(&1u32.to_le_bytes());
     // ANA Group Descriptor @ offset 16
@@ -224,10 +224,11 @@ pub(super) fn build_ana_log(c: &NvmeController, bytes: usize) -> Vec<u8> {
     buf[off..off + 4].copy_from_slice(&1u32.to_le_bytes());
     // bytes 4..8 = NumNSID
     buf[off + 4..off + 8].copy_from_slice(&n_nsid.to_le_bytes());
-    // bytes 8..16 = Change Count = 1
-    buf[off + 8..off + 16].copy_from_slice(&1u64.to_le_bytes());
-    // byte 16 = ANA State = 1 (Optimized)
-    buf[off + 16] = 0x01;
+    // bytes 8..16 = Change Count（per-group），与 header 相同
+    buf[off + 8..off + 16].copy_from_slice(&c.ana_change_count.to_le_bytes());
+    // byte 16 = ANA State（spec 取值：0x01 Optimized / 0x02 Non-Optimized
+    //                                / 0x03 Inaccessible / 0x04 Persistent Loss）
+    buf[off + 16] = c.ana_state;
     // bytes 17..32 reserved
     // NSID list @ offset 16+32
     for (i, n) in nsids.iter().enumerate() {

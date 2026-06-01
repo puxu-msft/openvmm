@@ -108,6 +108,38 @@ impl NvmeController {
             "Reservation Notification queued"
         );
     }
+
+    /// **Phase S7** — 切换 controller ANA state；递增 change_count 并发
+    /// AEN type=0x02 (Notice) info=0x03 (ANA Change) log=0x0C，让 driver
+    /// 重新读 Log 0x0C。new_state 取值：0x01 Optimized / 0x02 Non-Optimized
+    /// / 0x03 Inaccessible / 0x04 Persistent Loss。返 true = state 真变。
+    ///
+    /// 当前仅 tests 调用；未来可挂到 vsock disconnect / re-handshake 事件，
+    /// 让 driver 自动 multipath fail-over。
+    #[allow(dead_code)]
+    pub(super) fn set_ana_state(
+        &mut self,
+        ctx: &mut DeviceCtx<'_>,
+        new_state: u8,
+    ) -> bool {
+        if !(0x01..=0x04).contains(&new_state) {
+            return false;
+        }
+        if self.ana_state == new_state {
+            return false;
+        }
+        self.ana_state = new_state;
+        self.ana_change_count = self.ana_change_count.wrapping_add(1);
+        tracing::info!(
+            new_state,
+            change_count = self.ana_change_count,
+            "ANA state changed"
+        );
+        // 发 ANA Change Notice (NVMe spec § 5.2 Figure 174):
+        //   type 0x02 Notice / info 0x03 ANA Change / log 0x0C ANA
+        let _ = self.fire_aen(ctx, 0x02, 0x03, 0x0C);
+        true
+    }
 }
 
 /// Pending IO command 等 DMA 完成。
@@ -796,6 +828,16 @@ pub struct NvmeController {
     /// 自启动累积的 reservation notification 总数（也写入 log page count 字段）。
     pub(super) reservation_notification_count: u64,
 
+    /// **Phase S7** — Asymmetric Namespace Access (ANA) 全 controller 单
+    /// ANA group (groupid=1)，当前 state 字段。spec § 8.1 取值：
+    ///   0x01 Optimized / 0x02 Non-Optimized / 0x03 Inaccessible /
+    ///   0x04 Persistent Loss / 0x0F Change（瞬态）。默认 0x01。
+    /// Log Page 0x0C ANA + change_count 都从这里读。
+    pub(super) ana_state: u8,
+    /// ANA log change count（spec § 5.16.1.13 'Change Count' 字段）。
+    /// state 切换时 +1；driver poll Log 0x0C 时按此判定 stale。
+    pub(super) ana_change_count: u64,
+
     // ----- Phase K8: Power States -----
     /// 当前 power state index (0..31)。Set Features 0x02 Power Management
     /// 修改；Identify Controller .psd[N] 描述每个 state（spec § 5.17.2.2）。
@@ -1097,6 +1139,8 @@ impl NvmeController {
             crypto_gen: 0,
             reservation_notification_log: std::collections::VecDeque::new(),
             reservation_notification_count: 0,
+            ana_state: 0x01, // Optimized
+            ana_change_count: 1,
             current_ps: 0,
             irq_aggr_time: 0,
             irq_aggr_threshold: 0,
