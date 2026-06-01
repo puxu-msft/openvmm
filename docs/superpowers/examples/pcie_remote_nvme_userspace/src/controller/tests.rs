@@ -1299,3 +1299,58 @@ fn devicectx_mock_captures_dma_read() {
         _ => panic!("expected InterruptFire"),
     }
 }
+
+/// **Phase R1** — SGL inline single Data Block 解 prp1=address。
+#[test]
+fn sgl_inline_data_block_resolves_to_prp() {
+    use crate::controller::io::resolve_data_pointers;
+    // 构造 PSDT=01 SQE with SGL descriptor in bytes 24..40
+    let zero = [0u8; 64];
+    let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+    sqe.cdw0 = 0x0042_4002; // opc=READ(0x02), PSDT=01 (bits 15:14 = 01 = 0x4000), cid=0x42
+    // SGL Data Block: address=0xCAFE1000, length=4096, type=0x00 Data Block, sub=0
+    let address: u64 = 0xCAFE_1000;
+    let length: u32 = 4096;
+    sqe.prp1 = address; // bytes 24..32
+    sqe.prp2 = length as u64; // bytes 32..40: length lo + 0 reserved + 0x00 ID byte (Data Block, sub=0)
+    assert_eq!(sqe.psdt(), 1);
+    let (resolved_prp1, resolved_prp2) = resolve_data_pointers(&sqe).unwrap();
+    assert_eq!(resolved_prp1, address);
+    assert_eq!(resolved_prp2, 0); // single Data Block 不需要 prp2
+}
+
+/// **Phase R1** — PSDT=00 (PRP) 路径不变。
+#[test]
+fn psdt_zero_passes_through_prp() {
+    use crate::controller::io::resolve_data_pointers;
+    let zero = [0u8; 64];
+    let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+    sqe.cdw0 = 0x0042_0002; // PSDT=00
+    sqe.prp1 = 0xBEEF_0000;
+    sqe.prp2 = 0xBEEF_1000;
+    let (p1, p2) = resolve_data_pointers(&sqe).unwrap();
+    assert_eq!(p1, 0xBEEF_0000);
+    assert_eq!(p2, 0xBEEF_1000);
+}
+
+/// **Phase R1** — PSDT=10 (Segment pointer) 当前不支持。
+#[test]
+fn psdt_segment_pointer_rejected() {
+    use crate::controller::io::resolve_data_pointers;
+    let zero = [0u8; 64];
+    let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+    sqe.cdw0 = 0x0042_8002; // PSDT=10 (bits 15:14 = 10 = 0x8000)
+    let r = resolve_data_pointers(&sqe);
+    assert_eq!(r, Err(crate::cmd::sc::SGL_DESCRIPTOR_TYPE_INVALID));
+}
+
+/// **Phase R3** — IdentifyController.sgls advertise (bits 1:0 = 01 + Bit Bucket + byte-aligned)
+#[test]
+fn identify_controller_advertises_sgl() {
+    let buf = IdentifyController::build_v2_bytes(0x1414, 0xc0de, 1);
+    // SGLS @ offset 536..540 (NVMe 2.0c Identify Controller Figure 282)
+    let sgls = u32::from_le_bytes(buf[536..540].try_into().unwrap());
+    assert_eq!(sgls & 0x0003, 0x0001, "SGL Supported bits 1:0 = 01");
+    assert!(sgls & (1 << 16) != 0, "Bit Bucket supported");
+    assert!(sgls & (1 << 17) != 0, "Byte-aligned supported");
+}

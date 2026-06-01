@@ -246,6 +246,18 @@ pub mod sc {
     /// **Phase Q7** — Command Prohibited by Command and Feature Lockdown
     /// (spec § 4.6.1.2.1 + § 5.18) — driver 已 lock 此 opcode 时返。
     pub const COMMAND_PROHIBITED_BY_LOCKDOWN: u8 = 0x23;
+    /// **Phase R1** — SGL_DESCRIPTOR_TYPE_INVALID — driver SGL 解析出未识别
+    /// type 时返。spec § 4.6.1.2.1 Generic SC 0x15。
+    pub const SGL_DESCRIPTOR_TYPE_INVALID: u8 = 0x15;
+    /// **Phase R1** — INVALID_USE_OF_CONTROLLER_MEMORY_BUFFER — SGL Data Block
+    /// 指向无效 GPA / CMB 但 CMB 未启用时返。
+    pub const SGL_INVALID_USE_OF_CMB: u8 = 0x16;
+    /// **Phase R1** — PRP_OFFSET_INVALID — SGL Last Segment 必须最后一个；
+    /// 中途出现 Last 之后还有 descriptor 时返。
+    pub const SGL_DATA_BLOCK_GRANULARITY_INVALID: u8 = 0x17;
+    /// **Phase R1** — INVALID_NUMBER_OF_SGL_DESCRIPTORS — total length < cmd
+    /// 要求 transfer 字节数时返。
+    pub const SGL_INVALID_NUMBER_OF_DESCRIPTORS: u8 = 0x14;
 }
 
 /// Submission Queue Entry — 64 bytes 固定。
@@ -286,6 +298,29 @@ impl Sqe {
     /// spec § 6.2 Fused Operations。
     pub fn fuse(&self) -> u8 {
         ((self.cdw0 >> 8) & 0x3) as u8
+    }
+    /// **Phase R1** — PSDT (PRP or SGL for Data Transfer) field (cdw0 bits 15:14)。
+    ///   00 = PRP（默认；prp1/prp2 各自含义见 spec § 4.1.1）
+    ///   01 = SGL，**首个 SGL descriptor 内嵌**在 SQE bytes 24..40
+    ///        (即 SDK 解析后 prp1=bytes 24..32, prp2=bytes 32..40)
+    ///   10 = SGL，bytes 24..40 是 SGL Segment descriptor 指向首段 SGL list
+    ///   11 = reserved
+    /// spec § 4.4 Scatter Gather Lists。
+    pub fn psdt(&self) -> u8 {
+        ((self.cdw0 >> 14) & 0x3) as u8
+    }
+    /// **Phase R1** — SGL embedded in SQE：driver 用 PSDT=01 把首个 SGL
+    /// descriptor 直接放在 prp1/prp2 字段位置（16 byte total）。
+    /// 返回 raw bytes 让 sgl::SglDescriptor::parse 解码。
+    pub fn embedded_sgl_bytes(&self) -> [u8; 16] {
+        let mut buf = [0u8; 16];
+        // prp1 / prp2 是 #[repr(C, packed)]，copy 到本地避免对 packed
+        // 字段取引用 UB。
+        let prp1 = self.prp1;
+        let prp2 = self.prp2;
+        buf[0..8].copy_from_slice(&prp1.to_le_bytes());
+        buf[8..16].copy_from_slice(&prp2.to_le_bytes());
+        buf
     }
 }
 
@@ -510,6 +545,15 @@ impl IdentifyController {
         id.anacap = 0x0F; // optimized + non-opt + inaccessible + persistent loss states 都支持
         id.anagrpmax = 1; // 最多 1 ANA group
         id.nanagrpid = 1; // 当前 1 ANA group active
+        // **Phase R3** — SGLS (SGL Support) field (spec § 5.17.2.2)。
+        // bits 1:0 = 01 (SGL supported, no alignment requirements 不强制对齐)
+        // bit 2     = 0 (Keyed SGL Data Block not supported — NVMe-oF only)
+        // bit 16    = 1 (SGL Bit Bucket descriptor supported)
+        // bit 17    = 1 (SGL Byte-Aligned 即 length 任意，与 PRP page-aligned 区别)
+        // bit 19    = 0 (SGL transport data block 不支持)
+        // 教学：driver Set PSDT=01 后我们走 R1 inline-Data-Block 路径；多
+        // fragment / Segment chain 仍返 INVALID 让 driver 拆小 IO 或回 PRP。
+        id.sgls = 0x0003_0001;
         id.as_bytes().to_vec()
     }
 }

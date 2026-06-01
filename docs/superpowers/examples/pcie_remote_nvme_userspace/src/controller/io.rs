@@ -306,6 +306,81 @@ pub(crate) fn advance_zns_wp(ns: &mut crate::controller::Namespace, lba: u64, nl
     }
 }
 
+/// **Phase R1** — 解析 SQE 的 data pointer：根据 PSDT 选 PRP 或 SGL。
+///
+/// 返回 (prp1, prp2) 让 caller 复用现有 PRP 三档 dispatch（≤1 page 单 PRP，
+/// ≤2 page dual PRP，> 2 page PRP list）。
+///
+/// SGL 教学路径：
+/// - PSDT=00：直接返 raw prp1/prp2（标准 PRP 路径）
+/// - PSDT=01：解析 SQE 内嵌 16-byte SGL descriptor (bytes 24..40)
+///   * 单 Data Block + 长度 ≤ 1 page → 用 address 当 prp1，prp2=0
+///   * 单 Data Block + 长度 > 1 page 或多 fragment → 当前不支持，返
+///     SGL_DESCRIPTOR_TYPE_INVALID（R2 时扩展 Segment 链式 walk）
+///   * 其他 type (Bit Bucket / Segment / Keyed) → reject
+/// - PSDT=10 (SGL Segment pointer)：留 R2
+/// - PSDT=11 reserved → INVALID_FIELD
+pub(crate) fn resolve_data_pointers(sqe: &Sqe) -> Result<(u64, u64), u8> {
+    let psdt = sqe.psdt();
+    let prp1 = sqe.prp1;
+    let prp2 = sqe.prp2;
+    match psdt {
+        0b00 => Ok((prp1, prp2)),
+        0b01 => {
+            // Inline SGL descriptor in bytes 24..40
+            let bytes = sqe.embedded_sgl_bytes();
+            let desc = match crate::sgl::SglDescriptor::parse(&bytes) {
+                Some(d) => d,
+                None => return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID),
+            };
+            if desc.sub_type != 0 {
+                return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID);
+            }
+            match desc.sgl_type {
+                crate::sgl::SglType::DataBlock => {
+                    // 单 Data Block：address → prp1，length 隐含由 NLB 验证。
+                    // length 必须 ≥ nlb*sector_size，否则不够装数据。
+                    // 教学路径不允许 length > 1 page 的单 SGL (driver 应拆
+                    // 多 fragment 走 R2 Segment 链)。
+                    if desc.length as u64 > crate::regs::NVME_PAGE_SIZE {
+                        tracing::warn!(
+                            length = desc.length,
+                            "SGL inline Data Block > 1 page; need R2 Segment chain"
+                        );
+                        return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID);
+                    }
+                    Ok((desc.address, 0))
+                }
+                crate::sgl::SglType::BitBucket => {
+                    // Bit Bucket 在 Read = controller 不写 host (driver 丢弃)；
+                    // Write = controller 看不到 host data。单 Bit Bucket 没
+                    // 意义（无数据传输），reject 让 driver 知道。
+                    tracing::warn!("SGL Bit Bucket as sole inline descriptor rejected");
+                    Err(sc::SGL_DESCRIPTOR_TYPE_INVALID)
+                }
+                crate::sgl::SglType::Segment | crate::sgl::SglType::LastSegment => {
+                    // PSDT=01 的 inline 应是数据 descriptor 而非 Segment；
+                    // 若 driver 想 chain 应用 PSDT=10。
+                    tracing::warn!("SGL Segment as inline (PSDT=01) is mis-encoded");
+                    Err(sc::SGL_DESCRIPTOR_TYPE_INVALID)
+                }
+                crate::sgl::SglType::KeyedDataBlock | crate::sgl::SglType::TransportSpecific => {
+                    tracing::warn!("SGL Keyed / Transport-specific (NVMe-oF only) unsupported");
+                    Err(sc::SGL_DESCRIPTOR_TYPE_INVALID)
+                }
+            }
+        }
+        0b10 => {
+            // PSDT=10：bytes 24..40 是 SGL Segment descriptor 指向首段。
+            // R2 留：需 DMA-read 后递归 walk 各段。当前 reject 让 driver
+            // 回退 PSDT=00 / 01。
+            tracing::warn!("PSDT=10 (SGL Segment pointer) not yet supported; use PSDT=01");
+            Err(sc::SGL_DESCRIPTOR_TYPE_INVALID)
+        }
+        _ => Err(sc::INVALID_FIELD),
+    }
+}
+
 impl NvmeController {
     /// IO command dispatch。Read/Write 走 DMA。
     pub(super) fn dispatch_io(
@@ -337,11 +412,21 @@ impl NvmeController {
                 let cdw10 = sqe.cdw10;
                 let cdw11 = sqe.cdw11;
                 let cdw12 = sqe.cdw12;
-                let prp1 = sqe.prp1;
-                let prp2 = sqe.prp2;
                 let nsid = sqe.nsid;
                 let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
                 let nlb = (cdw12 & 0xffff) as u32 + 1;
+                // **Phase R1** — PSDT (PRP or SGL) dispatch。
+                // PSDT=00 (PRP) → 直接用 sqe.prp1/prp2
+                // PSDT=01 (SGL inline) → 把 SQE bytes 24..40 解 SGL，单
+                //   Data Block 时 address→prp1 复用现有 PRP 路径；否则
+                //   reject。
+                // PSDT=10/11 → reject (Segment chain 需 R2，reserved)。
+                let (prp1, prp2) = match resolve_data_pointers(&sqe) {
+                    Ok(p) => p,
+                    Err(sc_byte) => {
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte, 0));
+                    }
+                };
                 // **Phase Q1** — PRACT (Protection Information Action) bit 29。
                 // spec § 8.3.1.2：PRACT=1 = driver 让 controller 自动 strip
                 // (Read) / insert (Write) PI tuple。我们 K4 路径本来就是
@@ -784,11 +869,16 @@ impl NvmeController {
                 let cdw10 = sqe.cdw10;
                 let cdw11 = sqe.cdw11;
                 let cdw12 = sqe.cdw12;
-                let prp1 = sqe.prp1;
-                let prp2 = sqe.prp2;
                 let nsid = sqe.nsid;
                 let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
                 let nlb = (cdw12 & 0xffff) as u32 + 1;
+                // **Phase R1** — PSDT dispatch（同 READ 路径，参 resolve_data_pointers）
+                let (prp1, prp2) = match resolve_data_pointers(&sqe) {
+                    Ok(p) => p,
+                    Err(sc_byte) => {
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte, 0));
+                    }
+                };
                 // **Phase Q1** — PRACT bit 29，参 READ 注释。PRACT=1 在 PI
                 // NS 上等价 PI K4 path（controller generate tuple on write）。
                 // 非 PI NS 上 PRACT=1 = INVALID_PROTECTION_INFO（NS 校验在

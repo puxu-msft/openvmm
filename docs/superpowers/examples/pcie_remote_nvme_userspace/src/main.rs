@@ -32,6 +32,7 @@ mod cmd;
 mod controller;
 mod pi;
 mod regs;
+mod sgl;
 
 use anyhow::Result;
 use anyhow::anyhow;
