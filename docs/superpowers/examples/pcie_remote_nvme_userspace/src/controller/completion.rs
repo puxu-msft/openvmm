@@ -34,11 +34,7 @@ use zerocopy::IntoBytes;
 /// (slba, nlb) 列表，若任两 source range 互重叠 / source 与 destination
 /// 区间互重叠 → 返 true（应返 SC 0x80 CONFLICTING_ATTRIBUTES）。
 /// 溢出当冲突处理（更保守）。O(n²)，n ≤ 128（range list ≤ 1 page）。
-pub(crate) fn check_copy_range_conflict(
-    sdlba: u64,
-    dst_total: u64,
-    ranges: &[(u64, u32)],
-) -> bool {
+pub(crate) fn check_copy_range_conflict(sdlba: u64, dst_total: u64, ranges: &[(u64, u32)]) -> bool {
     let dst_end = sdlba.checked_add(dst_total);
     ranges.iter().enumerate().any(|(i, &(s1, n1))| {
         let e1 = s1.checked_add(n1 as u64);
@@ -871,70 +867,77 @@ impl NvmeController {
                                 sc::SCT_COMMAND_SPECIFIC,
                             )
                         } else {
-                        // **Reviewer H-2** — checked_add 防 sdlba/slba 来自
-                        // driver / 恶意输入溢出 u64 后绕过 bounds 检查。
-                        let ok_bounds = sdlba
-                            .checked_add(dst_total)
-                            .is_some_and(|e| e <= ns.total_lba)
-                            && ranges.iter().all(|&(slba, nlb)| {
-                                slba.checked_add(nlb as u64)
-                                    .is_some_and(|e| e <= ns.total_lba)
-                            });
-                        if !ok_bounds {
-                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::LBA_OUT_OF_RANGE, 0)
-                        } else {
-                            // Per-range: read backing → write to sdlba offset
-                            let mut dst_off_lba = sdlba;
-                            let mut copy_err: Option<std::io::Error> = None;
-                            for &(slba, nlb) in &ranges {
-                                let bytes = nlb as usize * sector as usize;
-                                let mut buf = vec![0u8; bytes];
-                                if let Err(e) = ns.read_at(&mut buf, slba * sector) {
-                                    copy_err = Some(e);
-                                    break;
-                                }
-                                if let Err(e) = ns.write_at(&buf, dst_off_lba * sector) {
-                                    copy_err = Some(e);
-                                    break;
-                                }
-                                dst_off_lba += nlb as u64;
-                            }
-                            if let Some(e) = copy_err {
-                                tracing::warn!(error = %e, nsid, sdlba, "COPY backing IO fail");
-                                self.stat_num_err_log_entries += 1;
-                                self.push_error_log(
-                                    p.sq_id,
-                                    p.cid,
-                                    (sc::DATA_TRANSFER_ERROR as u16) << 1,
-                                    sdlba,
-                                    nsid,
-                                );
+                            // **Reviewer H-2** — checked_add 防 sdlba/slba 来自
+                            // driver / 恶意输入溢出 u64 后绕过 bounds 检查。
+                            let ok_bounds = sdlba
+                                .checked_add(dst_total)
+                                .is_some_and(|e| e <= ns.total_lba)
+                                && ranges.iter().all(|&(slba, nlb)| {
+                                    slba.checked_add(nlb as u64)
+                                        .is_some_and(|e| e <= ns.total_lba)
+                                });
+                            if !ok_bounds {
                                 Cqe::error(
                                     p.cid,
                                     p.sq_id,
                                     p.sq_head,
                                     phase,
-                                    sc::DATA_TRANSFER_ERROR,
+                                    sc::LBA_OUT_OF_RANGE,
                                     0,
                                 )
                             } else {
-                                // 计入 host_reads + host_writes (NVMe spec § 5.16.1.2
-                                // SMART 把 Copy 既算 read 也算 write，因为 backing
-                                // 真的双程 IO 了)
-                                self.stat_host_reads += 1;
-                                self.stat_host_writes += 1;
-                                self.stat_lba_read += dst_total;
-                                self.stat_lba_written += dst_total;
-                                tracing::debug!(
-                                    nsid,
-                                    sdlba,
-                                    dst_total,
-                                    num_ranges,
-                                    "COPY OK (controller-side backing)"
-                                );
-                                Cqe::success(p.cid, p.sq_id, p.sq_head, phase)
+                                // Per-range: read backing → write to sdlba offset
+                                let mut dst_off_lba = sdlba;
+                                let mut copy_err: Option<std::io::Error> = None;
+                                for &(slba, nlb) in &ranges {
+                                    let bytes = nlb as usize * sector as usize;
+                                    let mut buf = vec![0u8; bytes];
+                                    if let Err(e) = ns.read_at(&mut buf, slba * sector) {
+                                        copy_err = Some(e);
+                                        break;
+                                    }
+                                    if let Err(e) = ns.write_at(&buf, dst_off_lba * sector) {
+                                        copy_err = Some(e);
+                                        break;
+                                    }
+                                    dst_off_lba += nlb as u64;
+                                }
+                                if let Some(e) = copy_err {
+                                    tracing::warn!(error = %e, nsid, sdlba, "COPY backing IO fail");
+                                    self.stat_num_err_log_entries += 1;
+                                    self.push_error_log(
+                                        p.sq_id,
+                                        p.cid,
+                                        (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                                        sdlba,
+                                        nsid,
+                                    );
+                                    Cqe::error(
+                                        p.cid,
+                                        p.sq_id,
+                                        p.sq_head,
+                                        phase,
+                                        sc::DATA_TRANSFER_ERROR,
+                                        0,
+                                    )
+                                } else {
+                                    // 计入 host_reads + host_writes (NVMe spec § 5.16.1.2
+                                    // SMART 把 Copy 既算 read 也算 write，因为 backing
+                                    // 真的双程 IO 了)
+                                    self.stat_host_reads += 1;
+                                    self.stat_host_writes += 1;
+                                    self.stat_lba_read += dst_total;
+                                    self.stat_lba_written += dst_total;
+                                    tracing::debug!(
+                                        nsid,
+                                        sdlba,
+                                        dst_total,
+                                        num_ranges,
+                                        "COPY OK (controller-side backing)"
+                                    );
+                                    Cqe::success(p.cid, p.sq_id, p.sq_head, phase)
+                                }
                             }
-                        }
                         }
                     } else {
                         Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE, 0)
@@ -987,7 +990,11 @@ impl NvmeController {
                             // List 不含本 ctrl → spec § 5.20 "Controller Not Attached" /
                             // attach 时 "Namespace Not Attached" 等；简化返 success
                             // (no-op — 不针对本 ctrl)。
-                            tracing::debug!(nsid = p.nsid, sel, "NS Attachment list 不含 cntlid=1，no-op");
+                            tracing::debug!(
+                                nsid = p.nsid,
+                                sel,
+                                "NS Attachment list 不含 cntlid=1，no-op"
+                            );
                             Cqe::success(p.cid, p.sq_id, p.sq_head, phase)
                         } else if let Some(ns) = self.namespaces.get_mut(&p.nsid) {
                             match sel {
@@ -1017,15 +1024,15 @@ impl NvmeController {
                                     if !ns.attached {
                                         tracing::debug!(
                                             nsid = p.nsid,
-                                            "NS already detached"
+                                            "NS already detached (SC 0x19)"
                                         );
                                         Cqe::error(
                                             p.cid,
                                             p.sq_id,
                                             p.sq_head,
                                             phase,
-                                            sc::INVALID_FIELD,
-                                            0,
+                                            sc::NAMESPACE_NOT_ATTACHED,
+                                            sc::SCT_COMMAND_SPECIFIC,
                                         )
                                     } else {
                                         ns.attached = false;
@@ -1043,14 +1050,7 @@ impl NvmeController {
                                 ),
                             }
                         } else {
-                            Cqe::error(
-                                p.cid,
-                                p.sq_id,
-                                p.sq_head,
-                                phase,
-                                sc::INVALID_NAMESPACE,
-                                0,
-                            )
+                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE, 0)
                         }
                     };
                     self.post_cqe(ctx, p.cq_id, cqe);

@@ -392,10 +392,7 @@ pub(crate) fn check_ns_write_protection(
     phase: u8,
 ) -> Option<Cqe> {
     if ns.nswp != 0 {
-        tracing::debug!(
-            wps = ns.nswp,
-            "write rejected: NS Write Protection active"
-        );
+        tracing::debug!(wps = ns.nswp, "write rejected: NS Write Protection active");
         return Some(Cqe::error(
             cid,
             sq_id,
@@ -443,7 +440,14 @@ impl NvmeController {
             && !ns.attached
         {
             tracing::debug!(nsid, "IO rejected: NS detached");
-            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_NAMESPACE, 0));
+            return Some(Cqe::error(
+                cid,
+                sq_id,
+                sq_head,
+                phase,
+                sc::INVALID_NAMESPACE,
+                0,
+            ));
         }
         match sqe.opcode() {
             nvm_opc::READ => {

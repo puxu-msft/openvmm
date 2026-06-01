@@ -282,9 +282,12 @@ pub mod sc {
     /// FW Image Download with BPID=1 (Boot Partition write) 当 BP 被
     /// LOCKDOWN 或 read-only 时返。
     pub const BOOT_PARTITION_WRITE_PROHIBITED: u8 = 0x1E;
-    /// **Phase S2** — NAMESPACE_ALREADY_ATTACHED (spec SC 0x118)。
+    /// **Phase S2** — NAMESPACE_ALREADY_ATTACHED (spec SC 0x18)。
     /// NS Attachment SEL=0 (Attach) 时 NS 已 attached 到本 controller。
     pub const NAMESPACE_ALREADY_ATTACHED: u8 = 0x18;
+    /// **Phase S2** — NAMESPACE_NOT_ATTACHED (spec SC 0x19, Cmd-Specific)。
+    /// NS Attachment SEL=1 (Detach) 时 NS 已 detached（对称 0x18）。
+    pub const NAMESPACE_NOT_ATTACHED: u8 = 0x19;
     pub const SGL_DESCRIPTOR_TYPE_INVALID: u8 = 0x15;
     /// **Phase R1** — INVALID_USE_OF_CONTROLLER_MEMORY_BUFFER — SGL Data Block
     /// 指向无效 GPA / CMB 但 CMB 未启用时返。

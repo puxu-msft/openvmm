@@ -130,8 +130,10 @@ pub(super) fn build_self_test(c: &NvmeController, bytes: usize) -> Vec<u8> {
 ///   bytes 12..16 nsid
 ///   bytes 16..64 reserved
 ///
-/// 返回包含所有 queued entries 的 buffer；读后清空 queue 模拟 "consumed"。
-/// 教学：spec 允许 controller 自定 retention policy；我们用 read-then-clear。
+/// 返回当前 ring buffer 中所有 entries（最末 32 条；NVMe § 5.16.1.20 允许
+/// controller-defined retention，我们用 ring 而非 read-then-clear）。
+/// Driver 用 log_page_count 单调判定 stale，再次拉 log 会拿到同样 entries
+/// 直到被新事件挤出 ring。
 pub(super) fn build_reservation_notification(c: &NvmeController, bytes: usize) -> Vec<u8> {
     let n_entries = c.reservation_notification_log.len();
     let need = (n_entries * 64).max(64);

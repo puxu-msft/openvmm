@@ -295,6 +295,11 @@ impl NvmeController {
                         //                  bytes 2.. = u16[] cntlids 升序。
                         // 教学：单 controller cntlid=1；若 NSID 不存在 →
                         // INVALID_NAMESPACE；若 NS detached → NumIDs=0。
+                        // **review M3** — NSID=0 / broadcast 0xFFFF_FFFF 在
+                        // CNS 0x12 不合法 (spec 表 273) → INVALID_FIELD。
+                        if nsid == 0 || nsid == 0xFFFF_FFFF {
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                        }
                         let start_cntlid = ((sqe.cdw10 >> 16) & 0xffff) as u16;
                         let Some(ns) = self.namespaces.get(&nsid) else {
                             return Some(Cqe::error(
@@ -307,7 +312,7 @@ impl NvmeController {
                             ));
                         };
                         let mut buf = vec![0u8; 4096];
-                        if ns.attached && 1 >= start_cntlid {
+                        if ns.attached && start_cntlid <= 1 {
                             buf[0..2].copy_from_slice(&1u16.to_le_bytes());
                             buf[2..4].copy_from_slice(&1u16.to_le_bytes());
                         }
@@ -320,7 +325,7 @@ impl NvmeController {
                         // 教学：subsystem 仅 1 controller (cntlid=1)。
                         let start_cntlid = ((sqe.cdw10 >> 16) & 0xffff) as u16;
                         let mut buf = vec![0u8; 4096];
-                        if 1 >= start_cntlid {
+                        if start_cntlid <= 1 {
                             buf[0..2].copy_from_slice(&1u16.to_le_bytes());
                             buf[2..4].copy_from_slice(&1u16.to_le_bytes());
                         }
@@ -536,14 +541,7 @@ impl NvmeController {
                         let wps = (cdw11 & 0x7) as u8;
                         let nsid = sqe.nsid;
                         if nsid == 0 || nsid == 0xFFFF_FFFF {
-                            return Some(Cqe::error(
-                                cid,
-                                0,
-                                sq_head,
-                                phase,
-                                sc::INVALID_FIELD,
-                                0,
-                            ));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                         }
                         let Some(ns) = self.namespaces.get_mut(&nsid) else {
                             return Some(Cqe::error(
@@ -560,14 +558,7 @@ impl NvmeController {
                                 nsid,
                                 "Set Features 0x84 on permanently-write-protected NS rejected"
                             );
-                            return Some(Cqe::error(
-                                cid,
-                                0,
-                                sq_head,
-                                phase,
-                                sc::INVALID_FIELD,
-                                0,
-                            ));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                         }
                         ns.nswp = wps;
                         // **Phase S1 H2** — 不写 self.features：per-NS 值的
@@ -626,13 +617,16 @@ impl NvmeController {
                         // 读取目标 NS 的 nswp，而不是回 controller-global 缓存。
                         let nsid = sqe.nsid;
                         if nsid == 0 || nsid == 0xFFFF_FFFF {
-                            return Some(Cqe::error(
-                                cid, 0, sq_head, phase, sc::INVALID_FIELD, 0,
-                            ));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                         }
                         let Some(ns) = self.namespaces.get(&nsid) else {
                             return Some(Cqe::error(
-                                cid, 0, sq_head, phase, sc::INVALID_NAMESPACE, 0,
+                                cid,
+                                0,
+                                sq_head,
+                                phase,
+                                sc::INVALID_NAMESPACE,
+                                0,
                             ));
                         };
                         ns.nswp as u32
@@ -1256,19 +1250,13 @@ impl NvmeController {
                 let sel = (sqe.cdw10 & 0xf) as u8;
                 let nsid = sqe.nsid;
                 if nsid == 0 || nsid == 0xFFFF_FFFF {
-                    return Some(Cqe::error(
-                        cid, 0, sq_head, phase, sc::INVALID_FIELD, 0,
-                    ));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
                 if !self.namespaces.contains_key(&nsid) {
-                    return Some(Cqe::error(
-                        cid, 0, sq_head, phase, sc::INVALID_NAMESPACE, 0,
-                    ));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE, 0));
                 }
                 if sel > 1 {
-                    return Some(Cqe::error(
-                        cid, 0, sq_head, phase, sc::INVALID_FIELD, 0,
-                    ));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
                 // PRP1 → controller list 4 KiB DMA read，完成在 on_dma_complete。
                 let tok = ctx.dma_read(sqe.prp1, 4096);

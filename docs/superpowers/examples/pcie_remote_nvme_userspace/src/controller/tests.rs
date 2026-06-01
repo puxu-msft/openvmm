@@ -1453,7 +1453,9 @@ fn ns_write_protection_get_set_round_trip() {
         let mut ctx =
             pcie_remote_userspace_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
         // Set NS 1 WPS=1
-        let cqe = c.dispatch_admin(&mut ctx, make_set(1, 1), 0x11, 0, 0).unwrap();
+        let cqe = c
+            .dispatch_admin(&mut ctx, make_set(1, 1), 0x11, 0, 0)
+            .unwrap();
         assert_eq!(sc_of(&cqe), 0, "Set WPS=1 should succeed");
         // Get NS 1 → 1
         let cqe = c.dispatch_admin(&mut ctx, make_get(1), 0x22, 0, 0).unwrap();
@@ -1464,10 +1466,14 @@ fn ns_write_protection_get_set_round_trip() {
         let cdw0 = cqe.cdw0;
         assert_eq!(cdw0, 0, "Get NS 2 should still be 0 (per-NS)");
         // Set NS 1 WPS=3 (Permanent)
-        let cqe = c.dispatch_admin(&mut ctx, make_set(1, 3), 0x11, 0, 0).unwrap();
+        let cqe = c
+            .dispatch_admin(&mut ctx, make_set(1, 3), 0x11, 0, 0)
+            .unwrap();
         assert_eq!(sc_of(&cqe), 0, "Set WPS=3 should succeed");
         // 再 Set WPS=0 必 INVALID_FIELD（permanent lock-in）
-        let cqe = c.dispatch_admin(&mut ctx, make_set(1, 0), 0x11, 0, 0).unwrap();
+        let cqe = c
+            .dispatch_admin(&mut ctx, make_set(1, 0), 0x11, 0, 0)
+            .unwrap();
         assert_eq!(
             sc_of(&cqe),
             sc::INVALID_FIELD,
@@ -1633,7 +1639,8 @@ fn ns_attachment_via_admin_round_trip() {
         c.on_dma_complete_impl(&mut ctx, tok, true, ctrl_list.clone());
         assert!(c.namespaces[&1].attached, "Attach 后 attached=true");
     }
-    // 再 Attach 应 NAMESPACE_ALREADY_ATTACHED
+    // 再 Attach 应 NAMESPACE_ALREADY_ATTACHED (SC 0x18, SCT Cmd-Specific)
+    let outbound_pre = outbound.len();
     {
         let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::for_testing(
             &mut outbound,
@@ -1644,8 +1651,31 @@ fn ns_attachment_via_admin_round_trip() {
         assert!(r.is_none());
         let tok = *c.pending_ios.keys().next().expect("pending IO 应有一条");
         c.on_dma_complete_impl(&mut ctx, tok, true, ctrl_list.clone());
-        assert!(c.namespaces[&1].attached);
     }
+    // 状态未回退
+    assert!(c.namespaces[&1].attached);
+    // 抓 outbound_pre 之后最后一条 WriteGpa 解析为 Cqe（post_cqe via
+    // dma_write_fire_and_forget 把 16-byte CQE 发到 admin CQ GPA）。
+    use pcie_remote_userspace_sdk::pcie_remote_protocol::to_openhcl::Body;
+    let cqe_bytes = outbound
+        .iter()
+        .skip(outbound_pre)
+        .filter_map(|m| match m.body.as_ref()? {
+            Body::WriteGpa(w) if w.data.len() >= 16 => Some(w.data.clone()),
+            _ => None,
+        })
+        .next_back()
+        .expect("Already-Attached 应 post 一条 CQE 到 admin CQ");
+    // Cqe 16 byte：dw0(4) + dw1(4) + dw2(4) + dw3(4)
+    let dw3 = u32::from_le_bytes(cqe_bytes[12..16].try_into().unwrap());
+    let sc = (dw3 >> 17) as u8;
+    let sct = ((dw3 >> 25) & 0x7) as u8;
+    assert_eq!(
+        sc,
+        sc::NAMESPACE_ALREADY_ATTACHED,
+        "重复 Attach 必返 SC 0x18"
+    );
+    assert_eq!(sct, sc::SCT_COMMAND_SPECIFIC);
 }
 
 /// **Phase S5** — CNS 0x12/0x13 Controller List 返本 controller (cntlid=1)；
@@ -1717,7 +1747,11 @@ fn identify_controller_list_cns_0x12_0x13() {
         let _ = c.dispatch_admin(&mut ctx, make_sqe(0x13, 0, 2), 0x44, 0, 0);
     }
     let buf = extract_last_write(&outbound);
-    assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 0, "start>1 → NumIDs=0");
+    assert_eq!(
+        u16::from_le_bytes([buf[0], buf[1]]),
+        0,
+        "start>1 → NumIDs=0"
+    );
     outbound.clear();
 
     {
@@ -1757,49 +1791,16 @@ fn reservation_notification_log_records_events() {
     let nsid = 1u32;
     let mut buf = vec![0u8; 16];
     buf[8..16].copy_from_slice(&0xDEAD_BEEFu64.to_le_bytes()); // nrkey
-    let cqe = c.apply_reservation_cmd(
-        nsid,
-        ReservationKind::Register,
-        0,
-        0,
-        0,
-        &buf,
-        0,
-        0,
-        0,
-        1,
-    );
+    let cqe = c.apply_reservation_cmd(nsid, ReservationKind::Register, 0, 0, 0, &buf, 0, 0, 0, 1);
     assert_eq!((cqe.dw3 >> 17) as u8, 0, "Register OK");
     let mut buf = vec![0u8; 16];
     buf[0..8].copy_from_slice(&0xDEAD_BEEFu64.to_le_bytes()); // crkey
-    let cqe = c.apply_reservation_cmd(
-        nsid,
-        ReservationKind::Acquire,
-        0,
-        1,
-        0,
-        &buf,
-        0,
-        0,
-        0,
-        1,
-    );
+    let cqe = c.apply_reservation_cmd(nsid, ReservationKind::Acquire, 0, 1, 0, &buf, 0, 0, 0, 1);
     assert_eq!((cqe.dw3 >> 17) as u8, 0, "Acquire OK");
     // 这两条不应 push notification
     assert_eq!(c.reservation_notification_log.len(), 0);
     // Release 触发 type=2
-    let cqe = c.apply_reservation_cmd(
-        nsid,
-        ReservationKind::Release,
-        0,
-        1,
-        0,
-        &buf,
-        0,
-        0,
-        0,
-        1,
-    );
+    let cqe = c.apply_reservation_cmd(nsid, ReservationKind::Release, 0, 1, 0, &buf, 0, 0, 0, 1);
     assert_eq!((cqe.dw3 >> 17) as u8, 0, "Release OK");
     assert_eq!(c.reservation_notification_log.len(), 1);
     assert_eq!(c.reservation_notification_log[0].log_page_type, 2);
@@ -1840,11 +1841,8 @@ fn ana_state_change_triggers_aen() {
     let mut seq = 1u64;
     let mut tok = 1u64;
     {
-        let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::for_testing(
-            &mut outbound,
-            &mut seq,
-            &mut tok,
-        );
+        let mut ctx =
+            pcie_remote_userspace_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
         // 切到 Non-Optimized 0x02
         assert!(c.set_ana_state(&mut ctx, 0x02));
         // 重复设同值 → false

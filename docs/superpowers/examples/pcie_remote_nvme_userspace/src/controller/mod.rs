@@ -85,13 +85,8 @@ pub(super) struct ReservationNotification {
 impl NvmeController {
     /// **Phase S6** — push 一条 Reservation Notification 到 ring buffer。
     /// 保留末 32 条；log_page_count 单调递增。
-    pub(super) fn push_reservation_notification(
-        &mut self,
-        log_page_type: u8,
-        nsid: u32,
-    ) {
-        self.reservation_notification_count =
-            self.reservation_notification_count.wrapping_add(1);
+    pub(super) fn push_reservation_notification(&mut self, log_page_type: u8, nsid: u32) {
+        self.reservation_notification_count = self.reservation_notification_count.wrapping_add(1);
         let entry = ReservationNotification {
             log_page_count: self.reservation_notification_count,
             log_page_type,
@@ -117,11 +112,7 @@ impl NvmeController {
     /// 当前仅 tests 调用；未来可挂到 vsock disconnect / re-handshake 事件，
     /// 让 driver 自动 multipath fail-over。
     #[allow(dead_code)]
-    pub(super) fn set_ana_state(
-        &mut self,
-        ctx: &mut DeviceCtx<'_>,
-        new_state: u8,
-    ) -> bool {
+    pub(super) fn set_ana_state(&mut self, ctx: &mut DeviceCtx<'_>, new_state: u8) -> bool {
         if !(0x01..=0x04).contains(&new_state) {
             return false;
         }
@@ -824,7 +815,8 @@ pub struct NvmeController {
     /// available_log_pages (u8) + reserved + nsid (u32) + reserved 48 byte
     /// = 64 byte。我们 keep 末 32 条作 ring buffer。
     /// 资源 release / preemption / regstration preempted 事件 push 一条。
-    pub(super) reservation_notification_log: std::collections::VecDeque<crate::controller::ReservationNotification>,
+    pub(super) reservation_notification_log:
+        std::collections::VecDeque<crate::controller::ReservationNotification>,
     /// 自启动累积的 reservation notification 总数（也写入 log page count 字段）。
     pub(super) reservation_notification_count: u64,
 
