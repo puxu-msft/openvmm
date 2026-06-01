@@ -34,8 +34,21 @@ export OPENVMM_WINDOWS_CROSS_TOOL="$TOOLDIR/cross_tool.py"
 # Refresh windows-cross cache (in case PATH changed since last run)
 rm -f ~/.cache/windows-cross/cross-x86_64.json
 
-echo "Building $CRATE for x86_64-pc-windows-msvc..."
-cargo build --target x86_64-pc-windows-msvc -p "$CRATE" "${@:2}"
-echo
-echo "Output: target/x86_64-pc-windows-msvc/debug/$CRATE.exe"
-ls -la "target/x86_64-pc-windows-msvc/debug/$CRATE.exe" 2>/dev/null || true
+# **Phase Q12** — 对 exclude 列表里的 standalone example，cd 到目录构建
+# 而不 -p（否则 'package ID 不匹配'）。判断标准：example 目录存在 +
+# 根 Cargo.toml exclude 列表含此路径。
+EXAMPLE_DIR="docs/superpowers/examples/$CRATE"
+if [ -d "$EXAMPLE_DIR" ] && grep -q "\"$EXAMPLE_DIR\"" Cargo.toml; then
+    echo "Building $CRATE (standalone example) for x86_64-pc-windows-msvc..."
+    cd "$EXAMPLE_DIR"
+    cargo build --target x86_64-pc-windows-msvc "${@:2}"
+    echo
+    echo "Output: $EXAMPLE_DIR/target/x86_64-pc-windows-msvc/debug/$CRATE.exe"
+    ls -la "target/x86_64-pc-windows-msvc/debug/$CRATE.exe" 2>/dev/null || true
+else
+    echo "Building $CRATE for x86_64-pc-windows-msvc..."
+    cargo build --target x86_64-pc-windows-msvc -p "$CRATE" "${@:2}"
+    echo
+    echo "Output: target/x86_64-pc-windows-msvc/debug/$CRATE.exe"
+    ls -la "target/x86_64-pc-windows-msvc/debug/$CRATE.exe" 2>/dev/null || true
+fi
