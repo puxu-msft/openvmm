@@ -39,8 +39,10 @@
 
 mod admin;
 mod completion;
+mod enable;
 mod io;
 mod logs;
+mod mmio;
 mod reservation;
 
 use crate::cmd::*;
@@ -1038,113 +1040,6 @@ impl NvmeController {
     }
 
     /// CC 写入（每次 EN bit 变化都可能 enable/disable controller）。
-    fn write_cc(&mut self, new_cc: u32) {
-        let old_en = self.cc & cc::EN != 0;
-        let new_en = new_cc & cc::EN != 0;
-        self.cc = new_cc;
-        if !old_en && new_en {
-            self.enable();
-        } else if old_en && !new_en {
-            self.disable();
-        }
-    }
-
-    fn enable(&mut self) {
-        tracing::info!("NVMe: CC.EN 0→1 enabling controller");
-        // AQA: bits 11:0 ASQS (admin SQ size minus 1), bits 27:16 ACQS。
-        let asqs = (self.aqa & 0xfff) as u32 + 1;
-        let acqs = ((self.aqa >> 16) & 0xfff) as u32 + 1;
-        // 注册 admin SQ (ID 0)、admin CQ (ID 0)。
-        self.sqs.insert(
-            0,
-            SubmissionQueue {
-                base_gpa: self.asq,
-                size: asqs,
-                head: 0,
-                tail: 0,
-                cq_id: 0,
-            },
-        );
-        self.cqs.insert(
-            0,
-            CompletionQueue {
-                base_gpa: self.acq,
-                size: acqs,
-                tail: 0,
-                phase: 1,
-                head: 0,
-                interrupt_vector: 0,
-                interrupt_enabled: true,
-                pending_completions: 0,
-                last_fire: None,
-            },
-        );
-        self.state = CtrlState::Ready;
-        self.csts |= csts::RDY;
-        tracing::info!(
-            asqs,
-            acqs,
-            asq = format_args!("{:#x}", self.asq),
-            acq = format_args!("{:#x}", self.acq),
-            "NVMe: ready"
-        );
-    }
-
-    fn disable(&mut self) {
-        tracing::info!("NVMe: CC.EN 1→0 disabling controller");
-        // 简化：不等 outstanding DMA flush（容易 dead-lock），直接清状态。
-        // 真 NVMe driver 在 disable 前会 set CSTS.SHST→shutdown sequence,
-        // 但 v1 简化处理：driver 通常容忍立即重置。
-        //
-        // **reviewer C2 mitigation**：清后 SDK in-flight DMA 完成时找不到
-        // token → unknown-token warn 路径（mod.rs ok=true 分支末尾）。
-        // op_id 单调递增 (next_op_id 跨 reset 不重置)，新 op 不会与旧
-        // 完成回调撞 token / op_id；下面 debug_assert 让任何意外残留
-        // 在 test mode 立即响。
-        self.sqs.clear();
-        self.cqs.clear();
-        self.pending_fetches.clear();
-        self.pending_ios.clear();
-        self.dual_prp_writes.clear();
-        self.prp_list_ops.clear();
-        self.compare_ops.clear();
-        self.pi_writes.clear();
-        self.pi_reads.clear();
-        self.pending_fused.clear();
-        self.sqe_inbox.clear();
-        debug_assert!(self.pending_ios.is_empty());
-        debug_assert!(self.dual_prp_writes.is_empty());
-        debug_assert!(self.prp_list_ops.is_empty());
-        debug_assert!(self.compare_ops.is_empty());
-        debug_assert!(self.pi_writes.is_empty());
-        debug_assert!(self.pi_reads.is_empty());
-        debug_assert!(self.pending_fused.is_empty());
-        // AEN queue 跨 reset 不保留 (NVMe spec § 5.2 "Implicit Aborts on Reset")
-        self.aen_pending.clear();
-        self.aen_last_err_count = self.stat_num_err_log_entries;
-        // Phase G：self-test 跨 reset 撤回（spec § 5.11 "Reset terminates
-        // any in-progress Device Self-test"）；error log + self_test_last
-        // 跨 reset 保留（spec § 5.16.1.1 / § 5.16.1.6 持久化，仅 power-
-        // cycle 清空）。
-        self.self_test_in_progress = None;
-        // Phase H1：features 跨 reset 不保留（spec § 5.21.1 'Save' bit
-        // 默认 0；我们暂不实现 NVM Subsystem persistent）。
-        self.features.clear();
-        self.granted_io_queues = IO_QUEUE_CAP;
-        // K5: sanitize 跨 reset 撤回（spec § 5.26 'Sanitize Operation
-        // Aborts on Reset'），last_status 保留作 history
-        self.sanitize = None;
-        // K6: doorbell buffer 跨 reset 清（driver 重新配置）
-        self.doorbell_shadow_gpa = 0;
-        self.doorbell_event_idx_gpa = 0;
-        // K8: power state 重置到 PS0
-        self.current_ps = 0;
-        // M1: interrupt coalescing 重置默认（无 coalesce）
-        self.irq_aggr_time = 0;
-        self.irq_aggr_threshold = 0;
-        self.state = CtrlState::Disabled;
-        self.csts &= !csts::RDY;
-    }
 
     /// 计算 doorbell offset 是 SQ 还是 CQ + queue id。
     /// NVMe 1.4 § 3.1.7：doorbell 数组从 BAR0 + 0x1000 起，stride = 2^(2+CAP.DSTRD)。
@@ -1862,54 +1757,10 @@ impl PcieDevice for NvmeController {
         }
     }
 
+    // **Reviewer M-5 (Phase Q11)** — MMIO 读写实现在 controller/mmio.rs，
+    // 让 mod.rs 不背 ~130 行 BAR0 寄存器布局代码。
     fn mmio_read(&mut self, bar: u32, offset: u64, size: u32) -> u64 {
-        if bar != 0 {
-            return 0;
-        }
-        // CAP 是 64-bit register；driver 可以一次 8 字节读全 CAP，或分两次
-        // 4 字节读 lo/hi。处理两种情况。
-        let val = match (offset, size) {
-            (0x00, 8) => self.cap,
-            (0x00, 4) => self.cap & 0xffff_ffff,
-            (0x04, 4) => self.cap >> 32,
-            (0x08, _) => self.vs as u64,
-            (0x0c, _) => self.intms as u64,
-            (0x10, _) => self.intmc as u64,
-            (0x14, _) => self.cc as u64,
-            (0x1c, _) => self.csts as u64,
-            (0x24, _) => self.aqa as u64,
-            // ASQ/ACQ 同理可 8-byte 读
-            (0x28, 8) => self.asq,
-            (0x28, 4) => self.asq & 0xffff_ffff,
-            (0x2c, 4) => self.asq >> 32,
-            (0x30, 8) => self.acq,
-            (0x30, 4) => self.acq & 0xffff_ffff,
-            (0x34, 4) => self.acq >> 32,
-            // **Phase L3 + Q5** — CMB / BPINFO / PMR 寄存器
-            (0x38, _) => 0, // CMBLOC — Q6 (CMB) 仍 0
-            (0x3c, _) => 0, // CMBSZ — Q6 (CMB) 仍 0
-            // BPINFO — Q5：BPSZ = 1 (128 KiB boot partition)，bit 24..25 BRS=0 (idle)
-            (0x40, _) => 0x0000_0001,
-            (0x44, _) => self.bprsel as u64, // BPRSEL — RW，回读上次写值
-            (0x48, 8) => self.bpmbl,         // BPMBL 64-bit
-            (0x48, 4) => self.bpmbl & 0xFFFF_FFFF, // 低 32
-            (0x4c, 4) => self.bpmbl >> 32,   // 高 32
-            (0xe00, _) => 0,                 // PMRCAP — Q6 (PMR) 仍 0
-            (0xe04, _) => 0,                 // PMRCTL
-            (0xe08, _) => 0,                 // PMRSTS
-            (o, _) if o >= 0x1000 => 0,      // doorbell reads return 0 (write-only)
-            _ => {
-                tracing::debug!(offset, size, "MMIO read: unknown offset");
-                0
-            }
-        };
-        tracing::debug!(
-            offset = format_args!("{:#x}", offset),
-            size,
-            value = format_args!("{:#x}", val),
-            "MMIO read"
-        );
-        val
+        self.mmio_read_impl(bar, offset, size)
     }
 
     fn mmio_write(
@@ -1920,75 +1771,7 @@ impl PcieDevice for NvmeController {
         size: u32,
         value: u64,
     ) {
-        if bar != 0 {
-            return;
-        }
-        tracing::debug!(
-            offset = format_args!("{:#x}", offset),
-            size,
-            value = format_args!("{:#x}", value),
-            "MMIO write"
-        );
-        match offset {
-            0x0c => self.intms |= value as u32,    // mask set
-            0x10 => self.intms &= !(value as u32), // mask clear (INTMC sets bits to clear)
-            0x14 => self.write_cc(value as u32),
-            0x24 => self.aqa = value as u32,
-            0x28 => {
-                // ASQ low 32
-                self.asq = (self.asq & !0xffff_ffff) | (value & 0xffff_ffff);
-            }
-            0x2c => {
-                self.asq = (self.asq & 0xffff_ffff) | (value << 32);
-            }
-            0x30 => {
-                self.acq = (self.acq & !0xffff_ffff) | (value & 0xffff_ffff);
-            }
-            0x34 => {
-                self.acq = (self.acq & 0xffff_ffff) | (value << 32);
-            }
-            // **Phase Q5** — Boot Partition control registers
-            0x44 => {
-                // BPRSEL = boot partition read select。bits 9:0 = BPRSZ
-                // (read size 4 KiB units)；bits 31:10 = BPROF (offset 4 KiB units)；
-                // bit 31:30 实际为 BPID (active partition ID)。教学 controller
-                // 无真 boot image，写入立即返；driver 拉 BPINFO.BRS 看完成。
-                self.bprsel = value as u32;
-                tracing::debug!(value, "BPRSEL set (boot partition no-op)");
-            }
-            0x48 => {
-                // BPMBL low 32
-                self.bpmbl = (self.bpmbl & !0xffff_ffff) | (value & 0xffff_ffff);
-            }
-            0x4c => {
-                self.bpmbl = (self.bpmbl & 0xffff_ffff) | (value << 32);
-            }
-            o if o >= 0x1000 => {
-                // doorbell 写**必须** 4 字节 access；其它尺寸视为 driver bug
-                // 直接忽略（不应该按 8/2/1 字节写 doorbell）。
-                if size != 4 {
-                    tracing::warn!(
-                        offset = format_args!("{:#x}", o),
-                        size,
-                        "doorbell write with non-4-byte size; ignored"
-                    );
-                    return;
-                }
-                if let Some((is_sq, qid)) = Self::parse_doorbell(o) {
-                    if is_sq {
-                        self.on_sq_tail_doorbell(ctx, qid, value as u32);
-                    } else {
-                        self.on_cq_head_doorbell(qid, value as u32);
-                    }
-                }
-            }
-            _ => {}
-        }
-        // 处理 inbox SQE（dispatch_sqe 可能 mutably borrow self → 借出再回填）
-        let inbox = std::mem::take(&mut self.sqe_inbox);
-        for (sq_id, head, sqe) in inbox {
-            self.dispatch_sqe(ctx, sq_id, head, sqe);
-        }
+        self.mmio_write_impl(ctx, bar, offset, size, value);
     }
 
     fn reset(&mut self, kind: u32) {
