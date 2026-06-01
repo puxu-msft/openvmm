@@ -1647,3 +1647,102 @@ fn ns_attachment_via_admin_round_trip() {
         assert!(c.namespaces[&1].attached);
     }
 }
+
+/// **Phase S5** — CNS 0x12/0x13 Controller List 返本 controller (cntlid=1)；
+/// start_cntlid=2 时返空列表；detached NS 在 0x12 返 0。
+#[test]
+fn identify_controller_list_cns_0x12_0x13() {
+    let mut c = make_ctrl_with_tmp("cnslist");
+    c.cqs.insert(
+        0,
+        crate::regs::CompletionQueue {
+            base_gpa: 0x1000,
+            size: 16,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        },
+    );
+    // 模拟 build_v2 buf 直接（不走 admin dispatch；admin dispatch 走 DMA-write 较繁）
+    // 改成构造 sqe 跑 dispatch_admin → 完成时通过 outbound 抓 buf。
+    let mut outbound: Vec<pcie_remote_userspace_sdk::ToOpenhcl> = Vec::new();
+    let mut seq = 1u64;
+    let mut tok_counter = 0x2000u64;
+    let make_sqe = |cns: u8, nsid: u32, start_cntlid: u16| {
+        let zero = [0u8; 64];
+        let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+        sqe.cdw0 = (crate::cmd::admin_opc::IDENTIFY as u32) | (0x44 << 16);
+        sqe.nsid = nsid;
+        sqe.cdw10 = (cns as u32) | ((start_cntlid as u32) << 16);
+        sqe.prp1 = 0x10_0000;
+        sqe
+    };
+    // Helper：从 outbound 取最后一条 WriteGpa 的 data
+    use pcie_remote_userspace_sdk::pcie_remote_protocol::to_openhcl::Body;
+    let extract_last_write = |outbound: &[pcie_remote_userspace_sdk::ToOpenhcl]| -> Vec<u8> {
+        for msg in outbound.iter().rev() {
+            if let Some(Body::WriteGpa(w)) = msg.body.as_ref() {
+                return w.data.clone();
+            }
+        }
+        Vec::new()
+    };
+
+    {
+        let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::for_testing(
+            &mut outbound,
+            &mut seq,
+            &mut tok_counter,
+        );
+        // CNS 0x13 start=0 → 含本 ctrl
+        let _ = c.dispatch_admin(&mut ctx, make_sqe(0x13, 0, 0), 0x44, 0, 0);
+    }
+    let buf = extract_last_write(&outbound);
+    assert!(buf.len() >= 4, "WriteGpa buf 至少 4 byte");
+    assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 1, "NumIDs=1");
+    assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 1, "cntlid=1");
+    outbound.clear();
+
+    {
+        let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::for_testing(
+            &mut outbound,
+            &mut seq,
+            &mut tok_counter,
+        );
+        // CNS 0x13 start=2 → 空列表
+        let _ = c.dispatch_admin(&mut ctx, make_sqe(0x13, 0, 2), 0x44, 0, 0);
+    }
+    let buf = extract_last_write(&outbound);
+    assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 0, "start>1 → NumIDs=0");
+    outbound.clear();
+
+    {
+        let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::for_testing(
+            &mut outbound,
+            &mut seq,
+            &mut tok_counter,
+        );
+        // CNS 0x12 nsid=1 attached → NumIDs=1
+        let _ = c.dispatch_admin(&mut ctx, make_sqe(0x12, 1, 0), 0x44, 0, 0);
+    }
+    let buf = extract_last_write(&outbound);
+    assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 1, "NS 1 attached → 1");
+    outbound.clear();
+
+    // Detach NS 1 → 0x12 NumIDs=0
+    c.namespaces.get_mut(&1).unwrap().attached = false;
+    {
+        let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::for_testing(
+            &mut outbound,
+            &mut seq,
+            &mut tok_counter,
+        );
+        let _ = c.dispatch_admin(&mut ctx, make_sqe(0x12, 1, 0), 0x44, 0, 0);
+    }
+    let buf = extract_last_write(&outbound);
+    assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 0, "detached → 0");
+}

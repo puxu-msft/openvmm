@@ -287,6 +287,45 @@ impl NvmeController {
                         buf[0..8].copy_from_slice(&combo0.to_le_bytes());
                         buf
                     }
+                    0x12 => {
+                        // **Phase S5** — CNS 0x12 = Controller List attached
+                        // to the NSID (spec § 5.17.2.13)。CDW10 bits 31:16 =
+                        // start CNTLID (返 ≥ 该值的 cntlid 列表，递增)。
+                        // 返 4 KiB buffer：bytes 0..2 = NumIDs (LE u16)，
+                        //                  bytes 2.. = u16[] cntlids 升序。
+                        // 教学：单 controller cntlid=1；若 NSID 不存在 →
+                        // INVALID_NAMESPACE；若 NS detached → NumIDs=0。
+                        let start_cntlid = ((sqe.cdw10 >> 16) & 0xffff) as u16;
+                        let Some(ns) = self.namespaces.get(&nsid) else {
+                            return Some(Cqe::error(
+                                cid,
+                                0,
+                                sq_head,
+                                phase,
+                                sc::INVALID_NAMESPACE,
+                                0,
+                            ));
+                        };
+                        let mut buf = vec![0u8; 4096];
+                        if ns.attached && 1 >= start_cntlid {
+                            buf[0..2].copy_from_slice(&1u16.to_le_bytes());
+                            buf[2..4].copy_from_slice(&1u16.to_le_bytes());
+                        }
+                        buf
+                    }
+                    0x13 => {
+                        // **Phase S5** — CNS 0x13 = Controller List of all
+                        // controllers in the NVM subsystem (spec § 5.17.2.14)。
+                        // CDW10 bits 31:16 = start CNTLID。返同 0x12 格式。
+                        // 教学：subsystem 仅 1 controller (cntlid=1)。
+                        let start_cntlid = ((sqe.cdw10 >> 16) & 0xffff) as u16;
+                        let mut buf = vec![0u8; 4096];
+                        if 1 >= start_cntlid {
+                            buf[0..2].copy_from_slice(&1u16.to_le_bytes());
+                            buf[2..4].copy_from_slice(&1u16.to_le_bytes());
+                        }
+                        buf
+                    }
                     _ => {
                         tracing::warn!(cns, "Identify: unsupported CNS, returning zeros");
                         // 比 INVALID_FIELD 友好：返 4 KiB 零让 driver 继续。
