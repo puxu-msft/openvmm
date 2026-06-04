@@ -1984,5 +1984,19 @@ pub(super) fn parse_prp_list(data: &[u8]) -> Vec<u64> {
         .collect()
 }
 
+/// **Phase U-followup** — 让 vfio-user backend 拿到 BAR0/MSI-X 描述。
+///
+/// 仅在编译 `--cfg vfio_user` 时生效，避免给 OpenHCL 路径增加无用的
+/// dep。当前直接 inline 实现（不走 cfg gate），因为 trait 只暴露常量
+/// 查询，开销 0。
+impl pcie_vfio_user_sdk::Regions for NvmeController {
+    fn bar0_size(&self) -> u64 {
+        crate::regs::BAR0_SIZE
+    }
+    fn msix_count(&self) -> u32 {
+        self.msix_count as u32
+    }
+}
+
 #[cfg(test)]
 mod tests;

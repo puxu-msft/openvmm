@@ -75,6 +75,12 @@ struct Args {
     /// 仅 TCP 模式：连入此 host:port（非 Windows 测试用）。
     #[arg(long)]
     tcp_addr: Option<String>,
+    /// **Phase U-followup** — vfio-user backend：绑定 UNIX socket 监听，
+    /// 让 QEMU `-device vfio-user-pci,socket=...` 接管本 NVMe 控制器。
+    /// 与 `--tcp-addr` / `--vm-id` 互斥；指定后走 pcie_vfio_user_sdk
+    /// 而非 pcie_remote 协议。
+    #[arg(long)]
+    vfio_user_sock: Option<String>,
     /// Connect retry count。
     #[arg(long, default_value_t = 20)]
     retries: u32,
@@ -86,10 +92,13 @@ struct Args {
 #[cfg(not(windows))]
 fn main() -> Result<()> {
     let args = Args::parse();
-    if args.tcp_addr.is_none() {
+    if args.tcp_addr.is_none() && args.vfio_user_sock.is_none() {
         return Err(anyhow!(
-            "non-Windows build requires --tcp-addr (vsock AF_HYPERV unavailable)"
+            "non-Windows build requires --tcp-addr or --vfio-user-sock (vsock AF_HYPERV unavailable)"
         ));
+    }
+    if args.vfio_user_sock.is_some() {
+        return run_vfio_user(args);
     }
     run_main(args)
 }
@@ -97,10 +106,39 @@ fn main() -> Result<()> {
 #[cfg(windows)]
 fn main() -> Result<()> {
     let args = Args::parse();
-    if args.tcp_addr.is_none() && args.vm_id.is_none() {
-        return Err(anyhow!("provide --vm-id (vsock) or --tcp-addr"));
+    if args.tcp_addr.is_none() && args.vm_id.is_none() && args.vfio_user_sock.is_none() {
+        return Err(anyhow!(
+            "provide --vm-id (vsock) or --tcp-addr or --vfio-user-sock"
+        ));
+    }
+    if args.vfio_user_sock.is_some() {
+        return run_vfio_user(args);
     }
     run_main(args)
+}
+
+/// **Phase U-followup** — vfio-user 模式：绑定 UNIX socket，accept QEMU
+/// 接管，跑同一份 NvmeController（与 pcie_remote 路径共享 controller code）。
+fn run_vfio_user(args: Args) -> Result<()> {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        "pcie_remote_nvme_userspace=debug,pcie_vfio_user_sdk=debug,info".into()
+    });
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let sock = args
+        .vfio_user_sock
+        .as_ref()
+        .expect("checked by caller")
+        .clone();
+    tracing::info!(
+        sock = sock.as_str(),
+        backing_files = ?args.backing_files,
+        vid = format_args!("{:#x}", args.vid),
+        "vfio-user NVMe server starting"
+    );
+    pcie_vfio_user_sdk::serve_unix(&sock, || {
+        NvmeController::open(&args.backing_files, args.vid, args.ssvid, &args.zns_nsids)
+            .map_err(|e| anyhow!("NvmeController::open: {e}"))
+    })
 }
 
 fn run_main(args: Args) -> Result<()> {
