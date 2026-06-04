@@ -12,7 +12,9 @@
 //! - **V1** ✅ PDU 数据结构 + 编解码 + CRC32C digest + 同步 TCP framing
 //! - **V2** ✅ ICReq/ICResp 握手 + Fabric Connect / Property Get/Set
 //!   + minimal session state machine
-//! - **V3-V8** 计划中（见 docs/superpowers/plans/2026-06-04-phase-v-nvme-of-tcp.md）
+//! - **V3** ✅ admin cmd 派发到 NvmeController：Identify/Get Log Page
+//!   等异步路径 captured dma_write 转 C2HData + CapsuleResp
+//! - **V4-V8** 计划中
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -22,6 +24,7 @@ pub mod fabric;
 pub mod framing;
 pub mod pdu;
 pub mod session;
+pub mod tcp_transport;
 
 pub use digest::crc32c;
 pub use fabric::ConnectData;
@@ -32,6 +35,9 @@ pub use framing::Pdu;
 pub use framing::read_pdu;
 pub use framing::write_pdu;
 pub use pdu::*;
+pub use session::CQ_BASE_GPA;
 pub use session::NegotiatedIc;
+pub use session::PRP1_SENTINEL;
 pub use session::V2Session;
 pub use session::ic_handshake;
+pub use tcp_transport::TcpAdminTransport;

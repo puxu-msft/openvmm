@@ -1002,6 +1002,57 @@ impl NvmeController {
         self.mmio_write_impl(ctx, 0, ofst as u64, size, value);
         true
     }
+
+    /// **Phase V3** — NVMe-oF TCP target 用：直接派发一条 admin SQE 到
+    /// controller 的 dispatch_admin，不经 PCIe MMIO doorbell / ASQ 路径。
+    ///
+    /// 调用方需自己提供一个已 set 好的 admin CQ (id=0)，让 controller
+    /// `post_cqe` 写入；返 `Some(Cqe)` 表示 controller 同步完成（cmd 如
+    /// Set Features），caller 应自行决定怎么把它编码成 CapsuleResp。
+    /// 返 `None` 表示异步：controller 已 `ctx.dma_write` 数据并把 token 入
+    /// pending_ios；caller 需调 `nvme_admin_complete_dma` 让 controller
+    /// 走 post_cqe 路径。
+    pub fn nvme_admin_dispatch(
+        &mut self,
+        ctx: &mut pcie_remote_userspace_sdk::DeviceCtx<'_>,
+        sqe: crate::cmd::Sqe,
+        cid: u16,
+        cq_id: u16,
+    ) -> Option<crate::cmd::Cqe> {
+        self.dispatch_admin(ctx, sqe, cid, /*sq_head*/ 0, cq_id)
+    }
+
+    /// **Phase V3** — 让 controller 处理一条 DMA 完成事件（caller 通常
+    /// 是 V2Session 在 captured dma_write 全部 emit 完 C2HData 后，回调
+    /// 一次 ok=true 触发 controller post_cqe）。
+    pub fn nvme_admin_complete_dma(
+        &mut self,
+        ctx: &mut pcie_remote_userspace_sdk::DeviceCtx<'_>,
+        token: u64,
+        ok: bool,
+        data: Vec<u8>,
+    ) {
+        use pcie_remote_userspace_sdk::PcieDevice as _;
+        self.on_dma_complete(ctx, token, ok, data);
+    }
+
+    /// **Phase V3** — 给 V2Session 用：插入一个 admin CQ (cq_id=0) 让
+    /// controller `post_cqe` 能写进去。`base_gpa` 是 caller 用来识别
+    /// "这块 dma_write 是 CQE bytes" 的 sentinel；不真做 mmap。
+    pub fn nvme_install_admin_cq(&mut self, base_gpa: u64, qsize: u32) {
+        let cq = crate::regs::CompletionQueue {
+            base_gpa,
+            size: qsize,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        };
+        self.cqs.insert(0, cq);
+    }
 }
 
 impl NvmeController {

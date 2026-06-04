@@ -26,16 +26,35 @@ use crate::framing::Pdu;
 use crate::framing::read_pdu;
 use crate::framing::write_pdu;
 use crate::pdu::CommonHdr;
+use crate::pdu::DataPsh;
 use crate::pdu::IcPsh;
 use crate::pdu::TermPsh;
 use crate::pdu::flags;
 use crate::pdu::pdu_type;
 use crate::pdu::term_fes;
+use crate::tcp_transport::TcpAdminTransport;
 use anyhow::Context as _;
 use pcie_remote_nvme_userspace::NvmeController;
+use pcie_remote_nvme_userspace::cmd::Sqe;
 use std::net::TcpStream;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
+
+/// **Phase V3** — admin CQ base GPA 哨值。
+///
+/// NVMe-oF TCP 无真 GPA；我们给 NvmeController 安装一个"假"admin CQ，
+/// base_gpa = 此哨值。controller 的 `post_cqe` 调 `ctx.dma_write(cq_base + slot*16, cqe)`
+/// 时，session 识别 dma_write.gpa ≥ CQ_BASE_GPA 即"这是 CQE bytes，要走
+/// CapsuleResp 路径"，否则即"PRP1 data，要走 C2HData PDU"。
+pub const CQ_BASE_GPA: u64 = 0xC0DE_0000_0000_0000;
+
+/// **Phase V3** — admin CQ 容量（slot 数）。
+const ADMIN_CQ_SIZE: u32 = 64;
+
+/// **Phase V3** — 每次 CapsuleCmd 给 SQE.prp1 填的哨值（让 controller
+/// `dma_write(prp1, data)` 时 session 能识别这是 admin data payload）。
+/// PRP1 sentinel 必须 < CQ_BASE_GPA 才能区分。
+pub const PRP1_SENTINEL: u64 = 0x1000_0000;
 
 /// 握手后的协商参数。
 #[derive(Debug, Clone, Copy)]
@@ -72,9 +91,13 @@ impl V2Session {
     /// 给一个已 accept 的 [`TcpStream`] + 一个 fresh [`NvmeController`] 跑握手。
     pub fn accept_and_handshake(
         mut stream: TcpStream,
-        controller: NvmeController,
+        mut controller: NvmeController,
     ) -> anyhow::Result<Self> {
         let negotiated = ic_handshake(&mut stream).context("ICReq/ICResp handshake")?;
+        // **Phase V3** — 给 controller 装一个"假" admin CQ，让它能 post_cqe
+        // 通过 ctx.dma_write(CQ_BASE_GPA + slot*16, cqe_16B)。session 后续
+        // 通过 gpa ≥ CQ_BASE_GPA 识别这是 CQE bytes vs PRP1 data。
+        controller.nvme_install_admin_cq(CQ_BASE_GPA, ADMIN_CQ_SIZE);
         Ok(Self {
             stream,
             controller,
@@ -142,10 +165,150 @@ impl V2Session {
                 }
             }
         } else {
-            // 非 fabric — 真 NVMe 命令；V3+ 实现 Identify / SET_FEATURES 等。
-            tracing::warn!(opc, cid, "V2 不处理非 fabric NVMe cmd: opc={opc:#x}");
-            self.send_capsule_resp_err(cid, 0x01) // INVALID_OPCODE
+            // **Phase V3** — 真 NVMe 命令（Identify / Get Log Page /
+            // Set Features 等）：派发到 NvmeController.nvme_admin_dispatch。
+            self.handle_admin_cmd(cid, sqe)
         }
+    }
+
+    /// **Phase V3** — 把 CapsuleCmd 里的 NVMe SQE 派发到 controller，
+    /// captured 出来的 dma_write 转 NVMe-oF wire（C2HData PDU + CapsuleResp）。
+    ///
+    /// 策略：
+    /// 1. 把 SQE 的 prp1 改写成 [`PRP1_SENTINEL`] —— controller 用它当
+    ///    "数据回 host 的 GPA"，我们捕获后 emit 成 C2HData
+    /// 2. 用 [`TcpAdminTransport`] 跑 nvme_admin_dispatch：
+    ///    - 同步返 Some(cqe)：理论上 controller 已 post_cqe，captured 的
+    ///      dma_write 第一条就是 CQE。但 dispatch_admin 通常 *返* cqe 让
+    ///      caller 调 post_cqe；本路径不调 post_cqe，直接用返的 cqe
+    ///      encode CapsuleResp。
+    ///    - 异步返 None：controller 已 dma_write PRP1 data + 把 token
+    ///      入 pending_ios。我们调 nvme_admin_complete_dma(token, ok=true,
+    ///      vec![]) 让 controller 走 post_cqe（再产 1 条 CQE dma_write）。
+    /// 3. 区分 captured writes：gpa < CQ_BASE_GPA → C2HData payload；
+    ///    gpa ≥ CQ_BASE_GPA → CQE bytes → CapsuleResp。
+    fn handle_admin_cmd(&mut self, cid: u16, sqe_bytes: &[u8]) -> anyhow::Result<()> {
+        let mut sqe =
+            Sqe::read_from_bytes(sqe_bytes).map_err(|_| anyhow::anyhow!("SQE 不是 64 byte"))?;
+        // 用哨值替换 client 给的 prp1，让 controller dma_write 到我们能识别的 gpa
+        sqe.prp1 = PRP1_SENTINEL;
+        sqe.prp2 = 0;
+        let opc = (sqe.cdw0 & 0xff) as u8;
+        tracing::debug!(opc, cid, "V3 admin dispatch");
+
+        let mut tcp_t = TcpAdminTransport::default();
+        let immediate_cqe = {
+            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            self.controller.nvme_admin_dispatch(&mut ctx, sqe, cid, 0)
+        };
+
+        if let Some(cqe) = immediate_cqe {
+            // 同步路径：caller-style 直接用返的 cqe 编码 CapsuleResp，
+            // 不调 post_cqe（避免 controller 再次 dma_write CQE bytes 进我们
+            // 假 CQ + fire_interrupt）。
+            return self.write_capsule_resp_from_cqe(&cqe);
+        }
+
+        // 异步路径：controller 已 dma_write data + 注册 pending_io。
+        // 先处理 captured data write（PRP1 → C2HData PDU），然后调
+        // nvme_admin_complete_dma 让 controller 继续 post_cqe（会产 CQE
+        // dma_write + fire_interrupt）。
+
+        // 取所有 PRP1 sentinel data writes（按 FIFO 顺序合并）
+        let mut data_payload = Vec::new();
+        let mut data_writes = Vec::new();
+        // 暂存非 data writes，回填到 transport
+        let mut non_data = Vec::new();
+        while let Some(w) = tcp_t.pop_write() {
+            if w.gpa < CQ_BASE_GPA {
+                data_payload.extend_from_slice(&w.data);
+                data_writes.push(w.token);
+            } else {
+                non_data.push(w);
+            }
+        }
+        for w in non_data {
+            tcp_t.writes.push_back(w);
+        }
+
+        // 对每个 data write 投 ok=true completion；controller 会 post_cqe
+        // 触发新的 CQE dma_write。最后一条 completion 投完后 captured 应
+        // 多出一条 CQE write。
+        for tok in data_writes {
+            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            self.controller
+                .nvme_admin_complete_dma(&mut ctx, tok, true, Vec::new());
+        }
+
+        // 现在 captured 应只剩 CQE write（gpa ≥ CQ_BASE_GPA）
+        let cqe_write = loop {
+            match tcp_t.pop_write() {
+                Some(w) if w.gpa >= CQ_BASE_GPA => break Some(w),
+                Some(w) => {
+                    tracing::warn!(
+                        gpa = format_args!("{:#x}", { w.gpa }),
+                        "V3: unexpected non-CQE write after data completion; dropped"
+                    );
+                }
+                None => break None,
+            }
+        };
+        let cqe_bytes = match cqe_write {
+            Some(w) if w.data.len() == 16 => w.data,
+            Some(w) => {
+                anyhow::bail!("captured CQE write len={} != 16", w.data.len());
+            }
+            None => {
+                anyhow::bail!("V3: controller did not post CQE after data completion");
+            }
+        };
+
+        // 先发 C2HData（若有 data），再发 CapsuleResp
+        if !data_payload.is_empty() {
+            self.send_c2h_data(cid, &data_payload)?;
+        }
+        self.write_capsule_resp_bytes(&cqe_bytes)
+    }
+
+    /// 发 C2HData PDU：一次性投递整段 data，标 DATA_LAST。
+    fn send_c2h_data(&mut self, cid: u16, data: &[u8]) -> anyhow::Result<()> {
+        let hdr = CommonHdr {
+            pdu_type: pdu_type::C2H_DATA,
+            flags: flags::DATA_LAST,
+            hlen: 24,
+            pdo: 24,
+            plen: 24 + data.len() as u32,
+        };
+        let psh = DataPsh {
+            cccid: cid,
+            ttag_or_rsvd: 0,
+            data_offset: 0,
+            data_length: data.len() as u32,
+            rsvd: [0u8; 4],
+        };
+        write_pdu(&mut self.stream, &hdr, psh.as_bytes(), data).context("write C2HData")
+    }
+
+    /// 直接发 16-byte CQE bytes 作为 CapsuleResp PSH（NVMe-oF 协议规定 CQE
+    /// 就是 RSP PDU 的 PSH 内容）。
+    fn write_capsule_resp_bytes(&mut self, cqe_bytes: &[u8]) -> anyhow::Result<()> {
+        debug_assert_eq!(cqe_bytes.len(), 16);
+        let hdr = CommonHdr {
+            pdu_type: pdu_type::RSP,
+            flags: 0,
+            hlen: 24,
+            pdo: 0,
+            plen: 24,
+        };
+        write_pdu(&mut self.stream, &hdr, cqe_bytes, &[]).context("write CapsuleResp from raw CQE")
+    }
+
+    /// 同步路径用：把 Cqe struct 序列化成 16-byte CapsuleResp PSH。
+    fn write_capsule_resp_from_cqe(
+        &mut self,
+        cqe: &pcie_remote_nvme_userspace::cmd::Cqe,
+    ) -> anyhow::Result<()> {
+        self.write_capsule_resp_bytes(cqe.as_bytes())
     }
 
     fn handle_connect(&mut self, cid: u16, sqe: &[u8], data: &[u8]) -> anyhow::Result<()> {
@@ -833,6 +996,67 @@ mod tests {
             0,
             "Property Set CC.EN=1 后 CSTS.RDY 应为 1，得到 dw0={dw0:#x}"
         );
+        h.join().unwrap().unwrap();
+    }
+
+    /// **Phase V3** — 完整端到端：Identify Controller (CNS=1)，期望
+    /// C2HData PDU 带 4096B + CapsuleResp（status=success）。
+    #[test]
+    fn admin_identify_controller_emits_c2hdata_and_resp() {
+        let (mut client, server) = tcp_pair();
+        let controller = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect
+            sess.pump_one()?; // Identify Controller
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+
+        // Identify Controller: opc=0x06, CNS in cdw10 bits 7:0 = 0x01
+        let mut sqe = [0u8; 64];
+        sqe[0] = 0x06; // admin_opc::IDENTIFY
+        sqe[2..4].copy_from_slice(&0x00C1u16.to_le_bytes()); // cid
+        // nsid=0；prp1 这里随便（session 会改写为 PRP1_SENTINEL）
+        sqe[40..44].copy_from_slice(&0x0000_0001u32.to_le_bytes()); // cdw10 = CNS=1 (Identify Controller)
+        let cmd_hdr = CommonHdr {
+            pdu_type: pdu_type::CMD,
+            flags: 0,
+            hlen: 72,
+            pdo: 0,
+            plen: 72,
+        };
+        write_pdu(&mut client, &cmd_hdr, &sqe, &[]).unwrap();
+
+        // 先收 C2HData
+        let data_pdu = read_pdu(&mut client).unwrap();
+        let pt = data_pdu.header.pdu_type;
+        let fl = data_pdu.header.flags;
+        assert_eq!(pt, pdu_type::C2H_DATA);
+        assert!(fl & flags::DATA_LAST != 0, "应标 DATA_LAST");
+        let psh: DataPsh = crate::pdu::decode_psh(&data_pdu.psh).unwrap();
+        let cccid = psh.cccid;
+        let dlen = psh.data_length;
+        assert_eq!(cccid, 0x00C1);
+        assert_eq!(dlen, 4096);
+        assert_eq!(data_pdu.data.len(), 4096);
+        // Identify Controller bytes 0..2 = VID = 0x1414
+        assert_eq!(
+            u16::from_le_bytes(data_pdu.data[0..2].try_into().unwrap()),
+            0x1414
+        );
+
+        // 然后收 CapsuleResp（CQE）
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        let resp_cid = u16::from_le_bytes(resp.psh[12..14].try_into().unwrap());
+        let status = u16::from_le_bytes(resp.psh[14..16].try_into().unwrap());
+        let sc = ((status >> 1) & 0xff) as u8;
+        assert_eq!(resp_cid, 0x00C1);
+        assert_eq!(sc, 0, "Identify Controller 应 success");
         h.join().unwrap().unwrap();
     }
 }
