@@ -76,10 +76,24 @@ pub struct DmaTable {
 }
 
 impl DmaTable {
-    /// 加一条 region；若同 addr 已存在返 EEXIST。
+    /// 加一条 region；同 addr 已存在 → `Exists`；与已有 region 有
+    /// 任意 *字节级* 重叠（不同 addr）→ `Overlap`（**review M1** 新增校验）。
     pub fn insert(&mut self, r: DmaRegion) -> Result<(), DmaError> {
         if self.regions.contains_key(&r.addr) {
             return Err(DmaError::Exists);
+        }
+        // O(log n) 查左右邻居 + 校验是否相交。
+        let r_end = r.addr.saturating_add(r.size);
+        if let Some((_, prev)) = self.regions.range(..r.addr).next_back() {
+            let p_end = prev.addr.saturating_add(prev.size);
+            if p_end > r.addr {
+                return Err(DmaError::Overlap);
+            }
+        }
+        if let Some((_, next)) = self.regions.range(r.addr..).next()
+            && r_end > next.addr
+        {
+            return Err(DmaError::Overlap);
         }
         self.regions.insert(r.addr, r);
         Ok(())
@@ -122,6 +136,8 @@ impl DmaTable {
 pub enum DmaError {
     /// 同 addr 已存在映射（EEXIST）。
     Exists,
+    /// 与现有 region 有字节级重叠（**review M1** 新增）。
+    Overlap,
     /// 未找到（EINVAL）。
     NotFound,
 }
@@ -130,7 +146,7 @@ impl DmaError {
     /// 对应 UNIX errno。
     pub fn errno(self) -> u32 {
         match self {
-            Self::Exists => libc::EEXIST as u32,
+            Self::Exists | Self::Overlap => libc::EEXIST as u32,
             Self::NotFound => libc::EINVAL as u32,
         }
     }
@@ -138,8 +154,10 @@ impl DmaError {
 
 /// 处理 DMA_MAP cmd：解 payload + 入表 + 回 reply（OK / 错）。
 ///
-/// `fds` 是 SCM_RIGHTS 收到的 mmap fd；我们 *不* mmap，所以收到立即 drop（在
-/// 调用方 caller 端：fd 是 `OwnedFd` 出 [`Message`] scope 时自动 close）。
+/// **review M4** — 本路径 *有意* 忽略 `msg.fds`：spec 允许 server 不 mmap
+/// 共享 memfd，强制走 message-mediated DMA_READ/WRITE 往返。`msg.fds` 是
+/// `Vec<OwnedFd>`，调用方 (session) 在 Message drop 时自动 close，无 leak。
+/// 见模块 doc。
 pub fn handle_dma_map(
     stream: &mut UnixStream,
     table: &mut DmaTable,
@@ -158,6 +176,17 @@ pub fn handle_dma_map(
             return Ok(());
         }
     };
+    // **review M3** — 拒 size=0、flags=0、addr+size 溢出。
+    let perms =
+        pl.flags & (crate::proto::dma_map_flags::READABLE | crate::proto::dma_map_flags::WRITEABLE);
+    if pl.size == 0 || perms == 0 {
+        send_err(stream, msg_id, Command::DmaMap, libc::EINVAL as u32)?;
+        return Ok(());
+    }
+    if pl.addr.checked_add(pl.size).is_none() {
+        send_err(stream, msg_id, Command::DmaMap, libc::EINVAL as u32)?;
+        return Ok(());
+    }
     let region = DmaRegion {
         addr: pl.addr,
         size: pl.size,
@@ -223,9 +252,15 @@ pub fn handle_dma_unmap(
     write_message(stream, &hdr, pl.as_bytes(), &[]).context("write DMA_UNMAP reply")
 }
 
-/// 服务端发起的同步 DMA_READ：发 request → 阻塞 read reply → 返数据字节。
+/// 服务端发起的同步 DMA_READ：发 request → 等 reply。
 ///
-/// 校验 `[gpa, gpa+len)` 必须落在 [`DmaTable`] 内某条 region 中且 region 可读。
+/// **review H1** — vfio-user spec 两方向 msg_id 独立、不要求严格请求/应答
+/// 顺序；client 完全可能在我们等 reply 时插一条 REGION_READ。本函数本身
+/// 用 [`read_message`] *直接* 拿下一帧并按 msg_id+cmd 校验；若 caller 有
+/// 多路复用需求（U5 VfioUserTransport 需要在等 reply 期间继续处理 inbound
+/// cmd），应改用更上层的 session 方法走 wait-for-reply 循环（U5 加）。
+///
+/// **review H2** — 校验 `reply.header.msg_id == msg_id` + `cmd == DmaRead`。
 pub fn dma_read_sync(
     stream: &mut UnixStream,
     table: &DmaTable,
@@ -251,14 +286,7 @@ pub fn dma_read_sync(
     };
     write_message(stream, &hdr, req.as_bytes(), &[]).context("write DMA_READ request")?;
     let reply = read_message(stream).context("read DMA_READ reply")?;
-    if reply.header.flags().is_error() {
-        let err = reply.header.error_no;
-        anyhow::bail!("DMA_READ peer error: errno={err}");
-    }
-    let reply_cmd = reply.header.cmd;
-    if reply_cmd != Command::DmaRead as u16 {
-        anyhow::bail!("DMA_READ reply cmd mismatch: got {reply_cmd}");
-    }
+    validate_dma_reply(&reply, msg_id, Command::DmaRead)?;
     let want = core::mem::size_of::<DmaRwHdrPayload>() + len as usize;
     if reply.payload.len() != want {
         anyhow::bail!(
@@ -271,7 +299,7 @@ pub fn dma_read_sync(
     Ok(reply.payload[core::mem::size_of::<DmaRwHdrPayload>()..].to_vec())
 }
 
-/// 服务端发起的同步 DMA_WRITE：发 request + data → 阻塞 read echo reply。
+/// 服务端发起的同步 DMA_WRITE：发 request + data → 等 echo reply。
 pub fn dma_write_sync(
     stream: &mut UnixStream,
     table: &DmaTable,
@@ -300,9 +328,30 @@ pub fn dma_write_sync(
     payload.extend_from_slice(data);
     write_message(stream, &hdr, &payload, &[]).context("write DMA_WRITE request")?;
     let reply = read_message(stream).context("read DMA_WRITE reply")?;
+    validate_dma_reply(&reply, msg_id, Command::DmaWrite)?;
+    Ok(())
+}
+
+/// **review H2** — 公共 DMA reply 校验：msg_id + cmd + error flag。
+///
+/// 提取为 pub(crate) 让 U5 [`VfioUserTransport`] 在 multiplexed wait 循环中
+/// 复用同一套校验逻辑。
+pub(crate) fn validate_dma_reply(
+    reply: &crate::framing::Message,
+    expected_id: u16,
+    expected_cmd: Command,
+) -> anyhow::Result<()> {
+    let r_id = reply.header.msg_id;
+    let r_cmd = reply.header.cmd;
+    if r_id != expected_id {
+        anyhow::bail!("{expected_cmd:?} reply msg_id {r_id:#x} != expected {expected_id:#x}");
+    }
     if reply.header.flags().is_error() {
         let err = reply.header.error_no;
-        anyhow::bail!("DMA_WRITE peer error: errno={err}");
+        anyhow::bail!("{expected_cmd:?} peer error: errno={err}");
+    }
+    if r_cmd != expected_cmd as u16 {
+        anyhow::bail!("{expected_cmd:?} reply cmd mismatch: got {r_cmd}");
     }
     Ok(())
 }
@@ -558,5 +607,126 @@ mod tests {
         let mut n = 0x8000u16;
         assert_eq!(alloc_server_msg_id(&mut n), 0x8000);
         assert_eq!(n, 0x8001);
+    }
+
+    /// **review M1** — `insert` 拒 *字节级* 重叠（非同 addr 也被拒）。
+    #[test]
+    fn table_insert_rejects_overlapping_regions() {
+        let mut t = DmaTable::default();
+        let a = DmaRegion {
+            addr: 0x1000,
+            size: 0x2000, // [0x1000, 0x3000)
+            readable: true,
+            writeable: true,
+        };
+        t.insert(a).unwrap();
+        // 起点不同但与 a 末尾重叠
+        let b = DmaRegion {
+            addr: 0x2000,
+            size: 0x1000, // [0x2000, 0x3000)
+            readable: true,
+            writeable: true,
+        };
+        assert_eq!(t.insert(b), Err(DmaError::Overlap));
+        // 包含 a 整体
+        let c = DmaRegion {
+            addr: 0x0500,
+            size: 0x3000, // [0x0500, 0x3500)
+            readable: true,
+            writeable: true,
+        };
+        assert_eq!(t.insert(c), Err(DmaError::Overlap));
+        // 相邻但不重叠 — 允许
+        let d = DmaRegion {
+            addr: 0x3000,
+            size: 0x1000, // [0x3000, 0x4000)
+            readable: true,
+            writeable: true,
+        };
+        assert!(t.insert(d).is_ok());
+    }
+
+    /// **review M3** — handle_dma_map 拒 size=0 / flags=0 / addr 溢出。
+    #[test]
+    fn handle_dma_map_rejects_invalid_payload() {
+        for (label, pl) in [
+            (
+                "size=0",
+                DmaMapPayload {
+                    argsz: 32,
+                    flags: dma_map_flags::READABLE,
+                    offset: 0,
+                    addr: 0x1000,
+                    size: 0,
+                },
+            ),
+            (
+                "flags=0",
+                DmaMapPayload {
+                    argsz: 32,
+                    flags: 0,
+                    offset: 0,
+                    addr: 0x1000,
+                    size: 0x1000,
+                },
+            ),
+            (
+                "addr+size overflow",
+                DmaMapPayload {
+                    argsz: 32,
+                    flags: dma_map_flags::READABLE,
+                    offset: 0,
+                    addr: u64::MAX - 0x100,
+                    size: 0x1000,
+                },
+            ),
+        ] {
+            let (mut server, mut client) = pair();
+            let mut table = DmaTable::default();
+            let h = thread::spawn(move || -> anyhow::Result<()> {
+                let msg = read_message(&mut server)?;
+                handle_dma_map(&mut server, &mut table, msg.header.msg_id, &msg)?;
+                Ok(())
+            });
+            let hdr = Header::command(1, Command::DmaMap, pl.as_bytes().len() as u32);
+            fw_write(&mut client, &hdr, pl.as_bytes(), &[]).unwrap();
+            let reply = read_message(&mut client).unwrap();
+            assert!(reply.header.flags().is_error(), "case {label}: should err");
+            let err = reply.header.error_no;
+            assert_eq!(err, libc::EINVAL as u32, "case {label}: EINVAL");
+            h.join().unwrap().unwrap();
+        }
+    }
+
+    /// **review L2** — wire-level：第二次同 addr DMA_MAP 返 EEXIST。
+    #[test]
+    fn dma_map_duplicate_addr_returns_eexist() {
+        let (mut server, mut client) = pair();
+        let mut table = DmaTable::default();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let m1 = read_message(&mut server)?;
+            handle_dma_map(&mut server, &mut table, m1.header.msg_id, &m1)?;
+            let m2 = read_message(&mut server)?;
+            handle_dma_map(&mut server, &mut table, m2.header.msg_id, &m2)?;
+            Ok(())
+        });
+        let pl = DmaMapPayload {
+            argsz: 32,
+            flags: dma_map_flags::READABLE | dma_map_flags::WRITEABLE,
+            offset: 0,
+            addr: 0x4000,
+            size: 0x1000,
+        };
+        let hdr = Header::command(10, Command::DmaMap, pl.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, pl.as_bytes(), &[]).unwrap();
+        let r1 = read_message(&mut client).unwrap();
+        assert!(!r1.header.flags().is_error());
+        // 第二次同 addr
+        fw_write(&mut client, &hdr, pl.as_bytes(), &[]).unwrap();
+        let r2 = read_message(&mut client).unwrap();
+        assert!(r2.header.flags().is_error());
+        let err = r2.header.error_no;
+        assert_eq!(err, libc::EEXIST as u32);
+        h.join().unwrap().unwrap();
     }
 }
