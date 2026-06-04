@@ -19,17 +19,13 @@
 
 use crate::fabric;
 use crate::fabric::ConnectData;
-use crate::fabric::FabricError;
 use crate::fabric::fabric_sc;
 use crate::fabric::fctype;
-use crate::fabric::property_offset;
 use crate::framing::FramingError;
 use crate::framing::Pdu;
 use crate::framing::read_pdu;
 use crate::framing::write_pdu;
-use crate::pdu::CH_LEN;
 use crate::pdu::CommonHdr;
-use crate::pdu::DataPsh;
 use crate::pdu::IcPsh;
 use crate::pdu::TermPsh;
 use crate::pdu::flags;
@@ -83,7 +79,7 @@ impl V2Session {
             stream,
             controller,
             negotiated,
-            cntlid: 1, // 单 controller 教学版固定 1
+            cntlid: fabric::TEACHING_CNTLID,
             admin_connected: false,
         })
     }
@@ -152,7 +148,7 @@ impl V2Session {
         }
     }
 
-    fn handle_connect(&mut self, cid: u16, _sqe: &[u8], data: &[u8]) -> anyhow::Result<()> {
+    fn handle_connect(&mut self, cid: u16, sqe: &[u8], data: &[u8]) -> anyhow::Result<()> {
         if data.len() != fabric::CONNECT_DATA_SIZE {
             return self.send_capsule_resp_err(cid, fabric_sc::CONNECT_INVALID_PARAM);
         }
@@ -162,7 +158,7 @@ impl V2Session {
                 return self.send_capsule_resp_err(cid, fabric_sc::CONNECT_INVALID_PARAM);
             }
         };
-        let fields = match fabric::decode_connect_fields(_sqe) {
+        let fields = match fabric::decode_connect_fields(sqe) {
             Ok(f) => f,
             Err(_) => {
                 return self.send_capsule_resp_err(cid, fabric_sc::CONNECT_INVALID_PARAM);
@@ -170,13 +166,11 @@ impl V2Session {
         };
         let qid = fields.qid;
         let kato = fields.kato;
-        let subnqn = cd.subnqn_str().to_string();
-        let hostnqn = cd.hostnqn_str().to_string();
         tracing::info!(
             qid,
             kato,
-            subnqn = subnqn.as_str(),
-            hostnqn = hostnqn.as_str(),
+            subnqn = cd.subnqn_str(),
+            hostnqn = cd.hostnqn_str(),
             "Fabric Connect"
         );
         if qid == 0 {
@@ -204,14 +198,19 @@ impl V2Session {
             Ok(s) => s,
             Err(_) => return self.send_capsule_resp_err(cid, 0x02),
         };
-        if !valid_property_offset(pf.ofst) {
-            return self.send_capsule_resp_err(cid, 0x02);
-        }
-        let value = self.controller.mmio_read_impl(0, pf.ofst as u64, size);
-        // 4B 路径 → CQE.result DW0 = value（低 32 位）；8B → V2 简化也只
-        // 把低 32 位放 DW0；高 32 位 spec 用 DW1（CQE.result u32 字段之上
-        // 的 reserved DW），V8 完善。
-        self.send_capsule_resp_ok(cid, value as u32)
+        // **review H2** — 用 narrow wrapper 强制 NVMe-oF spec 白名单
+        let ofst = pf.ofst;
+        let value = match self.controller.nvme_property_get(ofst, size) {
+            Some(v) => v,
+            None => return self.send_capsule_resp_err(cid, 0x02),
+        };
+        // **review H1** — 8-byte value 必须把高 32 位放 CQE DW1 (cqe[4..8])，
+        // 否则 Linux nvme-tcp driver 读 CAP 拿不到 MPSMIN/MPSMAX/CSS/TO/AMS
+        // 等高位字段会拒绝 enumerate controller。
+        let lo = (value & 0xFFFF_FFFF) as u32;
+        let hi = (value >> 32) as u32;
+        let hi_for_dw1 = if size == 8 { hi } else { 0 };
+        self.send_capsule_resp_ok_with_dw1(cid, lo, hi_for_dw1)
     }
 
     fn handle_property_set(&mut self, cid: u16, sqe: &[u8]) -> anyhow::Result<()> {
@@ -223,28 +222,43 @@ impl V2Session {
             Ok(s) => s,
             Err(_) => return self.send_capsule_resp_err(cid, 0x02),
         };
-        if !valid_property_offset(pf.ofst) {
-            return self.send_capsule_resp_err(cid, 0x02);
-        }
-        // 调 controller mmio_write — mmio_write_impl 需要 DeviceCtx；构
-        // 一个本地 NoopTransport stub（CC.EN=1 等 reg 写入不会触发
-        // dma/interrupt，等 driver 发 SQE 才动）。
+        let ofst = pf.ofst;
+        let value = pf.value;
+        // **review M2** — NoopTransport 只在 V2 验证安全（CC.EN=1 等 reg
+        // 写入路径不 invoke ctx.dma_*/fire_interrupt）。V5 真 IO 上线后
+        // 应换成完整 transport bridge。
         let mut t = pcie_vfio_user_sdk::NoopTransport;
         let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut t);
-        self.controller
-            .mmio_write_impl(&mut ctx, 0, pf.ofst as u64, size, pf.value);
+        // **review H2** — 用 narrow wrapper；offset 不在白名单时返 false。
+        if !self
+            .controller
+            .nvme_property_set(&mut ctx, ofst, size, value)
+        {
+            return self.send_capsule_resp_err(cid, 0x02);
+        }
         self.send_capsule_resp_ok(cid, 0)
     }
 
     /// 写一条 CapsuleResp CQE（16 byte）回 client。`status_sf` = SF 字段
     /// （bits 1..15 of status；phase bit 我们填 0 — NVMe-oF spec 不用 phase）。
     fn send_capsule_resp_ok(&mut self, cid: u16, result_dw0: u32) -> anyhow::Result<()> {
+        self.send_capsule_resp_ok_with_dw1(cid, result_dw0, 0)
+    }
+
+    /// 同 [`send_capsule_resp_ok`] 但允许填 CQE DW1（用于 8-byte Property Get 高位）。
+    fn send_capsule_resp_ok_with_dw1(
+        &mut self,
+        cid: u16,
+        result_dw0: u32,
+        result_dw1: u32,
+    ) -> anyhow::Result<()> {
         let mut cqe = [0u8; 16];
         cqe[0..4].copy_from_slice(&result_dw0.to_le_bytes());
-        // bytes 4..8 reserved；bytes 8..10 sq_head（V2 不真追踪 SQ head，填 0）；
-        // bytes 10..12 sq_id（V2 admin queue = 0）；bytes 12..14 cmd id；
-        // bytes 14..16 status = 0 (success)。
+        cqe[4..8].copy_from_slice(&result_dw1.to_le_bytes()); // **review H1** Property Get 高 32 位
+        // bytes 8..10 sq_head（V2 不真追踪 SQ head，填 0）；
+        // bytes 10..12 sq_id（V2 admin queue = 0）；
         cqe[12..14].copy_from_slice(&cid.to_le_bytes());
+        // bytes 14..16 status = 0 (success)
         let hdr = CommonHdr {
             pdu_type: pdu_type::RSP,
             flags: 0,
@@ -258,8 +272,15 @@ impl V2Session {
     fn send_capsule_resp_err(&mut self, cid: u16, sc: u8) -> anyhow::Result<()> {
         let mut cqe = [0u8; 16];
         cqe[12..14].copy_from_slice(&cid.to_le_bytes());
-        // status word: bits 1..8 = SC, bit 0 = phase (= 0 NVMe-oF)
-        let status: u16 = (sc as u16) << 1;
+        // **review M3** — 对 fabric SC (0x80-0x9F)：SCT=0x07 (Command Specific)；
+        // 其它 generic SC 用 SCT=0。Linux nvme-tcp host 接受两种，但 spec 严格。
+        let sct: u8 = if (0x80..=0x9F).contains(&sc) {
+            0x07
+        } else {
+            0x00
+        };
+        // status word: bit 0 = phase (= 0 NVMe-oF); bits 1..8 = SC; bits 9..11 = SCT
+        let status: u16 = (sct as u16) << 9 | (sc as u16) << 1;
         cqe[14..16].copy_from_slice(&status.to_le_bytes());
         let hdr = CommonHdr {
             pdu_type: pdu_type::RSP,
@@ -288,15 +309,20 @@ impl V2Session {
     }
 }
 
-fn valid_property_offset(ofst: u32) -> bool {
-    matches!(
-        ofst,
-        property_offset::CAP
-            | property_offset::VS
-            | property_offset::CC
-            | property_offset::CSTS
-            | property_offset::NSSR
-    )
+fn write_term(stream: &mut TcpStream, fes: u16) -> anyhow::Result<()> {
+    let hdr = CommonHdr {
+        pdu_type: pdu_type::C2H_TERM,
+        flags: 0,
+        hlen: 24,
+        pdo: 0,
+        plen: 24,
+    };
+    let psh = TermPsh {
+        fes,
+        fei: [0u8; 4],
+        rsvd: [0u8; 10],
+    };
+    write_pdu(stream, &hdr, psh.as_bytes(), &[])
 }
 
 /// V2 ICReq/ICResp 握手。
@@ -361,30 +387,6 @@ pub fn ic_handshake(stream: &mut TcpStream) -> anyhow::Result<NegotiatedIc> {
     })
 }
 
-fn write_term(stream: &mut TcpStream, fes: u16) -> anyhow::Result<()> {
-    let hdr = CommonHdr {
-        pdu_type: pdu_type::C2H_TERM,
-        flags: 0,
-        hlen: 24,
-        pdo: 0,
-        plen: 24,
-    };
-    let psh = TermPsh {
-        fes,
-        fei: [0u8; 4],
-        rsvd: [0u8; 10],
-    };
-    write_pdu(stream, &hdr, psh.as_bytes(), &[])
-}
-
-// 让 IcPsh / DataPsh / CH_LEN / FabricError 出现在测试外部 use 链，避免
-// dead-code warning。
-const _LINK: usize =
-    CH_LEN + core::mem::size_of::<DataPsh>() + core::mem::size_of::<crate::pdu::R2tPsh>();
-
-#[allow(dead_code)]
-fn _link_fabric_error(_e: FabricError) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +394,7 @@ mod tests {
     use crate::fabric::PropertyFabricFields;
     use crate::fabric::fctype;
     use crate::fabric::property_offset;
+    use crate::pdu::DataPsh;
     use std::net::TcpListener;
     use std::thread;
 
@@ -645,5 +648,191 @@ mod tests {
             plen: 72 + 1024,
         };
         write_pdu(client, &cmd_hdr, &sqe, cdata.as_bytes()).unwrap();
+    }
+
+    fn send_connect_io(client: &mut TcpStream, qid: u16) {
+        let mut sqe = [0u8; 64];
+        sqe[0] = fabric::NVME_OPC_FABRIC;
+        sqe[2..4].copy_from_slice(&0x0007u16.to_le_bytes());
+        sqe[4] = fctype::CONNECT;
+        let f = ConnectFabricFields {
+            recfmt: 0,
+            qid,
+            sqsize: 31,
+            cattr: 0,
+            rsvd1: 0,
+            kato: 0,
+            rsvd2: [0u8; 12],
+        };
+        sqe[40..64].copy_from_slice(f.as_bytes());
+        let cdata = ConnectData::default();
+        let cmd_hdr = CommonHdr {
+            pdu_type: pdu_type::CMD,
+            flags: 0,
+            hlen: 72,
+            pdo: 72,
+            plen: 72 + 1024,
+        };
+        write_pdu(client, &cmd_hdr, &sqe, cdata.as_bytes()).unwrap();
+    }
+
+    fn send_property_set(client: &mut TcpStream, ofst: u32, size: u8, value: u64) {
+        let mut sqe = [0u8; 64];
+        sqe[0] = fabric::NVME_OPC_FABRIC;
+        sqe[2..4].copy_from_slice(&0x00AAu16.to_le_bytes());
+        sqe[4] = fctype::PROPERTY_SET;
+        let f = PropertyFabricFields {
+            attrib: size,
+            rsvd1: [0u8; 3],
+            ofst,
+            value,
+            rsvd2: [0u8; 8],
+        };
+        sqe[40..64].copy_from_slice(f.as_bytes());
+        let cmd_hdr = CommonHdr {
+            pdu_type: pdu_type::CMD,
+            flags: 0,
+            hlen: 72,
+            pdo: 0,
+            plen: 72,
+        };
+        write_pdu(client, &cmd_hdr, &sqe, &[]).unwrap();
+    }
+
+    fn send_property_get(client: &mut TcpStream, ofst: u32, size: u8) {
+        let mut sqe = [0u8; 64];
+        sqe[0] = fabric::NVME_OPC_FABRIC;
+        sqe[2..4].copy_from_slice(&0x00BBu16.to_le_bytes());
+        sqe[4] = fctype::PROPERTY_GET;
+        let f = PropertyFabricFields {
+            attrib: size,
+            rsvd1: [0u8; 3],
+            ofst,
+            value: 0,
+            rsvd2: [0u8; 8],
+        };
+        sqe[40..64].copy_from_slice(f.as_bytes());
+        let cmd_hdr = CommonHdr {
+            pdu_type: pdu_type::CMD,
+            flags: 0,
+            hlen: 72,
+            pdo: 0,
+            plen: 72,
+        };
+        write_pdu(client, &cmd_hdr, &sqe, &[]).unwrap();
+    }
+
+    /// **review M4 / H1** — Property Get CAP (8B) 必须把高 32 位放 CQE DW1。
+    /// 验证 mmio_read_impl(0,0,8) 返 self.cap (u64) 后 CQE byte 0..8 全字段。
+    #[test]
+    fn property_get_cap_8byte_uses_dw1() {
+        let (mut client, server) = tcp_pair();
+        let controller = make_test_controller();
+        let expected_cap = {
+            // 用同一份 controller 在另一个临时实例上读出 CAP，作为对照
+            let mut tmp = make_test_controller();
+            tmp.nvme_property_get(0, 8).unwrap()
+        };
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect
+            sess.pump_one()?; // Property Get
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_property_get(&mut client, property_offset::CAP, 1); // size=1 → 8B
+        let resp = read_pdu(&mut client).unwrap();
+        // CQE byte 0..4 = DW0 lo, 4..8 = DW1 hi（H1 修复后）
+        let dw0 = u32::from_le_bytes(resp.psh[0..4].try_into().unwrap());
+        let dw1 = u32::from_le_bytes(resp.psh[4..8].try_into().unwrap());
+        let full = (dw1 as u64) << 32 | dw0 as u64;
+        assert_eq!(
+            full, expected_cap,
+            "8B Property Get 必须返完整 CAP，含高位字段"
+        );
+        h.join().unwrap().unwrap();
+    }
+
+    /// **review M4** — Connect with qid=1 before admin → CONNECT_INVALID_PARAM。
+    #[test]
+    fn connect_io_before_admin_rejected() {
+        let (mut client, server) = tcp_pair();
+        let controller = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?;
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        // 直接 IO Connect qid=1，admin 没建过
+        send_connect_io(&mut client, 1);
+        let resp = read_pdu(&mut client).unwrap();
+        let status = u16::from_le_bytes(resp.psh[14..16].try_into().unwrap());
+        let sc = ((status >> 1) & 0xff) as u8;
+        assert_eq!(sc, fabric_sc::CONNECT_INVALID_PARAM);
+        h.join().unwrap().unwrap();
+    }
+
+    /// **review M4** — 第二次 Connect admin (qid=0) → CONNECT_INVALID_PARAM。
+    #[test]
+    fn connect_admin_twice_rejected() {
+        let (mut client, server) = tcp_pair();
+        let controller = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?;
+            sess.pump_one()?;
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client); // 第二次
+        let resp = read_pdu(&mut client).unwrap();
+        let status = u16::from_le_bytes(resp.psh[14..16].try_into().unwrap());
+        let sc = ((status >> 1) & 0xff) as u8;
+        let sct = ((status >> 9) & 0x07) as u8;
+        assert_eq!(sc, fabric_sc::CONNECT_INVALID_PARAM);
+        // **review M3** — fabric SC 0x80-0x9F 必须 SCT=0x07
+        assert_eq!(sct, 0x07);
+        h.join().unwrap().unwrap();
+    }
+
+    /// **review M4** — Property Set CC.EN=1 后 Get CSTS 应见 RDY=1。
+    #[test]
+    fn property_set_cc_enables_csts_rdy() {
+        let (mut client, server) = tcp_pair();
+        let controller = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect
+            sess.pump_one()?; // Property Set CC
+            sess.pump_one()?; // Property Get CSTS
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        // 先 AQA/ASQ/ACQ 应该已经 0 默认；直接 enable
+        // NvmeController write_cc 在 ASQ=0 时仍能进 enable（教学路径不强校验
+        // 这些 reg；真 Linux driver 会先 set ASQ/ACQ 才 enable）。
+        send_property_set(&mut client, property_offset::CC, 1, 0x0046_0001); // CC.EN=1
+        let _ = read_pdu(&mut client).unwrap();
+        send_property_get(&mut client, property_offset::CSTS, 0); // 4B
+        let resp = read_pdu(&mut client).unwrap();
+        let dw0 = u32::from_le_bytes(resp.psh[0..4].try_into().unwrap());
+        // CSTS.RDY = bit 0；enable 成功后应为 1
+        assert_ne!(
+            dw0 & 1,
+            0,
+            "Property Set CC.EN=1 后 CSTS.RDY 应为 1，得到 dw0={dw0:#x}"
+        );
+        h.join().unwrap().unwrap();
     }
 }

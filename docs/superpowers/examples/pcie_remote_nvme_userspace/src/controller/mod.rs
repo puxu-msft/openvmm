@@ -970,6 +970,41 @@ pub(crate) fn should_fire_irq(
 }
 
 impl NvmeController {
+    /// **Phase V2** — NVMe-oF property white-list（CAP/VS/CC/CSTS/NSSR）。
+    /// Fabric spec § 3 限制 Property Get/Set 只能访问 BAR0 偏移 0x00/0x08/
+    /// 0x14/0x1C/0x20；其它 reg（AQA/ASQ/ACQ/doorbell）由 Connect 命令携带
+    /// 参数替代，不能通过 Property 路径访问。
+    fn is_valid_property_offset(ofst: u32) -> bool {
+        matches!(ofst, 0x00 | 0x08 | 0x14 | 0x1C | 0x20)
+    }
+
+    /// **Phase V2** — Fabric Property Get：narrow wrapper 调 mmio_read_impl
+    /// 仅允许 NVMe-oF spec 白名单 offset，避免 nvme_of_tcp_target 等 caller
+    /// 误读 doorbell 等不该跨 fabric 暴露的 reg。`size` ∈ {4, 8}。
+    pub fn nvme_property_get(&mut self, ofst: u32, size: u32) -> Option<u64> {
+        if !Self::is_valid_property_offset(ofst) || !matches!(size, 4 | 8) {
+            return None;
+        }
+        Some(self.mmio_read_impl(0, ofst as u64, size))
+    }
+
+    /// **Phase V2** — Fabric Property Set 同窄 wrapper。
+    pub fn nvme_property_set(
+        &mut self,
+        ctx: &mut pcie_remote_userspace_sdk::DeviceCtx<'_>,
+        ofst: u32,
+        size: u32,
+        value: u64,
+    ) -> bool {
+        if !Self::is_valid_property_offset(ofst) || !matches!(size, 4 | 8) {
+            return false;
+        }
+        self.mmio_write_impl(ctx, 0, ofst as u64, size, value);
+        true
+    }
+}
+
+impl NvmeController {
     /// `backing_files`：每个文件成为一个 namespace（NSID 1, 2, ...）。
     /// 文件大小决定该 NS 容量（÷ 512 round down 到 LBA 数）。
     /// Phase H4：之前接受单 path string；现在 slice，至少 1 个。

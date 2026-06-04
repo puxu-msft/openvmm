@@ -39,6 +39,10 @@ pub mod fctype {
 /// Connect Data 大小：1024 byte（修正：之前 plan 写的 1792 是错的）。
 pub const CONNECT_DATA_SIZE: usize = 1024;
 
+/// **review L3** — 教学版单 controller 固定 CNTLID。V8 多 controller 时
+/// 改为 `next_cntlid: AtomicU16` 分配器。
+pub const TEACHING_CNTLID: u16 = 1;
+
 /// 1024-byte Connect Data 块。
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C, packed)]
