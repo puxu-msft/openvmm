@@ -210,6 +210,14 @@ pub enum PduError {
         /// 报告的 hlen。
         hlen: u8,
     },
+    /// **review H1** — `pdo` 必须 ≥ hlen+HDGST 或 = 0；其它值非法。
+    #[error("pdo ({pdo}) < consumed header bytes ({consumed})")]
+    InvalidPdo {
+        /// 报告的 pdo。
+        pdo: u8,
+        /// hlen + (HDGSTF ? 4 : 0)。
+        consumed: usize,
+    },
     /// plen 超 cap（DoS 防护）。
     #[error("plen ({plen}) > MAX_PDU_SIZE ({MAX_PDU_SIZE})")]
     PduTooLarge {
@@ -301,6 +309,8 @@ pub fn decode_psh<T: FromBytes + KnownLayout + Immutable + Copy>(
 ///
 /// **重要**：caller 必须已经 *正确填好* `hdr.hlen`、`hdr.pdo`、`hdr.plen`，
 /// 这是 spec invariant；本函数仅做计算 / digest 写入。
+///
+/// **review M3** — debug 模式下 assert plen 与实际写出字节数一致；release 无开销。
 pub fn encode_pdu(hdr: &CommonHdr, psh: &[u8], data: &[u8], out: &mut Vec<u8>) {
     let start = out.len();
     out.extend_from_slice(hdr.as_bytes());
@@ -321,6 +331,13 @@ pub fn encode_pdu(hdr: &CommonHdr, psh: &[u8], data: &[u8], out: &mut Vec<u8>) {
         let ddgst = crate::digest::crc32c_le_bytes(data);
         out.extend_from_slice(&ddgst);
     }
+    debug_assert_eq!(
+        out.len() - start,
+        hdr.plen as usize,
+        "hdr.plen 与实际写出 byte 数不一致；caller bug (plen={}, written={})",
+        { hdr.plen },
+        out.len() - start
+    );
 }
 
 // ─── 单测 ──────────────────────────────────────────────────────────────

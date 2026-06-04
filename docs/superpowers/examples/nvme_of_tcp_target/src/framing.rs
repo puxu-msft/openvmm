@@ -83,6 +83,15 @@ pub fn read_pdu(stream: &mut TcpStream) -> anyhow::Result<Pdu> {
 
     // 4. data + pad + DDGST
     let consumed = hlen + if header.has_hdgst() { 4 } else { 0 };
+    // **review H1** — pdo 必须 = 0（无 data 路径）或 ≥ consumed；其它值非法，
+    // 会让 saturating_sub 走错 data_len 算式甚至 hang 连接。
+    if pdo != 0 && pdo < consumed {
+        return Err(FramingError::Pdu(PduError::InvalidPdo {
+            pdo: header.pdo,
+            consumed,
+        })
+        .into());
+    }
     let mut data = Vec::new();
     if plen > consumed {
         // 有 trailing data
@@ -312,5 +321,35 @@ mod tests {
         assert_eq!(tt, 0xCAFE);
         assert_eq!(len, 4096);
         assert!(pdu.data.is_empty());
+    }
+
+    /// **review H1** — invalid pdo (>0 但 < hlen+HDGST) 应让 reader 返
+    /// `PduError::InvalidPdo`，不静默 hang / 读错字节。
+    #[test]
+    fn invalid_pdo_below_consumed_rejected() {
+        let (mut a, mut b) = tcp_pair();
+        let hdr = CommonHdr {
+            pdu_type: pdu_type::C2H_DATA,
+            flags: flags::HDGST,
+            hlen: 24,
+            pdo: 20, // 非法：consumed = 24 + 4 = 28，pdo < 28
+            plen: 28 + 8,
+        };
+        let psh = DataPsh::default();
+        // 手 build buf；不走 write_pdu 的 debug_assert
+        let mut buf = Vec::new();
+        buf.extend_from_slice(hdr.as_bytes());
+        buf.extend_from_slice(psh.as_bytes());
+        buf.extend_from_slice(&crate::digest::crc32c_le_bytes(&buf));
+        buf.extend_from_slice(&[0u8; 8]); // 填够 plen
+        use std::io::Write as _;
+        a.write_all(&buf).unwrap();
+        drop(a);
+        let r = read_pdu(&mut b);
+        let msg = format!("{:#}", r.unwrap_err());
+        assert!(
+            msg.contains("pdo") || msg.contains("InvalidPdo"),
+            "got: {msg}"
+        );
     }
 }
