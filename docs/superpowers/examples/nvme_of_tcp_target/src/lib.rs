@@ -26,6 +26,7 @@ pub mod digest;
 pub mod fabric;
 pub mod framing;
 pub mod h2c_reassembler;
+pub mod io_queue;
 pub mod pdu;
 pub mod r2t;
 pub mod session;

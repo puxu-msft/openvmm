@@ -1022,6 +1022,22 @@ impl NvmeController {
         self.dispatch_admin(ctx, sqe, cid, /*sq_head*/ 0, cq_id)
     }
 
+    /// **Phase V5a** — 与 [`nvme_admin_dispatch`] 同形的 IO 队列 dispatch
+    /// 入口。session 在 IO CapsuleCmd 时调本 wrapper，传入 created IO SQ
+    /// id (`sq_id`) 与对应 CQ id (`cq_id`)。返语义同 admin：`Some(Cqe)` =
+    /// 同步完成；`None` = 异步（已 dma_read/dma_write，等 caller 投
+    /// `nvme_admin_complete_dma`）。
+    pub fn nvme_io_dispatch(
+        &mut self,
+        ctx: &mut pcie_remote_userspace_sdk::DeviceCtx<'_>,
+        sq_id: u16,
+        sqe: crate::cmd::Sqe,
+        cid: u16,
+        cq_id: u16,
+    ) -> Option<crate::cmd::Cqe> {
+        self.dispatch_io(ctx, sq_id, sqe, cid, /*sq_head*/ 0, cq_id)
+    }
+
     /// **Phase V3** — 让 controller 处理一条 DMA 完成事件（caller 通常
     /// 是 V2Session 在 captured dma_write 全部 emit 完 C2HData 后，回调
     /// 一次 ok=true 触发 controller post_cqe）。

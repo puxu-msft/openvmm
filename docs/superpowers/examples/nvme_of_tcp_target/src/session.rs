@@ -26,6 +26,7 @@ use crate::framing::Pdu;
 use crate::framing::read_pdu;
 use crate::framing::write_pdu;
 use crate::h2c_reassembler::{AcceptOutcome, H2cReassembler};
+use crate::io_queue::IoQueueState;
 use crate::pdu::CommonHdr;
 use crate::pdu::DataPsh;
 use crate::pdu::IcPsh;
@@ -39,6 +40,7 @@ use crate::ttag::TtagAllocator;
 use anyhow::Context as _;
 use pcie_remote_nvme_userspace::NvmeController;
 use pcie_remote_nvme_userspace::cmd::Sqe;
+use std::collections::HashMap;
 use std::net::TcpStream;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
@@ -70,6 +72,18 @@ pub const MAXH2CDATA_BYTES: u32 = 64 * 1024;
 /// 次 read_pdu 同步阻塞）+ Vec::with_capacity 数 GiB 分配 OOM。
 /// V5 引入真 MDTS（controller IDENTIFY.MDTS 派生）后改为运行时决定。
 pub const V4_MAX_DMA_READ_BYTES: u32 = 8 * 1024 * 1024;
+
+/// **Phase V5a** — IO CQ sentinel 步长。
+/// 每个 IO CQ 分到 `[CQ_BASE_GPA + qid*STRIDE, CQ_BASE_GPA + (qid+1)*STRIDE)` 区间，
+/// 16 slot × 16B = 256B 已够本教学版（V4 admin CQ size=64 也只 1 KiB）。
+/// admin CQ (qid=0) 用 `CQ_BASE_GPA` 本身（offset=0），与 V3 兼容。
+pub const CQ_SENTINEL_STRIDE: u64 = 256;
+
+/// 算指定 qid 的 CQ sentinel GPA。`qid=0` 返 `CQ_BASE_GPA`（admin）；
+/// `qid≥1` 返 `CQ_BASE_GPA + qid*CQ_SENTINEL_STRIDE`。
+pub fn cq_sentinel(qid: u16) -> u64 {
+    CQ_BASE_GPA + (qid as u64) * CQ_SENTINEL_STRIDE
+}
 
 /// 握手后的协商参数。
 #[derive(Debug, Clone, Copy)]
@@ -106,6 +120,13 @@ pub struct V2Session {
     next_token: u64,
     /// **V4b** — R2T TTAG 分配器（单 session 共享，跨 cmd 单调）。
     ttag_alloc: TtagAllocator,
+    /// **V5a** — session 镜像的 IO queue 表。admin Create IO CQ/SQ 成功后
+    /// session 自己 insert，Fabric Connect qid≥1 时校验存在性。
+    pub io_queues: HashMap<u16, IoQueueState>,
+    /// **V5a** — 当前 conn 所属 qid。教学单 conn 单 qid（per Linux nvme-tcp
+    /// 真实行为：per-qid 一 TCP conn）。初始 0=未 Connect；admin Connect
+    /// 后 = 0；IO Connect 后 = N。`dispatch_capsule_cmd` 根据它区分 admin/IO。
+    pub current_qid: u16,
 }
 
 impl V2Session {
@@ -129,6 +150,9 @@ impl V2Session {
             // cmd 通过 token_high_water 累加。
             next_token: 1u64 << 48,
             ttag_alloc: TtagAllocator::default(),
+            // **V5a** — IO queue 表初空，Create IO CQ/SQ 成功后填充。
+            io_queues: HashMap::new(),
+            current_qid: 0,
         })
     }
 
@@ -190,10 +214,29 @@ impl V2Session {
                 }
             }
         } else {
-            // **Phase V3** — 真 NVMe 命令（Identify / Get Log Page /
-            // Set Features 等）：派发到 NvmeController.nvme_admin_dispatch。
-            self.handle_admin_cmd(cid, sqe)
+            // **Phase V3 / V5a** — 真 NVMe 命令派发：当前 conn 所属 qid
+            // 决定走 admin 还是 IO path（教学单 conn 单 qid，per Linux
+            // nvme-tcp 真实行为）。
+            if self.current_qid == 0 {
+                self.handle_admin_cmd(cid, sqe)
+            } else {
+                self.handle_io_cmd(cid, sqe)
+            }
         }
+    }
+
+    /// **Phase V5a stub** — IO CapsuleCmd 入口；V5a 仅返
+    /// CapsuleResp INVALID_OPCODE 让 wire 闭环验证 dispatch 二分逻辑。
+    /// V5b/V5c 改为 `run_dispatched_cmd` 共享 admin/IO 闭环。
+    fn handle_io_cmd(&mut self, cid: u16, sqe_bytes: &[u8]) -> anyhow::Result<()> {
+        let _sqe =
+            Sqe::read_from_bytes(sqe_bytes).map_err(|_| anyhow::anyhow!("IO SQE 不是 64 byte"))?;
+        tracing::warn!(
+            cid,
+            qid = self.current_qid,
+            "V5a stub: IO cmd 收到，回 CapsuleResp INVALID_OPCODE（V5b/V5c 接 IO Read/Write）"
+        );
+        self.send_capsule_resp_err(cid, /*INVALID_OPCODE=*/ 0x01)
     }
 
     /// **Phase V3 + V4b** — 把 CapsuleCmd 里的 NVMe SQE 派发到 controller，
@@ -228,7 +271,28 @@ impl V2Session {
         sqe.prp1 = PRP1_SENTINEL;
         sqe.prp2 = 0;
         let opc = (sqe.cdw0 & 0xff) as u8;
-        tracing::debug!(opc, cid, "V3/V4b admin dispatch");
+
+        // **V5a** — admin Create IO CQ (0x05) / Create IO SQ (0x01) peek：
+        // 改写 prp1 哨值 + 提取 qid/cq_id 准备 io_queues 记账。
+        // Create IO CQ: cdw10 bits 15:0 = qid；prp1 应改为 cq_sentinel(qid)
+        // Create IO SQ: cdw10 bits 15:0 = sq_id；cdw11 bits 31:16 = cq_id；
+        //               prp1 在 controller 内部 io.rs:382 不用（SQ 不需要
+        //               session 写 CQE）；保留 PRP1_SENTINEL 即可。
+        let create_io_cq_qid: Option<u16> =
+            (opc == 0x05).then_some((sqe.cdw10 & 0xffff) as u16);
+        let create_io_sq_pair: Option<(u16, u16)> = (opc == 0x01).then(|| {
+            let sq_id = (sqe.cdw10 & 0xffff) as u16;
+            let cq_id = ((sqe.cdw11 >> 16) & 0xffff) as u16;
+            (sq_id, cq_id)
+        });
+        if let Some(qid) = create_io_cq_qid {
+            // controller dispatch_admin Create IO CQ 内部 `cqs.insert(qid,
+            // CompletionQueue { base_gpa: sqe.prp1, ... })`；我们把 prp1
+            // 改成 cq_sentinel(qid)，post_cqe 时 ctx.dma_write 落到该哨值。
+            sqe.prp1 = cq_sentinel(qid);
+        }
+
+        tracing::debug!(opc, cid, "V3/V4b/V5a admin dispatch");
 
         // **修 M-1** — token 起点用 self.next_token 跨 cmd 单调；结束保存
         let mut tcp_t = TcpAdminTransport::new_with_token_base(self.next_token);
@@ -238,6 +302,30 @@ impl V2Session {
             let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
             self.controller.nvme_admin_dispatch(&mut ctx, sqe, cid, 0)
         };
+
+        // **V5a** — Create IO CQ/SQ 成功后镜像到 session.io_queues。
+        // 同步路径 (Some(Cqe))：Cqe.dw3 bits 17..32 是 SF (SC/SCT/...)，
+        // bits 17..25 = SC（status code）；SC=0 表示 success（spec §5.2）。
+        if let Some(cqe) = immediate_cqe.as_ref() {
+            let dw3 = cqe.dw3;
+            let sc = ((dw3 >> 17) & 0xff) as u8;
+            let success = sc == 0;
+            if success {
+                if let Some(qid) = create_io_cq_qid {
+                    let sentinel = cq_sentinel(qid);
+                    self.io_queues.insert(qid, IoQueueState::new_cq(sentinel));
+                    tracing::info!(
+                        qid,
+                        sentinel = format_args!("{sentinel:#x}"),
+                        "V5a: session mirrors Create IO CQ"
+                    );
+                }
+                if let Some((sq_id, cq_id)) = create_io_sq_pair {
+                    self.io_queues.insert(sq_id, IoQueueState::new_sq(cq_id));
+                    tracing::info!(sq_id, cq_id, "V5a: session mirrors Create IO SQ");
+                }
+            }
+        }
 
         // ─── Phase 1.5：**V4b-polish (review H-2)** mixed-path guard ──
         // V4b 不支持 dispatch 阶段同时产 data_write 和 dma_read（admin
@@ -498,11 +586,23 @@ impl V2Session {
                 return self.send_capsule_resp_err(cid, fabric_sc::CONNECT_INVALID_PARAM);
             }
             self.admin_connected = true;
+            self.current_qid = 0;
         } else {
-            // IO queue Connect — V8 真处理；V2 仅 ack 让 nvme-cli 初步发现
-            // 后再 disconnect 不卡。
+            // **Phase V5a** — IO queue Connect：必须前置 admin Connect
+            // 已 ack 且 host 已通过 admin path 跑过 Create IO CQ + Create
+            // IO SQ for this qid（session.io_queues[qid] 应为 Sq{connected=false}）。
             if !self.admin_connected {
                 return self.send_capsule_resp_err(cid, fabric_sc::CONNECT_INVALID_PARAM);
+            }
+            match self.io_queues.get_mut(&qid) {
+                Some(state @ IoQueueState::Sq { .. }) => {
+                    state.mark_connected();
+                    self.current_qid = qid;
+                }
+                _ => {
+                    tracing::warn!(qid, "Connect qid≥1 before Create IO SQ — reject");
+                    return self.send_capsule_resp_err(cid, fabric_sc::CONNECT_INVALID_PARAM);
+                }
             }
         }
         // CQE.result DW0 = cntlid（低 16 位）；CQE status = success
@@ -1863,6 +1963,162 @@ mod tests {
 
         let resp = read_pdu(&mut client).unwrap();
         assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        h.join().unwrap().unwrap();
+    }
+
+    // ─── Phase V5a — IO queue 安装 + Connect qid≥1 + dispatch 二分 ───
+
+    /// V5a helper：发一条带 cdw11 的 admin SQE（Create IO SQ 等需 cdw11）。
+    fn send_admin_sqe_cdw11(
+        client: &mut TcpStream,
+        opc: u8,
+        cid: u16,
+        nsid: u32,
+        cdw10: u32,
+        cdw11: u32,
+    ) {
+        let mut sqe = [0u8; 64];
+        sqe[0] = opc;
+        sqe[2..4].copy_from_slice(&cid.to_le_bytes());
+        sqe[4..8].copy_from_slice(&nsid.to_le_bytes());
+        sqe[40..44].copy_from_slice(&cdw10.to_le_bytes());
+        sqe[44..48].copy_from_slice(&cdw11.to_le_bytes());
+        let hdr = CommonHdr {
+            pdu_type: pdu_type::CMD,
+            flags: 0,
+            hlen: 72,
+            pdo: 0,
+            plen: 72,
+        };
+        write_pdu(client, &hdr, &sqe, &[]).unwrap();
+    }
+
+    /// 帮 V5a 跑前置：ICReq → Connect admin → Create IO CQ(qid=1, size=16)
+    /// → Create IO SQ(sq=1, cq=1, size=16) → Connect qid=1。
+    /// 返还 (client, server-thread join handle)。pump_one 次数已正确同步。
+    fn v5a_full_setup_qid1(
+        sess_pumps: usize,
+    ) -> (TcpStream, std::thread::JoinHandle<anyhow::Result<()>>) {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        // _backing 必须保活到 session 结束；测试函数把它绑 _backing 让生命周期
+        // 与本 helper 调用方对齐。本 helper 内部 leak `_backing`（forget）让
+        // tempfile 不 unlink；测试结束 OS 清。
+        std::mem::forget(_backing);
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            for _ in 0..sess_pumps {
+                let _ = sess.pump_one()?;
+            }
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        // Create IO CQ qid=1, qsize-1=15 (16 slot), cdw11: bit 0 PC=1
+        let cdw10_cq = 1u32 | (15u32 << 16);
+        send_admin_sqe_cdw11(&mut client, 0x05, 0x0501, 0, cdw10_cq, 0x0000_0001);
+        let _ = read_pdu(&mut client).unwrap();
+        // Create IO SQ qid=1, qsize-1=15; cdw11: bit 0 PC=1, bits 31:16 = CQ id=1
+        let cdw10_sq = 1u32 | (15u32 << 16);
+        let cdw11_sq = 0x0001_0001u32; // CQ id=1 + PC=1
+        send_admin_sqe_cdw11(&mut client, 0x01, 0x0502, 0, cdw10_sq, cdw11_sq);
+        let _ = read_pdu(&mut client).unwrap();
+        // Connect qid=1
+        send_connect_io(&mut client, 1);
+        let _ = read_pdu(&mut client).unwrap();
+        (client, h)
+    }
+
+    /// **V5a-1** — 完整 setup 流：4 步 admin 全 success + Connect qid=1 success。
+    #[test]
+    fn v5a_create_io_cq_sq_then_connect_io_qid1_succeeds() {
+        // setup 跑 5 个 pump：Connect admin + Create IO CQ + Create IO SQ
+        // + Connect qid=1 + 1 个 stub IO cmd 让 thread 不悬挂
+        let (mut client, h) = v5a_full_setup_qid1(5);
+        // 发一条 stub IO cmd（IO Read opc=0x02）让 thread 走 handle_io_cmd 后退出
+        send_admin_sqe_cdw11(&mut client, 0x02, 0x0AAA, 1, 0, 0);
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        // V5a stub: IO cmd 返 INVALID_OPCODE
+        assert_eq!(sc, 0x01, "V5a IO cmd 应 stub-return INVALID_OPCODE");
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V5a-2** — Connect qid=1 之前没 Create IO SQ → CONNECT_INVALID_PARAM。
+    #[test]
+    fn v5a_connect_io_qid_without_create_io_sq_rejected() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect admin
+            sess.pump_one()?; // Connect qid=1（应被拒）
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        // 没 Create IO CQ/SQ 直接 Connect qid=1
+        send_connect_io(&mut client, 1);
+        let resp = read_pdu(&mut client).unwrap();
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(sc, fabric_sc::CONNECT_INVALID_PARAM);
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V5a-3** — `cq_sentinel(qid)` 步长正确、不与 admin CQ 撞、属 [CQ_BASE_GPA, ..) 区。
+    #[test]
+    fn v5a_create_io_cq_sentinel_distinct_from_admin() {
+        assert_eq!(cq_sentinel(0), CQ_BASE_GPA);
+        assert_eq!(cq_sentinel(1), CQ_BASE_GPA + CQ_SENTINEL_STRIDE);
+        assert_eq!(cq_sentinel(2), CQ_BASE_GPA + 2 * CQ_SENTINEL_STRIDE);
+        assert!(cq_sentinel(1) >= CQ_BASE_GPA);
+        assert!(cq_sentinel(255) > cq_sentinel(254));
+    }
+
+    /// **V5a-4** — V5a stub：IO cmd 进 dispatch 后返 CapsuleResp INVALID_OPCODE。
+    /// （与 V5a-1 合并验证；保留独立 named test 表意。）
+    #[test]
+    fn v5a_io_cmd_after_connect_returns_invalid_opcode() {
+        let (mut client, h) = v5a_full_setup_qid1(5);
+        send_admin_sqe_cdw11(&mut client, 0x02, 0x0BBB, 1, 0, 0);
+        let resp = read_pdu(&mut client).unwrap();
+        let cid = u16::from_le_bytes(resp.psh[12..14].try_into().unwrap());
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(cid, 0x0BBB);
+        assert_eq!(sc, 0x01);
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V5a-5** — admin path 在 V5a 改动后仍跑通：Identify Controller 完整闭环。
+    /// 防 io_queues 记账误伤 admin 路径。
+    #[test]
+    fn v5a_admin_path_still_green_after_io_queue_tracking() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect admin
+            sess.pump_one()?; // Identify Controller
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_admin_sqe_cdw11(&mut client, 0x06, 0x00C1, 0, 0x0000_0001, 0);
+        // 先收 C2HData
+        let p = read_pdu(&mut client).unwrap();
+        assert_eq!(p.header.pdu_type, pdu_type::C2H_DATA);
+        // 再收 CapsuleResp success
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(sc, 0);
         h.join().unwrap().unwrap();
     }
 }
