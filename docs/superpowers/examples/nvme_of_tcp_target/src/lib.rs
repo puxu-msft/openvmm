@@ -14,7 +14,8 @@
 //!   + minimal session state machine
 //! - **V3** ✅ admin cmd 派发到 NvmeController：Identify/Get Log Page
 //!   等异步路径 captured dma_write 转 C2HData + CapsuleResp
-//! - **V4-V8** 计划中
+//! - **V4a** ✅ wire layer：R2T encode + H2CData reassembler + TTAG 分配器
+//! - **V4b–V8** 计划中
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -22,9 +23,12 @@
 pub mod digest;
 pub mod fabric;
 pub mod framing;
+pub mod h2c_reassembler;
 pub mod pdu;
+pub mod r2t;
 pub mod session;
 pub mod tcp_transport;
+pub mod ttag;
 
 pub use digest::crc32c;
 pub use fabric::ConnectData;
@@ -34,10 +38,13 @@ pub use fabric::PropertyFabricFields;
 pub use framing::Pdu;
 pub use framing::read_pdu;
 pub use framing::write_pdu;
+pub use h2c_reassembler::{AcceptOutcome, H2cReassembler};
 pub use pdu::*;
+pub use r2t::encode_r2t;
 pub use session::CQ_BASE_GPA;
 pub use session::NegotiatedIc;
 pub use session::PRP1_SENTINEL;
 pub use session::V2Session;
 pub use session::ic_handshake;
 pub use tcp_transport::TcpAdminTransport;
+pub use ttag::TtagAllocator;
