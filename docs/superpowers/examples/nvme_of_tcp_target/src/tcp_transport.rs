@@ -46,6 +46,22 @@ pub struct DmaWriteRecord {
 }
 
 /// V3 admin transport：捕获 dma_write、token 自增、ctx.dma_read 走错路径。
+///
+/// **TODO(V3-polish-2, review M-1)** — `next_token` 起点固定 `1<<48` →
+/// 每次 `default()` 都重启。如果 caller bail 中途打断异步路径，那条
+/// `pending_ios` entry 残留 controller 内，*下一条* admin cmd 的第一个
+/// dma_write 会拿到同一 token 静默覆盖该残留。功能自愈但日志/调试
+/// 语义漂移；更严重的是若残留 entry 是 NvmReadDmaWrite，on_dma_complete
+/// 仍会 post_cqe → captured 多出一条 CQE write → L1 invariant bail。
+/// 推荐：session 持有全局 `AtomicU64`，每次 `new_with_token_base(n)` 注入。
+///
+/// **TODO(V3-polish-2, review M-2)** — `dma_read` 当前只返 token + warn，
+/// 没投 `on_dma_complete(ok=false)`。session 看到 dispatch 返 None 且
+/// captured 无 write → Phase 3 找不到 CQE → bail "did not produce CQE"。
+/// 客户端看到 TCP 断而非 INVALID_OPCODE CapsuleResp。修复方案：
+/// (a) `dma_read` 入 pending_reads，handle_admin_cmd 立即投 ok=false 让
+///     controller 自身 post_cqe DATA_TRANSFER_ERROR；或
+/// (b) session 入口按 opcode 白名单 pre-reject。
 pub struct TcpAdminTransport {
     /// 累积本次 admin cmd 处理中 controller 产生的所有 dma_write。
     pub writes: VecDeque<DmaWriteRecord>,
@@ -66,10 +82,6 @@ impl Default for TcpAdminTransport {
 }
 
 impl TcpAdminTransport {
-    /// 当前 token 计数器（供测试观测）。
-    pub fn peek_next_token(&self) -> u64 {
-        self.next_token
-    }
     /// pop 出最旧一条 dma_write 记录（FIFO 顺序与 controller 写出顺序一致）。
     pub fn pop_write(&mut self) -> Option<DmaWriteRecord> {
         self.writes.pop_front()
@@ -100,6 +112,15 @@ impl Transport for TcpAdminTransport {
         token
     }
     fn dma_write(&mut self, gpa: u64, data: Vec<u8>) -> u64 {
+        // **review M1** — 数据 payload sentinel 与 CQ sentinel 之间留 ≥
+        // CQ_BASE_GPA - PRP1_SENTINEL bytes (~13.8 EiB)；V3 单 PDU
+        // ≤ 8 KiB 完全安全，但 V5 IO RW 引入多 PDU 累积时需要重新分配
+        // sentinel。本 debug assert 是 tripwire：一旦真撞上立即 panic in
+        // dev build，release 0 开销。
+        debug_assert!(
+            data.len() as u64 <= u64::MAX / 2,
+            "single dma_write > half u64 — sentinel scheme bug"
+        );
         let token = self.next_token;
         self.next_token = self.next_token.wrapping_add(1);
         tracing::debug!(

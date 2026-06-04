@@ -174,19 +174,20 @@ impl V2Session {
     /// **Phase V3** — 把 CapsuleCmd 里的 NVMe SQE 派发到 controller，
     /// captured 出来的 dma_write 转 NVMe-oF wire（C2HData PDU + CapsuleResp）。
     ///
-    /// 策略：
-    /// 1. 把 SQE 的 prp1 改写成 [`PRP1_SENTINEL`] —— controller 用它当
-    ///    "数据回 host 的 GPA"，我们捕获后 emit 成 C2HData
-    /// 2. 用 [`TcpAdminTransport`] 跑 nvme_admin_dispatch：
-    ///    - 同步返 Some(cqe)：理论上 controller 已 post_cqe，captured 的
-    ///      dma_write 第一条就是 CQE。但 dispatch_admin 通常 *返* cqe 让
-    ///      caller 调 post_cqe；本路径不调 post_cqe，直接用返的 cqe
-    ///      encode CapsuleResp。
-    ///    - 异步返 None：controller 已 dma_write PRP1 data + 把 token
-    ///      入 pending_ios。我们调 nvme_admin_complete_dma(token, ok=true,
-    ///      vec![]) 让 controller 走 post_cqe（再产 1 条 CQE dma_write）。
-    /// 3. 区分 captured writes：gpa < CQ_BASE_GPA → C2HData payload；
-    ///    gpa ≥ CQ_BASE_GPA → CQE bytes → CapsuleResp。
+    /// 策略（**review M2 / L1 / L2** 后统一）：
+    /// 1. SQE.prp1 改写为 [`PRP1_SENTINEL`]，controller 把"数据写回 host
+    ///    内存"的 dma_write 都打到该哨值 gpa，session 后续识别为 C2HData
+    ///    payload；CQE bytes 走 [`CQ_BASE_GPA`] 上的 16B write。
+    /// 2. 同步 vs 异步路径统一走 controller post_cqe：
+    ///    - 同步：dispatch 返 `Some(cqe)` → 立刻调 `nvme_post_cqe(cqe)`，
+    ///      让 controller 产 1 条 CQE dma_write 进 captured。
+    ///    - 异步：dispatch 返 `None` → captured 仅含 data writes。逐 token
+    ///      调 `nvme_admin_complete_dma(ok=true)`，controller 内部走 post_cqe
+    ///      产 1 条 CQE write。
+    ///
+    ///    两条路径出口都保证 captured = [data writes...] + [1 条 CQE write]。
+    /// 3. drain captured 严格按 "data 先 / CQE 后" 顺序拼 C2HData + CapsuleResp；
+    ///    任何顺序/计数违例 → `anyhow::bail!`（review L1 / L2，宁可断也别截断 wire）。
     fn handle_admin_cmd(&mut self, cid: u16, sqe_bytes: &[u8]) -> anyhow::Result<()> {
         let mut sqe =
             Sqe::read_from_bytes(sqe_bytes).map_err(|_| anyhow::anyhow!("SQE 不是 64 byte"))?;
@@ -197,73 +198,75 @@ impl V2Session {
         tracing::debug!(opc, cid, "V3 admin dispatch");
 
         let mut tcp_t = TcpAdminTransport::default();
+
+        // ─── Phase 1：dispatch ─────────────────────────────────────────
         let immediate_cqe = {
             let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
             self.controller.nvme_admin_dispatch(&mut ctx, sqe, cid, 0)
         };
 
+        // ─── Phase 2：统一两条路径，最终 captured 都含 1 条 CQE write ───
         if let Some(cqe) = immediate_cqe {
-            // 同步路径：caller-style 直接用返的 cqe 编码 CapsuleResp，
-            // 不调 post_cqe（避免 controller 再次 dma_write CQE bytes 进我们
-            // 假 CQ + fire_interrupt）。
-            return self.write_capsule_resp_from_cqe(&cqe);
-        }
-
-        // 异步路径：controller 已 dma_write data + 注册 pending_io。
-        // 先处理 captured data write（PRP1 → C2HData PDU），然后调
-        // nvme_admin_complete_dma 让 controller 继续 post_cqe（会产 CQE
-        // dma_write + fire_interrupt）。
-
-        // 取所有 PRP1 sentinel data writes（按 FIFO 顺序合并）
-        let mut data_payload = Vec::new();
-        let mut data_writes = Vec::new();
-        // 暂存非 data writes，回填到 transport
-        let mut non_data = Vec::new();
-        while let Some(w) = tcp_t.pop_write() {
-            if w.gpa < CQ_BASE_GPA {
-                data_payload.extend_from_slice(&w.data);
-                data_writes.push(w.token);
-            } else {
-                non_data.push(w);
-            }
-        }
-        for w in non_data {
-            tcp_t.writes.push_back(w);
-        }
-
-        // 对每个 data write 投 ok=true completion；controller 会 post_cqe
-        // 触发新的 CQE dma_write。最后一条 completion 投完后 captured 应
-        // 多出一条 CQE write。
-        for tok in data_writes {
+            // **review M2** — 同步路径也走 post_cqe，让 controller 内部
+            // CQ tail/phase 推进逻辑生效；保持与异步路径单一出口。
             let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
-            self.controller
-                .nvme_admin_complete_dma(&mut ctx, tok, true, Vec::new());
-        }
-
-        // 现在 captured 应只剩 CQE write（gpa ≥ CQ_BASE_GPA）
-        let cqe_write = loop {
-            match tcp_t.pop_write() {
-                Some(w) if w.gpa >= CQ_BASE_GPA => break Some(w),
-                Some(w) => {
-                    tracing::warn!(
-                        gpa = format_args!("{:#x}", { w.gpa }),
-                        "V3: unexpected non-CQE write after data completion; dropped"
+            self.controller.nvme_post_cqe(&mut ctx, cqe);
+        } else {
+            // 异步路径：dispatch 阶段 captured 必只含 data writes。
+            // 先快照 token 列表，再逐个投 ok=true completion。
+            // **review L2** — controller 协议规定 data dma_write 先于
+            // CQE，dispatch 阶段不应出 CQE write；若出，是 controller path
+            // 出 bug，bail 比静默丢更安全。
+            let mut data_tokens = Vec::with_capacity(tcp_t.writes.len());
+            for w in tcp_t.writes.iter() {
+                if w.gpa >= CQ_BASE_GPA {
+                    anyhow::bail!(
+                        "V3 invariant violation: async dispatch produced CQE write \
+                         before on_dma_complete (gpa={:#x})",
+                        { w.gpa }
                     );
                 }
-                None => break None,
+                data_tokens.push(w.token);
             }
-        };
-        let cqe_bytes = match cqe_write {
-            Some(w) if w.data.len() == 16 => w.data,
-            Some(w) => {
-                anyhow::bail!("captured CQE write len={} != 16", w.data.len());
+            for tok in data_tokens {
+                let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                self.controller
+                    .nvme_admin_complete_dma(&mut ctx, tok, true, Vec::new());
             }
-            None => {
-                anyhow::bail!("V3: controller did not post CQE after data completion");
-            }
-        };
+        }
 
-        // 先发 C2HData（若有 data），再发 CapsuleResp
+        // ─── Phase 3：drain captured → data_payload + cqe_bytes ───────
+        let mut data_payload = Vec::new();
+        let mut cqe_bytes: Option<Vec<u8>> = None;
+        while let Some(w) = tcp_t.pop_write() {
+            if w.gpa >= CQ_BASE_GPA {
+                if cqe_bytes.is_some() {
+                    anyhow::bail!(
+                        "V3 invariant violation: multiple CQE writes captured for single admin cmd"
+                    );
+                }
+                if w.data.len() != 16 {
+                    anyhow::bail!("captured CQE write len={} != 16", w.data.len());
+                }
+                cqe_bytes = Some(w.data);
+            } else {
+                // **review L1** — data write 必须先于 CQE write。反序意味
+                // controller 路径出错；bail 而非 warn-drop，避免发出截断/错序的 wire。
+                if cqe_bytes.is_some() {
+                    anyhow::bail!(
+                        "V3 invariant violation: data write captured after CQE write \
+                         (gpa={:#x}, {} bytes)",
+                        { w.gpa },
+                        w.data.len()
+                    );
+                }
+                data_payload.extend_from_slice(&w.data);
+            }
+        }
+        let cqe_bytes = cqe_bytes
+            .ok_or_else(|| anyhow::anyhow!("V3: controller did not produce CQE for admin cmd"))?;
+
+        // ─── Phase 4：emit C2HData (若有 data) + CapsuleResp ────────────
         if !data_payload.is_empty() {
             self.send_c2h_data(cid, &data_payload)?;
         }
@@ -304,6 +307,11 @@ impl V2Session {
     }
 
     /// 同步路径用：把 Cqe struct 序列化成 16-byte CapsuleResp PSH。
+    ///
+    /// **V3-polish (review M2)** — 同步路径已统一走 controller.nvme_post_cqe
+    /// + drain captured CQE write，本函数不再被 handle_admin_cmd 调用，但
+    ///   保留作为外部 caller（V6 AER 等）将 Cqe 直接 emit 的 helper。
+    #[allow(dead_code)]
     fn write_capsule_resp_from_cqe(
         &mut self,
         cqe: &pcie_remote_nvme_userspace::cmd::Cqe,
@@ -571,16 +579,22 @@ mod tests {
     }
 
     /// 临时 backing file + NvmeController 用于测试。
-    fn make_test_controller() -> NvmeController {
-        let path = std::env::temp_dir().join(format!(
-            "nvme_oftcp_v2_{}_{:?}.img",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let f = std::fs::File::create(&path).unwrap();
-        f.set_len(1024 * 1024).unwrap();
-        drop(f);
-        NvmeController::open(&[path.to_str().unwrap().to_string()], 0x1414, 0, &[]).unwrap()
+    ///
+    /// **V3-polish (review L6)** — 用 [`tempfile::NamedTempFile`] 而非
+    /// `temp_dir().join(pid+tid)` 拼路径；NamedTempFile drop 时自动 unlink，
+    /// 不需要测试函数手工清理（之前的方案会在 /tmp 永久积垢，CI 上每次
+    /// `cargo test` 跑都漏 ~1 KiB 文件 × N tests）。
+    ///
+    /// 返 `(controller, guard)` —— **调用者必须把 guard 绑到 `_guard` 之类
+    /// 的名字**（不能直接丢；丢即 drop，文件被 unlink，NvmeController
+    /// 的 backing file fd 还能正常 read/write（Unix unlink semantics），
+    /// 但 path-based 操作会消失）。
+    fn make_test_controller() -> (NvmeController, tempfile::NamedTempFile) {
+        let f = tempfile::NamedTempFile::new().expect("create tempfile");
+        f.as_file().set_len(1024 * 1024).expect("set_len");
+        let path = f.path().to_str().expect("temp path utf8").to_string();
+        let c = NvmeController::open(&[path], 0x1414, 0, &[]).expect("NvmeController::open");
+        (c, f)
     }
 
     /// ICReq → ICResp 握手 happy path（无 digest）。
@@ -677,7 +691,7 @@ mod tests {
     #[test]
     fn fabric_connect_admin_returns_cntlid() {
         let (mut client, server) = tcp_pair();
-        let controller = make_test_controller();
+        let (controller, _backing) = make_test_controller();
         let h = thread::spawn(move || -> anyhow::Result<()> {
             let mut sess = V2Session::accept_and_handshake(server, controller)?;
             sess.pump_one()?; // Connect
@@ -735,7 +749,7 @@ mod tests {
     #[test]
     fn property_get_cap_reads_bar0() {
         let (mut client, server) = tcp_pair();
-        let controller = make_test_controller();
+        let (controller, _backing) = make_test_controller();
         let h = thread::spawn(move || -> anyhow::Result<()> {
             let mut sess = V2Session::accept_and_handshake(server, controller)?;
             sess.pump_one()?; // Connect
@@ -890,10 +904,10 @@ mod tests {
     #[test]
     fn property_get_cap_8byte_uses_dw1() {
         let (mut client, server) = tcp_pair();
-        let controller = make_test_controller();
+        let (controller, _backing) = make_test_controller();
         let expected_cap = {
             // 用同一份 controller 在另一个临时实例上读出 CAP，作为对照
-            let mut tmp = make_test_controller();
+            let (mut tmp, _tmp_backing) = make_test_controller();
             tmp.nvme_property_get(0, 8).unwrap()
         };
         let h = thread::spawn(move || -> anyhow::Result<()> {
@@ -923,7 +937,7 @@ mod tests {
     #[test]
     fn connect_io_before_admin_rejected() {
         let (mut client, server) = tcp_pair();
-        let controller = make_test_controller();
+        let (controller, _backing) = make_test_controller();
         let h = thread::spawn(move || -> anyhow::Result<()> {
             let mut sess = V2Session::accept_and_handshake(server, controller)?;
             sess.pump_one()?;
@@ -944,7 +958,7 @@ mod tests {
     #[test]
     fn connect_admin_twice_rejected() {
         let (mut client, server) = tcp_pair();
-        let controller = make_test_controller();
+        let (controller, _backing) = make_test_controller();
         let h = thread::spawn(move || -> anyhow::Result<()> {
             let mut sess = V2Session::accept_and_handshake(server, controller)?;
             sess.pump_one()?;
@@ -970,7 +984,7 @@ mod tests {
     #[test]
     fn property_set_cc_enables_csts_rdy() {
         let (mut client, server) = tcp_pair();
-        let controller = make_test_controller();
+        let (controller, _backing) = make_test_controller();
         let h = thread::spawn(move || -> anyhow::Result<()> {
             let mut sess = V2Session::accept_and_handshake(server, controller)?;
             sess.pump_one()?; // Connect
@@ -1004,7 +1018,7 @@ mod tests {
     #[test]
     fn admin_identify_controller_emits_c2hdata_and_resp() {
         let (mut client, server) = tcp_pair();
-        let controller = make_test_controller();
+        let (controller, _backing) = make_test_controller();
         let h = thread::spawn(move || -> anyhow::Result<()> {
             let mut sess = V2Session::accept_and_handshake(server, controller)?;
             sess.pump_one()?; // Connect
@@ -1057,6 +1071,168 @@ mod tests {
         let sc = ((status >> 1) & 0xff) as u8;
         assert_eq!(resp_cid, 0x00C1);
         assert_eq!(sc, 0, "Identify Controller 应 success");
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V3-polish (review M4)** — Identify Namespace (CNS=0x00, nsid=1)：
+    /// 异步路径（controller 走 dma_write_then_complete），断言我们收到
+    /// 4 KiB C2HData + 成功 CapsuleResp。
+    #[test]
+    fn admin_identify_namespace_emits_c2hdata_and_resp() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect
+            sess.pump_one()?; // Identify NS
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+
+        let mut sqe = [0u8; 64];
+        sqe[0] = 0x06; // IDENTIFY
+        sqe[2..4].copy_from_slice(&0x00B2u16.to_le_bytes()); // cid
+        sqe[4..8].copy_from_slice(&1u32.to_le_bytes()); // nsid = 1
+        sqe[40..44].copy_from_slice(&0x0000_0000u32.to_le_bytes()); // CNS=0 (Identify NS)
+        let cmd_hdr = CommonHdr {
+            pdu_type: pdu_type::CMD,
+            flags: 0,
+            hlen: 72,
+            pdo: 0,
+            plen: 72,
+        };
+        write_pdu(&mut client, &cmd_hdr, &sqe, &[]).unwrap();
+
+        // C2HData PDU
+        let data_pdu = read_pdu(&mut client).unwrap();
+        let pt = data_pdu.header.pdu_type;
+        assert_eq!(pt, pdu_type::C2H_DATA);
+        let psh: DataPsh = crate::pdu::decode_psh(&data_pdu.psh).unwrap();
+        let cccid = psh.cccid;
+        let dlen = psh.data_length;
+        assert_eq!(cccid, 0x00B2);
+        assert_eq!(dlen, 4096);
+        assert_eq!(data_pdu.data.len(), 4096);
+
+        // CapsuleResp success
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        let status = u16::from_le_bytes(resp.psh[14..16].try_into().unwrap());
+        let sc = ((status >> 1) & 0xff) as u8;
+        assert_eq!(sc, 0, "Identify NS 应 success");
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V3-polish (review M4)** — Set Features 是 controller 内部
+    /// 同步路径（dispatch_admin 直接返 `Some(Cqe)`）。验证 V3 统一后
+    /// 同步路径也走 nvme_post_cqe → captured CQE write → CapsuleResp
+    /// 无 C2HData。Set FID=0x07 NUMBER_OF_QUEUES，CQE DW0 应回 (NSQA-1)
+    /// | ((NCQA-1) << 16)。
+    #[test]
+    fn admin_set_features_sync_path_no_c2hdata() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect
+            sess.pump_one()?; // Set Features
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+
+        let mut sqe = [0u8; 64];
+        sqe[0] = 0x09; // SET_FEATURES
+        sqe[2..4].copy_from_slice(&0x0011u16.to_le_bytes()); // cid
+        // CDW10 = FID=0x07 (NUMBER_OF_QUEUES)
+        sqe[40..44].copy_from_slice(&0x0000_0007u32.to_le_bytes());
+        // CDW11 = (NSQR-1) | ((NCQR-1) << 16)：要 4 SQ + 4 CQ
+        let cdw11: u32 = 3 | (3 << 16);
+        sqe[44..48].copy_from_slice(&cdw11.to_le_bytes());
+        let cmd_hdr = CommonHdr {
+            pdu_type: pdu_type::CMD,
+            flags: 0,
+            hlen: 72,
+            pdo: 0,
+            plen: 72,
+        };
+        write_pdu(&mut client, &cmd_hdr, &sqe, &[]).unwrap();
+
+        // 同步路径：不应有 C2HData，直接 CapsuleResp
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(
+            resp.header.pdu_type,
+            pdu_type::RSP,
+            "Set Features 同步路径不应先发 C2HData"
+        );
+        let resp_cid = u16::from_le_bytes(resp.psh[12..14].try_into().unwrap());
+        let status = u16::from_le_bytes(resp.psh[14..16].try_into().unwrap());
+        let sc = ((status >> 1) & 0xff) as u8;
+        assert_eq!(resp_cid, 0x0011);
+        assert_eq!(sc, 0, "Set Features 应 success");
+        // CQE DW0 = granted；IO_QUEUE_CAP=4，请求 NSQR=NCQR=4 应授满 → NSQA-1=3。
+        // **V3-polish (review M-3)** — 之前 `>= 1` 过宽，regression 时不易定位；
+        // 锁死 3 让 IO_QUEUE_CAP 漂移立即被这条断言捕获。
+        let dw0 = u32::from_le_bytes(resp.psh[..4].try_into().unwrap());
+        let nsqa_minus_1 = dw0 & 0xffff;
+        let ncqa_minus_1 = (dw0 >> 16) & 0xffff;
+        assert_eq!(
+            nsqa_minus_1, 3,
+            "应授满 IO_QUEUE_CAP=4 个 SQ → NSQA-1=3, dw0={dw0:#x}"
+        );
+        assert_eq!(nsqa_minus_1, ncqa_minus_1, "NSQA 应等于 NCQA");
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V3-polish (review M4)** — Identify NS 用非法 NSID：controller 内部
+    /// 走 `Cqe::error(INVALID_NAMESPACE)` 同步返回路径。验证 V3 统一后
+    /// 没有 C2HData，CapsuleResp 带 SC=0x0B (INVALID_NAMESPACE_OR_FORMAT)。
+    #[test]
+    fn admin_identify_namespace_invalid_nsid_returns_error_cqe() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect
+            sess.pump_one()?; // Identify NS bad NSID
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+
+        let mut sqe = [0u8; 64];
+        sqe[0] = 0x06; // IDENTIFY
+        sqe[2..4].copy_from_slice(&0x0099u16.to_le_bytes()); // cid
+        sqe[4..8].copy_from_slice(&999u32.to_le_bytes()); // NSID=999 不存在
+        sqe[40..44].copy_from_slice(&0x0000_0000u32.to_le_bytes()); // CNS=0
+        let cmd_hdr = CommonHdr {
+            pdu_type: pdu_type::CMD,
+            flags: 0,
+            hlen: 72,
+            pdo: 0,
+            plen: 72,
+        };
+        write_pdu(&mut client, &cmd_hdr, &sqe, &[]).unwrap();
+
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(
+            resp.header.pdu_type,
+            pdu_type::RSP,
+            "Identify NS bad NSID 同步错误路径不应先发 C2HData"
+        );
+        let resp_cid = u16::from_le_bytes(resp.psh[12..14].try_into().unwrap());
+        let status = u16::from_le_bytes(resp.psh[14..16].try_into().unwrap());
+        let sc = ((status >> 1) & 0xff) as u8;
+        assert_eq!(resp_cid, 0x0099);
+        // INVALID_NAMESPACE_OR_FORMAT = 0x0B
+        assert_eq!(sc, 0x0B, "应回 INVALID_NAMESPACE_OR_FORMAT, got sc={sc:#x}");
         h.join().unwrap().unwrap();
     }
 }

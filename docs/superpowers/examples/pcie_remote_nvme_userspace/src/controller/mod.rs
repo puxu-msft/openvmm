@@ -1039,7 +1039,22 @@ impl NvmeController {
     /// **Phase V3** — 给 V2Session 用：插入一个 admin CQ (cq_id=0) 让
     /// controller `post_cqe` 能写进去。`base_gpa` 是 caller 用来识别
     /// "这块 dma_write 是 CQE bytes" 的 sentinel；不真做 mmap。
+    ///
+    /// **review M3** — 若 cq_id=0 已存在则覆盖前 log warn（reconnect
+    /// 场景常见，session 应该用 fresh controller，覆盖通常无害但值得提示）。
+    ///
+    /// **V3-polish (review L-3)** — warn 时打印 old/new base_gpa + qsize，
+    /// 让维护者一眼看出"同 base 重装（无害）"vs"base 漂移（潜在 bug）"。
     pub fn nvme_install_admin_cq(&mut self, base_gpa: u64, qsize: u32) {
+        if let Some(old) = self.cqs.get(&0) {
+            tracing::warn!(
+                old_base = format_args!("{:#x}", old.base_gpa),
+                old_size = old.size,
+                new_base = format_args!("{base_gpa:#x}"),
+                new_size = qsize,
+                "nvme_install_admin_cq: admin CQ already exists, overwriting"
+            );
+        }
         let cq = crate::regs::CompletionQueue {
             base_gpa,
             size: qsize,
@@ -1052,6 +1067,26 @@ impl NvmeController {
             last_fire: None,
         };
         self.cqs.insert(0, cq);
+    }
+
+    /// **Phase V3** — 让 caller 自己 post_cqe，用于把同步返的 `Some(Cqe)`
+    /// 路径也走 controller 内部 post_cqe（统一异步/同步路径，让 CQ tail
+    /// 推进与 wire-emit 一致）。
+    ///
+    /// **V3-polish (review L-2)** — 加 debug_assert 防 caller 漏调
+    /// [`Self::nvme_install_admin_cq`]；漏调时 post_cqe 内部 warn no-op，
+    /// session 后续 drain 找不到 CQE bytes → bail "did not produce CQE"
+    /// 错位归因为 controller bug。tripwire 让 panic 直接命中 root cause。
+    pub fn nvme_post_cqe(
+        &mut self,
+        ctx: &mut pcie_remote_userspace_sdk::DeviceCtx<'_>,
+        cqe: crate::cmd::Cqe,
+    ) {
+        debug_assert!(
+            self.cqs.contains_key(&0),
+            "nvme_post_cqe: caller must call nvme_install_admin_cq before dispatching admin cmds"
+        );
+        self.post_cqe(ctx, 0, cqe);
     }
 }
 
