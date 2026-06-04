@@ -57,17 +57,30 @@ pub trait Regions {
 
 /// Server-side session：握手已完成，循环派发入站命令到 [`PcieDevice`]。
 ///
-/// 当前 phase 不维护 DMA map 表 / IRQ eventfd 列表（U4/U5 加）。
+/// 当前 phase 不维护 IRQ eventfd 列表（U5 加）。**Phase U4**：内部持
+/// [`crate::DmaTable`] 跟踪 client 通告的 guest RAM region；DMA_READ/WRITE
+/// 现在通过 [`crate::dma::dma_read_sync`] / [`dma_write_sync`] 走真往返。
 pub struct VfioUserSession {
     stream: UnixStream,
     #[allow(dead_code)] // U5 之后会用 negotiated caps 限速
     negotiated: Negotiated,
+    /// DMA_MAP 通告的所有 guest RAM region。
+    pub(crate) dma_table: crate::dma::DmaTable,
+    /// server-initiated DMA_READ/WRITE 的 msg_id 计数器（顶位 0x8000）。
+    /// U5 [`VfioUserTransport`] 用，当前仅做占位。
+    #[allow(dead_code)]
+    pub(crate) next_server_msg_id: u16,
 }
 
 impl VfioUserSession {
     /// 用已 handshake 的 UnixStream + Negotiated 构造 session。
     pub fn new(stream: UnixStream, negotiated: Negotiated) -> Self {
-        Self { stream, negotiated }
+        Self {
+            stream,
+            negotiated,
+            dma_table: crate::dma::DmaTable::default(),
+            next_server_msg_id: 0x8000,
+        }
     }
 
     /// 阻塞处理一条入站消息：read → dispatch → 自动 reply。
@@ -121,9 +134,16 @@ impl VfioUserSession {
             Command::RegionRead => self.handle_region_read(id, &msg, device),
             Command::RegionWrite => self.handle_region_write(id, &msg, device),
             Command::DeviceReset => self.handle_reset(id, &msg, device),
-            // U4/U5 实现：
-            Command::DmaMap | Command::DmaUnmap | Command::DeviceSetIrqs => {
-                tracing::warn!(?cmd, "{cmd:?} not yet implemented (Phase U4/U5)");
+            // **Phase U4** — DMA 表已接：
+            Command::DmaMap => {
+                crate::dma::handle_dma_map(&mut self.stream, &mut self.dma_table, id, &msg)
+            }
+            Command::DmaUnmap => {
+                crate::dma::handle_dma_unmap(&mut self.stream, &mut self.dma_table, id, &msg)
+            }
+            // U5 实现：
+            Command::DeviceSetIrqs => {
+                tracing::warn!(?cmd, "{cmd:?} not yet implemented (Phase U5)");
                 self.send_err(id, cmd, libc::ENOTSUP as u32);
                 Ok(())
             }
@@ -623,21 +643,22 @@ mod tests {
         assert_eq!(last_reset, 0);
     }
 
-    /// Phase U4 待实现命令 DMA_MAP → 服务端礼貌回 ENOTSUP。
+    /// Phase U5 待实现命令 SET_IRQS → 服务端礼貌回 ENOTSUP。
+    /// (Phase U4 后 DmaMap/DmaUnmap 已 真处理，不再返 ENOTSUP。)
     #[test]
-    fn dma_map_returns_enotsup() {
+    fn set_irqs_returns_enotsup() {
         let (server, mut client) = pair();
         let mut sess = VfioUserSession::new(server, neg());
         let mut dev = MockDev::new();
         let _h = thread::spawn(move || sess.pump_one(&mut dev));
-        let pl = crate::proto::DmaMapPayload {
-            argsz: 32,
-            flags: 3,
-            offset: 0,
-            addr: 0x1_0000,
-            size: 0x1000,
+        let pl = crate::proto::IrqSetPayload {
+            argsz: 20,
+            flags: crate::proto::irq_set::DATA_NONE | crate::proto::irq_set::ACTION_TRIGGER,
+            index: pci_irq::MSIX,
+            start: 0,
+            count: 0,
         };
-        let hdr = Header::command(42, Command::DmaMap, pl.as_bytes().len() as u32);
+        let hdr = Header::command(42, Command::DeviceSetIrqs, pl.as_bytes().len() as u32);
         fw_write(&mut client, &hdr, pl.as_bytes(), &[]).unwrap();
         let reply = read_message(&mut client).unwrap();
         assert!(reply.header.flags().is_error());

@@ -14,7 +14,8 @@
 //! - **U1**：proto 数据结构 + 编解码 + 单测 ✅
 //! - **U2**：UNIX socket framing + SCM_RIGHTS fd 传递 + 单测 ✅
 //! - **U3**：VfioUserSession + REGION/INFO/RESET 命令派发到 PcieDevice ✅
-//! - **U4-U5**：DMA / IRQ / 端到端 QEMU demo（pending）
+//! - **U4**：DMA_MAP/UNMAP 表 + DMA_READ/WRITE server-initiated sync ✅
+//! - **U5**：SET_IRQS eventfd + VfioUserTransport + NVMe CLI demo（pending）
 //!
 //! 完整 wire 参考：`docs/superpowers/specs/2026-06-04-vfio-user-wire-reference.md`。
 //!
@@ -31,6 +32,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod dma;
 pub mod framing;
 pub mod handshake;
 pub mod proto;
@@ -38,6 +40,9 @@ pub mod server;
 pub mod session;
 pub mod transport;
 
+pub use dma::DmaError;
+pub use dma::DmaRegion;
+pub use dma::DmaTable;
 pub use framing::MAX_MSG_FDS;
 pub use framing::Message;
 pub use framing::read_message;
