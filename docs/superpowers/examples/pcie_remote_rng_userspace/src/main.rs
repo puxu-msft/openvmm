@@ -277,13 +277,7 @@ impl PcieDevice for RngDevice {
         }
     }
 
-    fn on_dma_complete(
-        &mut self,
-        ctx: &mut DeviceCtx<'_>,
-        token: u64,
-        ok: bool,
-        data: Vec<u8>,
-    ) {
+    fn on_dma_complete(&mut self, ctx: &mut DeviceCtx<'_>, token: u64, ok: bool, data: Vec<u8>) {
         let _ = data;
         // **reviewer M1 修复** — 按 token 取 in-flight 字节数；ok 才计数。
         let n = self.in_flight.remove(&token).unwrap_or(0);
@@ -405,7 +399,7 @@ fn run_main(args: Args) -> Result<()> {
     })
 }
 
-async fn connect_with_retry(driver: &pal_async::DefaultDriver, args: &Args) -> Result<Transport> {
+async fn connect_with_retry(driver: &pal_async::DefaultDriver, args: &Args) -> Result<WireStream> {
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -422,7 +416,7 @@ async fn connect_with_retry(driver: &pal_async::DefaultDriver, args: &Args) -> R
     }
 }
 
-async fn try_one(driver: &pal_async::DefaultDriver, args: &Args) -> Result<Transport> {
+async fn try_one(driver: &pal_async::DefaultDriver, args: &Args) -> Result<WireStream> {
     if let Some(addr) = &args.tcp_addr {
         return connect_tcp(driver, addr).await;
     }

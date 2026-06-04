@@ -156,7 +156,7 @@ fn run_main(args: Args) -> Result<()> {
     })
 }
 
-async fn connect_with_retry(driver: &pal_async::DefaultDriver, args: &Args) -> Result<Transport> {
+async fn connect_with_retry(driver: &pal_async::DefaultDriver, args: &Args) -> Result<WireStream> {
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -176,7 +176,7 @@ async fn connect_with_retry(driver: &pal_async::DefaultDriver, args: &Args) -> R
     }
 }
 
-async fn try_one(driver: &pal_async::DefaultDriver, args: &Args) -> Result<Transport> {
+async fn try_one(driver: &pal_async::DefaultDriver, args: &Args) -> Result<WireStream> {
     if let Some(addr) = &args.tcp_addr {
         return connect_tcp(driver, addr).await;
     }

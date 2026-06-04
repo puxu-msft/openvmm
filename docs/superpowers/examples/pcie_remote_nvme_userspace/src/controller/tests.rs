@@ -1267,7 +1267,7 @@ fn o3_fused_cw_dispatch_chain_smoke() {
     // 仅验证 helper 可用 — 完整 SQE → dispatch_io → on_dma_complete 链
     // 涉及 enable controller / create IO SQ 等大量 setup，这里只 smoke
     // test mock ctx 能 fire_interrupt / dma_read 而不 panic。
-    let _ = ctx;
+    drop(ctx); // Phase T 后 ctx 借 outbound &mut，断言前要 drop
     assert!(outbound.is_empty(), "no outbound yet");
 }
 

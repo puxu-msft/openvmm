@@ -19,6 +19,9 @@
 //!   用户不需考虑并发；用户内部如果要后台任务，请自己 spawn。
 //! - **Reconnect 友好**：transport EOF / error 时 `run` 返回；调用方可外
 //!   层 reconnect。这对应 OpenHCL 侧 K-20 hotplug。
+//! - **Phase T transport 抽象**：[`DeviceCtx`] 内部持 `&mut dyn Transport`，
+//!   pcie_remote 协议路径走 [`OpenhclVsockTransport`]；Phase U/V 加
+//!   vfio-user / NVMe-oF TCP 时只需新增 `impl Transport`，controller 0 改动。
 //!
 //! # 用法
 //!
@@ -55,11 +58,14 @@
 #![warn(missing_docs)]
 
 mod device;
+mod openhcl_transport;
 mod run;
 mod transport;
 
 pub use device::DeviceCtx;
 pub use device::PcieDevice;
+pub use device::Transport;
+pub use openhcl_transport::OpenhclVsockTransport;
 // **Phase Q10** — re-export protocol types so example crates can use them
 // in test fixtures (DeviceCtx::for_testing 输出 outbound 包).
 pub use pcie_remote_protocol;
@@ -70,7 +76,7 @@ pub use pcie_remote_protocol::ToOpenhcl;
 pub use pcie_remote_protocol::bar_info::Kind as BarKind;
 pub use run::RunOptions;
 pub use run::run;
-pub use transport::Transport;
+pub use transport::WireStream;
 pub use transport::connect_tcp;
 #[cfg(windows)]
 pub use transport::connect_vsock;

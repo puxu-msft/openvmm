@@ -5,10 +5,15 @@
 //!
 //! 整个 SDK 的 wire-protocol 处理全在本文件 + transport.rs；用户实现完全
 //! 不需要 import `pcie_remote_protocol` 的 ToHost/ToOpenhcl 等底层类型。
+//!
+//! **Phase T**：本文件不再手攒 `outbound: Vec<ToOpenhcl>` + seq/token 分配器，
+//! 改为持一个 [`OpenhclVsockTransport`] 把这些状态封进 backend；
+//! `DeviceCtx` 在每次回调里以 `&mut dyn Transport` 形式借给 device。
 
 use crate::DeviceCtx;
+use crate::OpenhclVsockTransport;
 use crate::PcieDevice;
-use crate::Transport;
+use crate::WireStream;
 use anyhow::Result;
 use anyhow::anyhow;
 use futures::FutureExt;
@@ -22,7 +27,6 @@ use pcie_remote_protocol::ToHost;
 use pcie_remote_protocol::ToOpenhcl;
 use pcie_remote_protocol::codec;
 use pcie_remote_protocol::to_host::Body as HostBody;
-use pcie_remote_protocol::to_openhcl::Body as OpenhclBody;
 use std::time::Duration;
 
 /// `run` 行为可调项。
@@ -43,7 +47,7 @@ impl Default for RunOptions {
     }
 }
 
-/// 主循环。Handshake → 驱动 PcieDevice 直到 transport EOF / err。
+/// 主循环。Handshake → 驱动 PcieDevice 直到 wire EOF / err。
 ///
 /// 调用方应在外层 reconnect loop 中重复调用本函数 —— EOF/err 后重 connect
 /// + 新 device instance + 再调 `run`。这对应 OpenHCL K-20 hotplug。
@@ -51,16 +55,16 @@ impl Default for RunOptions {
 /// # Errors
 ///
 /// - handshake 失败（OpenHCL 拒接 / 协议版本不匹配）
-/// - transport read/write Err
+/// - wire read/write Err
 /// - PcieDevice 返回的 MMIO size 非法（应自检，但 SDK 也兜底检查）
 pub async fn run<D: PcieDevice>(
     driver: &impl Driver,
-    mut transport: Transport,
+    mut wire: WireStream,
     mut device: D,
     options: RunOptions,
 ) -> Result<()> {
     // ─── 1. Handshake ───
-    let hello: Hello = codec::read_frame(&mut transport).await?;
+    let hello: Hello = codec::read_frame(&mut wire).await?;
     if hello.magic != PROTOCOL_MAGIC {
         return Err(anyhow!(
             "protocol magic mismatch: got {:#x} want {:#x}",
@@ -80,23 +84,20 @@ pub async fn run<D: PcieDevice>(
         reason: String::new(),
         device: Some(describe),
     };
-    codec::write_frame(&mut transport, &ack).await?;
+    codec::write_frame(&mut wire, &ack).await?;
     tracing::info!("SDK sent HelloAck; entering main loop");
 
     // ─── 2. 主循环 ───
     //
-    // 协议状态：seq 由 SDK 单调分配（高位区间避免与 OpenHCL 侧 seq 撞）。
-    // dma_token 同理，独立空间便于 device state machine 关联请求-响应。
-    let mut next_seq: u64 = 1u64 << 32;
-    let mut next_dma_token: u64 = 1u64 << 40;
-    // 出站帧缓冲：device 回调可能 push 多个；本循环串行 flush。
-    let mut outbound: Vec<ToOpenhcl> = Vec::with_capacity(16);
+    // Phase T：seq 与 dma_token 分配由 OpenhclVsockTransport 接管。
+    let mut backend = OpenhclVsockTransport::new();
+    let mut flush_buf: Vec<ToOpenhcl> = Vec::with_capacity(16);
     let mut timer = PolledTimer::new(driver);
 
     loop {
         // 2a. 等 inbound 或超时 tick。
         let inbound = {
-            let read_fut = codec::read_frame::<_, ToHost>(&mut transport).fuse();
+            let read_fut = codec::read_frame::<_, ToHost>(&mut wire).fuse();
             let timer_fut = timer.sleep(options.read_timeout).fuse();
             futures::pin_mut!(read_fut, timer_fut);
             futures::select_biased! {
@@ -107,41 +108,30 @@ pub async fn run<D: PcieDevice>(
 
         match inbound {
             Some(Ok(req)) => {
-                dispatch_inbound(
-                    &mut device,
-                    req,
-                    &mut outbound,
-                    &mut next_seq,
-                    &mut next_dma_token,
-                )?;
+                dispatch_inbound(&mut device, req, &mut backend)?;
             }
             Some(Err(e)) => return Err(anyhow!("transport read failed: {e}")),
             None => {
-                let mut ctx = DeviceCtx {
-                    outbound: &mut outbound,
-                    next_seq: &mut next_seq,
-                    next_dma_token: &mut next_dma_token,
-                };
+                let mut ctx = DeviceCtx::new(&mut backend);
                 device.tick(&mut ctx);
             }
         }
 
         // 2b. flush outbound（mmio_read 的 reply、interrupt、DMA 请求）。
-        for frame in outbound.drain(..) {
-            if let Err(e) = codec::write_frame(&mut transport, &frame).await {
+        backend.drain(&mut flush_buf);
+        for frame in flush_buf.drain(..) {
+            if let Err(e) = codec::write_frame(&mut wire, &frame).await {
                 return Err(anyhow!("transport write failed: {e}"));
             }
         }
     }
 }
 
-/// 处理一帧 ToHost：派发到 PcieDevice + 把响应 push 到 outbound。
+/// 处理一帧 ToHost：派发到 PcieDevice + 把响应 push 进 backend outbound。
 fn dispatch_inbound<D: PcieDevice>(
     device: &mut D,
     req: ToHost,
-    outbound: &mut Vec<ToOpenhcl>,
-    next_seq: &mut u64,
-    next_dma_token: &mut u64,
+    backend: &mut OpenhclVsockTransport<'_>,
 ) -> Result<()> {
     let seq = req.seq;
     match req.body {
@@ -158,12 +148,9 @@ fn dispatch_inbound<D: PcieDevice>(
             // value 截到 size 字节（PCI 协议低位有效）；用 mask 防御 device
             // 实现误返高位 garbage。
             let masked = mask_value(value, m.size);
-            outbound.push(ToOpenhcl {
-                seq,
-                body: Some(OpenhclBody::MmioReadResult(MmioReadResult {
-                    value: masked,
-                })),
-            });
+            // MmioRead 的 reply 必须复用 *inbound* seq 与 OpenHCL 侧关联，
+            // 不能 alloc 新 seq；走 dedicated helper 让 invariant 类型化。
+            backend.push_mmio_read_result(seq, MmioReadResult { value: masked });
         }
         Some(HostBody::MmioWrite(m)) => {
             if !matches!(m.size, 1 | 2 | 4 | 8) {
@@ -172,11 +159,7 @@ fn dispatch_inbound<D: PcieDevice>(
                     m.size
                 ));
             }
-            let mut ctx = DeviceCtx {
-                outbound,
-                next_seq,
-                next_dma_token,
-            };
+            let mut ctx = DeviceCtx::new(backend);
             device.mmio_write(&mut ctx, m.bar, m.offset, m.size, m.value);
         }
         Some(HostBody::CfgWriteSideEffect(c)) => {
@@ -186,11 +169,7 @@ fn dispatch_inbound<D: PcieDevice>(
             device.reset(r.kind);
         }
         Some(HostBody::DmaCompletion(d)) => {
-            let mut ctx = DeviceCtx {
-                outbound,
-                next_seq,
-                next_dma_token,
-            };
+            let mut ctx = DeviceCtx::new(backend);
             device.on_dma_complete(&mut ctx, d.token, d.ok, d.data);
         }
         None => {
@@ -224,29 +203,26 @@ mod tests {
         assert_eq!(mask_value(0xdead_beef_cafe_babe, 8), 0xdead_beef_cafe_babe);
     }
 
-    /// **Phase N1** — DeviceCtx 基础 API：每个动作往 outbound 队列加一条
-    /// protobuf message，seq 单调递增。
+    /// **Phase N1**（Phase T 重构后）— DeviceCtx 基础 API：每个动作往
+    /// 内部 buffer push 一条 protobuf message，seq 单调递增。
     #[test]
     fn device_ctx_outbound_seq_monotonic() {
         let mut outbound = Vec::new();
         let mut seq = 0u64;
         let mut tok = 0u64;
-        let mut ctx = crate::DeviceCtx {
-            outbound: &mut outbound,
-            next_seq: &mut seq,
-            next_dma_token: &mut tok,
-        };
-        ctx.fire_interrupt(0);
-        let t1 = ctx.dma_read(0x1000, 4096);
-        let t2 = ctx.dma_write(0x2000, vec![0xab; 256]);
+        {
+            let mut ctx = crate::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
+            ctx.fire_interrupt(0);
+            let t1 = ctx.dma_read(0x1000, 4096);
+            let t2 = ctx.dma_write(0x2000, vec![0xab; 256]);
+            assert_eq!(t1, 0);
+            assert_eq!(t2, 1);
+        }
         assert_eq!(outbound.len(), 3);
         // seq 从 0 起，alloc 返回当前再 +1
         assert_eq!(outbound[0].seq, 0);
         assert_eq!(outbound[1].seq, 1);
         assert_eq!(outbound[2].seq, 2);
-        // 同样 tokens 从 0 起
-        assert_eq!(t1, 0);
-        assert_eq!(t2, 1);
     }
 
     /// **Phase N1** — fire_interrupt 生成 InterruptFire body，msix_index 透传。
@@ -255,12 +231,10 @@ mod tests {
         let mut outbound = Vec::new();
         let mut seq = 0u64;
         let mut tok = 0u64;
-        let mut ctx = crate::DeviceCtx {
-            outbound: &mut outbound,
-            next_seq: &mut seq,
-            next_dma_token: &mut tok,
-        };
-        ctx.fire_interrupt(3);
+        {
+            let mut ctx = crate::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
+            ctx.fire_interrupt(3);
+        }
         let msg = &outbound[0];
         match msg.body.as_ref().unwrap() {
             Body::InterruptFire(ifire) => assert_eq!(ifire.msix_index, 3),
@@ -274,15 +248,14 @@ mod tests {
         let mut outbound = Vec::new();
         let mut seq = 0u64;
         let mut tok = 0u64;
-        let mut ctx = crate::DeviceCtx {
-            outbound: &mut outbound,
-            next_seq: &mut seq,
-            next_dma_token: &mut tok,
-        };
-        let t = ctx.dma_read(0xdead_beef, 8192);
+        let returned_token;
+        {
+            let mut ctx = crate::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
+            returned_token = ctx.dma_read(0xdead_beef, 8192);
+        }
         match outbound[0].body.as_ref().unwrap() {
             Body::ReadGpa(r) => {
-                assert_eq!(r.token, t);
+                assert_eq!(r.token, returned_token);
                 assert_eq!(r.gpa, 0xdead_beef);
                 assert_eq!(r.len, 8192);
             }
@@ -296,16 +269,15 @@ mod tests {
         let mut outbound = Vec::new();
         let mut seq = 0u64;
         let mut tok = 0u64;
-        let mut ctx = crate::DeviceCtx {
-            outbound: &mut outbound,
-            next_seq: &mut seq,
-            next_dma_token: &mut tok,
-        };
         let payload = vec![1, 2, 3, 4, 5];
-        let t = ctx.dma_write(0xcafe_babe, payload.clone());
+        let returned_token;
+        {
+            let mut ctx = crate::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
+            returned_token = ctx.dma_write(0xcafe_babe, payload.clone());
+        }
         match outbound[0].body.as_ref().unwrap() {
             Body::WriteGpa(w) => {
-                assert_eq!(w.token, t);
+                assert_eq!(w.token, returned_token);
                 assert_eq!(w.gpa, 0xcafe_babe);
                 assert_eq!(w.data, payload);
             }
@@ -366,14 +338,21 @@ mod tests {
         }
     }
 
+    /// **Phase T 重构后** — 单测改用 with_buffers backend，drain 进 sink 后断言。
+    fn drain(backend: &mut OpenhclVsockTransport<'_>) -> Vec<ToOpenhcl> {
+        let mut sink = Vec::new();
+        backend.drain(&mut sink);
+        sink
+    }
+
     /// **Phase N1b** — MmioRead inbound 经过 mask 后返回；调用 device.mmio_read。
     #[test]
     fn dispatch_inbound_mmio_read_masks_value() {
-        let mut dev = CaptureDevice::default();
-        dev.mmio_read_return = 0xDEAD_BEEF_CAFE_BABE;
-        let mut out = Vec::new();
-        let mut seq = 0u64;
-        let mut tok = 0u64;
+        let mut dev = CaptureDevice {
+            mmio_read_return: 0xDEAD_BEEF_CAFE_BABE,
+            ..Default::default()
+        };
+        let mut backend = OpenhclVsockTransport::new();
         let req = make_req(
             42,
             HostBody::MmioRead(pcie_remote_protocol::MmioAccess {
@@ -383,11 +362,12 @@ mod tests {
                 value: 0,
             }),
         );
-        super::dispatch_inbound(&mut dev, req, &mut out, &mut seq, &mut tok).unwrap();
+        super::dispatch_inbound(&mut dev, req, &mut backend).unwrap();
         // 设备被调用且参数透传
         assert_eq!(dev.last_mmio_read, Some((0, 0x10, 2)));
+        let out = drain(&mut backend);
         assert_eq!(out.len(), 1);
-        // outbound seq = 入站 seq
+        // outbound seq = 入站 seq（MmioReadResult 必须用 inbound seq 关联）
         assert_eq!(out[0].seq, 42);
         match out[0].body.as_ref().unwrap() {
             Body::MmioReadResult(r) => assert_eq!(r.value, 0xBABE), // mask 到低 16 位
@@ -399,9 +379,7 @@ mod tests {
     #[test]
     fn dispatch_inbound_mmio_read_rejects_bad_size() {
         let mut dev = CaptureDevice::default();
-        let mut out = Vec::new();
-        let mut seq = 0u64;
-        let mut tok = 0u64;
+        let mut backend = OpenhclVsockTransport::new();
         let req = make_req(
             1,
             HostBody::MmioRead(pcie_remote_protocol::MmioAccess {
@@ -411,20 +389,18 @@ mod tests {
                 value: 0,
             }),
         );
-        let r = super::dispatch_inbound(&mut dev, req, &mut out, &mut seq, &mut tok);
+        let r = super::dispatch_inbound(&mut dev, req, &mut backend);
         assert!(r.is_err());
         // 设备未被调用
         assert_eq!(dev.last_mmio_read, None);
-        assert!(out.is_empty());
+        assert!(drain(&mut backend).is_empty());
     }
 
     /// **Phase N1b** — MmioWrite 入站只调用 device.mmio_write，无 outbound。
     #[test]
     fn dispatch_inbound_mmio_write_no_outbound() {
         let mut dev = CaptureDevice::default();
-        let mut out = Vec::new();
-        let mut seq = 0u64;
-        let mut tok = 0u64;
+        let mut backend = OpenhclVsockTransport::new();
         let req = make_req(
             7,
             HostBody::MmioWrite(pcie_remote_protocol::MmioAccess {
@@ -434,18 +410,16 @@ mod tests {
                 value: 0xCAFEBABE,
             }),
         );
-        super::dispatch_inbound(&mut dev, req, &mut out, &mut seq, &mut tok).unwrap();
+        super::dispatch_inbound(&mut dev, req, &mut backend).unwrap();
         assert_eq!(dev.last_mmio_write, Some((1, 0x1000, 4, 0xCAFEBABE)));
-        assert!(out.is_empty()); // MMIO Write 无 response
+        assert!(drain(&mut backend).is_empty()); // MMIO Write 无 response
     }
 
     /// **Phase N1b** — CfgWriteSideEffect 路由到 device。
     #[test]
     fn dispatch_inbound_cfg_write_side_effect() {
         let mut dev = CaptureDevice::default();
-        let mut out = Vec::new();
-        let mut seq = 0u64;
-        let mut tok = 0u64;
+        let mut backend = OpenhclVsockTransport::new();
         let req = make_req(
             5,
             HostBody::CfgWriteSideEffect(pcie_remote_protocol::CfgAccess {
@@ -454,7 +428,7 @@ mod tests {
                 value: 0x0006_0000, // PCI_COMMAND
             }),
         );
-        super::dispatch_inbound(&mut dev, req, &mut out, &mut seq, &mut tok).unwrap();
+        super::dispatch_inbound(&mut dev, req, &mut backend).unwrap();
         assert_eq!(dev.last_cfg, Some((0x04, 0x0006_0000)));
     }
 
@@ -462,11 +436,9 @@ mod tests {
     #[test]
     fn dispatch_inbound_reset() {
         let mut dev = CaptureDevice::default();
-        let mut out = Vec::new();
-        let mut seq = 0u64;
-        let mut tok = 0u64;
+        let mut backend = OpenhclVsockTransport::new();
         let req = make_req(9, HostBody::Reset(pcie_remote_protocol::Reset { kind: 2 }));
-        super::dispatch_inbound(&mut dev, req, &mut out, &mut seq, &mut tok).unwrap();
+        super::dispatch_inbound(&mut dev, req, &mut backend).unwrap();
         assert_eq!(dev.last_reset, Some(2));
     }
 
@@ -474,9 +446,7 @@ mod tests {
     #[test]
     fn dispatch_inbound_dma_completion() {
         let mut dev = CaptureDevice::default();
-        let mut out = Vec::new();
-        let mut seq = 0u64;
-        let mut tok = 0u64;
+        let mut backend = OpenhclVsockTransport::new();
         let req = make_req(
             11,
             HostBody::DmaCompletion(pcie_remote_protocol::DmaCompletion {
@@ -485,7 +455,7 @@ mod tests {
                 data: vec![0x11, 0x22, 0x33],
             }),
         );
-        super::dispatch_inbound(&mut dev, req, &mut out, &mut seq, &mut tok).unwrap();
+        super::dispatch_inbound(&mut dev, req, &mut backend).unwrap();
         assert_eq!(dev.last_dma, Some((0xAA, true, vec![0x11, 0x22, 0x33])));
     }
 
@@ -494,9 +464,7 @@ mod tests {
     #[test]
     fn dispatch_inbound_dma_completion_failure() {
         let mut dev = CaptureDevice::default();
-        let mut out = Vec::new();
-        let mut seq = 0u64;
-        let mut tok = 0u64;
+        let mut backend = OpenhclVsockTransport::new();
         let req = make_req(
             13,
             HostBody::DmaCompletion(pcie_remote_protocol::DmaCompletion {
@@ -505,7 +473,7 @@ mod tests {
                 data: vec![],
             }),
         );
-        super::dispatch_inbound(&mut dev, req, &mut out, &mut seq, &mut tok).unwrap();
+        super::dispatch_inbound(&mut dev, req, &mut backend).unwrap();
         assert_eq!(dev.last_dma, Some((0xBB, false, vec![])));
     }
 
@@ -513,12 +481,10 @@ mod tests {
     #[test]
     fn dispatch_inbound_empty_body_is_ignored() {
         let mut dev = CaptureDevice::default();
-        let mut out = Vec::new();
-        let mut seq = 0u64;
-        let mut tok = 0u64;
+        let mut backend = OpenhclVsockTransport::new();
         let req = ToHost { seq: 0, body: None };
-        let r = super::dispatch_inbound(&mut dev, req, &mut out, &mut seq, &mut tok);
+        let r = super::dispatch_inbound(&mut dev, req, &mut backend);
         assert!(r.is_ok());
-        assert!(out.is_empty());
+        assert!(drain(&mut backend).is_empty());
     }
 }
