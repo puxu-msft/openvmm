@@ -79,7 +79,8 @@ struct Args {
     /// 让 QEMU `-device vfio-user-pci,socket=...` 接管本 NVMe 控制器。
     /// 与 `--tcp-addr` / `--vm-id` 互斥；指定后走 pcie_vfio_user_sdk
     /// 而非 pcie_remote 协议。
-    #[arg(long)]
+    /// **review M2** — clap 强制互斥校验。
+    #[arg(long, conflicts_with_all = ["vm_id", "tcp_addr"])]
     vfio_user_sock: Option<String>,
     /// Connect retry count。
     #[arg(long, default_value_t = 20)]
@@ -124,11 +125,13 @@ fn run_vfio_user(args: Args) -> Result<()> {
         "pcie_remote_nvme_userspace=debug,pcie_vfio_user_sdk=debug,info".into()
     });
     tracing_subscriber::fmt().with_env_filter(filter).init();
-    let sock = args
-        .vfio_user_sock
-        .as_ref()
-        .expect("checked by caller")
-        .clone();
+    let Some(sock) = args.vfio_user_sock.clone() else {
+        // **review M4** — caller 应已经校验，但 unwrap 误判会 panic；
+        // 走 Result 路径让 clap 的错误信息保留。
+        return Err(anyhow!(
+            "internal: run_vfio_user requires --vfio-user-sock; this is a CLI dispatch bug"
+        ));
+    };
     tracing::info!(
         sock = sock.as_str(),
         backing_files = ?args.backing_files,
