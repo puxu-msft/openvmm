@@ -17,7 +17,10 @@
 //! - **V4a** ✅ wire layer：R2T encode + H2CData reassembler + TTAG 分配器
 //! - **V4b** ✅ controller dma_read → R2T → H2CData 闭环（单段 ≤ 64 KiB）
 //! - **V4c** ✅ MAXH2CDATA 分片 + 多 R2T 串行（dma_read > 64 KiB 自动切片）
-//! - **V5–V8** 计划中
+//! - **V5a** ✅ IO queue 安装 + Fabric Connect qid≥1 + dispatch 二分
+//! - **V5b** ✅ IO Read nlb=1 走 C2HData 闭环
+//! - **V5c** ✅ IO Write nlb=1 走 R2T/H2CData 闭环（含数据持久化验证）
+//! - **V5d–V8** 计划中
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

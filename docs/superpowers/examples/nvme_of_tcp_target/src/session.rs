@@ -225,18 +225,62 @@ impl V2Session {
         }
     }
 
-    /// **Phase V5a stub** — IO CapsuleCmd 入口；V5a 仅返
-    /// CapsuleResp INVALID_OPCODE 让 wire 闭环验证 dispatch 二分逻辑。
-    /// V5b/V5c 改为 `run_dispatched_cmd` 共享 admin/IO 闭环。
+    /// **Phase V5b / V5c** — IO CapsuleCmd 入口。共享 `run_post_dispatch`
+    /// 闭环；与 `handle_admin_cmd` 唯一差异：dispatch 走 `nvme_io_dispatch`
+    /// + 需查 sq_id→cq_id 映射 + nlb=1 guard（V5 教学版单 PRP1 上限）。
     fn handle_io_cmd(&mut self, cid: u16, sqe_bytes: &[u8]) -> anyhow::Result<()> {
-        let _sqe =
+        let mut sqe =
             Sqe::read_from_bytes(sqe_bytes).map_err(|_| anyhow::anyhow!("IO SQE 不是 64 byte"))?;
-        tracing::warn!(
-            cid,
-            qid = self.current_qid,
-            "V5a stub: IO cmd 收到，回 CapsuleResp INVALID_OPCODE（V5b/V5c 接 IO Read/Write）"
-        );
-        self.send_capsule_resp_err(cid, /*INVALID_OPCODE=*/ 0x01)
+
+        // **V5b (R-5)** — 清 PSDT bits（cdw0 bits 15:14）让 controller 走
+        // PRP path；Linux nvme-tcp host 默认 PSDT=01 SGL Transport-specific 0x5，
+        // controller PRP/SGL resolver 见 0x5 直接 reject。session 端清掉
+        // 让 controller 用 prp1+prp2 走 PRP path（对 host 透明）。
+        sqe.cdw0 &= !(0b11u32 << 14);
+
+        // sentinel 改写 prp1（V5 IO 单段 ≤ 4 KiB，prp2 不用）
+        sqe.prp1 = PRP1_SENTINEL;
+        sqe.prp2 = 0;
+
+        let opc = (sqe.cdw0 & 0xff) as u8;
+        let sq_id = self.current_qid;
+        // 查 sq_id → cq_id
+        let cq_id = match self.io_queues.get(&sq_id) {
+            Some(IoQueueState::Sq { cq_id, .. }) => *cq_id,
+            _ => anyhow::bail!(
+                "V5b invariant violation: handle_io_cmd 但 current_qid={sq_id} 不是已建 IO SQ"
+            ),
+        };
+
+        // **V5b/V5c (R-4)** — IO Read/Write nlb=1 guard。cdw12 bits 15:0 = NLB
+        // (0-based) → nlb_real = +1。nlb_real > 1 → 拒 SC=0x18
+        // SGL_DATA_LENGTH_INVALID 让 driver 重发分片。当前 cmd 不进 dispatch
+        // （防 controller 已起 IO 后又 reject 的 wire 混乱）。
+        if matches!(opc, 0x01 /* WRITE */ | 0x02 /* READ */) {
+            let nlb_real = (sqe.cdw12 & 0xffff) + 1;
+            if nlb_real > 1 {
+                tracing::warn!(
+                    opc,
+                    nlb_real,
+                    "V5 IO nlb>1 unsupported (单 PRP 上限)，回 SC=0x18 让 driver 拆"
+                );
+                return self.send_capsule_resp_err(cid, /*SGL_DATA_LENGTH_INVALID=*/ 0x18);
+            }
+        }
+
+        tracing::debug!(cid, opc, sq_id, cq_id, "V5b/V5c IO dispatch");
+
+        let mut tcp_t = TcpAdminTransport::new_with_token_base(self.next_token);
+
+        // ─── Phase 1：dispatch ─────────────────────────────────────────
+        let immediate_cqe = {
+            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            self.controller
+                .nvme_io_dispatch(&mut ctx, sq_id, sqe, cid, cq_id)
+        };
+
+        // ─── Phase 1.5..5 → shared helper ──────────────────────────────
+        self.run_post_dispatch(cid, immediate_cqe, tcp_t)
     }
 
     /// **Phase V3 + V4b** — 把 CapsuleCmd 里的 NVMe SQE 派发到 controller，
@@ -278,8 +322,7 @@ impl V2Session {
         // Create IO SQ: cdw10 bits 15:0 = sq_id；cdw11 bits 31:16 = cq_id；
         //               prp1 在 controller 内部 io.rs:382 不用（SQ 不需要
         //               session 写 CQE）；保留 PRP1_SENTINEL 即可。
-        let create_io_cq_qid: Option<u16> =
-            (opc == 0x05).then_some((sqe.cdw10 & 0xffff) as u16);
+        let create_io_cq_qid: Option<u16> = (opc == 0x05).then_some((sqe.cdw10 & 0xffff) as u16);
         let create_io_sq_pair: Option<(u16, u16)> = (opc == 0x01).then(|| {
             let sq_id = (sqe.cdw10 & 0xffff) as u16;
             let cq_id = ((sqe.cdw11 >> 16) & 0xffff) as u16;
@@ -327,18 +370,35 @@ impl V2Session {
             }
         }
 
-        // ─── Phase 1.5：**V4b-polish (review H-2)** mixed-path guard ──
-        // V4b 不支持 dispatch 阶段同时产 data_write 和 dma_read（admin
-        // 范围无该 opcode）。混合时 read 闭环 complete_dma 会触发 controller
-        // post_cqe，但 dispatch-time data write 的 token 永远不会被
-        // complete → controller.pending_ios 静默 leak。V5 IO Write 引入
-        // 混合时需把 read 完后再处理 dispatch-time data writes 的逻辑加回。
+        // ─── Phase 1.5..5 → 抽出共享 helper（V5b 起 admin/IO 都走它）─
+        self.run_post_dispatch(cid, immediate_cqe, tcp_t)
+    }
+
+    /// **V5b** — `handle_admin_cmd` / `handle_io_cmd` 共享的"post-dispatch"
+    /// Phase 1.5..5 闭环：mixed-path guard → R2T read loop → write-out
+    /// completion 投递 → drain captured.writes → C2HData + CapsuleResp。
+    ///
+    /// 调用方负责：
+    /// 1. 改写 sqe.prp1=PRP1_SENTINEL（+ Create IO CQ 的 cq_sentinel(qid)）
+    /// 2. 用 `TcpAdminTransport::new_with_token_base(self.next_token)` 起 transport
+    /// 3. 调 `nvme_admin_dispatch` 或 `nvme_io_dispatch`
+    /// 4. 把 `immediate_cqe + tcp_t` 喂给本函数
+    ///
+    /// 本函数结束时 `self.next_token = tcp_t.token_high_water()` 已保存。
+    /// review H-1 / H-2 / L-1 / L-2 / M-2 invariant 已在内部统一处理。
+    fn run_post_dispatch(
+        &mut self,
+        cid: u16,
+        immediate_cqe: Option<pcie_remote_nvme_userspace::cmd::Cqe>,
+        mut tcp_t: TcpAdminTransport,
+    ) -> anyhow::Result<()> {
+        // ─── Phase 1.5：mixed-path guard ─────────────────────────────
         let dispatch_data_writes = tcp_t.writes.iter().filter(|w| w.gpa < CQ_BASE_GPA).count();
         let dispatch_pending_reads = tcp_t.pending_reads.len();
         if dispatch_data_writes > 0 && dispatch_pending_reads > 0 {
             anyhow::bail!(
-                "V4b invariant violation: admin cmd produced both data_write ({}) and \
-                 dma_read ({}) in dispatch — mixed path not supported in V4b",
+                "V4b/V5 invariant violation: cmd produced both data_write ({}) and \
+                 dma_read ({}) in dispatch — mixed path not supported until V5e",
                 dispatch_data_writes,
                 dispatch_pending_reads
             );
@@ -346,23 +406,7 @@ impl V2Session {
         let had_pending_reads = dispatch_pending_reads > 0;
 
         // ─── Phase 2：处理 captured pending_reads（V4b dma_read 闭环）───
-        // 关键：先 read 后 write/complete —— controller 在 dispatch 阶段先
-        // dma_read（pending_reads），收齐 bytes 投 complete_dma 后，controller
-        // 才会 dma_write（writes）+ post_cqe。所以 read loop 在 write drain 之前。
-        //
-        // **V4b 单段简化**：当前仅处理"dispatch 阶段产 ≤ 1 条 read"；多段
-        // dma_read（V4c+ IO Write 多 PRP）需要交错 loop。
-        //
-        // **V4b-polish (review H-1)**：await_host_data 的任何 Err（H2C_TERM
-        // / wrong_ttag / data_offset gap / write_term 已发）都通过 `?` 直接
-        // 上抛，跳过 Phase 3/4/5。wire 上不能在 C2HTermReq 后再 emit
-        // CapsuleResp（spec § 5.2 TermReq 是 fatal，post-term PDU 会让 Linux
-        // nvme-tcp host log "unexpected PDU after term"）。
-        // controller.pending_ios 内残留的 entry 随 controller drop 一起释放，
-        // 不 leak；下条 cmd 的 token 通过 token_high_water 跨 cmd 单调保证
-        // 不会撞到这条孤立 entry。
         while let Some(read_req) = tcp_t.pop_read() {
-            // **V4c** — 切片：长度 > MAXH2CDATA_BYTES 时切多 R2T 串行
             tracing::debug!(
                 cid,
                 token = read_req.token,
@@ -376,22 +420,16 @@ impl V2Session {
                     l = read_req.len
                 )
             })?;
-
-            // 喂回 controller，让它继续 post_cqe
             let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
             self.controller
                 .nvme_admin_complete_dma(&mut ctx, read_req.token, true, bytes);
         }
 
-        // ─── Phase 3：处理同步 / 异步 write-out 路径，让 captured 含 CQE write ─
+        // ─── Phase 3：同步 / 异步 write-out 路径 ─────────────────────
         if let Some(cqe) = immediate_cqe {
-            // **review M2** — 同步路径走 post_cqe，CQ tail/phase 推进一致。
             let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
             self.controller.nvme_post_cqe(&mut ctx, cqe);
         } else if !had_pending_reads {
-            // 纯异步 write-out：dispatch 仅产 data writes，无 read。逐 token
-            // 投 ok=true completion 让 controller post_cqe。
-            // **review L2** — 此处 captured 必只含 data writes（gpa<CQ_BASE_GPA）。
             let mut data_tokens = Vec::with_capacity(tcp_t.writes.len());
             for w in tcp_t.writes.iter() {
                 if w.gpa >= CQ_BASE_GPA {
@@ -409,20 +447,18 @@ impl V2Session {
                     .nvme_admin_complete_dma(&mut ctx, tok, true, Vec::new());
             }
         }
-        // 否则（had_pending_reads=true 且 immediate_cqe=None）：read 闭环
-        // 已让 controller post_cqe；captured 已含 CQE write，直接进 Phase 4。
 
         // 保存 token high water 跨 cmd
         self.next_token = tcp_t.token_high_water();
 
-        // ─── Phase 4：drain captured.writes → data_payload + cqe_bytes ───
+        // ─── Phase 4：drain captured.writes → data + cqe ────────────
         let mut data_payload = Vec::new();
         let mut cqe_bytes: Option<Vec<u8>> = None;
         while let Some(w) = tcp_t.pop_write() {
             if w.gpa >= CQ_BASE_GPA {
                 if cqe_bytes.is_some() {
                     anyhow::bail!(
-                        "V3 invariant violation: multiple CQE writes captured for single admin cmd"
+                        "V3 invariant violation: multiple CQE writes captured for single cmd"
                     );
                 }
                 if w.data.len() != 16 {
@@ -430,8 +466,6 @@ impl V2Session {
                 }
                 cqe_bytes = Some(w.data);
             } else {
-                // **review L1** — data write 必须先于 CQE write。反序意味
-                // controller 路径出错；bail 而非 warn-drop，避免发出截断/错序的 wire。
                 if cqe_bytes.is_some() {
                     anyhow::bail!(
                         "V3 invariant violation: data write captured after CQE write \
@@ -444,9 +478,9 @@ impl V2Session {
             }
         }
         let cqe_bytes = cqe_bytes
-            .ok_or_else(|| anyhow::anyhow!("V3: controller did not produce CQE for admin cmd"))?;
+            .ok_or_else(|| anyhow::anyhow!("V3: controller did not produce CQE for cmd"))?;
 
-        // ─── Phase 5：emit C2HData (若有 data) + CapsuleResp ────────────
+        // ─── Phase 5：emit C2HData + CapsuleResp ─────────────────────
         if !data_payload.is_empty() {
             self.send_c2h_data(cid, &data_payload)?;
         }
@@ -2038,7 +2072,7 @@ mod tests {
         // + Connect qid=1 + 1 个 stub IO cmd 让 thread 不悬挂
         let (mut client, h) = v5a_full_setup_qid1(5);
         // 发一条 stub IO cmd（IO Read opc=0x02）让 thread 走 handle_io_cmd 后退出
-        send_admin_sqe_cdw11(&mut client, 0x02, 0x0AAA, 1, 0, 0);
+        send_admin_sqe_cdw11(&mut client, 0xFE, 0x0AAA, 1, 0, 0);
         let resp = read_pdu(&mut client).unwrap();
         assert_eq!(resp.header.pdu_type, pdu_type::RSP);
         let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
@@ -2085,7 +2119,7 @@ mod tests {
     #[test]
     fn v5a_io_cmd_after_connect_returns_invalid_opcode() {
         let (mut client, h) = v5a_full_setup_qid1(5);
-        send_admin_sqe_cdw11(&mut client, 0x02, 0x0BBB, 1, 0, 0);
+        send_admin_sqe_cdw11(&mut client, 0xFE, 0x0BBB, 1, 0, 0);
         let resp = read_pdu(&mut client).unwrap();
         let cid = u16::from_le_bytes(resp.psh[12..14].try_into().unwrap());
         let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
@@ -2119,6 +2153,338 @@ mod tests {
         assert_eq!(resp.header.pdu_type, pdu_type::RSP);
         let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
         assert_eq!(sc, 0);
+        h.join().unwrap().unwrap();
+    }
+
+    // ─── Phase V5b — IO Read (nlb=1 / 4 KiB / C2HData 闭环) ──────────
+
+    /// V5b helper: 用预填 pattern 起一个 controller（512 byte / sector，默认 LBADS=9）。
+    fn make_test_controller_with_pattern(pattern: u8) -> (NvmeController, tempfile::NamedTempFile) {
+        let f = tempfile::NamedTempFile::new().expect("create tempfile");
+        f.as_file().set_len(1024 * 1024).expect("set_len");
+        let buf = vec![pattern; 4096]; // 写 8 sector 的 pattern
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .write(true)
+                .open(f.path())
+                .unwrap(),
+            &buf,
+        )
+        .unwrap();
+        let path = f.path().to_str().expect("temp path utf8").to_string();
+        let c = NvmeController::open(&[path], 0x1414, 0, &[]).expect("NvmeController::open");
+        (c, f)
+    }
+
+    /// 发一条 IO Read SQE：opc=0x02, cid, nsid, cdw10/11 = SLBA, cdw12 = NLB-1
+    fn send_io_read(client: &mut TcpStream, cid: u16, nsid: u32, slba: u64, nlb: u32) {
+        let mut sqe = [0u8; 64];
+        sqe[0] = 0x02;
+        sqe[2..4].copy_from_slice(&cid.to_le_bytes());
+        sqe[4..8].copy_from_slice(&nsid.to_le_bytes());
+        sqe[40..44].copy_from_slice(&((slba & 0xffff_ffff) as u32).to_le_bytes()); // cdw10
+        sqe[44..48].copy_from_slice(&((slba >> 32) as u32).to_le_bytes()); // cdw11
+        sqe[48..52].copy_from_slice(&(nlb - 1).to_le_bytes()); // cdw12 = NLB-1
+        let hdr = CommonHdr {
+            pdu_type: pdu_type::CMD,
+            flags: 0,
+            hlen: 72,
+            pdo: 0,
+            plen: 72,
+        };
+        write_pdu(client, &hdr, &sqe, &[]).unwrap();
+    }
+
+    /// **V5b-1** — IO Read nlb=1 → C2HData(512B) + CapsuleResp success；
+    /// 内容应 = backing file LBA 0 内容（0xAB pattern）。
+    #[test]
+    fn v5b_io_read_nlb1_emits_c2hdata_and_resp() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller_with_pattern(0xAB);
+        std::mem::forget(_backing);
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            // setup 5 cmds: Connect admin + Create IO CQ + Create IO SQ +
+            // Connect qid=1 + 1 IO Read
+            for _ in 0..5 {
+                sess.pump_one()?;
+            }
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        let cdw10_cq = 1u32 | (15u32 << 16);
+        send_admin_sqe_cdw11(&mut client, 0x05, 0x0501, 0, cdw10_cq, 0x0000_0001);
+        let _ = read_pdu(&mut client).unwrap();
+        let cdw10_sq = 1u32 | (15u32 << 16);
+        send_admin_sqe_cdw11(&mut client, 0x01, 0x0502, 0, cdw10_sq, 0x0001_0001);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_io(&mut client, 1);
+        let _ = read_pdu(&mut client).unwrap();
+
+        // IO Read nsid=1 SLBA=0 nlb=1
+        send_io_read(&mut client, 0x0700, 1, 0, 1);
+
+        // 先收 C2HData(512 byte = 1 LBA at LBADS=9)
+        let p = read_pdu(&mut client).unwrap();
+        assert_eq!(p.header.pdu_type, pdu_type::C2H_DATA);
+        assert_eq!(p.data.len(), 512);
+        assert!(
+            p.data.iter().all(|&b| b == 0xAB),
+            "IO Read 返的 512B 必为 backing file pattern 0xAB"
+        );
+
+        // 再收 CapsuleResp success
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(sc, 0, "IO Read 应 success");
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V5b-2** — IO Read nlb=2 → CapsuleResp SC=0x18，未发 C2HData。
+    #[test]
+    fn v5b_io_read_nlb2_rejected_with_sgl_data_length_invalid() {
+        let (mut client, h) = v5a_full_setup_qid1(5);
+        send_io_read(&mut client, 0x0801, 1, 0, 2);
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(
+            resp.header.pdu_type,
+            pdu_type::RSP,
+            "nlb>1 应直接 reject 不发 C2HData"
+        );
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(sc, 0x18, "应回 SGL_DATA_LENGTH_INVALID");
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V5b-3** — IO Read 非法 NSID → controller 返 INVALID_NAMESPACE (0x0B)。
+    #[test]
+    fn v5b_io_read_invalid_nsid_returns_invalid_namespace() {
+        let (mut client, h) = v5a_full_setup_qid1(5);
+        send_io_read(&mut client, 0x0902, /*nsid=*/ 999, 0, 1);
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(sc, 0x0B, "INVALID_NAMESPACE_OR_FORMAT");
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V5b-4** — IO Read 带 PSDT=01 SGL Transport-specific：session 清掉
+    /// PSDT bits 让 controller 走 PRP path；host 视角与 PSDT=00 无差。
+    #[test]
+    fn v5b_io_read_psdt01_transparent_to_host() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller_with_pattern(0xCD);
+        std::mem::forget(_backing);
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            for _ in 0..5 {
+                sess.pump_one()?;
+            }
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        let cdw10_cq = 1u32 | (15u32 << 16);
+        send_admin_sqe_cdw11(&mut client, 0x05, 0x0501, 0, cdw10_cq, 0x0000_0001);
+        let _ = read_pdu(&mut client).unwrap();
+        let cdw10_sq = 1u32 | (15u32 << 16);
+        send_admin_sqe_cdw11(&mut client, 0x01, 0x0502, 0, cdw10_sq, 0x0001_0001);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_io(&mut client, 1);
+        let _ = read_pdu(&mut client).unwrap();
+
+        // IO Read with PSDT=01 in cdw0 bits 15:14
+        let mut sqe = [0u8; 64];
+        let cdw0: u32 = 0x02 | (0b01u32 << 14); // opc=READ, PSDT=01
+        sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
+        sqe[2..4].copy_from_slice(&0x0AA0u16.to_le_bytes()); // CID 覆盖
+        sqe[4..8].copy_from_slice(&1u32.to_le_bytes()); // nsid
+        sqe[48..52].copy_from_slice(&0u32.to_le_bytes()); // cdw12 NLB-1=0
+        let hdr = CommonHdr {
+            pdu_type: pdu_type::CMD,
+            flags: 0,
+            hlen: 72,
+            pdo: 0,
+            plen: 72,
+        };
+        write_pdu(&mut client, &hdr, &sqe, &[]).unwrap();
+
+        let p = read_pdu(&mut client).unwrap();
+        assert_eq!(p.header.pdu_type, pdu_type::C2H_DATA);
+        assert!(p.data.iter().all(|&b| b == 0xCD));
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(sc, 0, "PSDT=01 host 视角应透明走 success");
+        h.join().unwrap().unwrap();
+    }
+
+    // ─── Phase V5c — IO Write (nlb=1 / 512B / R2T+H2CData 闭环) ──────
+
+    /// 发一条 IO Write SQE：opc=0x01, cid, nsid, cdw10/11 = SLBA, cdw12 = NLB-1
+    fn send_io_write(client: &mut TcpStream, cid: u16, nsid: u32, slba: u64, nlb: u32) {
+        let mut sqe = [0u8; 64];
+        sqe[0] = 0x01;
+        sqe[2..4].copy_from_slice(&cid.to_le_bytes());
+        sqe[4..8].copy_from_slice(&nsid.to_le_bytes());
+        sqe[40..44].copy_from_slice(&((slba & 0xffff_ffff) as u32).to_le_bytes()); // cdw10
+        sqe[44..48].copy_from_slice(&((slba >> 32) as u32).to_le_bytes()); // cdw11
+        sqe[48..52].copy_from_slice(&(nlb - 1).to_le_bytes()); // cdw12
+        let hdr = CommonHdr {
+            pdu_type: pdu_type::CMD,
+            flags: 0,
+            hlen: 72,
+            pdo: 0,
+            plen: 72,
+        };
+        write_pdu(client, &hdr, &sqe, &[]).unwrap();
+    }
+
+    /// **V5c-1** — IO Write nlb=1 完整闭环：server 发 R2T → client 回 H2CData
+    /// → server post_cqe → CapsuleResp success。后置：reopen backing 验
+    /// LBA 0 内容 = client pattern。
+    #[test]
+    fn v5c_io_write_nlb1_round_trip() {
+        let (mut client, server) = tcp_pair();
+        // 起一个 fresh tempfile 让 backing path 在 thread 外仍可读
+        let f = tempfile::NamedTempFile::new().expect("tempfile");
+        f.as_file().set_len(1024 * 1024).expect("set_len");
+        let backing_path = f.path().to_str().expect("utf8").to_string();
+        let backing_path_for_verify = backing_path.clone();
+        std::mem::forget(f); // 让文件不在 drop 时 unlink
+        let controller =
+            NvmeController::open(&[backing_path], 0x1414, 0, &[]).expect("open controller");
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            for _ in 0..5 {
+                sess.pump_one()?;
+            }
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        let cdw10_cq = 1u32 | (15u32 << 16);
+        send_admin_sqe_cdw11(&mut client, 0x05, 0x0501, 0, cdw10_cq, 0x0000_0001);
+        let _ = read_pdu(&mut client).unwrap();
+        let cdw10_sq = 1u32 | (15u32 << 16);
+        send_admin_sqe_cdw11(&mut client, 0x01, 0x0502, 0, cdw10_sq, 0x0001_0001);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_io(&mut client, 1);
+        let _ = read_pdu(&mut client).unwrap();
+
+        // IO Write nsid=1 SLBA=0 nlb=1
+        send_io_write(&mut client, 0x0C00, 1, 0, 1);
+
+        // 期望先收 R2T(ttag, offset=0, length=512)
+        let p = read_pdu(&mut client).unwrap();
+        assert_eq!(p.header.pdu_type, pdu_type::R2T);
+        let r: crate::pdu::R2tPsh = crate::pdu::decode_psh(&p.psh).unwrap();
+        let ttag = r.ttag;
+        let length = r.r2t_length;
+        assert_eq!(length, 512, "1 LBA Write at LBADS=9 = 512 byte R2T");
+        assert!(ttag != 0);
+
+        // client 回 H2CData
+        let pattern = vec![0xE5u8; 512];
+        send_h2cdata_at(&mut client, 0x0C00, ttag, 0, &pattern);
+
+        // 收 CapsuleResp success
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(sc, 0, "IO Write 应 success");
+        h.join().unwrap().unwrap();
+
+        // 后置：reopen backing 验 LBA 0 = pattern
+        let mut readback = vec![0u8; 512];
+        use std::io::Read as _;
+        let mut bf = std::fs::File::open(&backing_path_for_verify).unwrap();
+        bf.read_exact(&mut readback).unwrap();
+        assert!(
+            readback.iter().all(|&b| b == 0xE5),
+            "backing file LBA 0 应被 IO Write 改写为 0xE5"
+        );
+    }
+
+    /// **V5c-2** — IO Write nlb=2 → reject SC=0x18，不发 R2T。
+    #[test]
+    fn v5c_io_write_nlb2_rejected() {
+        let (mut client, h) = v5a_full_setup_qid1(5);
+        send_io_write(&mut client, 0x0D11, 1, 0, 2);
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(
+            resp.header.pdu_type,
+            pdu_type::RSP,
+            "nlb>1 应直接 reject 不发 R2T"
+        );
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(sc, 0x18, "应回 SGL_DATA_LENGTH_INVALID");
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V5c-3** — Write→Read 持久化一致性：同一 sector 先 Write 0xC3 再 Read
+    /// → C2HData 内容 = 0xC3。验数据持久化 + admin/IO 状态切换。
+    #[test]
+    fn v5c_io_write_then_read_roundtrip_data_integrity() {
+        let (mut client, server) = tcp_pair();
+        let f = tempfile::NamedTempFile::new().expect("tempfile");
+        f.as_file().set_len(1024 * 1024).expect("set_len");
+        let path = f.path().to_str().expect("utf8").to_string();
+        std::mem::forget(f);
+        let controller = NvmeController::open(&[path], 0x1414, 0, &[]).expect("open controller");
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            for _ in 0..6 {
+                // 4 setup + Write + Read
+                sess.pump_one()?;
+            }
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        let cdw10_cq = 1u32 | (15u32 << 16);
+        send_admin_sqe_cdw11(&mut client, 0x05, 0x0501, 0, cdw10_cq, 0x0000_0001);
+        let _ = read_pdu(&mut client).unwrap();
+        let cdw10_sq = 1u32 | (15u32 << 16);
+        send_admin_sqe_cdw11(&mut client, 0x01, 0x0502, 0, cdw10_sq, 0x0001_0001);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_io(&mut client, 1);
+        let _ = read_pdu(&mut client).unwrap();
+
+        // Write 0xC3 pattern
+        send_io_write(&mut client, 0x0E22, 1, 0, 1);
+        let p = read_pdu(&mut client).unwrap();
+        assert_eq!(p.header.pdu_type, pdu_type::R2T);
+        let r: crate::pdu::R2tPsh = crate::pdu::decode_psh(&p.psh).unwrap();
+        let ttag = r.ttag;
+        send_h2cdata_at(&mut client, 0x0E22, ttag, 0, &vec![0xC3u8; 512]);
+        let resp = read_pdu(&mut client).unwrap();
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(sc, 0);
+
+        // Read 同 LBA
+        send_io_read(&mut client, 0x0E33, 1, 0, 1);
+        let p = read_pdu(&mut client).unwrap();
+        assert_eq!(p.header.pdu_type, pdu_type::C2H_DATA);
+        assert_eq!(p.data.len(), 512);
+        assert!(
+            p.data.iter().all(|&b| b == 0xC3),
+            "Read 应拿到 Write 写入的 0xC3"
+        );
+        let resp = read_pdu(&mut client).unwrap();
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(sc, 0);
+
         h.join().unwrap().unwrap();
     }
 }
