@@ -10,19 +10,28 @@
 //! 当前进度：
 //! - **V0** ✅ controller crate 拆 lib+bin（外部 crate 可 import）
 //! - **V1** ✅ PDU 数据结构 + 编解码 + CRC32C digest + 同步 TCP framing
-//! - **V2-V8** 计划中（见 docs/superpowers/plans/2026-06-04-phase-v-nvme-of-tcp.md）
-//!
-//! 完整 wire 参考：`docs/superpowers/specs/2026-06-04-nvme-tcp-wire-reference.md`。
+//! - **V2** ✅ ICReq/ICResp 握手 + Fabric Connect / Property Get/Set
+//!   + minimal session state machine
+//! - **V3-V8** 计划中（见 docs/superpowers/plans/2026-06-04-phase-v-nvme-of-tcp.md）
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod digest;
+pub mod fabric;
 pub mod framing;
 pub mod pdu;
+pub mod session;
 
 pub use digest::crc32c;
+pub use fabric::ConnectData;
+pub use fabric::ConnectFabricFields;
+pub use fabric::FabricError;
+pub use fabric::PropertyFabricFields;
 pub use framing::Pdu;
 pub use framing::read_pdu;
 pub use framing::write_pdu;
 pub use pdu::*;
+pub use session::NegotiatedIc;
+pub use session::V2Session;
+pub use session::ic_handshake;

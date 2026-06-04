@@ -11,7 +11,7 @@
 use super::*;
 
 impl NvmeController {
-    pub(super) fn mmio_read_impl(&mut self, bar: u32, offset: u64, size: u32) -> u64 {
+    pub fn mmio_read_impl(&mut self, bar: u32, offset: u64, size: u32) -> u64 {
         if bar != 0 {
             return 0;
         }
@@ -65,7 +65,7 @@ impl NvmeController {
         val
     }
 
-    pub(super) fn mmio_write_impl(
+    pub fn mmio_write_impl(
         &mut self,
         ctx: &mut DeviceCtx<'_>,
         bar: u32,
