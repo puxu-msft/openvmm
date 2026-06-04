@@ -69,6 +69,7 @@ exclude = [
   "docs/superpowers/examples/pcie_remote_userspace_sdk",
   "docs/superpowers/examples/pcie_remote_nvme_userspace",
   "docs/superpowers/examples/pcie_remote_rng_userspace",
+  "docs/superpowers/examples/pcie_vfio_user_sdk",
   "docs/superpowers/examples/vmrs_log_scanner",
 ]
 
