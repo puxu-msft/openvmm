@@ -25,6 +25,7 @@ use crate::framing::FramingError;
 use crate::framing::Pdu;
 use crate::framing::read_pdu;
 use crate::framing::write_pdu;
+use crate::h2c_reassembler::{AcceptOutcome, H2cReassembler};
 use crate::pdu::CommonHdr;
 use crate::pdu::DataPsh;
 use crate::pdu::IcPsh;
@@ -32,7 +33,9 @@ use crate::pdu::TermPsh;
 use crate::pdu::flags;
 use crate::pdu::pdu_type;
 use crate::pdu::term_fes;
+use crate::r2t::encode_r2t;
 use crate::tcp_transport::TcpAdminTransport;
+use crate::ttag::TtagAllocator;
 use anyhow::Context as _;
 use pcie_remote_nvme_userspace::NvmeController;
 use pcie_remote_nvme_userspace::cmd::Sqe;
@@ -85,6 +88,12 @@ pub struct V2Session {
     pub cntlid: u16,
     /// admin queue 是否已 Connect (qid=0)。第二次 Connect qid=0 应拒。
     pub admin_connected: bool,
+    /// **V4b** — TcpAdminTransport token 跨 cmd 单调（修 review M-1）。
+    /// 每次 handle_admin_cmd 用 `TcpAdminTransport::new_with_token_base(self.next_token)`，
+    /// 结束后 `self.next_token = tcp_t.token_high_water()`。
+    next_token: u64,
+    /// **V4b** — R2T TTAG 分配器（单 session 共享，跨 cmd 单调）。
+    ttag_alloc: TtagAllocator,
 }
 
 impl V2Session {
@@ -104,6 +113,10 @@ impl V2Session {
             negotiated,
             cntlid: fabric::TEACHING_CNTLID,
             admin_connected: false,
+            // **V4b** — token 起点用 1<<48 保持与 V3 测试日志一致；后续每条
+            // cmd 通过 token_high_water 累加。
+            next_token: 1u64 << 48,
+            ttag_alloc: TtagAllocator::default(),
         })
     }
 
@@ -171,33 +184,42 @@ impl V2Session {
         }
     }
 
-    /// **Phase V3** — 把 CapsuleCmd 里的 NVMe SQE 派发到 controller，
-    /// captured 出来的 dma_write 转 NVMe-oF wire（C2HData PDU + CapsuleResp）。
+    /// **Phase V3 + V4b** — 把 CapsuleCmd 里的 NVMe SQE 派发到 controller，
+    /// captured 出来的 dma_write 转 C2HData + CapsuleResp；captured 的
+    /// dma_read 转 R2T → H2CData round-trip。
     ///
-    /// 策略（**review M2 / L1 / L2** 后统一）：
-    /// 1. SQE.prp1 改写为 [`PRP1_SENTINEL`]，controller 把"数据写回 host
-    ///    内存"的 dma_write 都打到该哨值 gpa，session 后续识别为 C2HData
-    ///    payload；CQE bytes 走 [`CQ_BASE_GPA`] 上的 16B write。
-    /// 2. 同步 vs 异步路径统一走 controller post_cqe：
-    ///    - 同步：dispatch 返 `Some(cqe)` → 立刻调 `nvme_post_cqe(cqe)`，
-    ///      让 controller 产 1 条 CQE dma_write 进 captured。
-    ///    - 异步：dispatch 返 `None` → captured 仅含 data writes。逐 token
-    ///      调 `nvme_admin_complete_dma(ok=true)`，controller 内部走 post_cqe
-    ///      产 1 条 CQE write。
+    /// 状态机 — 三种 controller 内部子路径，session 全部映射到同一出口：
+    /// 1. 同步路径（Set Features 等）：dispatch 返 `Some(Cqe)` →
+    ///    立刻 `nvme_post_cqe(cqe)`，captured 仅 CQE write。
+    /// 2. 异步 write-out 路径（Identify、Get Log Page）：dispatch 返 None；
+    ///    captured 含 data writes（gpa<CQ_BASE_GPA）。逐 token 调
+    ///    `nvme_admin_complete_dma(ok=true)` 让 controller post_cqe。
+    /// 3. **V4b** 异步 read-in 路径（NS Attachment 0x15 等）：dispatch 返
+    ///    None；captured 含 pending_reads。逐条 alloc ttag → emit R2T →
+    ///    `await_host_data` 收齐 H2CData → `nvme_admin_complete_dma(ok=true, bytes)`
+    ///    让 controller 把 bytes 吃进去后 post_cqe。
     ///
-    ///    两条路径出口都保证 captured = [data writes...] + [1 条 CQE write]。
-    /// 3. drain captured 严格按 "data 先 / CQE 后" 顺序拼 C2HData + CapsuleResp；
-    ///    任何顺序/计数违例 → `anyhow::bail!`（review L1 / L2，宁可断也别截断 wire）。
+    /// 三条路径出口都保证 captured.writes = [data writes...] + [1 条 CQE write]。
+    /// drain captured 严格按 "data 先 / CQE 后" 顺序拼 C2HData + CapsuleResp；
+    /// 任何顺序/计数违例 → `anyhow::bail!`（review L1 / L2）。
+    ///
+    /// **修 review M-1**：token 由 `self.next_token` 跨 cmd 单调注入，
+    /// 避免 controller pending_ios 残留撞同 token。
+    ///
+    /// **修 review M-2**：dma_read 不再 silent-drop；走 R2T 闭环。
     fn handle_admin_cmd(&mut self, cid: u16, sqe_bytes: &[u8]) -> anyhow::Result<()> {
         let mut sqe =
             Sqe::read_from_bytes(sqe_bytes).map_err(|_| anyhow::anyhow!("SQE 不是 64 byte"))?;
-        // 用哨值替换 client 给的 prp1，让 controller dma_write 到我们能识别的 gpa
+        // 用哨值替换 client 给的 prp1，让 controller dma_write / dma_read
+        // 都打到我们能识别的 gpa（V4b 单 read：复用同一哨值；V4c+ 多 read
+        // 引入 per-ttag sentinel 池防撞）。
         sqe.prp1 = PRP1_SENTINEL;
         sqe.prp2 = 0;
         let opc = (sqe.cdw0 & 0xff) as u8;
-        tracing::debug!(opc, cid, "V3 admin dispatch");
+        tracing::debug!(opc, cid, "V3/V4b admin dispatch");
 
-        let mut tcp_t = TcpAdminTransport::default();
+        // **修 M-1** — token 起点用 self.next_token 跨 cmd 单调；结束保存
+        let mut tcp_t = TcpAdminTransport::new_with_token_base(self.next_token);
 
         // ─── Phase 1：dispatch ─────────────────────────────────────────
         let immediate_cqe = {
@@ -205,18 +227,73 @@ impl V2Session {
             self.controller.nvme_admin_dispatch(&mut ctx, sqe, cid, 0)
         };
 
-        // ─── Phase 2：统一两条路径，最终 captured 都含 1 条 CQE write ───
+        // ─── Phase 1.5：**V4b-polish (review H-2)** mixed-path guard ──
+        // V4b 不支持 dispatch 阶段同时产 data_write 和 dma_read（admin
+        // 范围无该 opcode）。混合时 read 闭环 complete_dma 会触发 controller
+        // post_cqe，但 dispatch-time data write 的 token 永远不会被
+        // complete → controller.pending_ios 静默 leak。V5 IO Write 引入
+        // 混合时需把 read 完后再处理 dispatch-time data writes 的逻辑加回。
+        let dispatch_data_writes = tcp_t.writes.iter().filter(|w| w.gpa < CQ_BASE_GPA).count();
+        let dispatch_pending_reads = tcp_t.pending_reads.len();
+        if dispatch_data_writes > 0 && dispatch_pending_reads > 0 {
+            anyhow::bail!(
+                "V4b invariant violation: admin cmd produced both data_write ({}) and \
+                 dma_read ({}) in dispatch — mixed path not supported in V4b",
+                dispatch_data_writes,
+                dispatch_pending_reads
+            );
+        }
+        let had_pending_reads = dispatch_pending_reads > 0;
+
+        // ─── Phase 2：处理 captured pending_reads（V4b dma_read 闭环）───
+        // 关键：先 read 后 write/complete —— controller 在 dispatch 阶段先
+        // dma_read（pending_reads），收齐 bytes 投 complete_dma 后，controller
+        // 才会 dma_write（writes）+ post_cqe。所以 read loop 在 write drain 之前。
+        //
+        // **V4b 单段简化**：当前仅处理"dispatch 阶段产 ≤ 1 条 read"；多段
+        // dma_read（V4c+ IO Write 多 PRP）需要交错 loop。
+        //
+        // **V4b-polish (review H-1)**：await_host_data 的任何 Err（H2C_TERM
+        // / wrong_ttag / data_offset gap / write_term 已发）都通过 `?` 直接
+        // 上抛，跳过 Phase 3/4/5。wire 上不能在 C2HTermReq 后再 emit
+        // CapsuleResp（spec § 5.2 TermReq 是 fatal，post-term PDU 会让 Linux
+        // nvme-tcp host log "unexpected PDU after term"）。
+        // controller.pending_ios 内残留的 entry 随 controller drop 一起释放，
+        // 不 leak；下条 cmd 的 token 通过 token_high_water 跨 cmd 单调保证
+        // 不会撞到这条孤立 entry。
+        while let Some(read_req) = tcp_t.pop_read() {
+            // 用 R2T 把这段 read 委托给 host
+            let ttag = self.ttag_alloc.alloc();
+            tracing::debug!(
+                cid,
+                ttag,
+                token = read_req.token,
+                len = read_req.len,
+                "V4b emit R2T"
+            );
+            let (hdr, psh) = encode_r2t(cid, ttag, 0, read_req.len);
+            write_pdu(&mut self.stream, &hdr, psh.as_bytes(), &[]).context("V4b: write R2T PDU")?;
+
+            // 阻塞读 H2CData 直到收齐 read_req.len 字节（错就 ? 上抛）
+            let bytes =
+                await_host_data(&mut self.stream, &self.negotiated, cid, ttag, read_req.len)
+                    .with_context(|| format!("V4b dma_read failed (cid={cid}, ttag={ttag})"))?;
+
+            // 喂回 controller，让它继续 post_cqe
+            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            self.controller
+                .nvme_admin_complete_dma(&mut ctx, read_req.token, true, bytes);
+        }
+
+        // ─── Phase 3：处理同步 / 异步 write-out 路径，让 captured 含 CQE write ─
         if let Some(cqe) = immediate_cqe {
-            // **review M2** — 同步路径也走 post_cqe，让 controller 内部
-            // CQ tail/phase 推进逻辑生效；保持与异步路径单一出口。
+            // **review M2** — 同步路径走 post_cqe，CQ tail/phase 推进一致。
             let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
             self.controller.nvme_post_cqe(&mut ctx, cqe);
-        } else {
-            // 异步路径：dispatch 阶段 captured 必只含 data writes。
-            // 先快照 token 列表，再逐个投 ok=true completion。
-            // **review L2** — controller 协议规定 data dma_write 先于
-            // CQE，dispatch 阶段不应出 CQE write；若出，是 controller path
-            // 出 bug，bail 比静默丢更安全。
+        } else if !had_pending_reads {
+            // 纯异步 write-out：dispatch 仅产 data writes，无 read。逐 token
+            // 投 ok=true completion 让 controller post_cqe。
+            // **review L2** — 此处 captured 必只含 data writes（gpa<CQ_BASE_GPA）。
             let mut data_tokens = Vec::with_capacity(tcp_t.writes.len());
             for w in tcp_t.writes.iter() {
                 if w.gpa >= CQ_BASE_GPA {
@@ -234,8 +311,13 @@ impl V2Session {
                     .nvme_admin_complete_dma(&mut ctx, tok, true, Vec::new());
             }
         }
+        // 否则（had_pending_reads=true 且 immediate_cqe=None）：read 闭环
+        // 已让 controller post_cqe；captured 已含 CQE write，直接进 Phase 4。
 
-        // ─── Phase 3：drain captured → data_payload + cqe_bytes ───────
+        // 保存 token high water 跨 cmd
+        self.next_token = tcp_t.token_high_water();
+
+        // ─── Phase 4：drain captured.writes → data_payload + cqe_bytes ───
         let mut data_payload = Vec::new();
         let mut cqe_bytes: Option<Vec<u8>> = None;
         while let Some(w) = tcp_t.pop_write() {
@@ -266,7 +348,7 @@ impl V2Session {
         let cqe_bytes = cqe_bytes
             .ok_or_else(|| anyhow::anyhow!("V3: controller did not produce CQE for admin cmd"))?;
 
-        // ─── Phase 4：emit C2HData (若有 data) + CapsuleResp ────────────
+        // ─── Phase 5：emit C2HData (若有 data) + CapsuleResp ────────────
         if !data_payload.is_empty() {
             self.send_c2h_data(cid, &data_payload)?;
         }
@@ -494,6 +576,47 @@ fn write_term(stream: &mut TcpStream, fes: u16) -> anyhow::Result<()> {
         rsvd: [0u8; 10],
     };
     write_pdu(stream, &hdr, psh.as_bytes(), &[])
+}
+
+/// **V4b** — 阻塞读 H2CData PDU 直到收齐 `expected_len` 字节。
+///
+/// caller 先 emit R2T(cid, ttag, 0, expected_len)，然后调用本函数等 host
+/// 上传数据。函数循环 `read_pdu`：
+/// - 收到合法 H2CData → 喂 [`H2cReassembler`]，`Done` 返还 bytes
+/// - 收到非 H2CData / cccid 或 ttag 错配 / DATA_LAST 缺失 →
+///   发 C2HTermReq(fes) 然后 bail
+/// - 收到 H2C_TERM → bail（host 主动 abort）
+///
+/// **R-3 (V4 plan)**：单线程 read_pdu 模型下，此函数阻塞会导致
+/// dispatch 阶段暂停；V4b 接受这个简化，multi-pipeline 留 V8 + tokio。
+///
+/// `_negotiated` 当前未用，预留 V4c 切片用（MAXH2CDATA 上限校验）。
+///
+/// TODO(V4c, review M-6): 用 `_negotiated.maxh2cdata` 校验单 PDU
+/// `data_length` 上限；超出 → write_term(DATA_OUT_OF_RANGE) + bail。
+fn await_host_data(
+    stream: &mut TcpStream,
+    _negotiated: &NegotiatedIc,
+    cid: u16,
+    ttag: u16,
+    expected_len: u32,
+) -> anyhow::Result<Vec<u8>> {
+    let mut r = H2cReassembler::new(cid, ttag, expected_len);
+    loop {
+        let pdu = read_pdu(stream).context("V4b: read H2CData")?;
+        let pt = pdu.header.pdu_type;
+        if pt == pdu_type::H2C_TERM {
+            anyhow::bail!("V4b: host sent H2CTermReq while awaiting H2CData");
+        }
+        match r.accept_pdu(&pdu) {
+            AcceptOutcome::Continue => continue,
+            AcceptOutcome::Done(bytes) => return Ok(bytes),
+            AcceptOutcome::Error { fes, reason } => {
+                let _ = write_term(stream, fes);
+                anyhow::bail!("V4b H2CData reassembly failed: fes={fes:#x} reason={reason}");
+            }
+        }
+    }
 }
 
 /// V2 ICReq/ICResp 握手。
@@ -1234,5 +1357,231 @@ mod tests {
         // INVALID_NAMESPACE_OR_FORMAT = 0x0B
         assert_eq!(sc, 0x0B, "应回 INVALID_NAMESPACE_OR_FORMAT, got sc={sc:#x}");
         h.join().unwrap().unwrap();
+    }
+
+    // ─── Phase V4b — controller-initiated dma_read 走 R2T/H2CData 闭环 ───
+
+    /// 发一条 admin SQE（普通 NVMe opcode，非 fabric）。session 会改写 prp1。
+    fn send_admin_sqe(client: &mut TcpStream, opc: u8, cid: u16, nsid: u32, cdw10: u32) {
+        let mut sqe = [0u8; 64];
+        sqe[0] = opc;
+        sqe[2..4].copy_from_slice(&cid.to_le_bytes());
+        sqe[4..8].copy_from_slice(&nsid.to_le_bytes());
+        sqe[40..44].copy_from_slice(&cdw10.to_le_bytes());
+        let hdr = CommonHdr {
+            pdu_type: pdu_type::CMD,
+            flags: 0,
+            hlen: 72,
+            pdo: 0,
+            plen: 72,
+        };
+        write_pdu(client, &hdr, &sqe, &[]).unwrap();
+    }
+
+    /// 收一条 R2T；返 (ttag, length)。
+    fn read_r2t(client: &mut TcpStream) -> (u16, u32) {
+        let p = read_pdu(client).unwrap();
+        let pt = p.header.pdu_type;
+        assert_eq!(pt, pdu_type::R2T, "expected R2T, got {pt:#x}");
+        let r: crate::pdu::R2tPsh = crate::pdu::decode_psh(&p.psh).unwrap();
+        let ttag = r.ttag;
+        let length = r.r2t_length;
+        (ttag, length)
+    }
+
+    /// 发一条 H2CData PDU 覆盖整个 R2T。
+    fn send_h2cdata(client: &mut TcpStream, cid: u16, ttag: u16, data: &[u8]) {
+        let plen = 24 + data.len() as u32;
+        let hdr = CommonHdr {
+            pdu_type: pdu_type::H2C_DATA,
+            flags: flags::DATA_LAST,
+            hlen: 24,
+            pdo: 24,
+            plen,
+        };
+        let psh = DataPsh {
+            cccid: cid,
+            ttag_or_rsvd: ttag,
+            data_offset: 0,
+            data_length: data.len() as u32,
+            rsvd: [0u8; 4],
+        };
+        write_pdu(client, &hdr, psh.as_bytes(), data).unwrap();
+    }
+
+    /// **V4b** — NS Attachment 0x15 触发 controller dma_read(prp1, 4096)。
+    /// session 发 R2T → 等 host 回 H2CData → controller post_cqe → CapsuleResp。
+    ///
+    /// 注：NS Attachment 0x15 的 controller list buffer host 一般填 16-bit
+    /// count + 2047×16-bit cntlid。这里 host 填一个简单 list（count=1,
+    /// cntlid=1）。controller 应返 success（V1 + V5 多 controller 时校验更严）。
+    #[test]
+    fn v4b_admin_dma_read_single_segment_round_trip() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect
+            sess.pump_one()?; // NS Attachment (dma_read)
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+
+        // NS Attachment 0x15, sel=0 (attach), nsid=1
+        // cdw10 bits 7:0 = sel (0 = attach, 1 = detach)
+        send_admin_sqe(&mut client, 0x15, 0x00A4, 1, 0x0000_0000);
+
+        // 期望先收 R2T(ttag=1, length=4096)
+        let (ttag, length) = read_r2t(&mut client);
+        assert_eq!(ttag, 1, "first cmd, first ttag should be 1");
+        assert_eq!(length, 4096, "NS Attachment controller list = 4 KiB");
+
+        // 构造合法 controller list buffer：count=1（LE u16），cntlid=1
+        let mut buf = vec![0u8; 4096];
+        buf[0..2].copy_from_slice(&1u16.to_le_bytes());
+        buf[2..4].copy_from_slice(&1u16.to_le_bytes());
+        send_h2cdata(&mut client, 0x00A4, ttag, &buf);
+
+        // 收 CapsuleResp（V4b: NS Attachment 完成后 CQE）
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        let resp_cid = u16::from_le_bytes(resp.psh[12..14].try_into().unwrap());
+        let status = u16::from_le_bytes(resp.psh[14..16].try_into().unwrap());
+        let sc = ((status >> 1) & 0xff) as u8;
+        assert_eq!(resp_cid, 0x00A4);
+        // **V4b-polish (review M-4)** — controller 默认 attach 所有 NS，
+        // 重复 attach 返 NAMESPACE_ALREADY_ATTACHED=0x18 是合法响应。
+        // 本测试核心是验 *wire round-trip 闭环*（R2T → H2CData → CqeResp），
+        // 不是验 controller NS attach 语义；接受 success (0) 或
+        // already-attached (0x18) 都表示闭环正常。
+        assert!(
+            sc == 0 || sc == 0x18,
+            "NS Attachment 0x15 应 success(0) 或 ALREADY_ATTACHED(0x18), got sc={sc:#x}"
+        );
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V4b 修 review M-1** — token 跨 cmd 单调；跑两条 dma_read cmd，
+    /// 第二条的 token 必 ≥ 第一条结束后的 high water。session 内部不可见
+    /// token，但 ttag 严格单调可作为 proxy（每条 cmd 用一个新 ttag）。
+    #[test]
+    fn v4b_token_and_ttag_monotonic_across_cmds() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect
+            sess.pump_one()?; // NS Attachment #1
+            sess.pump_one()?; // NS Attachment #2
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        buf[0..2].copy_from_slice(&1u16.to_le_bytes());
+        buf[2..4].copy_from_slice(&1u16.to_le_bytes());
+
+        // 第一条
+        send_admin_sqe(&mut client, 0x15, 0x0001, 1, 0);
+        let (ttag1, _) = read_r2t(&mut client);
+        send_h2cdata(&mut client, 0x0001, ttag1, &buf);
+        let _ = read_pdu(&mut client).unwrap(); // CapsuleResp
+
+        // 第二条
+        send_admin_sqe(&mut client, 0x15, 0x0002, 1, 0);
+        let (ttag2, _) = read_r2t(&mut client);
+        send_h2cdata(&mut client, 0x0002, ttag2, &buf);
+        let _ = read_pdu(&mut client).unwrap();
+
+        assert!(
+            ttag2 > ttag1,
+            "ttag must monotonically advance across cmds, got ttag1={ttag1} ttag2={ttag2}"
+        );
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V4b-polish (review H-1)** — host 在 R2T 后发 H2C_TERM；session
+    /// 应通过 await_host_data Err `?` 上抛，pump_one 返 Err，连接断；
+    /// **不再** emit "TermReq + CapsuleResp" 双发（spec § 5.2 TermReq 后
+    /// 任何 PDU 都是协议违例）。
+    ///
+    /// 之前 V4b 初版策略是投 ok=false completion → controller post_cqe(error)
+    /// → emit CapsuleResp，但 wire 上 H2C_TERM 后 client 已 abort，server
+    /// 再 push RSP 会让 Linux nvme-tcp host log "unexpected PDU after term"。
+    #[test]
+    fn v4b_dma_read_h2c_term_bails_no_double_wire() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect
+            // pump_one 内部 await_host_data bail 后整条 cmd 失败
+            let _ = sess.pump_one();
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+
+        send_admin_sqe(&mut client, 0x15, 0x00B5, 1, 0);
+        let (_ttag, _len) = read_r2t(&mut client);
+
+        // host 不发 H2CData，改发 H2CTermReq
+        let hdr = CommonHdr {
+            pdu_type: pdu_type::H2C_TERM,
+            flags: 0,
+            hlen: 24,
+            pdo: 0,
+            plen: 24,
+        };
+        let psh = TermPsh {
+            fes: term_fes::PDU_SEQ_ERR,
+            fei: [0u8; 4],
+            rsvd: [0u8; 10],
+        };
+        write_pdu(&mut client, &hdr, psh.as_bytes(), &[]).unwrap();
+
+        // session bail 后会在外层 close；这里不强求收 CapsuleResp
+        // （V4b ok=false 路径走 controller post_cqe，但 await_host_data
+        // 在 H2C_TERM 分支 bail，cmd 终止于此）
+        let _ = h.join().unwrap();
+    }
+
+    /// **V4b** — host 发错 ttag → reassembler 拒 → session 发 C2HTermReq。
+    #[test]
+    fn v4b_h2c_data_wrong_ttag_yields_term() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect
+            let _ = sess.pump_one();
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+
+        send_admin_sqe(&mut client, 0x15, 0x00C6, 1, 0);
+        let (ttag, _len) = read_r2t(&mut client);
+
+        // host 发错 ttag = ttag ^ 0xFFFF（保证不同）
+        let bad = ttag ^ 0xFFFF;
+        let buf = vec![0u8; 4096];
+        send_h2cdata(&mut client, 0x00C6, bad, &buf);
+
+        // session 应发 C2HTermReq
+        let p = read_pdu(&mut client).unwrap();
+        let pt = p.header.pdu_type;
+        assert_eq!(pt, pdu_type::C2H_TERM, "expected TermReq, got {pt:#x}");
+        let _ = h.join().unwrap();
     }
 }

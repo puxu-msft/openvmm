@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! **Phase V3** — Tcp Admin Transport：把 NvmeController 的 ctx.dma_write/
-//! fire_interrupt 调用截下来，让 V2Session 后续转成 NVMe-oF C2HData PDU +
-//! CapsuleResp。
+//! **Phase V3 / V4b** — Tcp Admin Transport：把 NvmeController 的
+//! ctx.dma_write / ctx.dma_read / fire_interrupt 调用截下来，让 V2Session
+//! 后续翻成 NVMe-oF wire (C2HData PDU / R2T → H2CData / CapsuleResp)。
 //!
 //! 设计思路（教学最简化版）：
 //!
@@ -11,24 +11,30 @@
 //! 1. 同步路径（Set Features 等）：dispatch_admin 直接返 `Some(Cqe)`，
 //!    caller 调 post_cqe → 触发 `ctx.dma_write(cqe_gpa, 16B)` +
 //!    `ctx.fire_interrupt(irq_vec)`。
-//! 2. 异步路径（Identify、Get Log Page）：dispatch_admin 返 `None`，
-//!    内部已 `ctx.dma_write(prp1_gpa, data_buf)` + 把 token 存
-//!    pending_ios。然后必须由 caller 主动调
-//!    `device.on_dma_complete(token, ok=true, data=空)`，controller 才会
-//!    继续 post_cqe（再次 dma_write + fire_interrupt）。
+//! 2. 异步 write-out 路径（Identify、Get Log Page）：dispatch_admin 返
+//!    `None`，内部已 `ctx.dma_write(prp1_gpa, data_buf)` + 把 token 存
+//!    pending_ios。caller 调 `on_dma_complete(token, ok=true, data=空)`，
+//!    controller 走 post_cqe。
+//! 3. **V4b 新加：异步 read-in 路径**（NS Attachment 0x15、Firmware
+//!    Download 等）：dispatch_admin 返 `None`，内部 `ctx.dma_read(prp1, len)`
+//!    + 把 token 存 pending_ios。caller 必须主动调
+//!      `on_dma_complete(token, ok=true, data=Vec<bytes>)` 把 host 那边 *拉
+//!      回来* 的 bytes 喂给 controller。在 NVMe-oF TCP 上这一步走
+//!      R2T → H2CData round-trip。
 //!
 //! 本 transport：
-//! - 把所有 `dma_write` 写入按 gpa 分类记录（gpa 是 caller — 即 V2Session —
-//!   构造 SQE 时填的 sentinel，session 通过比对 gpa 知道是 PRP1 data
-//!   还是 CQ entry）。
-//! - 对 `dma_read` 返 0 + 即时投递 ok=false 的 completion（V3 不处理
-//!   controller 主动 read host mem 的 admin cmd，比如 NS Attachment 的
-//!   controller list、Set Features Host Identifier — 这些 V4 SGL R2 加）。
-//! - `fire_interrupt` 只 log + 计数（NVMe-oF 不需要传统 MSI-X；C2HData
-//!   + CapsuleResp 自身就是 "中断"）。
+//! - **dma_write** 入 `writes: VecDeque<DmaWriteRecord>`；session 通过 gpa
+//!   ≥ `CQ_BASE_GPA` 区分 CQE bytes vs PRP1 data。
+//! - **dma_read** (V4b) 入 `pending_reads: VecDeque<DmaReadRecord>`；
+//!   session 对每条 read 分配 ttag → emit R2T → 收齐 H2CData → 调
+//!   `nvme_admin_complete_dma(tok, true, bytes)`。
+//! - **fire_interrupt** 只 log + 计数（NVMe-oF 不需要传统 MSI-X；
+//!   C2HData + CapsuleResp 自身就是 "中断"）。
 //!
-//! token 编码：直接用 caller 自增计数器（low bit 区分 data write vs
-//! cqe write 是 caller 的责任，本 transport 不解释）。
+//! token 编码：caller (V2Session) 持 monotonic counter，通过
+//! [`Self::new_with_token_base`] 注入；本 transport 自增，结束后通过
+//! [`Self::token_high_water`] 取回。**修 V3-polish review M-1**：跨 cmd
+//! 单调，不再每次 default() 重启撞 controller pending_ios 残留。
 
 use pcie_remote_userspace_sdk::Transport;
 use std::collections::VecDeque;
@@ -45,46 +51,70 @@ pub struct DmaWriteRecord {
     pub token: u64,
 }
 
-/// V3 admin transport：捕获 dma_write、token 自增、ctx.dma_read 走错路径。
+/// **V4b** 一次 dma_read 调用的快照：caller (session) 后续 emit R2T
+/// `r2t_length = len` 给 host，等 H2CData 收齐再投 `on_dma_complete(token, true, bytes)`。
+#[derive(Debug, Clone)]
+pub struct DmaReadRecord {
+    /// caller 在 SQE.prp1 填的 sentinel（V4b 仅用作 opaque cookie）。
+    pub gpa: u64,
+    /// 请求字节数（→ R2T.r2t_length）。
+    pub len: u32,
+    /// transport 分配的 token；投 `on_dma_complete(token, ...)` 时回填。
+    pub token: u64,
+}
+
+/// V3/V4b admin transport：捕获 dma_write + dma_read、token 自增、跨 cmd 单调。
 ///
-/// **TODO(V3-polish-2, review M-1)** — `next_token` 起点固定 `1<<48` →
-/// 每次 `default()` 都重启。如果 caller bail 中途打断异步路径，那条
-/// `pending_ios` entry 残留 controller 内，*下一条* admin cmd 的第一个
-/// dma_write 会拿到同一 token 静默覆盖该残留。功能自愈但日志/调试
-/// 语义漂移；更严重的是若残留 entry 是 NvmReadDmaWrite，on_dma_complete
-/// 仍会 post_cqe → captured 多出一条 CQE write → L1 invariant bail。
-/// 推荐：session 持有全局 `AtomicU64`，每次 `new_with_token_base(n)` 注入。
+/// **修 review M-1**：`next_token` 由 caller (V2Session) 通过
+/// [`Self::new_with_token_base`] 注入，结束后通过 [`Self::token_high_water`]
+/// 取回，避免跨 cmd 复用同 token 撞 controller pending_ios 残留。
 ///
-/// **TODO(V3-polish-2, review M-2)** — `dma_read` 当前只返 token + warn，
-/// 没投 `on_dma_complete(ok=false)`。session 看到 dispatch 返 None 且
-/// captured 无 write → Phase 3 找不到 CQE → bail "did not produce CQE"。
-/// 客户端看到 TCP 断而非 INVALID_OPCODE CapsuleResp。修复方案：
-/// (a) `dma_read` 入 pending_reads，handle_admin_cmd 立即投 ok=false 让
-///     controller 自身 post_cqe DATA_TRANSFER_ERROR；或
-/// (b) session 入口按 opcode 白名单 pre-reject。
+/// **修 review M-2**：`dma_read` 不再 silent-drop；入 `pending_reads`
+/// 让 session 走 R2T → H2CData → complete 闭环。
 pub struct TcpAdminTransport {
     /// 累积本次 admin cmd 处理中 controller 产生的所有 dma_write。
     pub writes: VecDeque<DmaWriteRecord>,
+    /// **V4b** 累积本次 admin cmd 处理中 controller 产生的所有 dma_read。
+    pub pending_reads: VecDeque<DmaReadRecord>,
     /// 计数 fire_interrupt 调用（仅 log；V3 不主动转 NVMe-oF 中断）。
     pub interrupts_fired: u32,
-    /// token 计数器（顶位置 1 便于日志区分）。
+    /// token 计数器，跨 cmd 单调（由 caller 注入起点）。
     next_token: u64,
 }
 
 impl Default for TcpAdminTransport {
     fn default() -> Self {
-        Self {
-            writes: VecDeque::new(),
-            interrupts_fired: 0,
-            next_token: 1u64 << 48,
-        }
+        // 起点 1<<48；测试 / 教学起点用得到。生产路径 V4b+ 一律用
+        // [`Self::new_with_token_base`] 跨 cmd 推进。
+        Self::new_with_token_base(1u64 << 48)
     }
 }
 
 impl TcpAdminTransport {
+    /// **V4b** — caller 注入 token 起点；结束后 [`token_high_water`] 拿回。
+    pub fn new_with_token_base(base: u64) -> Self {
+        Self {
+            writes: VecDeque::new(),
+            pending_reads: VecDeque::new(),
+            interrupts_fired: 0,
+            next_token: base,
+        }
+    }
+
+    /// **V4b** — 取下次会分配的 token（即"high water mark + 1"）；
+    /// caller 把这个值存回 session.next_token，跨 cmd 单调。
+    pub fn token_high_water(&self) -> u64 {
+        self.next_token
+    }
+
     /// pop 出最旧一条 dma_write 记录（FIFO 顺序与 controller 写出顺序一致）。
     pub fn pop_write(&mut self) -> Option<DmaWriteRecord> {
         self.writes.pop_front()
+    }
+
+    /// **V4b** — pop 出最旧一条 dma_read 记录（FIFO 顺序）。
+    pub fn pop_read(&mut self) -> Option<DmaReadRecord> {
+        self.pending_reads.pop_front()
     }
 }
 
@@ -97,18 +127,18 @@ impl Transport for TcpAdminTransport {
         );
     }
     fn dma_read(&mut self, gpa: u64, len: u32) -> u64 {
-        // V3 不处理 controller 主动读 host mem 的 admin 路径。
-        // 返非零 token；caller 应在 dispatch 后立即给 on_dma_complete(
-        // token, ok=false, vec![]) 让 controller 走 IO-error 清理。
+        // **V4b** — 不再 silent-drop；入队由 session 通过 R2T/H2CData 闭环
+        // 拉回 bytes 后 on_dma_complete。
         let token = self.next_token;
         self.next_token = self.next_token.wrapping_add(1);
-        tracing::warn!(
+        tracing::debug!(
             token,
             gpa = format_args!("{gpa:#x}"),
             len,
-            "TcpAdminTransport.dma_read: V3 不支持 controller-initiated read; \
-             返 token + 等 caller 投 ok=false completion"
+            "TcpAdminTransport: capture dma_read (V4b → R2T)"
         );
+        self.pending_reads
+            .push_back(DmaReadRecord { gpa, len, token });
         token
     }
     fn dma_write(&mut self, gpa: u64, data: Vec<u8>) -> u64 {
@@ -164,13 +194,45 @@ mod tests {
         assert!(t.writes.is_empty());
     }
 
+    /// **V4b** dma_read 现在入队，不再 silent。
     #[test]
-    fn dma_read_returns_token_but_logs_warn() {
+    fn dma_read_captured_to_pending_reads() {
         let mut t = TcpAdminTransport::default();
         let tok = t.dma_read(0xCAFE, 4096);
-        assert_eq!(tok, 1u64 << 48);
-        // 不写入 writes
-        assert!(t.writes.is_empty());
+        assert_eq!(t.pending_reads.len(), 1);
+        let r = t.pop_read().unwrap();
+        assert_eq!(r.gpa, 0xCAFE);
+        assert_eq!(r.len, 4096);
+        assert_eq!(r.token, tok);
+        assert!(t.pop_read().is_none());
+    }
+
+    /// **V4b** — caller-injected token base 让 token 跨 cmd 单调（修 M-1）。
+    #[test]
+    fn new_with_token_base_monotonic_across_cmds() {
+        let mut t1 = TcpAdminTransport::new_with_token_base(100);
+        let _ = t1.dma_write(0x10, vec![0; 4]); // → token=100
+        let _ = t1.dma_write(0x20, vec![0; 4]); // → token=101
+        let high = t1.token_high_water();
+        assert_eq!(high, 102, "next token after two writes should be 102");
+
+        // 下一条 cmd 用 high 继续
+        let mut t2 = TcpAdminTransport::new_with_token_base(high);
+        let tok = t2.dma_write(0x30, vec![0; 4]);
+        assert_eq!(tok, 102, "token must continue monotonically across cmds");
+    }
+
+    /// **V4b** — dma_read 与 dma_write 用同一 token 池（避免 controller
+    /// pending_ios 内 read/write entry 撞）。
+    #[test]
+    fn dma_read_and_write_share_token_pool() {
+        let mut t = TcpAdminTransport::new_with_token_base(1);
+        let tw = t.dma_write(0x10, vec![0; 4]); // token=1
+        let tr = t.dma_read(0x20, 4096); // token=2
+        let tw2 = t.dma_write(0x30, vec![0; 4]); // token=3
+        assert_eq!(tw, 1);
+        assert_eq!(tr, 2);
+        assert_eq!(tw2, 3);
     }
 
     /// Trait object safety — confirm we can pass &mut dyn Transport。
