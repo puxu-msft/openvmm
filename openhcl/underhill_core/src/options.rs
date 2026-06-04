@@ -346,7 +346,9 @@ impl FromStr for PcieRemoteCliConfig {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self, anyhow::Error> {
         let mut parts = s.split(',');
-        let head = parts.next().ok_or_else(|| anyhow::anyhow!("empty config"))?;
+        let head = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("empty config"))?;
         let (guid_s, port_s) = head
             .split_once(':')
             .ok_or_else(|| anyhow::anyhow!("expected <guid>:<port>"))?;
@@ -792,7 +794,10 @@ mod pcie_remote_tests {
         // config_timeout = 5s → max = 2500ms。10000ms 超出。
         let raw = "deadbeef-0000-0000-0000-000000000000:50000,handshake_timeout_ms=10000";
         let out = parse_pcie_remote_entries(raw, "TEST", None, None, 5).unwrap();
-        assert!(out.is_empty(), "oversized handshake_timeout should be skipped");
+        assert!(
+            out.is_empty(),
+            "oversized handshake_timeout should be skipped"
+        );
     }
 
     /// K-19: handshake_timeout_ms 在限内应被保留。

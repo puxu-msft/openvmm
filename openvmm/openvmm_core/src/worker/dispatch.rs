@@ -2102,7 +2102,11 @@ impl InitializedVm {
                 .pcie_remote_tcp_instances
                 .iter()
                 .map(|(id, addr, timeout_ms)| {
-                    (*id, addr.clone(), std::time::Duration::from_millis(*timeout_ms as u64))
+                    (
+                        *id,
+                        addr.clone(),
+                        std::time::Duration::from_millis(*timeout_ms as u64),
+                    )
                 })
                 .collect();
             // 算出最大超时，作为 boot grace period
@@ -3523,13 +3527,13 @@ impl LoadedVm {
 
         let manifest = Manifest {
             load_mode: self.inner.load_mode,
-            floppy_disks: vec![],        // TODO
-            ide_disks: vec![],           // TODO
-            pcie_root_complexes: vec![], // TODO
-            pcie_devices: vec![],        // TODO
-            pcie_switches: vec![],       // TODO
+            floppy_disks: vec![],              // TODO
+            ide_disks: vec![],                 // TODO
+            pcie_root_complexes: vec![],       // TODO
+            pcie_devices: vec![],              // TODO
+            pcie_switches: vec![],             // TODO
             pcie_remote_tcp_instances: vec![], // TODO
-            vpci_devices: vec![],        // TODO
+            vpci_devices: vec![],              // TODO
             memory: self.inner.memory_cfg,
             processor_topology: self.inner.processor_topology.to_config(),
             chipset: self.inner.chipset_cfg,
