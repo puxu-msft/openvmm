@@ -35,6 +35,7 @@
 pub mod dma;
 pub mod framing;
 pub mod handshake;
+pub mod irq;
 pub mod proto;
 pub mod server;
 pub mod session;
@@ -50,6 +51,7 @@ pub use framing::write_message;
 pub use handshake::Negotiated;
 pub use handshake::SERVER_CAPS_JSON;
 pub use handshake::server_handshake;
+pub use irq::IrqVectors;
 pub use proto::Command;
 pub use proto::HEADER_LEN;
 pub use proto::Header;

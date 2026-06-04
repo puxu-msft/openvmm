@@ -57,15 +57,21 @@ pub trait Regions {
 
 /// Server-side session：握手已完成，循环派发入站命令到 [`PcieDevice`]。
 ///
-/// 当前 phase 不维护 IRQ eventfd 列表（U5 加）。**Phase U4**：内部持
-/// [`crate::DmaTable`] 跟踪 client 通告的 guest RAM region；DMA_READ/WRITE
-/// 现在通过 [`crate::dma::dma_read_sync`] / [`dma_write_sync`] 走真往返。
+/// **Phase U4**：内部持 [`crate::DmaTable`] 跟踪 client 通告的 guest RAM
+/// region；DMA_READ/WRITE 通过 [`crate::dma::dma_read_sync`] / `dma_write_sync`
+/// 走真往返。
+///
+/// **Phase U5**：内部持 [`crate::IrqVectors`] 收 MSI-X eventfd；session
+/// 的 `fire_interrupt(idx)` 方法（U5 后由 [`VfioUserTransport`] 调）会
+/// 往该 eventfd 写 8 byte u64=1 触发 guest 中断。
 pub struct VfioUserSession {
     stream: UnixStream,
     #[allow(dead_code)] // U5 之后会用 negotiated caps 限速
     negotiated: Negotiated,
     /// DMA_MAP 通告的所有 guest RAM region。
     pub(crate) dma_table: crate::dma::DmaTable,
+    /// MSI-X 向量 eventfd 数组。
+    pub(crate) irq_vectors: crate::irq::IrqVectors,
     /// server-initiated DMA_READ/WRITE 的 msg_id 计数器（顶位 0x8000）。
     /// U5 [`VfioUserTransport`] 用，当前仅做占位。
     #[allow(dead_code)]
@@ -79,6 +85,7 @@ impl VfioUserSession {
             stream,
             negotiated,
             dma_table: crate::dma::DmaTable::default(),
+            irq_vectors: crate::irq::IrqVectors::default(),
             next_server_msg_id: 0x8000,
         }
     }
@@ -143,9 +150,8 @@ impl VfioUserSession {
             }
             // U5 实现：
             Command::DeviceSetIrqs => {
-                tracing::warn!(?cmd, "{cmd:?} not yet implemented (Phase U5)");
-                self.send_err(id, cmd, libc::ENOTSUP as u32);
-                Ok(())
+                let mut msg = msg;
+                crate::irq::handle_set_irqs(&mut self.stream, &mut self.irq_vectors, id, &mut msg)
             }
             // 我们不实现 — 礼貌地回 ENOTSUP。
             Command::DeviceGetRegionIoFds => {
@@ -383,6 +389,87 @@ impl VfioUserSession {
                 errno,
                 "failed to send error reply"
             );
+        }
+    }
+}
+
+/// **Phase U5** — `VfioUserSession` impl `Transport`：让 PcieDevice 通过
+/// `DeviceCtx` 反向触发 DMA / 中断时，走 vfio-user wire 真路径。
+///
+/// **设计选择**：让 session 直接 impl Transport，而非把 transport 单独
+/// 拎出来对象化。原因：dma_read/write 内部要 *读 stream*（同步等 reply），
+/// 那这个 stream 必须就是 session 自己的 — 没法解耦。
+///
+/// **同步语义**：`dma_read` 阻塞直到收到 reply；当前 *单 socket 同步模型*
+/// 假设 client 不会在 reply 之前插 inbound cmd。若 client 真插了 → 我们
+/// 当 reply 解析必然 msg_id 不匹配 → 返 Err。Phase U-followup 可加多路复用。
+///
+/// `dma_read` / `dma_write` 失败时返 token=0；这与 [`NoopTransport`] 等价
+/// 但 caller (NVMe controller) 应当通过 [`pcie_remote_userspace_sdk::PcieDevice::
+/// on_dma_complete`] 收 `ok=false`。本 impl **synchronously** 完成 DMA 并
+/// *不再* invoke on_dma_complete — caller 需手动桥接（U5-followup）。
+impl pcie_remote_userspace_sdk::Transport for VfioUserSession {
+    fn fire_interrupt(&mut self, msix_index: u32) {
+        let _ = self.irq_vectors.fire(msix_index);
+    }
+
+    fn dma_read(&mut self, gpa: u64, len: u32) -> u64 {
+        // 同步 read → 直接拿数据；但 Transport API 返 token 让 caller 等
+        // on_dma_complete。我们 *没* 走 SDK 主循环投递 callback，所以这
+        // 路径目前只对"unused dma_read"安全；真用需要 caller 桥接。
+        // U5 demo NVMe 主循环会在 dma_read 返 token 后立刻调
+        // `on_dma_complete(token, ok=true, data)` 同步推。
+        match crate::dma::dma_read_sync(
+            &mut self.stream,
+            &self.dma_table,
+            &mut self.next_server_msg_id,
+            gpa,
+            len,
+        ) {
+            Ok(data) => {
+                // 存入 pending 表让 caller 用 token 取回（U5-followup 加）。
+                // 当前先 log + 返 token=msg_id-1（最近 alloc 出的）。
+                let token = self.next_server_msg_id.wrapping_sub(1) as u64;
+                tracing::debug!(
+                    token,
+                    gpa = format_args!("{gpa:#x}"),
+                    len,
+                    bytes = data.len(),
+                    "VfioUserTransport.dma_read OK (sync, caller must bridge on_dma_complete)"
+                );
+                token
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, gpa = format_args!("{gpa:#x}"), len,
+                    "VfioUserTransport.dma_read failed");
+                0
+            }
+        }
+    }
+
+    fn dma_write(&mut self, gpa: u64, data: Vec<u8>) -> u64 {
+        match crate::dma::dma_write_sync(
+            &mut self.stream,
+            &self.dma_table,
+            &mut self.next_server_msg_id,
+            gpa,
+            &data,
+        ) {
+            Ok(()) => {
+                let token = self.next_server_msg_id.wrapping_sub(1) as u64;
+                tracing::debug!(
+                    token,
+                    gpa = format_args!("{gpa:#x}"),
+                    bytes = data.len(),
+                    "VfioUserTransport.dma_write OK"
+                );
+                token
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, gpa = format_args!("{gpa:#x}"),
+                    "VfioUserTransport.dma_write failed");
+                0
+            }
         }
     }
 }
@@ -643,10 +730,9 @@ mod tests {
         assert_eq!(last_reset, 0);
     }
 
-    /// Phase U5 待实现命令 SET_IRQS → 服务端礼貌回 ENOTSUP。
-    /// (Phase U4 后 DmaMap/DmaUnmap 已 真处理，不再返 ENOTSUP。)
+    /// Phase U5 后 SET_IRQS 真处理（DATA_NONE+count=0 → 清向量表 OK reply）。
     #[test]
-    fn set_irqs_returns_enotsup() {
+    fn set_irqs_clear_returns_ok() {
         let (server, mut client) = pair();
         let mut sess = VfioUserSession::new(server, neg());
         let mut dev = MockDev::new();
@@ -661,9 +747,7 @@ mod tests {
         let hdr = Header::command(42, Command::DeviceSetIrqs, pl.as_bytes().len() as u32);
         fw_write(&mut client, &hdr, pl.as_bytes(), &[]).unwrap();
         let reply = read_message(&mut client).unwrap();
-        assert!(reply.header.flags().is_error());
-        let err = reply.header.error_no;
-        assert_eq!(err, libc::ENOTSUP as u32);
+        assert!(!reply.header.flags().is_error());
     }
 
     /// **review L1** — GET_REGION_INFO idx >= NUM_REGIONS → EINVAL + session 存活
