@@ -15,7 +15,9 @@
 //! - **V3** ✅ admin cmd 派发到 NvmeController：Identify/Get Log Page
 //!   等异步路径 captured dma_write 转 C2HData + CapsuleResp
 //! - **V4a** ✅ wire layer：R2T encode + H2CData reassembler + TTAG 分配器
-//! - **V4b–V8** 计划中
+//! - **V4b** ✅ controller dma_read → R2T → H2CData 闭环（单段 ≤ 64 KiB）
+//! - **V4c** ✅ MAXH2CDATA 分片 + 多 R2T 串行（dma_read > 64 KiB 自动切片）
+//! - **V5–V8** 计划中
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -42,6 +44,7 @@ pub use h2c_reassembler::{AcceptOutcome, H2cReassembler};
 pub use pdu::*;
 pub use r2t::encode_r2t;
 pub use session::CQ_BASE_GPA;
+pub use session::MAXH2CDATA_BYTES;
 pub use session::NegotiatedIc;
 pub use session::PRP1_SENTINEL;
 pub use session::V2Session;

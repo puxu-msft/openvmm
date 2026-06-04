@@ -59,6 +59,18 @@ const ADMIN_CQ_SIZE: u32 = 64;
 /// PRP1 sentinel 必须 < CQ_BASE_GPA 才能区分。
 pub const PRP1_SENTINEL: u64 = 0x1000_0000;
 
+/// **Phase V4c** — 单个 R2T 一次准许 host 上传的最大字节数。
+/// = ICResp 里宣告的 `maxh2cdata`（64 KiB，与 Linux nvmet default 对齐）。
+/// 单常量两处用（[`ic_handshake`] 宣告 + V4c [`dma_read_via_r2t`] 切片），
+/// `MAXH2CDATA_CONST_MATCHES_HANDSHAKE` 单测把这个不变式锁死。
+pub const MAXH2CDATA_BYTES: u32 = 64 * 1024;
+
+/// **Phase V4c (review H-2)** — 单条 dma_read total_len 上限。
+/// 与 controller 内部 `FW_MAX = 8 MiB` 对齐，防 R2T 循环爆炸（u32::MAX/64K
+/// 次 read_pdu 同步阻塞）+ Vec::with_capacity 数 GiB 分配 OOM。
+/// V5 引入真 MDTS（controller IDENTIFY.MDTS 派生）后改为运行时决定。
+pub const V4_MAX_DMA_READ_BYTES: u32 = 8 * 1024 * 1024;
+
 /// 握手后的协商参数。
 #[derive(Debug, Clone, Copy)]
 pub struct NegotiatedIc {
@@ -262,22 +274,20 @@ impl V2Session {
         // 不 leak；下条 cmd 的 token 通过 token_high_water 跨 cmd 单调保证
         // 不会撞到这条孤立 entry。
         while let Some(read_req) = tcp_t.pop_read() {
-            // 用 R2T 把这段 read 委托给 host
-            let ttag = self.ttag_alloc.alloc();
+            // **V4c** — 切片：长度 > MAXH2CDATA_BYTES 时切多 R2T 串行
             tracing::debug!(
                 cid,
-                ttag,
                 token = read_req.token,
                 len = read_req.len,
-                "V4b emit R2T"
+                "V4b/V4c dispatch dma_read"
             );
-            let (hdr, psh) = encode_r2t(cid, ttag, 0, read_req.len);
-            write_pdu(&mut self.stream, &hdr, psh.as_bytes(), &[]).context("V4b: write R2T PDU")?;
-
-            // 阻塞读 H2CData 直到收齐 read_req.len 字节（错就 ? 上抛）
-            let bytes =
-                await_host_data(&mut self.stream, &self.negotiated, cid, ttag, read_req.len)
-                    .with_context(|| format!("V4b dma_read failed (cid={cid}, ttag={ttag})"))?;
+            let bytes = self.dma_read_via_r2t(cid, read_req.len).with_context(|| {
+                format!(
+                    "V4 dma_read failed (cid={cid}, token={tok}, len={l})",
+                    tok = read_req.token,
+                    l = read_req.len
+                )
+            })?;
 
             // 喂回 controller，让它继续 post_cqe
             let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
@@ -353,6 +363,63 @@ impl V2Session {
             self.send_c2h_data(cid, &data_payload)?;
         }
         self.write_capsule_resp_bytes(&cqe_bytes)
+    }
+
+    /// **Phase V4c** — 把 controller 一条 `dma_read(len)` 拆成多条
+    /// `MAXH2CDATA_BYTES` 大小的 R2T 串行拉回，拼接成 `Vec<u8>` 返。
+    ///
+    /// 流程（每片）：
+    /// 1. 计算 `chunk = min(remaining, MAXH2CDATA_BYTES)`
+    /// 2. 分配新 ttag
+    /// 3. emit `R2T(cid, ttag, offset, chunk)`
+    /// 4. 调 [`await_host_data`] 带 `base_offset = offset` 阻塞收齐 chunk 字节
+    ///    （**review H-1 fix**：host 端 Linux nvme-tcp 填的 `psh.data_offset`
+    ///    是 cmd 累计 offset，reassembler 用 `base_offset + received` 匹配）
+    /// 5. push 到 accumulator
+    ///
+    /// 串行 vs 流水线：spec 允许 controller 同时发多 R2T（多 ttag 并发），
+    /// 但本教学版单线程 read_pdu 阻塞，做不到。串行 multi-R2T 仍然合规
+    /// （Linux nvme-tcp host 会按 ttag 严格 demux），只是性能不优。
+    ///
+    /// **R-3 (plan)**：read_pdu 阻塞 → 整条 admin cmd 处理期间不能并发处理
+    /// 其他 cmd；V8 + tokio refactor 解决。
+    ///
+    /// **review H-2 fix**：单条 dma_read 长度 cap 到 [`V4_MAX_DMA_READ_BYTES`]
+    /// （8 MiB，与 controller 内部 FW_MAX 对齐）。超出 → bail 防 R2T 循环
+    /// 爆炸 + Vec::with_capacity 大块分配 OOM。
+    fn dma_read_via_r2t(&mut self, cid: u16, total_len: u32) -> anyhow::Result<Vec<u8>> {
+        if total_len > V4_MAX_DMA_READ_BYTES {
+            anyhow::bail!(
+                "V4c: dma_read total_len {} exceeds policy cap {} (防 R2T 循环爆炸 / OOM)",
+                total_len,
+                V4_MAX_DMA_READ_BYTES
+            );
+        }
+        let max = MAXH2CDATA_BYTES;
+        let mut buf: Vec<u8> = Vec::with_capacity(total_len as usize);
+        let mut offset: u32 = 0;
+        while offset < total_len {
+            let remaining = total_len - offset;
+            let chunk = remaining.min(max);
+            let bytes = self.dma_read_one_chunk(cid, offset, chunk)?;
+            buf.extend_from_slice(&bytes);
+            offset += chunk;
+        }
+        debug_assert_eq!(buf.len(), total_len as usize);
+        Ok(buf)
+    }
+
+    /// **V4c (review M-1)** — 单片 R2T 子路径：alloc ttag → emit R2T →
+    /// await_host_data 收齐 → 返字节。从 [`dma_read_via_r2t`] 拆出降低
+    /// 函数体积，invariant 集中。
+    fn dma_read_one_chunk(&mut self, cid: u16, offset: u32, chunk: u32) -> anyhow::Result<Vec<u8>> {
+        let ttag = self.ttag_alloc.alloc();
+        tracing::debug!(cid, ttag, offset, chunk, "V4c emit R2T (chunk)");
+        let (hdr, psh) = encode_r2t(cid, ttag, offset, chunk);
+        write_pdu(&mut self.stream, &hdr, psh.as_bytes(), &[]).context("V4c: write R2T PDU")?;
+        await_host_data(&mut self.stream, &self.negotiated, cid, ttag, offset, chunk).with_context(
+            || format!("V4c await_host_data failed (ttag={ttag}, offset={offset}, chunk={chunk})"),
+        )
     }
 
     /// 发 C2HData PDU：一次性投递整段 data，标 DATA_LAST。
@@ -599,9 +666,10 @@ fn await_host_data(
     _negotiated: &NegotiatedIc,
     cid: u16,
     ttag: u16,
+    base_offset: u32,
     expected_len: u32,
 ) -> anyhow::Result<Vec<u8>> {
-    let mut r = H2cReassembler::new(cid, ttag, expected_len);
+    let mut r = H2cReassembler::with_base_offset(cid, ttag, base_offset, expected_len);
     loop {
         let pdu = read_pdu(stream).context("V4b: read H2CData")?;
         let pt = pdu.header.pdu_type;
@@ -645,7 +713,7 @@ pub fn ic_handshake(stream: &mut TcpStream) -> anyhow::Result<NegotiatedIc> {
     let hdgst = false;
     let ddgst = false;
     // maxh2cdata 我们 advertise 64 KiB（与 Linux nvmet default 一致）。
-    let our_maxh2cdata: u32 = 64 * 1024;
+    let our_maxh2cdata: u32 = MAXH2CDATA_BYTES;
     let our_cpda: u8 = 0; // 4-byte align
 
     let resp_hdr = CommonHdr {
@@ -1389,8 +1457,14 @@ mod tests {
         (ttag, length)
     }
 
-    /// 发一条 H2CData PDU 覆盖整个 R2T。
+    /// 发一条 H2CData PDU 覆盖整个 R2T，`data_offset=0`（V4b 单 R2T 用）。
     fn send_h2cdata(client: &mut TcpStream, cid: u16, ttag: u16, data: &[u8]) {
+        send_h2cdata_at(client, cid, ttag, 0, data);
+    }
+
+    /// **V4c** — 发一条 H2CData PDU 带 cmd 累计 `data_offset`。
+    /// 对应 Linux nvme-tcp host 真实行为（`psh.data_offset = req->data_sent`）。
+    fn send_h2cdata_at(client: &mut TcpStream, cid: u16, ttag: u16, data_offset: u32, data: &[u8]) {
         let plen = 24 + data.len() as u32;
         let hdr = CommonHdr {
             pdu_type: pdu_type::H2C_DATA,
@@ -1402,7 +1476,7 @@ mod tests {
         let psh = DataPsh {
             cccid: cid,
             ttag_or_rsvd: ttag,
-            data_offset: 0,
+            data_offset,
             data_length: data.len() as u32,
             rsvd: [0u8; 4],
         };
@@ -1583,5 +1657,212 @@ mod tests {
         let pt = p.header.pdu_type;
         assert_eq!(pt, pdu_type::C2H_TERM, "expected TermReq, got {pt:#x}");
         let _ = h.join().unwrap();
+    }
+
+    // ─── Phase V4c — MAXH2CDATA 分片 + 多 R2T 串行 ───────────────────
+
+    /// **V4c invariant** — 单一来源：[`MAXH2CDATA_BYTES`] const 必须与
+    /// ICResp 宣告的 `maxh2cdata` 字段保持一致。两处定义漂移会让 host 看到
+    /// 与我们 R2T 切片大小不符的协商值，立即拒连接。
+    #[test]
+    fn v4c_maxh2cdata_const_matches_handshake() {
+        let (mut client, mut server) = tcp_pair();
+        let h = thread::spawn(move || ic_handshake(&mut server));
+        send_icreq(&mut client);
+        let resp = read_pdu(&mut client).unwrap();
+        let rp: IcPsh = crate::pdu::decode_psh(&resp.psh).unwrap();
+        let advertised = rp.maxr2t_or_maxh2cdata;
+        let neg = h.join().unwrap().unwrap();
+        assert_eq!(neg.maxh2cdata, MAXH2CDATA_BYTES);
+        assert_eq!(advertised, MAXH2CDATA_BYTES);
+    }
+
+    /// **V4c** — 触发一段 >MAXH2CDATA 的 dma_read，断 session 发出 *多* R2T
+    /// 串行，最终 CapsuleResp 成功。用 FW Image Download (opcode 0x11)
+    /// 请求 128 KiB（NUMD = 128 KiB/4 - 1 = 32767）。MAXH2CDATA = 64 KiB
+    /// 应切成 2 段 R2T (offset 0/65536, length 65536 each)。
+    #[test]
+    fn v4c_dma_read_128kib_emits_two_r2t() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect
+            sess.pump_one()?; // FW Download
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+
+        // FW_IMAGE_DOWNLOAD = 0x11；CDW10 = NUMD = (128 KiB/4) - 1 = 32767；
+        // CDW11 = OFFSET dwords = 0
+        let total_bytes: u32 = 128 * 1024;
+        let numd: u32 = total_bytes / 4 - 1;
+        let mut sqe = [0u8; 64];
+        sqe[0] = 0x11;
+        sqe[2..4].copy_from_slice(&0x00D7u16.to_le_bytes());
+        // nsid=0 for admin
+        sqe[40..44].copy_from_slice(&numd.to_le_bytes()); // cdw10 = NUMD
+        sqe[44..48].copy_from_slice(&0u32.to_le_bytes()); // cdw11 = OFFSET
+        let cmd_hdr = CommonHdr {
+            pdu_type: pdu_type::CMD,
+            flags: 0,
+            hlen: 72,
+            pdo: 0,
+            plen: 72,
+        };
+        write_pdu(&mut client, &cmd_hdr, &sqe, &[]).unwrap();
+
+        // 期望连续收 2 条 R2T（offset 0 / MAXH2CDATA），每条 length=MAXH2CDATA
+        let mut total_received: u32 = 0;
+        let mut r2t_count = 0;
+        let mut expected_offset: u32 = 0;
+        loop {
+            let p = read_pdu(&mut client).unwrap();
+            let pt = p.header.pdu_type;
+            if pt == pdu_type::RSP {
+                break;
+            }
+            assert_eq!(pt, pdu_type::R2T, "expected R2T or RSP, got {pt:#x}");
+            let r: crate::pdu::R2tPsh = crate::pdu::decode_psh(&p.psh).unwrap();
+            let ttag = r.ttag;
+            let length = r.r2t_length;
+            let offset = r.r2t_offset;
+            assert_eq!(offset, expected_offset, "R2T offset 必递增连续");
+            assert_eq!(length, MAXH2CDATA_BYTES, "每条 R2T 必 = MAXH2CDATA");
+            assert!(ttag != 0, "ttag 不可为 0");
+            // **V4c (review H-1)** — 回 H2CData 带 cmd 累计 data_offset（与
+            // Linux nvme-tcp host 真实行为对齐：psh.data_offset = req->data_sent）。
+            let data = vec![0xCDu8; length as usize];
+            send_h2cdata_at(&mut client, 0x00D7, ttag, offset, &data);
+            r2t_count += 1;
+            total_received += length;
+            expected_offset += length;
+            assert!(r2t_count <= 8, "防 R2T 无限循环");
+        }
+        assert_eq!(r2t_count, 2, "128 KiB / 64 KiB = 2 条 R2T");
+        assert_eq!(total_received, total_bytes);
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V4c** — 边界值 dma_read 64 KiB 恰好等于 MAXH2CDATA，应单条 R2T。
+    /// 用 FW Image Download (NUMD=64KiB/4-1=16383)。
+    #[test]
+    fn v4c_dma_read_64kib_exact_one_r2t() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?;
+            sess.pump_one()?;
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+
+        let total: u32 = MAXH2CDATA_BYTES;
+        let numd = total / 4 - 1;
+        let mut sqe = [0u8; 64];
+        sqe[0] = 0x11;
+        sqe[2..4].copy_from_slice(&0x00E8u16.to_le_bytes());
+        sqe[40..44].copy_from_slice(&numd.to_le_bytes());
+        let cmd_hdr = CommonHdr {
+            pdu_type: pdu_type::CMD,
+            flags: 0,
+            hlen: 72,
+            pdo: 0,
+            plen: 72,
+        };
+        write_pdu(&mut client, &cmd_hdr, &sqe, &[]).unwrap();
+
+        // 单 R2T
+        let p = read_pdu(&mut client).unwrap();
+        let pt = p.header.pdu_type;
+        assert_eq!(pt, pdu_type::R2T);
+        let r: crate::pdu::R2tPsh = crate::pdu::decode_psh(&p.psh).unwrap();
+        let ttag = r.ttag;
+        let length = r.r2t_length;
+        assert_eq!(length, total);
+        let data = vec![0xEEu8; length as usize];
+        send_h2cdata(&mut client, 0x00E8, ttag, &data);
+
+        // 然后 CapsuleResp
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V4c** — off-by-one 边界：dma_read 64 KiB + 4 byte → 2 段 R2T
+    /// (64 KiB + 4 byte)。第二段 length 必恰 = 4，否则 host 会拒。
+    #[test]
+    fn v4c_dma_read_64kib_plus_4_emits_two_r2t() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?;
+            sess.pump_one()?;
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+
+        let total: u32 = MAXH2CDATA_BYTES + 4;
+        let numd = total / 4 - 1;
+        let mut sqe = [0u8; 64];
+        sqe[0] = 0x11;
+        sqe[2..4].copy_from_slice(&0x00F9u16.to_le_bytes());
+        sqe[40..44].copy_from_slice(&numd.to_le_bytes());
+        let cmd_hdr = CommonHdr {
+            pdu_type: pdu_type::CMD,
+            flags: 0,
+            hlen: 72,
+            pdo: 0,
+            plen: 72,
+        };
+        write_pdu(&mut client, &cmd_hdr, &sqe, &[]).unwrap();
+
+        // R2T #1: length = 65536
+        let p = read_pdu(&mut client).unwrap();
+        let r: crate::pdu::R2tPsh = crate::pdu::decode_psh(&p.psh).unwrap();
+        let ttag1 = r.ttag;
+        let len1 = r.r2t_length;
+        let off1 = r.r2t_offset;
+        assert_eq!(len1, MAXH2CDATA_BYTES);
+        assert_eq!(off1, 0);
+        send_h2cdata_at(
+            &mut client,
+            0x00F9,
+            ttag1,
+            off1,
+            &vec![0xA1u8; len1 as usize],
+        );
+
+        // R2T #2: length = 4
+        let p = read_pdu(&mut client).unwrap();
+        let r: crate::pdu::R2tPsh = crate::pdu::decode_psh(&p.psh).unwrap();
+        let ttag2 = r.ttag;
+        let len2 = r.r2t_length;
+        let off2 = r.r2t_offset;
+        assert_eq!(len2, 4, "remainder R2T length 必恰 = 4");
+        assert_eq!(off2, MAXH2CDATA_BYTES);
+        assert!(ttag2 != ttag1, "每片新 ttag");
+        send_h2cdata_at(
+            &mut client,
+            0x00F9,
+            ttag2,
+            off2,
+            &[0xB2u8, 0xB2, 0xB2, 0xB2],
+        );
+
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        h.join().unwrap().unwrap();
     }
 }

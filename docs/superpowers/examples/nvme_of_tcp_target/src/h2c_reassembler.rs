@@ -45,6 +45,12 @@ pub enum AcceptOutcome {
 pub struct H2cReassembler {
     expected_cccid: u16,
     expected_ttag: u16,
+    /// **V4c**：cmd 级累计 offset 基址。host 端 Linux nvme-tcp driver 填
+    /// `psh.data_offset = req->data_sent`（spec § 8.2.5），即 cmd 内累计；
+    /// reassembler 收到的 `data_offset` 应 == `base_offset + received`。
+    /// V4b 单 R2T 时 `base_offset = 0`；V4c 多 R2T 时每片 `base_offset =
+    /// 该 R2T 的 r2t_offset`。
+    base_offset: u32,
     expected_total: u32,
     /// 已接收字节数。
     received: u32,
@@ -56,6 +62,8 @@ pub struct H2cReassembler {
 
 impl H2cReassembler {
     /// 起一个新 reassembler，对应即将 emit 的 R2T(cccid, ttag, length)。
+    /// `base_offset` 是 cmd 内累计 offset（V4b 单 R2T = 0；V4c 多 R2T 用
+    /// R2T 的 `r2t_offset`），用于与 host 填的 `psh.data_offset` 对齐。
     ///
     /// **V4a-polish (review M-6)** — `length == 0` 是 spec violation
     /// (R2T length 必须 > 0)，直接 panic 防止上层 controller 路径 bug
@@ -70,10 +78,18 @@ impl H2cReassembler {
     /// （目前 `received == expected_total` 不变，新 PDU 会被 OUT_OF_RANGE
     /// 拒，但语义上不应依赖）。
     pub fn new(cccid: u16, ttag: u16, length: u32) -> Self {
+        Self::with_base_offset(cccid, ttag, 0, length)
+    }
+
+    /// **V4c (review H-1)** — 带 `base_offset` 的构造器。
+    /// 多 R2T 场景下每片 reassembler 用本片的 `r2t_offset` 当 base，
+    /// 与 host 端 `psh.data_offset = req->data_sent` 累计语义对齐。
+    pub fn with_base_offset(cccid: u16, ttag: u16, base_offset: u32, length: u32) -> Self {
         assert!(length > 0, "R2T length must be > 0 (spec §8.2.4)");
         Self {
             expected_cccid: cccid,
             expected_ttag: ttag,
+            base_offset,
             expected_total: length,
             received: 0,
             buf: Vec::with_capacity(length as usize),
@@ -116,11 +132,14 @@ impl H2cReassembler {
                 reason: "H2CData ttag mismatch",
             };
         }
-        // 必须严格按递增 offset 拼接，无空洞
-        if off != self.received {
+        // 必须严格按递增 offset 拼接，无空洞。
+        // **V4c (review H-1)** — host 端 `psh.data_offset` 是 cmd 内累计；
+        // 我们期望 `data_offset == base_offset + received`。
+        let expected_off = self.base_offset.saturating_add(self.received);
+        if off != expected_off {
             return AcceptOutcome::Error {
                 fes: term_fes::DATA_OUT_OF_RANGE,
-                reason: "H2CData data_offset out of order / has gap",
+                reason: "H2CData data_offset out of order / has gap / wrong base",
             };
         }
         if len as usize != pdu.data.len() {
@@ -343,6 +362,41 @@ mod tests {
         match r.accept_pdu(&p) {
             AcceptOutcome::Error { fes, .. } => assert_eq!(fes, term_fes::PDU_SEQ_ERR),
             other => panic!("expected Error (wrong pdu_type), got {other:?}"),
+        }
+    }
+
+    /// **V4c (review H-1 regression)** — `base_offset != 0` 时按
+    /// "host 端 psh.data_offset == base_offset + received" 接受。
+    /// 模拟多 R2T 第 2 段：base=65536，单 PDU 4 byte，psh.data_offset=65536。
+    #[test]
+    fn h2c_reassembler_with_base_offset_accepts_cumulative() {
+        let (mut client, mut server) = tcp_pair();
+        let mut r = H2cReassembler::with_base_offset(0xF9, 7, 65536, 4);
+        let (hdr, psh, payload) = h2c_pdu(0xF9, 7, 65536, &[1, 2, 3, 4], true);
+        let _t = thread::spawn(move || {
+            write_pdu(&mut client, &hdr, psh.as_bytes(), &payload).unwrap();
+        });
+        let p = read_pdu(&mut server).unwrap();
+        match r.accept_pdu(&p) {
+            AcceptOutcome::Done(b) => assert_eq!(b, vec![1, 2, 3, 4]),
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    /// **V4c (review H-1)** — base_offset 与 psh.data_offset 不匹配时拒。
+    /// 模拟 host bug：第 2 段本应 data_offset=65536 却填 0。
+    #[test]
+    fn h2c_reassembler_with_base_offset_rejects_zero_offset() {
+        let (mut client, mut server) = tcp_pair();
+        let mut r = H2cReassembler::with_base_offset(0xF9, 7, 65536, 4);
+        let (hdr, psh, payload) = h2c_pdu(0xF9, 7, 0, &[1, 2, 3, 4], true);
+        let _t = thread::spawn(move || {
+            write_pdu(&mut client, &hdr, psh.as_bytes(), &payload).unwrap();
+        });
+        let p = read_pdu(&mut server).unwrap();
+        match r.accept_pdu(&p) {
+            AcceptOutcome::Error { fes, .. } => assert_eq!(fes, term_fes::DATA_OUT_OF_RANGE),
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 }
