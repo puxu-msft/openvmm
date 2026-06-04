@@ -28,11 +28,21 @@
 //! 设备识别为 `Disk` —— `Get-Disk` 应该能看到（每 NS 一块盘），且可
 //! Initialize / format。
 
-mod cmd;
-mod controller;
-mod pi;
-mod regs;
-mod sgl;
+mod cmd {
+    pub use pcie_remote_nvme_userspace::cmd::*;
+}
+mod controller {
+    pub use pcie_remote_nvme_userspace::controller::*;
+}
+mod pi {
+    pub use pcie_remote_nvme_userspace::pi::*;
+}
+mod regs {
+    pub use pcie_remote_nvme_userspace::regs::*;
+}
+mod sgl {
+    pub use pcie_remote_nvme_userspace::sgl::*;
+}
 
 use anyhow::Result;
 use anyhow::anyhow;
