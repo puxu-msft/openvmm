@@ -31,6 +31,19 @@ use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 use std::os::fd::RawFd;
 use std::os::unix::net::UnixStream;
+use thiserror::Error;
+
+/// framing 层错误。caller 用 `e.downcast_ref::<FramingError>()` 区分
+/// PeerClosed（正常断连）与其它 IO/protocol 错误。
+#[derive(Debug, Error)]
+pub enum FramingError {
+    /// peer 关闭 socket（EOF）。区分于其它 IO err 让 caller 干净退出 loop。
+    #[error("vfio-user peer closed (EOF) {at}")]
+    PeerClosed {
+        /// "while reading header" / "while reading payload" 等位置上下文。
+        at: &'static str,
+    },
+}
 
 /// 单条 vfio-user 消息允许的 fd 最大数。spec 默认 `max_msg_fds=1`；
 /// `SET_IRQS` 多 fd 时我们 advertise 更高（最多 64 = MSI-X 向量上限），
@@ -85,7 +98,10 @@ pub fn read_message(stream: &mut UnixStream) -> anyhow::Result<Message> {
         .context("recvmsg header")?;
         let n = msg.bytes;
         if n == 0 {
-            anyhow::bail!("vfio-user peer closed (EOF) while reading header");
+            return Err(FramingError::PeerClosed {
+                at: "while reading header",
+            }
+            .into());
         }
         for c in msg.cmsgs().context("parse cmsgs")? {
             if let ControlMessageOwned::ScmRights(raw) = c {
@@ -124,9 +140,10 @@ pub fn read_message(stream: &mut UnixStream) -> anyhow::Result<Message> {
         .context("recvmsg payload")?;
         let n = msg.bytes;
         if n == 0 {
-            anyhow::bail!(
-                "vfio-user peer closed (EOF) while reading payload (got {got}/{payload_len})"
-            );
+            return Err(FramingError::PeerClosed {
+                at: "while reading payload",
+            }
+            .into());
         }
         for c in msg.cmsgs().context("parse payload cmsgs")? {
             if let ControlMessageOwned::ScmRights(raw) = c {

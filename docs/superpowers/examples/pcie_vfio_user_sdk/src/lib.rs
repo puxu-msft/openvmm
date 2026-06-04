@@ -13,7 +13,8 @@
 //! 当前进度：
 //! - **U1**：proto 数据结构 + 编解码 + 单测 ✅
 //! - **U2**：UNIX socket framing + SCM_RIGHTS fd 传递 + 单测 ✅
-//! - **U3-U5**：region IO / DMA / IRQ / 端到端 QEMU demo（pending）
+//! - **U3**：VfioUserSession + REGION/INFO/RESET 命令派发到 PcieDevice ✅
+//! - **U4-U5**：DMA / IRQ / 端到端 QEMU demo（pending）
 //!
 //! 完整 wire 参考：`docs/superpowers/specs/2026-06-04-vfio-user-wire-reference.md`。
 //!
@@ -33,6 +34,9 @@
 pub mod framing;
 pub mod handshake;
 pub mod proto;
+pub mod server;
+pub mod session;
+pub mod transport;
 
 pub use framing::MAX_MSG_FDS;
 pub use framing::Message;
@@ -46,3 +50,7 @@ pub use proto::HEADER_LEN;
 pub use proto::Header;
 pub use proto::HeaderFlags;
 pub use proto::ProtoError;
+pub use server::serve_unix;
+pub use session::Regions;
+pub use session::VfioUserSession;
+pub use transport::NoopTransport;
