@@ -10,7 +10,7 @@ anyhow = "1.0.102"
 thiserror = "1.0"
 tracing = "0.1.44"
 parking_lot = "0.12.5"
-nix = { version = "0.30", features = ["socket", "uio", "fs"] }
+nix = { version = "0.30", features = ["socket", "uio", "fs", "event"] }
 zerocopy = { version = "0.8", features = ["derive"] }
 bytes = "1.10"
 libc = "0.2"

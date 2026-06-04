@@ -90,6 +90,12 @@ fn write_eventfd(fd: &OwnedFd, buf: &[u8]) -> std::io::Result<()> {
 ///
 /// 仅识别 DATA_EVENTFD + ACTION_TRIGGER (typical QEMU MSI-X 设置)；其它
 /// flag 组合（MASK/UNMASK/DATA_NONE）当前 best-effort log + 回 OK。
+///
+/// **review L3** — 顺序：先 payload 长度 → idx 校验，避免短包路径漏校。
+/// **review M1** — DATA_EVENTFD + count=0 视作"清 [start..start+0) = 0
+/// 个槽位"；本路径默认 no-op，与 spec deassign 区分需 `start` 上下文，
+/// 教学版接受 spec 灰区（QEMU 实际只发 count>0 trigger 或 NONE+TRIGGER）。
+/// **review M2** — fd 数与 count 不匹配 → EINVAL，避免静默 None 覆盖。
 pub fn handle_set_irqs(
     stream: &mut UnixStream,
     vectors: &mut IrqVectors,
@@ -137,13 +143,17 @@ pub fn handle_set_irqs(
         return write_message(stream, &hdr, &[], &[]).context("write SET_IRQS reply (clear)");
     }
     if is_data_eventfd && is_trigger {
-        // 期望 fd 数 = count；多了截断 / 少了视 None（如 partial assign）。
         let need = count as usize;
+        // **review M2** — fd 数必须 == count。少了静默 None 会让中断丢失。
+        if msg.fds.len() != need {
+            send_err(stream, msg_id, libc::EINVAL as u32)?;
+            return Ok(());
+        }
         let upto = (start as usize) + need;
         if vectors.vectors.len() < upto {
             vectors.vectors.resize_with(upto, || None);
         }
-        // **review M2** — 从 msg.fds 取走 fd（用 drain，让 OwnedFd 移交不被 Message drop close）。
+        // **review M2** — 从 msg.fds 取走 fd（drain，OwnedFd 移交不被 Message drop close）。
         let mut fd_iter = msg.fds.drain(..);
         for i in 0..need {
             let slot = (start as usize) + i;
@@ -184,6 +194,7 @@ mod tests {
     use crate::framing::read_message;
     use crate::framing::write_message as fw_write;
     use crate::proto::pci_irq;
+    use std::os::fd::AsFd;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
     use std::thread;
@@ -200,21 +211,22 @@ mod tests {
         assert!(v.is_empty());
     }
 
-    /// 完整链路：客户端 SET_IRQS 带 2 个 eventfd → server 存表 → fire 写 8 byte。
+    /// 完整链路：客户端 SET_IRQS 带 2 个 eventfd → server 存表 → fire 写
+    /// 8 byte → reader 端读出 counter=1。**review M5** 用真 eventfd 替
+    /// `/dev/null`，验证写 8B 原子语义而非 /dev/null 万能 accept。
     #[test]
     fn set_irqs_assign_eventfds_and_fire() {
+        use nix::sys::eventfd::EfdFlags;
+        use nix::sys::eventfd::EventFd;
         let (mut server, mut client) = pair();
-        // 准备 2 个 eventfd（用 /dev/null 占位 — 写 8B 不报错）
-        let efd1 = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/null")
-            .unwrap();
-        let efd2 = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/null")
-            .unwrap();
+        // 准备 2 个真 eventfd（counter 起始 0）。
+        let efd1 = EventFd::from_value_and_flags(0, EfdFlags::empty()).unwrap();
+        let efd2 = EventFd::from_value_and_flags(0, EfdFlags::empty()).unwrap();
         let raw1 = efd1.as_raw_fd();
         let raw2 = efd2.as_raw_fd();
+        // client 端 dup 一份原 RawFd，让 fire 后还能 read counter 验证
+        let efd1_dup = nix::unistd::dup(efd1.as_fd()).unwrap();
+        let efd2_dup = nix::unistd::dup(efd2.as_fd()).unwrap();
 
         let h = thread::spawn(move || -> anyhow::Result<IrqVectors> {
             let mut vectors = IrqVectors::default();
@@ -236,21 +248,30 @@ mod tests {
         assert!(!reply.header.flags().is_error());
         let mut vectors = h.join().unwrap().unwrap();
         assert_eq!(vectors.len(), 2);
+        // 关掉本地的 EventFd（OwnedFd 在 SCM_RIGHTS 传过去后 server 有 dup）
+        drop(efd1);
+        drop(efd2);
         assert!(vectors.fire(0));
         assert!(vectors.fire(1));
         assert!(!vectors.fire(2)); // 越界
+
+        // 验证：counter 真的被加到 1（不是 /dev/null 假成功）
+        let mut buf = [0u8; 8];
+        nix::unistd::read(&efd1_dup, &mut buf).unwrap();
+        assert_eq!(u64::from_ne_bytes(buf), 1);
+        nix::unistd::read(&efd2_dup, &mut buf).unwrap();
+        assert_eq!(u64::from_ne_bytes(buf), 1);
     }
 
     /// DATA_NONE + count=0 + TRIGGER = 清整 vector 数组。
     #[test]
     fn set_irqs_data_none_clears_vectors() {
+        use nix::sys::eventfd::EfdFlags;
+        use nix::sys::eventfd::EventFd;
         let (mut server, mut client) = pair();
         let mut vectors = IrqVectors::default();
-        // 先手 push 几个假 fd 占位
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/null")
-            .unwrap();
+        // 先手 push 一个真 eventfd 占位
+        let f = EventFd::from_value_and_flags(0, EfdFlags::empty()).unwrap();
         vectors.vectors.push(Some(f.into()));
         assert_eq!(vectors.len(), 1);
 
@@ -271,6 +292,32 @@ mod tests {
         let _ = read_message(&mut client).unwrap();
         let vectors = h.join().unwrap().unwrap();
         assert!(vectors.is_empty());
+    }
+
+    /// **review M2** — fd 数 < count → EINVAL，不静默 None 覆盖。
+    #[test]
+    fn set_irqs_fd_count_mismatch_returns_einval() {
+        let (mut server, mut client) = pair();
+        let mut vectors = IrqVectors::default();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut msg = read_message(&mut server)?;
+            handle_set_irqs(&mut server, &mut vectors, msg.header.msg_id, &mut msg)?;
+            Ok(())
+        });
+        let pl = IrqSetPayload {
+            argsz: 20,
+            flags: irq_set::DATA_EVENTFD | irq_set::ACTION_TRIGGER,
+            index: pci_irq::MSIX,
+            start: 0,
+            count: 3, // 故意要 3 个 fd
+        };
+        let hdr = Header::command(11, Command::DeviceSetIrqs, pl.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, pl.as_bytes(), &[]).unwrap(); // 只发 0 个 fd
+        let reply = read_message(&mut client).unwrap();
+        assert!(reply.header.flags().is_error());
+        let err = reply.header.error_no;
+        assert_eq!(err, libc::EINVAL as u32);
+        h.join().unwrap().unwrap();
     }
 
     /// SET_IRQS for INTX (idx=0) — no-op + OK reply。

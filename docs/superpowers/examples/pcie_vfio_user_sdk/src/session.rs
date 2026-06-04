@@ -64,6 +64,12 @@ pub trait Regions {
 /// **Phase U5**：内部持 [`crate::IrqVectors`] 收 MSI-X eventfd；session
 /// 的 `fire_interrupt(idx)` 方法（U5 后由 [`VfioUserTransport`] 调）会
 /// 往该 eventfd 写 8 byte u64=1 触发 guest 中断。
+///
+/// **Phase U5-polish (review H1)**：DMA 走 *同步完成 + pending 队列* —
+/// `dma_read` 内部完成 wire 往返后把 `(token, data)` 推 `pending_completions`，
+/// `pump_one` 在 dispatch inbound 后 drain 队列调 `device.on_dma_complete`。
+/// 这让 NVMe controller `pending_ios` 表能被正常 close，不会因为 SDK
+/// 丢 callback 而 hang。
 pub struct VfioUserSession {
     stream: UnixStream,
     #[allow(dead_code)] // U5 之后会用 negotiated caps 限速
@@ -73,9 +79,22 @@ pub struct VfioUserSession {
     /// MSI-X 向量 eventfd 数组。
     pub(crate) irq_vectors: crate::irq::IrqVectors,
     /// server-initiated DMA_READ/WRITE 的 msg_id 计数器（顶位 0x8000）。
-    /// U5 [`VfioUserTransport`] 用，当前仅做占位。
-    #[allow(dead_code)]
     pub(crate) next_server_msg_id: u16,
+    /// **review H1** — DMA 完成事件队列：(token, ok, data)。
+    /// `dma_read`/`dma_write` 完成 wire round-trip 后入队；`pump_one` 在
+    /// inbound 处理后 drain，调 `device.on_dma_complete(token, ok, data, ctx)`。
+    pub(crate) pending_completions: std::collections::VecDeque<DmaCompletion>,
+}
+
+/// 一条等待投递给 device 的 DMA 完成事件。
+#[derive(Debug)]
+pub struct DmaCompletion {
+    /// `dma_read`/`dma_write` 返给 device 的 token（= server-initiated msg_id）。
+    pub token: u64,
+    /// 成功 = true；wire error / region 校验失败 = false。
+    pub ok: bool,
+    /// `dma_read` 成功时 = 字节数据；其它情形 = 空 Vec。
+    pub data: Vec<u8>,
 }
 
 impl VfioUserSession {
@@ -87,6 +106,7 @@ impl VfioUserSession {
             dma_table: crate::dma::DmaTable::default(),
             irq_vectors: crate::irq::IrqVectors::default(),
             next_server_msg_id: 0x8000,
+            pending_completions: std::collections::VecDeque::new(),
         }
     }
 
@@ -123,7 +143,27 @@ impl VfioUserSession {
             }
         };
         self.dispatch(cmd, msg, device)?;
+        // **review H1** — dispatch 完后 drain DMA 完成事件投给 device。
+        // 设备 mmio_write handler 内调 ctx.dma_read() 时本 transport 同步
+        // 完成 wire，把 (token, ok, data) 推 pending_completions；现在
+        // 在 pump 主循环里调 on_dma_complete 让 NVMe controller `pending_ios`
+        // 取走 token + 数据。
+        self.drain_dma_completions(device);
         Ok(true)
+    }
+
+    /// 把 `pending_completions` 队列里的 DMA 完成事件依次投给 device。
+    /// `device.on_dma_complete` 内部还可能再触发 dma_*（如 NVMe PRP list
+    /// 第二阶段），所以用 `pop_front` 循环；每条事件 pop 出来 *再* 调 device，
+    /// 避免重复借用 self（self 在 dma_read/write 中已被 transport 借走）。
+    fn drain_dma_completions<D: PcieDevice>(&mut self, device: &mut D) {
+        while let Some(c) = self.pending_completions.pop_front() {
+            // 给 device 的 ctx 借 *self*：device.on_dma_complete 可能继续
+            // 调 ctx.dma_*，又往 pending_completions 推新事件 — while 循环
+            // 自动 drain 干净。
+            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(self);
+            device.on_dma_complete(&mut ctx, c.token, c.ok, c.data);
+        }
     }
 
     /// 内部 dispatch — 按 [`Command`] 路由到对应处理函数。
@@ -400,25 +440,22 @@ impl VfioUserSession {
 /// 拎出来对象化。原因：dma_read/write 内部要 *读 stream*（同步等 reply），
 /// 那这个 stream 必须就是 session 自己的 — 没法解耦。
 ///
-/// **同步语义**：`dma_read` 阻塞直到收到 reply；当前 *单 socket 同步模型*
-/// 假设 client 不会在 reply 之前插 inbound cmd。若 client 真插了 → 我们
-/// 当 reply 解析必然 msg_id 不匹配 → 返 Err。Phase U-followup 可加多路复用。
+/// **同步语义** (review H1 修复)：
+/// - `dma_read` 立刻 issue wire round-trip → 拿到 data；
+/// - 把 `(token=msg_id, ok, data)` 推 `pending_completions` 队列；
+/// - 返回 token 给 caller (device 的 mmio_write/tick handler)；
+/// - `pump_one` 主循环 dispatch 完后会 drain 队列，调
+///   `device.on_dma_complete(token, ok, data, ctx)` — 这条 callback
+///   让 NVMe controller `pending_ios` 表正确 close。
 ///
-/// `dma_read` / `dma_write` 失败时返 token=0；这与 [`NoopTransport`] 等价
-/// 但 caller (NVMe controller) 应当通过 [`pcie_remote_userspace_sdk::PcieDevice::
-/// on_dma_complete`] 收 `ok=false`。本 impl **synchronously** 完成 DMA 并
-/// *不再* invoke on_dma_complete — caller 需手动桥接（U5-followup）。
+/// 失败时（DMA 表查不到 region / wire IO err）：返非零 token + 把
+/// `ok=false data=[]` 推队列，让 device 走 NVMe 标准 DMA-fail 清理路径。
 impl pcie_remote_userspace_sdk::Transport for VfioUserSession {
     fn fire_interrupt(&mut self, msix_index: u32) {
         let _ = self.irq_vectors.fire(msix_index);
     }
 
     fn dma_read(&mut self, gpa: u64, len: u32) -> u64 {
-        // 同步 read → 直接拿数据；但 Transport API 返 token 让 caller 等
-        // on_dma_complete。我们 *没* 走 SDK 主循环投递 callback，所以这
-        // 路径目前只对"unused dma_read"安全；真用需要 caller 桥接。
-        // U5 demo NVMe 主循环会在 dma_read 返 token 后立刻调
-        // `on_dma_complete(token, ok=true, data)` 同步推。
         match crate::dma::dma_read_sync(
             &mut self.stream,
             &self.dma_table,
@@ -426,23 +463,33 @@ impl pcie_remote_userspace_sdk::Transport for VfioUserSession {
             gpa,
             len,
         ) {
-            Ok(data) => {
-                // 存入 pending 表让 caller 用 token 取回（U5-followup 加）。
-                // 当前先 log + 返 token=msg_id-1（最近 alloc 出的）。
-                let token = self.next_server_msg_id.wrapping_sub(1) as u64;
+            Ok((msg_id, data)) => {
+                let token = msg_id as u64;
                 tracing::debug!(
                     token,
                     gpa = format_args!("{gpa:#x}"),
                     len,
                     bytes = data.len(),
-                    "VfioUserTransport.dma_read OK (sync, caller must bridge on_dma_complete)"
+                    "VfioUserTransport.dma_read OK; enqueue on_dma_complete"
                 );
+                self.pending_completions.push_back(DmaCompletion {
+                    token,
+                    ok: true,
+                    data,
+                });
                 token
             }
             Err(e) => {
                 tracing::warn!(error = %e, gpa = format_args!("{gpa:#x}"), len,
                     "VfioUserTransport.dma_read failed");
-                0
+                // 取下一个 msg_id 作为合成 token（让 pending_ios 仍能 close）。
+                let token = self.next_server_msg_id as u64;
+                self.pending_completions.push_back(DmaCompletion {
+                    token,
+                    ok: false,
+                    data: Vec::new(),
+                });
+                token
             }
         }
     }
@@ -455,20 +502,31 @@ impl pcie_remote_userspace_sdk::Transport for VfioUserSession {
             gpa,
             &data,
         ) {
-            Ok(()) => {
-                let token = self.next_server_msg_id.wrapping_sub(1) as u64;
+            Ok(msg_id) => {
+                let token = msg_id as u64;
                 tracing::debug!(
                     token,
                     gpa = format_args!("{gpa:#x}"),
                     bytes = data.len(),
-                    "VfioUserTransport.dma_write OK"
+                    "VfioUserTransport.dma_write OK; enqueue on_dma_complete"
                 );
+                self.pending_completions.push_back(DmaCompletion {
+                    token,
+                    ok: true,
+                    data: Vec::new(),
+                });
                 token
             }
             Err(e) => {
                 tracing::warn!(error = %e, gpa = format_args!("{gpa:#x}"),
                     "VfioUserTransport.dma_write failed");
-                0
+                let token = self.next_server_msg_id as u64;
+                self.pending_completions.push_back(DmaCompletion {
+                    token,
+                    ok: false,
+                    data: Vec::new(),
+                });
+                token
             }
         }
     }

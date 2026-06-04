@@ -254,20 +254,24 @@ pub fn handle_dma_unmap(
 
 /// 服务端发起的同步 DMA_READ：发 request → 等 reply。
 ///
-/// **review H1** — vfio-user spec 两方向 msg_id 独立、不要求严格请求/应答
+/// 返 `(msg_id, data)`：`msg_id` 就是我们用过的 wire id（=token，写给
+/// caller 当 DMA 完成 token）；`data` 是 guest mem 字节。
+///
+/// **review H1/H2** — vfio-user spec 两方向 msg_id 独立、不要求严格请求/应答
 /// 顺序；client 完全可能在我们等 reply 时插一条 REGION_READ。本函数本身
 /// 用 [`read_message`] *直接* 拿下一帧并按 msg_id+cmd 校验；若 caller 有
 /// 多路复用需求（U5 VfioUserTransport 需要在等 reply 期间继续处理 inbound
 /// cmd），应改用更上层的 session 方法走 wait-for-reply 循环（U5 加）。
 ///
-/// **review H2** — 校验 `reply.header.msg_id == msg_id` + `cmd == DmaRead`。
+/// **review H2** — 校验 `reply.header.msg_id == msg_id` + `cmd == DmaRead`，
+/// 并把 `msg_id` 返给 caller，token 由它直接持有不依赖 `wrapping_sub(1)`。
 pub fn dma_read_sync(
     stream: &mut UnixStream,
     table: &DmaTable,
     next_server_msg_id: &mut u16,
     gpa: u64,
     len: u32,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<(u16, Vec<u8>)> {
     let region = table
         .find(gpa, len as u64)
         .ok_or_else(|| anyhow::anyhow!("DMA_READ {gpa:#x}+{len} not in any DMA region"))?;
@@ -296,17 +300,20 @@ pub fn dma_read_sync(
             len
         );
     }
-    Ok(reply.payload[core::mem::size_of::<DmaRwHdrPayload>()..].to_vec())
+    Ok((
+        msg_id,
+        reply.payload[core::mem::size_of::<DmaRwHdrPayload>()..].to_vec(),
+    ))
 }
 
-/// 服务端发起的同步 DMA_WRITE：发 request + data → 等 echo reply。
+/// 服务端发起的同步 DMA_WRITE：发 request + data → 等 echo reply。返 msg_id。
 pub fn dma_write_sync(
     stream: &mut UnixStream,
     table: &DmaTable,
     next_server_msg_id: &mut u16,
     gpa: u64,
     data: &[u8],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u16> {
     let len = data.len() as u64;
     let region = table
         .find(gpa, len)
@@ -329,7 +336,7 @@ pub fn dma_write_sync(
     write_message(stream, &hdr, &payload, &[]).context("write DMA_WRITE request")?;
     let reply = read_message(stream).context("read DMA_WRITE reply")?;
     validate_dma_reply(&reply, msg_id, Command::DmaWrite)?;
-    Ok(())
+    Ok(msg_id)
 }
 
 /// **review H2** — 公共 DMA reply 校验：msg_id + cmd + error flag。
@@ -491,7 +498,7 @@ mod tests {
             })
             .unwrap();
         // 启 server thread 发 DMA_READ 阻塞等
-        let h = thread::spawn(move || -> anyhow::Result<Vec<u8>> {
+        let h = thread::spawn(move || -> anyhow::Result<(u16, Vec<u8>)> {
             let mut next = 0x8000u16;
             dma_read_sync(&mut server, &table, &mut next, 0x1100, 8)
         });
@@ -518,7 +525,8 @@ mod tests {
         reply_pl.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22]);
         let rhdr = Header::reply_ok(req.header.msg_id, Command::DmaRead, reply_pl.len() as u32);
         fw_write(&mut client, &rhdr, &reply_pl, &[]).unwrap();
-        let data = h.join().unwrap().unwrap();
+        let (msg_id, data) = h.join().unwrap().unwrap();
+        assert_eq!(msg_id, 0x8000);
         assert_eq!(data, vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22]);
     }
 
@@ -552,7 +560,7 @@ mod tests {
                 writeable: true,
             })
             .unwrap();
-        let h = thread::spawn(move || -> anyhow::Result<()> {
+        let h = thread::spawn(move || -> anyhow::Result<u16> {
             let mut next = 0x8000u16;
             dma_write_sync(&mut server, &table, &mut next, 0x2200, &[1, 2, 3, 4])
         });
@@ -576,7 +584,8 @@ mod tests {
             core::mem::size_of::<DmaRwHdrPayload>() as u32,
         );
         fw_write(&mut client, &rhdr, &req.payload[..data_off], &[]).unwrap();
-        h.join().unwrap().unwrap();
+        let written_id = h.join().unwrap().unwrap();
+        assert_eq!(written_id, 0x8000);
     }
 
     #[test]
