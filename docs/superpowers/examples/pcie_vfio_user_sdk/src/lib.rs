@@ -12,17 +12,35 @@
 //!
 //! 当前进度：
 //! - **U1**：proto 数据结构 + 编解码 + 单测 ✅
-//! - **U2-U5**：handshake / region IO / DMA / IRQ / 端到端 QEMU demo（pending）
+//! - **U2**：UNIX socket framing + SCM_RIGHTS fd 传递 + 单测 ✅
+//! - **U3-U5**：region IO / DMA / IRQ / 端到端 QEMU demo（pending）
 //!
 //! 完整 wire 参考：`docs/superpowers/specs/2026-06-04-vfio-user-wire-reference.md`。
 //!
+//! # unsafe 范围
+//!
+//! 本 crate 整体走 `#![deny(unsafe_code)]`（不是 forbid），仅
+//! [`framing::into_owned_fd`] 一处 `#[allow(unsafe_code)]` 调
+//! `OwnedFd::from_raw_fd` 将 `SCM_RIGHTS` 收到的 RawFd 转 owned 句柄。
+//! 该 unsafe 由严密 SAFETY 注释保护并被 [`framing::tests::roundtrip_with_one_fd`]
+//! 覆盖。
+//!
 //! [spec]: https://github.com/nutanix/libvfio-user/blob/master/docs/vfio-user.rst
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod framing;
+pub mod handshake;
 pub mod proto;
 
+pub use framing::MAX_MSG_FDS;
+pub use framing::Message;
+pub use framing::read_message;
+pub use framing::write_message;
+pub use handshake::Negotiated;
+pub use handshake::SERVER_CAPS_JSON;
+pub use handshake::server_handshake;
 pub use proto::Command;
 pub use proto::HEADER_LEN;
 pub use proto::Header;

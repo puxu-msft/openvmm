@@ -505,16 +505,15 @@ pub fn encode_header_only(hdr: &Header, out: &mut Vec<u8>) -> usize {
 
 /// 从 `buf` 头部解 Header；剩余字节即 payload 待 caller 继续解析。
 ///
-/// **review H1/H2** — 严格校验三件事：
-/// 1. `buf.len() >= HEADER_LEN`
+/// **review H1/H2** — 严格校验：
+/// 1. `buf.len() >= HEADER_LEN`（够 header 字节数）
 /// 2. `msg_size >= HEADER_LEN`（合法消息至少含 header）
 /// 3. `msg_size <= MAX_MSG_SIZE`（DoS 上限）
-/// 4. `msg_size <= buf.len()`（caller buffer 必须能容下完整消息）
 ///
-/// 4 条 guard 都过后再 zerocopy 解 header；这一步在长度已 ≥16 的 packed
-/// 结构上不会失败（packed 无对齐要求 + FromBytes 对任意 16 字节有效），
-/// 但仍走 `Result` 不 `expect`：spec 演进若 header 加入 invariant，这里
-/// 自动转 error 不 panic。
+/// **注意**：本函数 *不* 校验 `msg_size <= buf.len()` —— framing path 中
+/// `read_message` 把 header 与 payload 分两次读，调本函数时 buf 只有 16 字节。
+/// 若 caller 一次性持有整个消息字节（例如 fixture / unit test），需自行
+/// 校验，可调 [`validate_msg_in_buffer`] 完成对应检查。
 pub fn decode_header(buf: &[u8]) -> Result<Header, ProtoError> {
     if buf.len() < HEADER_LEN {
         return Err(ProtoError::TooShort {
@@ -531,13 +530,20 @@ pub fn decode_header(buf: &[u8]) -> Result<Header, ProtoError> {
     if (msg_size as usize) > MAX_MSG_SIZE {
         return Err(ProtoError::TooLong { msg_size });
     }
-    if (msg_size as usize) > buf.len() {
+    Ok(hdr)
+}
+
+/// **review H1** — 帮 unit-test 风格 caller 校验"持有完整消息字节"：
+/// `decode_header` 自身不校验 `msg_size <= buf.len()`（因为 framing path
+/// 分两次读），但 fixture / 单测一次拿全消息时仍应校验，避免后续 slice panic。
+pub fn validate_msg_in_buffer(hdr: &Header, buf: &[u8]) -> Result<(), ProtoError> {
+    if (hdr.msg_size as usize) > buf.len() {
         return Err(ProtoError::BufferShort {
-            msg_size,
+            msg_size: hdr.msg_size,
             buf_len: buf.len() as u32,
         });
     }
-    Ok(hdr)
+    Ok(())
 }
 
 /// 从 `payload` 解一个具体 struct 类型；长度必须 *精确* 匹配。
@@ -779,14 +785,16 @@ mod tests {
         assert!(matches!(r, Err(ProtoError::TooLong { .. })));
     }
 
-    /// **review H1** — decode_header 拒 msg_size > buf.len()（合法但 caller
-    /// buffer 不足，例如 Header 说 48 字节但只读到 16）。
+    /// **review H1** — `validate_msg_in_buffer` 拒 msg_size > buf.len()（合法
+    /// 但 caller buffer 不足）。`decode_header` 不再做这检查，框架层 split-read
+    /// 不会被误报，仍能让单测/fixture 走 explicit validate path。
     #[test]
-    fn decode_header_rejects_short_buffer() {
+    fn validate_msg_in_buffer_rejects_short_buffer() {
         let h = Header::command(0, Command::DeviceReset, 32); // 16 + 32 = 48
-        let mut buf = vec![0u8; HEADER_LEN]; // 只有 header，不含 payload
+        let mut buf = vec![0u8; HEADER_LEN]; // 只 header，不含 payload
         buf.copy_from_slice(h.as_bytes());
-        let r = decode_header(&buf);
+        let hdr = decode_header(&buf).unwrap(); // 注意：decode_header 现在不再检 buf.len
+        let r = validate_msg_in_buffer(&hdr, &buf);
         assert!(matches!(
             r,
             Err(ProtoError::BufferShort {
@@ -794,6 +802,9 @@ mod tests {
                 buf_len: 16,
             })
         ));
+        // 同等大 buffer 应通过
+        let big = vec![0u8; 48];
+        assert!(validate_msg_in_buffer(&hdr, &big).is_ok());
     }
 
     /// **review M2** — TryFrom 返 UnknownCommand 而非 None。
