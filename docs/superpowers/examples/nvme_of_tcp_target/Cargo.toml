@@ -18,9 +18,6 @@ parking_lot = "0.12.5"
 zerocopy = { version = "0.8", features = ["derive"] }
 clap = { version = "4.6", features = ["derive"] }
 crc32c = "0.6"
-# V5d-fix-2 (review M-1) — 真正的 SIGINT/SIGTERM handler；跨平台、无 unsafe；
-# 替代之前 fake-fix 的 placeholder
-ctrlc = { version = "3", features = ["termination"] }
 # V8f reviewer H-2 — discovery controller 用独立 0-byte tempfile 作 backing 隔离
 # 主 backing；运行时也用到，从 dev-dependencies 提升到 dependencies。
 tempfile = "3"

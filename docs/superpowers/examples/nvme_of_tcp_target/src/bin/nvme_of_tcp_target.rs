@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! **Phase V5d / V8b / V8f** — NVMe-over-Fabrics TCP target 长跑入口。
+//! **Phase V5d / V8b / V8f / V8e-2** — NVMe-over-Fabrics TCP target 长跑入口。
 //!
 //! 监听 4420（NVMe-oF TCP 常用端口），accept 一条 TCP 连接 → 在 thread
 //! pool（最多 `--max-connections`）spawn 一个工作线程跑
@@ -13,9 +13,14 @@
 //! 同一 controller 实例。V5d R-8 per-backing Mutex 已拆除。
 //!
 //! **V8f** — 可选 `--discovery-listen` 开 dual-listener：主 `--listen` 跑 IO
-//! controller，第二端口跑独立 Discovery controller (0-byte tempfile backing，
-//! 不接 IO)。两个 controller 实例 AER / qid 状态隔离防串扰。共享 SIGINT
-//! `running` flag 让 SIGINT/SIGTERM 同时停两 loop。
+//! controller，第二端口跑独立 Discovery controller (512B tempfile backing，
+//! 不接 IO)。两个 controller 实例 AER / qid 状态隔离防串扰。
+//!
+//! **V8e-2** — bin 主入口改 `#[tokio::main(multi_thread)]`；ctrlc + AtomicBool
+//! → `tokio::signal::ctrl_c` + `tokio::sync::watch::Sender<bool>` 作 shutdown
+//! 信号；`std::net::TcpListener` → `tokio::net::TcpListener`；每条 conn
+//! `tokio::task::spawn_blocking` 包当前 sync `handle_conn`（V8e-3 后改 async）。
+//! V8f 双 listener 共享 watch channel，SIGINT/SIGTERM 同时停。
 //!
 //! # 安全 (V5d-fix security review)
 //!
@@ -38,11 +43,10 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 use nvme_of_tcp_target::V2Session;
 use pcie_remote_nvme_userspace::NvmeController;
-use std::io;
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// **V5d-fix C-1** — 默认最大并发 conn 数。超出立即 drop。
@@ -51,6 +55,8 @@ const DEFAULT_MAX_CONNECTIONS: usize = 16;
 const HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 /// **V5d-fix H-3** — accept Err 退避上限。
 const ACCEPT_BACKOFF_MAX_MS: u64 = 1000;
+/// **V8e-2** — shutdown 信号收到后等 in-flight worker drain 上限。
+const SHUTDOWN_DRAIN_SECS: u64 = 2;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "NVMe-over-Fabrics TCP target (Phase V5d)")]
@@ -114,7 +120,8 @@ fn parse_hex_u16(s: &str) -> Result<u16, String> {
     u16::from_str_radix(stripped, 16).map_err(|e| format!("invalid u16 hex {s:?}: {e}"))
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
     // **V5d-fix H-1** — 默认 RUST_LOG=info；未设时也至少出 info。
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -312,83 +319,110 @@ fn main() -> Result<()> {
     let inflight = Arc::new(AtomicUsize::new(0));
     let max_conn = cli.max_connections;
 
-    // **V5d-fix-2 (review M-1) + V5e-1-fix (review H-2)** — SIGINT/SIGTERM
-    // graceful shutdown via `ctrlc` crate（跨平台、无 unsafe）。flag flip
-    // → non-blocking listener exit accept loop → 等 in-flight worker 最多
-    // 2s drain → exit 0。
+    // **V8e-2** — SIGINT/SIGTERM 改 tokio 原生支持：
+    //   - `tokio::signal::ctrl_c()` 拿 SIGINT future
+    //   - `tokio::sync::watch::Sender<bool>` 作 shutdown 信号 channel
+    //   - main + V8f discovery accept loop 各 `subscribe()` 拿独立 Receiver
+    //   - signal handler task 收到 SIGINT/SIGTERM → `send(true)`
     //
-    // **H-2 fix**：startup 失败必须 hard-fail。本 bin 唯一 graceful shutdown
-    // 机制就是 ctrlc handler；silent degrade 到 "Ctrl-C 整 process 死" 与
-    // M-1 立意冲突。
-    let running = Arc::new(AtomicBool::new(true));
+    // 替代 V5d/V5e/V8f 用的 `ctrlc` crate + `AtomicBool running`；watch 是 tokio
+    // 内置（V8e-1 dep）无 unsafe，跨 unix/windows，比 AtomicBool 更适合 async。
+    //
+    // **V8e-2 reviewer M-2** — SIGTERM listener 在 spawn 前 main 内构造，让
+    // 安装失败 hard-fail（spawn 内 `.expect()` panic 会被 tokio 吞导致 process
+    // 僵尸 accept）。
+    let (shutdown_tx, shutdown_rx_main) = tokio::sync::watch::channel(false);
+    let shutdown_rx_disc = shutdown_tx.subscribe();
+    #[cfg(unix)]
+    let mut sigterm_stream = {
+        use tokio::signal::unix::{SignalKind, signal};
+        signal(SignalKind::terminate()).context("install SIGTERM listener (V8e-2)")?
+    };
     {
-        let running = Arc::clone(&running);
-        ctrlc::set_handler(move || {
-            tracing::info!("SIGINT/SIGTERM received; stopping accept loop");
-            running.store(false, Ordering::SeqCst);
-        })
-        .context("install SIGINT/SIGTERM handler (V5e-1-fix H-2 require)")?;
+        let shutdown_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            // ctrl_c() 已跨平台抽象（unix=SIGINT；windows=Ctrl-C event）
+            // SIGTERM (unix-only) 通过 main 端 signal() 构造的 stream 接收。
+            #[cfg(unix)]
+            {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        tracing::info!("SIGINT received; stopping accept loops");
+                    }
+                    _ = sigterm_stream.recv() => {
+                        tracing::info!("SIGTERM received; stopping accept loops");
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("Ctrl-C received; stopping accept loops");
+            }
+            let _ = shutdown_tx.send(true);
+        });
     }
+    // **V8e-2 reviewer M-1** — 之前留的 `shutdown_rx_signal` 哨值已删；watch
+    // sender 由 `shutdown_tx`（main）+ clone（signal task）共持，receiver drop
+    // 不影响 sender 生命周期。
 
-    let listener =
-        TcpListener::bind(parsed_listen).with_context(|| format!("bind {parsed_listen}"))?;
-    listener
-        .set_nonblocking(true)
-        .context("set listener non-blocking")?;
+    let listener = tokio::net::TcpListener::bind(parsed_listen)
+        .await
+        .with_context(|| format!("bind {parsed_listen}"))?;
     tracing::info!("listening on {}", listener.local_addr()?);
 
-    // **V8f** — 若 dual-listener 模式，先 spawn discovery accept loop（独立 thread），
-    // 主 thread 跑主 IO listener。两个 loop 共享 `running` flag，SIGINT 同时停。
-    let disc_thread: Option<std::thread::JoinHandle<Result<()>>> =
+    // **V8f / V8e-2** — 若 dual-listener 模式，先 spawn discovery accept loop
+    // （独立 tokio task），主 task 跑主 IO listener。两个 loop 共享 watch
+    // shutdown channel，SIGINT 同时停。
+    let disc_task: Option<tokio::task::JoinHandle<Result<()>>> =
         if let (Some(disc_shared), Some(disc_addr)) =
             (discovery_shared.clone(), parsed_discovery_listen)
         {
-            let disc_listener = TcpListener::bind(disc_addr)
+            let disc_listener = tokio::net::TcpListener::bind(disc_addr)
+                .await
                 .with_context(|| format!("bind discovery {disc_addr}"))?;
-            disc_listener
-                .set_nonblocking(true)
-                .context("set discovery listener non-blocking")?;
             tracing::info!("V8f discovery listening on {}", disc_listener.local_addr()?);
-            let running_clone = Arc::clone(&running);
             let disc_inflight = Arc::new(AtomicUsize::new(0));
-            Some(std::thread::spawn(move || -> Result<()> {
-                run_accept_loop(
-                    disc_listener,
-                    disc_shared,
-                    running_clone,
-                    disc_inflight,
-                    max_conn,
-                    "discovery",
-                )
-            }))
+            Some(tokio::spawn(run_accept_loop(
+                disc_listener,
+                disc_shared,
+                shutdown_rx_disc,
+                disc_inflight,
+                max_conn,
+                "discovery",
+            )))
         } else {
+            drop(shutdown_rx_disc);
             None
         };
 
-    // **V8f reviewer H-1** — 不论 main loop 成功还是 Err 都先 flip running 通知
-    // discovery thread 停，防 main 早 Err return 留下僵尸 discovery thread。
+    // **V8f reviewer H-1 / V8e-2** — 不论 main loop 成功还是 Err 都先让
+    // shutdown_tx 发信号通知 discovery task 停。
     let main_result = run_accept_loop(
         listener,
         Arc::clone(&shared_controller),
-        Arc::clone(&running),
+        shutdown_rx_main,
         Arc::clone(&inflight),
         max_conn,
         "main",
-    );
-    running.store(false, Ordering::SeqCst);
+    )
+    .await;
+    let _ = shutdown_tx.send(true);
 
-    // **V8f reviewer H-3** — discovery thread Err 应让 process exit code != 0。
-    let disc_result: Result<()> = if let Some(t) = disc_thread {
-        match t.join() {
+    // **V8f reviewer H-3 / V8e-2** — discovery task Err 应让 process exit code != 0。
+    let disc_result: Result<()> = if let Some(t) = disc_task {
+        match t.await {
             Ok(r) => r,
-            Err(_) => Err(anyhow::anyhow!("V8f discovery thread panic")),
+            Err(e) if e.is_cancelled() => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("V8f discovery task join: {e}")),
         }
     } else {
         Ok(())
     };
 
     tracing::info!("exit");
-    // 优先返 main Err（启动后主路径失败更关键）；main OK 时返 disc Err。
+    // **V8f reviewer H-3 + V8e-2 reviewer M-3** — 优先返 main Err（启动后主路径
+    // 失败更关键）；main OK 时返 disc Err 让 process exit code != 0。
     match (main_result, disc_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(e), _) => Err(e),
@@ -396,35 +430,41 @@ fn main() -> Result<()> {
     }
 }
 
-/// **V8f** — accept loop 抽出复用（主 IO listener 与 discovery listener 共用）。
-/// 与 V5d 原 inline 实现 1:1 等价；只把 `&listener` / `shared_ctrl` / 标签提
-/// 成参数。`label` 出现在日志，便于区分两 loop。
-fn run_accept_loop(
-    listener: TcpListener,
+/// **V8f / V8e-2** — accept loop 抽出复用（主 IO listener 与 discovery listener
+/// 共用）。改 `tokio::net::TcpListener::accept().await` + `tokio::select!`
+/// 与 shutdown watch 多路复用；每条 conn `spawn_blocking` 把当前 sync
+/// `handle_conn` 跑在 blocking pool（V8e-3 后改 async `tokio::spawn`）。
+async fn run_accept_loop(
+    listener: tokio::net::TcpListener,
     shared: nvme_of_tcp_target::SharedController,
-    running: Arc<AtomicBool>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     inflight: Arc<AtomicUsize>,
     max_conn: usize,
     label: &'static str,
 ) -> Result<()> {
-    // **V5d-fix H-3** — accept Err 指数退避
     let mut accept_backoff_ms: u64 = 0;
-    while running.load(Ordering::SeqCst) {
-        let (stream, peer) = match listener.accept() {
+    loop {
+        // **V8e-2** — select! 替代 V5d non-blocking + 10ms sleep poll。
+        let accept_result = tokio::select! {
+            biased; // 优先看 shutdown，防 burst 连接饥饿信号
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow_and_update() {
+                    break;
+                }
+                continue;
+            }
+            r = listener.accept() => r,
+        };
+
+        let (stream, peer) = match accept_result {
             Ok((s, addr)) => {
                 accept_backoff_ms = 0;
                 (s, addr)
             }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                accept_backoff_ms = 0;
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
                 let dur = Duration::from_millis(accept_backoff_ms.max(10));
                 tracing::warn!(label, error = %e, backoff_ms = dur.as_millis(), "accept failed");
-                std::thread::sleep(dur);
+                tokio::time::sleep(dur).await;
                 accept_backoff_ms = (accept_backoff_ms.max(10) * 2).min(ACCEPT_BACKOFF_MAX_MS);
                 continue;
             }
@@ -438,14 +478,36 @@ fn run_accept_loop(
             continue;
         }
 
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS)));
+        // **V5d-fix L-6 / V8e-2** — handshake 阶段强 read/write timeout 防 slowloris。
+        // 转 sync `std::net::TcpStream` 给现有 sync handle_conn 用；V8e-3 后改
+        // 直接传 `tokio::net::TcpStream` 给 async session pump。
+        let std_stream = match stream.into_std() {
+            Ok(s) => s,
+            Err(e) => {
+                inflight.fetch_sub(1, Ordering::SeqCst);
+                tracing::warn!(label, %peer, error = %e, "tokio→std stream 转换失败");
+                continue;
+            }
+        };
+        let _ = std_stream.set_read_timeout(Some(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS)));
+        let _ = std_stream.set_write_timeout(Some(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS)));
+        // **V8e-2 reviewer M-4** — `set_nonblocking(false)` 失败会让现有 sync
+        // `read_exact` busy-loop `WouldBlock`；必须 reject 这条 conn 不进 handle。
+        // timeout 失败保持 V5d-fix L-6 silent 路径（无致命，仅放宽 slowloris 防御）。
+        if let Err(e) = std_stream.set_nonblocking(false) {
+            inflight.fetch_sub(1, Ordering::SeqCst);
+            tracing::warn!(label, %peer, error = %e, "set_nonblocking(false) 失败；reject conn");
+            continue;
+        }
         tracing::info!(label, %peer, "accepted connection");
 
         let inflight = Arc::clone(&inflight);
         let shared_ctrl = Arc::clone(&shared);
-        std::thread::spawn(move || {
-            let r = handle_conn(stream, shared_ctrl);
+        // **V8e-2** — `spawn_blocking` 让现有 sync `handle_conn` 跑在 blocking
+        // 线程池，不阻塞 tokio runtime 的 worker thread。V8e-3 改 async session
+        // 后此调用变为 `tokio::spawn(handle_conn_async(...))`。
+        tokio::task::spawn_blocking(move || {
+            let r = handle_conn(std_stream, shared_ctrl);
             inflight.fetch_sub(1, Ordering::SeqCst);
             match r {
                 Ok(()) => tracing::info!(label, %peer, "connection closed normally"),
@@ -455,11 +517,12 @@ fn run_accept_loop(
     }
     tracing::info!(
         label,
-        "accept loop stopped; waiting up to 2s for in-flight workers"
+        secs = SHUTDOWN_DRAIN_SECS,
+        "accept loop stopped; waiting for in-flight workers"
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while inflight.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(SHUTDOWN_DRAIN_SECS);
+    while inflight.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Ok(())
 }
