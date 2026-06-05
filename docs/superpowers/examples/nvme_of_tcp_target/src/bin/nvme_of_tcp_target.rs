@@ -67,6 +67,10 @@ const HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 const ACCEPT_BACKOFF_MAX_MS: u64 = 1000;
 /// **V8e-2** — shutdown 信号收到后等 in-flight worker drain 上限。
 const SHUTDOWN_DRAIN_SECS: u64 = 2;
+/// **V-followup-tls-3 (plan R-10)** — TLS handshake 整 socket 超时（含
+/// ClientHello 半句 slowloris 防护）。spec 不规定具体值；与 sync 路径
+/// `HANDSHAKE_TIMEOUT_SECS=30` 对等。
+const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "NVMe-over-Fabrics TCP target (Phase V5d)")]
@@ -119,6 +123,27 @@ struct Cli {
     /// 仍可让主 listener 切 Discovery，但不再支持"同时 IO + Discovery"）。
     #[arg(long)]
     discovery_listen: Option<String>,
+    /// **V-followup-tls-3** 额外开 TLS listener（spec § 8.13 推荐端口 8009）。
+    /// 同进程内 main IO listener 与本 TLS listener 共享同一 controller；
+    /// plaintext 路径行为 100% 不变。TLS port 不 fallback plaintext，handshake
+    /// fail 直接 drop 防 downgrade 漏洞（plan R-5）。
+    /// 设此字段时必须同时配 `--tls-cert + --tls-key + --tls-i-trust-this-cert`。
+    #[arg(long)]
+    tls_listen: Option<String>,
+    /// **V-followup-tls-3** X.509 cert PEM 路径（PEM block "CERTIFICATE"）。
+    /// 单 cert 或 cert chain 均可。
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+    /// **V-followup-tls-3** 私钥 PEM 路径（接受 PKCS#8 / PKCS#1 RSA / SEC1 EC）。
+    /// 文件权限请设 `chmod 600` 防误读。
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
+    /// **V-followup-tls-3** 显式 consent：本 TLS cert 不做 chain validation，
+    /// 也不做 host NQN ↔ identity binding。自签 cert 或测试 cert 也接受 —
+    /// 等于让任何能跑成 TLS handshake 的 peer 远程读写 backing file。
+    /// 与 `--tls-listen` 同设强制。
+    #[arg(long, default_value_t = false)]
+    tls_i_trust_this_cert: bool,
 }
 
 fn parse_hex_u16(s: &str) -> Result<u16, String> {
@@ -343,6 +368,7 @@ async fn main() -> Result<()> {
     // 僵尸 accept）。
     let (shutdown_tx, shutdown_rx_main) = tokio::sync::watch::channel(false);
     let shutdown_rx_disc = shutdown_tx.subscribe();
+    let shutdown_rx_tls = shutdown_tx.subscribe();
     #[cfg(unix)]
     let mut sigterm_stream = {
         use tokio::signal::unix::{SignalKind, signal};
@@ -381,6 +407,59 @@ async fn main() -> Result<()> {
         .with_context(|| format!("bind {parsed_listen}"))?;
     tracing::info!("listening on {}", listener.local_addr()?);
 
+    // **V-followup-tls-3 (plan R-4/R-5)** — CLI 校验 + acceptor build。
+    // 双 explicit consent 模型：`--tls-listen` 必须配 `--tls-cert + --tls-key
+    // + --tls-i-trust-this-cert`。本 cert 不做 chain validation，缺一即 hard-fail。
+    // acceptor build 在 controller open 之前做，PEM 解析错快速 abort。
+    let parsed_tls_listen: Option<SocketAddr> = match cli.tls_listen.as_deref() {
+        Some(addr_str) => {
+            if cli.tls_cert.is_none() || cli.tls_key.is_none() {
+                anyhow::bail!("--tls-listen 必须同时配 --tls-cert + --tls-key (V-followup-tls-3)");
+            }
+            if !cli.tls_i_trust_this_cert {
+                eprintln!(
+                    "\n\x1b[1;31m⛔ refused to start TLS listener — \
+                     --tls-i-trust-this-cert required\x1b[0m"
+                );
+                eprintln!(
+                    "   本 TLS cert 不做 chain validation 也不做 host NQN identity\n   \
+                     binding；自签 cert 或测试 cert 直通。\n   \
+                     仅在 dev / lab / CTF 等可控环境启用；生产请等 V-followup-auth\n   \
+                     (NQN binding) + V-followup-mtls (client cert require) 落地。\n"
+                );
+                std::process::exit(2);
+            }
+            Some(
+                addr_str
+                    .parse()
+                    .with_context(|| format!("--tls-listen {addr_str:?} 不是合法 SocketAddr"))?,
+            )
+        }
+        None => {
+            if cli.tls_cert.is_some() || cli.tls_key.is_some() || cli.tls_i_trust_this_cert {
+                anyhow::bail!(
+                    "--tls-cert / --tls-key / --tls-i-trust-this-cert 仅在 --tls-listen 启用时生效"
+                );
+            }
+            None
+        }
+    };
+
+    // **V-followup-tls-3** — TlsAcceptor build；PEM 错快速 abort
+    let tls_acceptor: Option<tokio_rustls::TlsAcceptor> = if parsed_tls_listen.is_some() {
+        let cert_path = cli.tls_cert.as_ref().expect("CLI 校验保证非 None");
+        let key_path = cli.tls_key.as_ref().expect("CLI 校验保证非 None");
+        let acc = nvme_of_tcp_target::build_acceptor_from_pem(cert_path, key_path)
+            .context("V-followup-tls-3: TlsAcceptor build")?;
+        tracing::warn!(
+            cert = %cert_path.display(),
+            "⚠️  TLS listener enabled WITHOUT cert chain validation / NQN identity binding"
+        );
+        Some(acc)
+    } else {
+        None
+    };
+
     // **V8f / V8e-2** — 若 dual-listener 模式，先 spawn discovery accept loop
     // （独立 tokio task），主 task 跑主 IO listener。两个 loop 共享 watch
     // shutdown channel，SIGINT 同时停。
@@ -403,6 +482,33 @@ async fn main() -> Result<()> {
             )))
         } else {
             drop(shutdown_rx_disc);
+            None
+        };
+
+    // **V-followup-tls-3** — TLS accept loop（共享同一 controller）。
+    // 与 main / discovery loop 同结构；区别在 accept 后多一步 acceptor.accept
+    // + timeout 包；session handler 用 `handle_conn_async_tls` (泛型 monomorphize
+    // 一份给 TlsStream<TcpStream>)。
+    let tls_task: Option<tokio::task::JoinHandle<Result<()>>> =
+        if let (Some(acceptor), Some(tls_addr)) = (tls_acceptor, parsed_tls_listen) {
+            let tls_listener = tokio::net::TcpListener::bind(tls_addr)
+                .await
+                .with_context(|| format!("bind tls {tls_addr}"))?;
+            tracing::info!(
+                "V-followup-tls-3 TLS listening on {}",
+                tls_listener.local_addr()?
+            );
+            let tls_inflight = Arc::new(AtomicUsize::new(0));
+            Some(tokio::spawn(run_accept_loop_tls(
+                tls_listener,
+                acceptor,
+                Arc::clone(&shared_controller),
+                shutdown_rx_tls,
+                tls_inflight,
+                max_conn,
+            )))
+        } else {
+            drop(shutdown_rx_tls);
             None
         };
 
@@ -430,13 +536,25 @@ async fn main() -> Result<()> {
         Ok(())
     };
 
+    // **V-followup-tls-3** — 与 discovery 同模式；TLS task Err 让 exit != 0
+    let tls_result: Result<()> = if let Some(t) = tls_task {
+        match t.await {
+            Ok(r) => r,
+            Err(e) if e.is_cancelled() => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("V-followup-tls-3 TLS task join: {e}")),
+        }
+    } else {
+        Ok(())
+    };
+
     tracing::info!("exit");
-    // **V8f reviewer H-3 + V8e-2 reviewer M-3** — 优先返 main Err（启动后主路径
-    // 失败更关键）；main OK 时返 disc Err 让 process exit code != 0。
-    match (main_result, disc_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(e), _) => Err(e),
-        (Ok(()), Err(e)) => Err(e.context("V8f discovery listener failed")),
+    // **V8f reviewer H-3 + V8e-2 reviewer M-3 + V-followup-tls-3** — 优先返 main
+    // Err（启动后主路径失败更关键）；其余 task Err 按顺序传播让 process exit != 0。
+    match (main_result, disc_result, tls_result) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(e), _, _) => Err(e),
+        (Ok(()), Err(e), _) => Err(e.context("V8f discovery listener failed")),
+        (Ok(()), Ok(()), Err(e)) => Err(e.context("V-followup-tls-3 TLS listener failed")),
     }
 }
 
@@ -590,5 +708,160 @@ fn handle_conn(stream: TcpStream, shared_ctrl: nvme_of_tcp_target::SharedControl
     let mut sess = V2Session::accept_and_handshake_shared(stream, shared_ctrl)
         .context("V2Session handshake (V8b shared)")?;
     while sess.pump_one_with_events(std::time::Duration::from_millis(100))? {}
+    Ok(())
+}
+
+/// **V-followup-tls-3** — TLS accept loop。
+///
+/// 与 `run_accept_loop` 同骨架，accept 后多一步 `acceptor.accept(tcp_stream)`
+/// + `tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT_SECS, ...)` 防 ClientHello
+///   slowloris；TLS handshake 完成后 stream 类型为
+///   `TlsStream<TcpStream>`，泛型 monomorphize 给
+///   `AsyncSession<TlsStream<TcpStream>>`（V-followup-tls-1 已铺路）。
+///
+/// **TLS handshake 失败不 fallback plaintext**（plan R-5 downgrade 防护）：
+/// timeout / cert reject / IO err 直接 drop conn。
+async fn run_accept_loop_tls(
+    listener: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    shared: nvme_of_tcp_target::SharedController,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    inflight: Arc<AtomicUsize>,
+    max_conn: usize,
+) -> Result<()> {
+    let label = "tls";
+    let mut accept_backoff_ms: u64 = 0;
+    loop {
+        let accept_result = tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow_and_update() {
+                    break;
+                }
+                continue;
+            }
+            r = listener.accept() => r,
+        };
+
+        let (tcp_stream, peer) = match accept_result {
+            Ok((s, addr)) => {
+                accept_backoff_ms = 0;
+                (s, addr)
+            }
+            Err(e) => {
+                let dur = Duration::from_millis(accept_backoff_ms.max(10));
+                tracing::warn!(label, error = %e, backoff_ms = dur.as_millis(), "accept failed");
+                tokio::time::sleep(dur).await;
+                accept_backoff_ms = (accept_backoff_ms.max(10) * 2).min(ACCEPT_BACKOFF_MAX_MS);
+                continue;
+            }
+        };
+
+        let cur = inflight.fetch_add(1, Ordering::SeqCst);
+        if cur >= max_conn {
+            inflight.fetch_sub(1, Ordering::SeqCst);
+            tracing::warn!(label, %peer, max_conn, "rejecting: max-connections reached");
+            drop(tcp_stream);
+            continue;
+        }
+
+        tracing::info!(label, %peer, "accepted TCP; starting TLS handshake");
+
+        let inflight = Arc::clone(&inflight);
+        let shared_ctrl = Arc::clone(&shared);
+        let shutdown_rx = shutdown_rx.clone();
+        let acceptor = acceptor.clone();
+        let _handle = tokio::spawn(async move {
+            struct InflightGuard(Arc<AtomicUsize>);
+            impl Drop for InflightGuard {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let _g = InflightGuard(inflight);
+
+            // **plan R-10** — TLS handshake 整 socket 30s 超时防 slowloris
+            let tls_stream = match tokio::time::timeout(
+                Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
+                acceptor.accept(tcp_stream),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    tracing::warn!(label, %peer, error = %e, "TLS handshake failed; dropping");
+                    return;
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        label,
+                        %peer,
+                        timeout_secs = TLS_HANDSHAKE_TIMEOUT_SECS,
+                        "TLS handshake timeout; dropping (slowloris guard)"
+                    );
+                    return;
+                }
+            };
+
+            let fut = std::panic::AssertUnwindSafe(handle_conn_async_tls(
+                tls_stream,
+                shared_ctrl,
+                shutdown_rx,
+            ));
+            let r = futures::FutureExt::catch_unwind(fut).await;
+            match r {
+                Ok(Ok(())) => {
+                    tracing::info!(label, %peer, "TLS connection closed normally")
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(label, %peer, error = %e, "TLS connection ended with error")
+                }
+                Err(_) => tracing::error!(
+                    label,
+                    %peer,
+                    "V-followup-tls-3 handle_conn_async_tls panic"
+                ),
+            }
+        });
+    }
+    tracing::info!(
+        label,
+        secs = SHUTDOWN_DRAIN_SECS,
+        "TLS accept loop stopped; waiting for in-flight workers"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(SHUTDOWN_DRAIN_SECS);
+    while inflight.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+/// **V-followup-tls-3** — TLS conn handler；与 `handle_conn_async` 结构 1:1
+/// 等价，stream 类型由泛型 monomorphize 给 `TlsStream<TcpStream>`。
+async fn handle_conn_async_tls(
+    stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    shared_ctrl: nvme_of_tcp_target::SharedController,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let mut sess = nvme_of_tcp_target::accept_and_handshake_async(stream, shared_ctrl)
+        .await
+        .context("V-followup-tls-3 AsyncSession over TLS handshake")?;
+    loop {
+        let event = sess.pump_one_async(&mut shutdown_rx).await?;
+        match event {
+            nvme_of_tcp_target::PumpEvent::Pdu(pdu) => {
+                let outcome = sess.dispatch_pdu_async(pdu).await?;
+                if outcome.disconnected {
+                    break;
+                }
+            }
+            nvme_of_tcp_target::PumpEvent::AenReady { .. } => {
+                sess.drain_aers_async().await?;
+            }
+            nvme_of_tcp_target::PumpEvent::KatoExpired
+            | nvme_of_tcp_target::PumpEvent::PeerClosed
+            | nvme_of_tcp_target::PumpEvent::Shutdown => break,
+        }
+    }
     Ok(())
 }
