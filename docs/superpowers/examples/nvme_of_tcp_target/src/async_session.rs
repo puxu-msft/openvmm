@@ -43,7 +43,10 @@ use crate::SharedController;
 use crate::framing::{Pdu, read_pdu_async, write_pdu_async};
 use crate::pdu::{CommonHdr, IcPsh, pdu_type};
 use anyhow::Context as _;
+use std::pin::Pin;
+use std::time::Duration;
 use tokio::net::TcpStream as TokioStream;
+use tokio::time::{Instant as TokioInstant, Sleep, sleep_until};
 use zerocopy::IntoBytes;
 
 /// **V8e-3** — async session：握手完成后通过 [`pump_one_async`] 接 PDU
@@ -68,6 +71,17 @@ pub struct AsyncSession {
     /// 唤醒后自检 `nvme_pending_aer_count_for_conn(conn_id)` 过滤 spurious
     /// wakeup。
     pub aen_notify: std::sync::Arc<tokio::sync::Notify>,
+    /// **V8e-5** — Keep-Alive Timeout (spec § 7.13)。Connect 成功后由 admin
+    /// cmd handler 调 [`Self::set_kato`] 注入；0 = 禁用 timer（spec § 7.13
+    /// "Keep Alive disabled"）。
+    pub kato_tmo: Duration,
+    /// **V8e-5** — 下一次 KATO 超时时刻。`Some(Pin<Box<Sleep>>)` 已 arm；
+    /// `None` = KATO 禁用（kato_tmo=0）或 Connect 未完成。每次 admin/IO cmd
+    /// 入口调 [`Self::reset_kato_deadline`] 原地 `Pin::as_mut.reset` 刷新。
+    ///
+    /// 设计依据：plan §3 Q2 — Sleep 比 Interval 语义更贴 deadline；Pin<Box>
+    /// 让 reset 不破坏已有 future state。
+    kato_deadline: Option<Pin<Box<Sleep>>>,
 }
 
 /// **V8e-3** — async 版 ICReq/ICResp handshake。语义与 sync
@@ -148,22 +162,34 @@ pub async fn accept_and_handshake_async(
         next_token,
         discovery_mode,
         aen_notify,
+        kato_tmo: Duration::from_secs(0),
+        kato_deadline: None,
     })
 }
 
 impl AsyncSession {
-    /// **V8e-3 / V8e-4** — async 主循环单次 tick。
+    /// **V8e-3 / V8e-4 / V8e-5** — async 主循环单次 tick。
     ///
-    /// 现有 3 arm（V8e-5 加 KATO 第 4 arm；V8e-6 后 dispatch 路径填充）：
-    /// 1. `shutdown.changed()` → 返 `Ok(PumpEvent::Shutdown)` 让 caller 退 loop
-    /// 2. `aen_notify.notified()` → 返 `Ok(PumpEvent::AenReady)` 让 caller drain AER
-    /// 3. `read_pdu_async` → 返 `Ok(PumpEvent::Pdu(pdu))` 让 caller dispatch
+    /// 4 arm（V8e-6 后 dispatch 路径填充 PDU 处理）：
+    /// 1. `shutdown.changed()` → 返 `Shutdown` 让 caller 退 loop
+    /// 2. `aen_notify.notified()` → 返 `AenReady{pending}` 让 caller drain AER
+    /// 3. `kato_deadline` 触发 (kato_tmo>0 时) → 返 `KatoExpired` 让 caller 关 conn
+    /// 4. `read_pdu_async` → 返 `Pdu(pdu)` 让 caller dispatch
     ///
-    /// V8e-3 时 PDU 仅打 log + drop；V8e-6 加完整 admin/IO dispatch。
+    /// 注意：`PumpEvent::Pdu(_)` 触发后 caller 应在真 dispatch 完成后调
+    /// [`Self::reset_kato_deadline`]（V8e-6 admin/IO handler 入口逻辑）。
     pub async fn pump_one_async(
         &mut self,
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<PumpEvent> {
+        // V8e-5：KATO=0 时第 3 arm 用 `std::future::pending()` 占位（spec § 7.13
+        // "Keep Alive disabled"）。已 arm 的 Sleep 通过 `as_mut` 拿 Pin 借用。
+        let kato_fut = async {
+            match self.kato_deadline.as_mut() {
+                Some(s) => s.as_mut().await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             biased;
             _ = shutdown.changed() => {
@@ -182,6 +208,14 @@ impl AsyncSession {
                 );
                 Ok(PumpEvent::AenReady { pending: cnt })
             }
+            _ = kato_fut => {
+                tracing::warn!(
+                    conn_id = self.conn_id,
+                    kato_ms = self.kato_tmo.as_millis(),
+                    "V8e-5 KATO expired"
+                );
+                Ok(PumpEvent::KatoExpired)
+            }
             r = read_pdu_async(&mut self.stream) => {
                 match r {
                     Ok(pdu) => Ok(PumpEvent::Pdu(pdu)),
@@ -199,6 +233,38 @@ impl AsyncSession {
         }
     }
 
+    /// **V8e-5** — caller (Connect handler 完成 / V8e-6 admin/IO dispatch
+    /// 入口) 注入 KATO 超时；spec § 7.13 KATO 字段单位 ms。
+    /// `kato_ms = 0` 表示 disable（spec 允许）。
+    pub fn set_kato(&mut self, kato_ms: u32) {
+        self.kato_tmo = Duration::from_millis(u64::from(kato_ms));
+        if self.kato_tmo.is_zero() {
+            self.kato_deadline = None;
+        } else {
+            self.kato_deadline = Some(Box::pin(sleep_until(TokioInstant::now() + self.kato_tmo)));
+        }
+        tracing::info!(
+            conn_id = self.conn_id,
+            kato_ms = self.kato_tmo.as_millis(),
+            "V8e-5 KATO armed"
+        );
+    }
+
+    /// **V8e-5** — admin/IO cmd handler 入口调，把 KATO deadline 原地刷到
+    /// `now + kato_tmo`（plan §3 Q2: Pin::as_mut.reset 不破坏 select! 拿到的
+    /// future borrow）。kato_tmo=0 时 no-op。
+    pub fn reset_kato_deadline(&mut self) {
+        if self.kato_tmo.is_zero() {
+            return;
+        }
+        let new_deadline = TokioInstant::now() + self.kato_tmo;
+        if let Some(s) = self.kato_deadline.as_mut() {
+            s.as_mut().reset(new_deadline);
+        } else {
+            self.kato_deadline = Some(Box::pin(sleep_until(new_deadline)));
+        }
+    }
+
     /// 暴露 controller 引用供测试 / V8e-4..6 callsite 用。
     pub fn controller(&self) -> &SharedController {
         &self.controller
@@ -208,18 +274,27 @@ impl AsyncSession {
     pub fn next_token(&self) -> u64 {
         self.next_token
     }
+
+    /// **V8e-5 test-only** — 暴露 kato_tmo 给测试断言。
+    pub fn kato_tmo(&self) -> Duration {
+        self.kato_tmo
+    }
 }
 
-/// **V8e-3 / V8e-4** — `pump_one_async` 单次 tick 的结果。
+/// **V8e-3 / V8e-4 / V8e-5** — `pump_one_async` 单次 tick 的结果。
 ///
-/// `Shutdown` / `PeerClosed` caller 应退 loop；`AenReady` caller 应 drain AER；
-/// `Pdu(pdu)` caller 应 dispatch（V8e-6 后 admin/IO handler）。
+/// caller 行动：
+/// - `Shutdown` / `PeerClosed` / `KatoExpired` 都应退 loop
+/// - `AenReady` 应 drain AER + 调 fire_aen_for_conn wire emit
+/// - `Pdu(pdu)` 应 dispatch（V8e-6 后 admin/IO handler）+ 调 reset_kato_deadline
 #[derive(Debug)]
 pub enum PumpEvent {
     /// shutdown signal 触发，session 应退 loop。
     Shutdown,
     /// peer close stream（EOF），session 应退 loop。
     PeerClosed,
+    /// **V8e-5** — KATO 超时（spec § 7.13），session 应关 conn。
+    KatoExpired,
     /// AER wakeup 触发，session 应 drain；`pending` 是本 conn pending AER 数。
     AenReady {
         /// 本 conn 在 controller 端的 pending AER 计数（spurious wakeup 时 = 0）。
