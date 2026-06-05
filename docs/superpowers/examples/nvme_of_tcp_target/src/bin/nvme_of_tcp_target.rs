@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! **Phase V5d / V8b / V8f / V8e-2** — NVMe-over-Fabrics TCP target 长跑入口。
+//! **Phase V5d / V8b / V8f / V8e-2 / V8e-7-4** — NVMe-over-Fabrics TCP target 长跑入口。
 //!
 //! 监听 4420（NVMe-oF TCP 常用端口），accept 一条 TCP 连接 → 在 thread
 //! pool（最多 `--max-connections`）spawn 一个工作线程跑
@@ -18,9 +18,16 @@
 //!
 //! **V8e-2** — bin 主入口改 `#[tokio::main(multi_thread)]`；ctrlc + AtomicBool
 //! → `tokio::signal::ctrl_c` + `tokio::sync::watch::Sender<bool>` 作 shutdown
-//! 信号；`std::net::TcpListener` → `tokio::net::TcpListener`；每条 conn
-//! `tokio::task::spawn_blocking` 包当前 sync `handle_conn`（V8e-3 后改 async）。
+//! 信号；`std::net::TcpListener` → `tokio::net::TcpListener`。
+//!
+//! **V8e-7-4** — 每条 conn 改 `tokio::spawn(handle_conn_async)` 直接走
+//! `AsyncSession::dispatch_pdu_async`（V8e-2 的 `spawn_blocking(handle_conn)`
+//! sync 桥已退役）。AsyncSession 端 select! 4 arm 接 shutdown / AER notify /
+//! KATO Sleep / read_pdu_async；KATO timer 在 Connect 后真 arm（spec § 7.13）。
 //! V8f 双 listener 共享 watch channel，SIGINT/SIGTERM 同时停。
+//!
+//! sync `handle_conn`（V8b legacy 路径）保留作 V8b/c/d/f 集成测试 + V-followup
+//! 参考，bin 主路径已不再调用（`#[allow(dead_code)]`）。
 //!
 //! # 安全 (V5d-fix security review)
 //!
@@ -52,6 +59,9 @@ use std::time::Duration;
 /// **V5d-fix C-1** — 默认最大并发 conn 数。超出立即 drop。
 const DEFAULT_MAX_CONNECTIONS: usize = 16;
 /// **V5d-fix L-6** — handshake 阶段 socket read/write timeout。
+/// **V8e-7-4**：bin 切到 AsyncSession 后不再用（KATO timer 接管 idle 防护）；
+/// 保留作 sync `handle_conn` legacy 路径以及 V-followup 参考。
+#[allow(dead_code)]
 const HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 /// **V5d-fix H-3** — accept Err 退避上限。
 const ACCEPT_BACKOFF_MAX_MS: u64 = 1000;
@@ -478,36 +488,18 @@ async fn run_accept_loop(
             continue;
         }
 
-        // **V5d-fix L-6 / V8e-2** — handshake 阶段强 read/write timeout 防 slowloris。
-        // 转 sync `std::net::TcpStream` 给现有 sync handle_conn 用；V8e-3 后改
-        // 直接传 `tokio::net::TcpStream` 给 async session pump。
-        let std_stream = match stream.into_std() {
-            Ok(s) => s,
-            Err(e) => {
-                inflight.fetch_sub(1, Ordering::SeqCst);
-                tracing::warn!(label, %peer, error = %e, "tokio→std stream 转换失败");
-                continue;
-            }
-        };
-        let _ = std_stream.set_read_timeout(Some(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS)));
-        let _ = std_stream.set_write_timeout(Some(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS)));
-        // **V8e-2 reviewer M-4** — `set_nonblocking(false)` 失败会让现有 sync
-        // `read_exact` busy-loop `WouldBlock`；必须 reject 这条 conn 不进 handle。
-        // timeout 失败保持 V5d-fix L-6 silent 路径（无致命，仅放宽 slowloris 防御）。
-        if let Err(e) = std_stream.set_nonblocking(false) {
-            inflight.fetch_sub(1, Ordering::SeqCst);
-            tracing::warn!(label, %peer, error = %e, "set_nonblocking(false) 失败；reject conn");
-            continue;
-        }
+        // **V8e-7-4** — bin 切到全 async：直接传 `tokio::net::TcpStream` 给
+        // AsyncSession path，删 spawn_blocking 桥与 std_stream 转换。
+        // KATO timer 在 dispatch_pdu_async 入口接管（Connect 后真 arm）；不再
+        // 依赖 sync OS-level set_read_timeout 防 slowloris（handshake 期间靠
+        // `ic_handshake_async` 自然短路 + V8e-5 KATO 真护盘）。
         tracing::info!(label, %peer, "accepted connection");
 
         let inflight = Arc::clone(&inflight);
         let shared_ctrl = Arc::clone(&shared);
-        // **V8e-2** — `spawn_blocking` 让现有 sync `handle_conn` 跑在 blocking
-        // 线程池，不阻塞 tokio runtime 的 worker thread。V8e-3 改 async session
-        // 后此调用变为 `tokio::spawn(handle_conn_async(...))`。
-        tokio::task::spawn_blocking(move || {
-            let r = handle_conn(std_stream, shared_ctrl);
+        let shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let r = handle_conn_async(stream, shared_ctrl, shutdown_rx).await;
             inflight.fetch_sub(1, Ordering::SeqCst);
             match r {
                 Ok(()) => tracing::info!(label, %peer, "connection closed normally"),
@@ -527,17 +519,52 @@ async fn run_accept_loop(
     Ok(())
 }
 
-/// **V8b** — 每条 TCP 连接的工作流（多 conn 共享 controller）：
-/// 1. 走 `V2Session::accept_and_handshake_shared` 把已 wrap 的 controller
-///    Arc clone 给 session
-/// 2. `pump_one_with_events` loop 直至 peer close 或 Err
+/// **V8e-7-4** — async 版 conn 主循环（取代 V8b/V8e-2 的 sync `handle_conn`
+/// + spawn_blocking 桥）。
 ///
-/// V5d R-8 per-backing Mutex 已拆；多 conn 通过 `Arc<Mutex<NvmeController>>`
-/// 共享同一 controller 实例（短锁 dispatch + R-1 死锁规避在 session 端）。
+/// 流程：
+/// 1. `accept_and_handshake_async` ICReq/ICResp + 分 conn_id / token slab
+/// 2. loop `pump_one_async`（select! 监听 shutdown / AER notify / KATO / read_pdu）
+///    - `Pdu(p)` → `dispatch_pdu_async(p)`；DispatchOutcome.disconnected → break
+///    - `AenReady` → `drain_aers_async`
+///    - `KatoExpired / PeerClosed / Shutdown` → break
+/// 3. session drop → V8c/V8d AER cleanup + IO queue sweep
+async fn handle_conn_async(
+    stream: tokio::net::TcpStream,
+    shared_ctrl: nvme_of_tcp_target::SharedController,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let mut sess = nvme_of_tcp_target::accept_and_handshake_async(stream, shared_ctrl)
+        .await
+        .context("V8e-7-4 AsyncSession handshake")?;
+    loop {
+        let event = sess.pump_one_async(&mut shutdown_rx).await?;
+        match event {
+            nvme_of_tcp_target::PumpEvent::Pdu(pdu) => {
+                let outcome = sess.dispatch_pdu_async(pdu).await?;
+                if outcome.disconnected {
+                    break;
+                }
+            }
+            nvme_of_tcp_target::PumpEvent::AenReady { .. } => {
+                sess.drain_aers_async().await?;
+            }
+            nvme_of_tcp_target::PumpEvent::KatoExpired
+            | nvme_of_tcp_target::PumpEvent::PeerClosed
+            | nvme_of_tcp_target::PumpEvent::Shutdown => break,
+        }
+    }
+    Ok(())
+}
+
+/// **V8b（legacy）** — sync 版 conn 主循环；V8b/c/d/f sync 集成测试仍用
+/// `V2Session::accept_and_handshake_shared`，不通过本函数。本函数 V8e-7-4
+/// 后 bin 端不再调用，保留以避免破坏 `bin_smoke.rs` 间接依赖；标
+/// `#[allow(dead_code)]` 防 unused warning。
+#[allow(dead_code)]
 fn handle_conn(stream: TcpStream, shared_ctrl: nvme_of_tcp_target::SharedController) -> Result<()> {
     let mut sess = V2Session::accept_and_handshake_shared(stream, shared_ctrl)
         .context("V2Session handshake (V8b shared)")?;
-    // **V6b** — pump_one_with_events 每 100ms drain pending AEN + try read_pdu
     while sess.pump_one_with_events(std::time::Duration::from_millis(100))? {}
     Ok(())
 }

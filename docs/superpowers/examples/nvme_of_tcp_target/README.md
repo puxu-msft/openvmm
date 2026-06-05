@@ -217,8 +217,22 @@ notify / KATO deadline / read PDU 四 arm）；sync `V2Session` 双轨保留兼�
   `reset_kato_deadline()`；超时 → `PumpEvent::KatoExpired` (spec § 7.13)
 - **V8e-6 [e2e]**：4-conn 并发握手 / AER storm 不饥饿 / KATO 续命与 expire
   混合 / shutdown 全 drain
+- **V8e-7-1 [dispatch_plan 决策表]**：抽 sans-IO `decide_capsule_kind /
+  decide_admin_aer_path / decide_admin_discovery_whitelist /
+  decide_admin_blocked_opc / decide_io_nlb_check / prp2_sentinel_for_nlb`
+  纯函数，sync/async dispatch 共用决策核（防漂移）
+- **V8e-7-2 [fabric handlers async]**：`dispatch_pdu_async` 入口 +
+  `handle_connect_async / property_get_async / property_set_async /
+  disconnect_async`；KATO reset 在 dispatch 入口统一调；Drop 扩展 IO queue
+  sweep
+- **V8e-7-3 [admin/IO async + AER drain]**：`handle_admin_cmd_async /
+  handle_io_cmd_async / run_post_dispatch_async`（R2T 三段式 lock-pop /
+  unlock-await wire / lock-complete）；`drain_aers_async / inject_aen_async`
+- **V8e-7-4 [bin 切纯 async]**：每条 conn `tokio::spawn(handle_conn_async)`
+  直接走 AsyncSession 全 async path；V8e-2 `spawn_blocking(handle_conn)` 桥
+  退役（sync `handle_conn` 保留作 V8b/c/d/f 集成测试 + V-followup 参考）
 
-### Linux nvme-cli 真使用 (V8e 后)
+### Linux nvme-cli 真使用 (V8e-7 后)
 
 ```bash
 # 启 bin（kernel ≥ 5.0 nvme-tcp 模块；--keep-alive-tmo 单位 s）
@@ -235,9 +249,10 @@ sudo fio --name=v8e --rw=randread --bs=4k --iodepth=1 --numjobs=4 \
     --runtime=10 --filename=/dev/nvme0n1
 ```
 
-V8e 后并发 IO 真在 controller 端走 `parking_lot::Mutex` 短锁串行化（设计
-plan §3 Q1 决策；async-aware lock 留 V-followup），但 wire 层 4 conn 真并发
-握手 + AER + KATO timer 全 tokio 调度。
+V8e-7-4 后 bin 端 4 conn 真并发 IO 全走 `tokio::spawn` async path（无
+spawn_blocking thread pool 阻塞）；controller 端仍 `parking_lot::Mutex` 短锁
+串行化（plan §3 Q1 决策；async-aware lock 留 V-followup），但 wire 层 4 conn
+真并发握手 + AER + KATO timer 全 tokio 调度。
 
 ## 内部参考
 
@@ -246,6 +261,7 @@ plan §3 Q1 决策；async-aware lock 留 V-followup），但 wire 层 4 conn �
   + [V5 详细计划](../../plans/2026-06-05-phase-v5-detailed.md)
   + [V8 详细计划](../../plans/2026-06-06-phase-v8-detailed.md)
   + [V8e tokio refactor 详细计划](../../plans/2026-06-06-phase-v8e-tokio-detailed.md)
+  + [V8e-7 dispatch 详细计划](../../plans/2026-06-06-phase-v8e-7-dispatch-detailed.md)
 - wire spec：[`../../specs/2026-06-04-nvme-tcp-wire-reference.md`](../../specs/2026-06-04-nvme-tcp-wire-reference.md)
 - backend controller：[`../pcie_remote_nvme_userspace/README.md`](../pcie_remote_nvme_userspace/README.md)
 
