@@ -723,6 +723,15 @@ impl NvmeController {
                     0x0f => super::logs::build_endurance_group_event(self, bytes),
                     0x80 => super::logs::build_reservation_notification(self, bytes),
                     0x81 => super::logs::build_sanitize_status(self, bytes),
+                    // **Phase V7** — Discovery Log Page (spec § 5.16.1.20 / § 5.1.4)。
+                    // session 启动 `--discovery-mode` 时通过 nvme_set_discovery_target
+                    // 注入 portals；非 discovery mode 时 portals 空 → 返 header-only
+                    // empty log (NUMREC=0)。host 也可正常解析。
+                    0x70 => super::discovery_log::build_discovery_log(
+                        self.discovery_gen_ctr,
+                        &self.discovery_portals,
+                        bytes,
+                    ),
                     _ => {
                         tracing::debug!(
                             lid = format_args!("{:#x}", lid),

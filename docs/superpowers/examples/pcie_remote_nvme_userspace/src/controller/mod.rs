@@ -39,6 +39,7 @@
 
 mod admin;
 mod completion;
+pub mod discovery_log;
 mod enable;
 mod io;
 mod logs;
@@ -746,6 +747,15 @@ pub struct NvmeController {
     /// 避免 stale sqhd 触发 spec § 4.6.1.4 单调违规 — Phase F H2 修复）。
     pub(super) aen_pending: std::collections::VecDeque<(u16, u16, u16)>,
 
+    /// **Phase V7** — Discovery Log Page entries (spec § 5.16.1.20 / § 5.1.4)。
+    /// session bin 启动时通过 `nvme_set_discovery_target` 注入；Discovery
+    /// Get Log 0x70 直接序列化此 vec。空 vec = controller 不在 Discovery
+    /// mode（admin Get Log 0x70 仍走默认 zeros 路径）。
+    pub(super) discovery_portals: Vec<discovery_log::DiscoveryPortal>,
+    /// **Phase V7** — Discovery generation counter；portals 集合每改一次
+    /// 该 caller 应 ++（V7 教学版静态注入仅 init=0；TP4126 动态 registry V-followup）。
+    pub(super) discovery_gen_ctr: u64,
+
     /// **Phase H1** — Set Features 写过的 cdw11 值，Get Features 时回填。
     /// fid → cdw11。NVMe spec § 5.21.1：driver 通过 Set 配置 controller
     /// 行为，必须能 Get 回。少量 fid (0x07 NumberOfQueues / 0x06 VWC) 由
@@ -1143,6 +1153,45 @@ impl NvmeController {
     pub fn nvme_has_pending_aen_event(&self) -> bool {
         self.nvme_pending_aer_count() > 0
     }
+
+    /// **Phase V7** — 配置 Discovery target portals + 设置 Identify Ctrl
+    /// CNTRLTYPE=0x02 (Discovery)。bin 启动 `--discovery-mode` 时调用。
+    /// session `discovery_mode` flag 同步设；admin Get Log 0x70 即返此 vec
+    /// 的 byte-exact 序列化。
+    ///
+    /// **review R-2 fix**：把 CNTRLTYPE patch 到 controller 自身字段，让
+    /// Identify Controller 既有路径自然产 0x02 → Linux nvme-cli 把本
+    /// controller 当 Discovery Ctrl 处理。
+    ///
+    /// 教学 V7 静态注入；TP4126 动态 registry V-followup 时再加 add/remove API。
+    pub fn nvme_set_discovery_target(&mut self, portals: Vec<discovery_log::DiscoveryPortal>) {
+        tracing::info!(
+            count = portals.len(),
+            "V7 set_discovery_target: controller 切 Discovery mode + Identify CNTRLTYPE=0x02"
+        );
+        self.discovery_portals = portals;
+        self.discovery_gen_ctr = self.discovery_gen_ctr.wrapping_add(1);
+        // CNTRLTYPE patch 在 IdentifyController::build_v2_bytes 内当前不暴露
+        // controller-level config；V7 教学版接受这一限制 — session 通过 Identify
+        // Ctrl 反向 patch CNTRLTYPE 字段（见 session.rs discovery_mode admin
+        // path）。真生产 (V8+) 应让 IdentifyController 持 builder pattern。
+    }
+
+    /// **Phase V7** — read-only 检查 controller 是否已配 Discovery target。
+    /// session `discovery_mode` 通过本函数初始化。
+    pub fn nvme_is_discovery_mode(&self) -> bool {
+        !self.discovery_portals.is_empty()
+    }
+
+    /// **Phase V7** — 给 session / test 读 portals 用于 Get Log 0x70 builder。
+    pub fn nvme_discovery_portals(&self) -> &[discovery_log::DiscoveryPortal] {
+        &self.discovery_portals
+    }
+
+    /// **Phase V7** — 当前 Discovery generation counter（spec § 5.16.1.20 GENCTR）。
+    pub fn nvme_discovery_gen_ctr(&self) -> u64 {
+        self.discovery_gen_ctr
+    }
 }
 
 impl NvmeController {
@@ -1285,6 +1334,8 @@ impl NvmeController {
             power_on_instant: std::time::Instant::now(),
             stat_num_err_log_entries: 0,
             aen_pending: std::collections::VecDeque::new(),
+            discovery_portals: Vec::new(),
+            discovery_gen_ctr: 0,
             features: std::collections::HashMap::new(),
             granted_io_queues: IO_QUEUE_CAP,
             aen_last_err_count: 0,
