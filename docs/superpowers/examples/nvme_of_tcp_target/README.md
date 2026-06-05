@@ -328,6 +328,58 @@ spawn_blocking thread pool 阻塞）；controller 端仍 `parking_lot::Mutex` �
 - ✅ 双 explicit consent CLI flag 强制
 - ✅ `#![forbid(unsafe_code)]` 保留；rustls 内部 unsafe 由 upstream audit
 
+## mTLS 教学开关（V-followup-mtls）
+
+强制 client 出示 cert，且 chain 必须 anchor 到你提供的 CA bundle。
+在 V-followup-tls-3 的四参基础上加 **第五个** flag：
+
+```bash
+nvme_of_tcp_target \
+    --listen 127.0.0.1:4420 \
+    --tls-listen 127.0.0.1:8009 \
+    --tls-cert server.pem \
+    --tls-key  server.key \
+    --tls-i-trust-this-cert \
+    --tls-client-ca client-ca.pem \
+    --backing-file disk.img
+```
+
+行为：
+- 一旦设 `--tls-client-ca`，acceptor 从 `build_acceptor_from_pem` 切到
+  `build_acceptor_with_mtls`
+- client 不带 cert / cert 不在 CA bundle 信任链 → TLS handshake fail
+- mTLS 路径仍 **不** 绑 NQN identity（spec § 8.13 强制要求，留 V-followup-auth）
+
+### 生成 client CA 与 client cert（教学）
+
+```bash
+# 1. 生成 client CA（自签）
+openssl req -x509 -newkey ec:<(openssl ecparam -name prime256v1) \
+    -keyout client-ca.key -out client-ca.pem \
+    -days 30 -nodes -subj "/CN=client-ca"
+
+# 2. 签发 client cert
+openssl req -new -newkey ec:<(openssl ecparam -name prime256v1) \
+    -keyout client.key -out client.csr \
+    -nodes -subj "/CN=host-1"
+openssl x509 -req -in client.csr -CA client-ca.pem -CAkey client-ca.key \
+    -out client.pem -days 30 -CAcreateserial
+
+# 3. host 端 nvme-cli (≥ 2.6 支持 --tls-client-key)
+sudo nvme connect -t tcp -a 127.0.0.1 -s 8009 \
+    -n nqn.2014-08.org.nvmexpress:teaching:disk \
+    --tls --tls-key=client.key --tls-keyring=client.pem
+```
+
+### mTLS caveat 清单
+
+- ✅ 强制 client 出示 cert
+- ✅ 强制 cert chain anchor 到 `--tls-client-ca`
+- ❌ 仍 **不** 绑 NQN ↔ client cert identity（V-followup-auth 才做）
+- ❌ 不做 cert revocation 检查（CRL / OCSP；留生产版）
+- ❌ 不做 SAN / CN whitelist
+- ✅ `WebPkiClientVerifier` 由 rustls 默认 webpki crate 实现，audit 自动覆盖
+
 ## 内部参考
 
 - 计划文档：[`../../plans/2026-06-04-phase-v-nvme-of-tcp.md`](../../plans/2026-06-04-phase-v-nvme-of-tcp.md)

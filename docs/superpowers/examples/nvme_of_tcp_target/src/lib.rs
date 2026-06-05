@@ -40,6 +40,8 @@
 //!   + `TLS_HANDSHAKE_TIMEOUT_SECS=30` 防 slowloris + 不 fallback plaintext 防 downgrade）
 //! - **V-followup-tls-4** ✅ 应用层 byte-identical gate（plaintext vs TLS 解密后等价）
 //!   + README "TLS 教学开关" 章节
+//! - **V-followup-mtls** ✅ `build_acceptor_with_mtls` + `--tls-client-ca`
+//!   CLI；`WebPkiClientVerifier` 强制 client cert chain 锚到 trust roots
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -93,7 +95,7 @@ pub use session::PRP1_SENTINEL;
 pub use session::V2Session;
 pub use session::V5_NLB_MAX;
 pub use session::ic_handshake;
-pub use tls::build_acceptor_from_pem;
+pub use tls::{build_acceptor_from_pem, build_acceptor_with_mtls};
 
 /// **Phase V8b** — 多 conn 共享 controller 的 wrapper（reviewer C-1 / M-1）。
 ///

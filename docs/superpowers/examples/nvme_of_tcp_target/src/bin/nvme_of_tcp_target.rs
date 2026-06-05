@@ -144,6 +144,13 @@ struct Cli {
     /// 与 `--tls-listen` 同设强制。
     #[arg(long, default_value_t = false)]
     tls_i_trust_this_cert: bool,
+    /// **V-followup-mtls** 启用 mTLS：强制 client 出示 cert，且 chain 必须
+    /// anchor 到本 PEM bundle 的 trust roots。一旦设置，TLS listener 即
+    /// 改走 [`nvme_of_tcp_target::build_acceptor_with_mtls`]；client
+    /// 不带 cert / cert 不可信 → handshake 失败被 drop。
+    /// 仅当 `--tls-listen` 启用时生效。
+    #[arg(long)]
+    tls_client_ca: Option<PathBuf>,
 }
 
 fn parse_hex_u16(s: &str) -> Result<u16, String> {
@@ -436,25 +443,42 @@ async fn main() -> Result<()> {
             )
         }
         None => {
-            if cli.tls_cert.is_some() || cli.tls_key.is_some() || cli.tls_i_trust_this_cert {
+            if cli.tls_cert.is_some()
+                || cli.tls_key.is_some()
+                || cli.tls_i_trust_this_cert
+                || cli.tls_client_ca.is_some()
+            {
                 anyhow::bail!(
-                    "--tls-cert / --tls-key / --tls-i-trust-this-cert 仅在 --tls-listen 启用时生效"
+                    "--tls-cert / --tls-key / --tls-i-trust-this-cert / --tls-client-ca 仅在 --tls-listen 启用时生效"
                 );
             }
             None
         }
     };
 
-    // **V-followup-tls-3** — TlsAcceptor build；PEM 错快速 abort
+    // **V-followup-tls-3 / V-followup-mtls** — TlsAcceptor build；PEM 错快速 abort
     let tls_acceptor: Option<tokio_rustls::TlsAcceptor> = if parsed_tls_listen.is_some() {
         let cert_path = cli.tls_cert.as_ref().expect("CLI 校验保证非 None");
         let key_path = cli.tls_key.as_ref().expect("CLI 校验保证非 None");
-        let acc = nvme_of_tcp_target::build_acceptor_from_pem(cert_path, key_path)
-            .context("V-followup-tls-3: TlsAcceptor build")?;
-        tracing::warn!(
-            cert = %cert_path.display(),
-            "⚠️  TLS listener enabled WITHOUT cert chain validation / NQN identity binding"
-        );
+        let acc = match cli.tls_client_ca.as_ref() {
+            Some(ca_path) => {
+                tracing::warn!(
+                    cert = %cert_path.display(),
+                    client_ca = %ca_path.display(),
+                    "🔒 V-followup-mtls 启用：强制 client cert，chain 必须 anchor 到 --tls-client-ca"
+                );
+                nvme_of_tcp_target::build_acceptor_with_mtls(cert_path, key_path, ca_path)
+                    .context("V-followup-mtls: TlsAcceptor build (with client CA)")?
+            }
+            None => {
+                tracing::warn!(
+                    cert = %cert_path.display(),
+                    "⚠️  TLS listener enabled WITHOUT cert chain validation / NQN identity binding (server-auth only)"
+                );
+                nvme_of_tcp_target::build_acceptor_from_pem(cert_path, key_path)
+                    .context("V-followup-tls-3: TlsAcceptor build")?
+            }
+        };
         Some(acc)
     } else {
         None
