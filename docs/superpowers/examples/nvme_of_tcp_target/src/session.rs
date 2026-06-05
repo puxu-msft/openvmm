@@ -2109,15 +2109,18 @@ mod tests {
     /// **V5-P9 fix**：调用者必须把 backing guard 绑到一个 `_` 前缀的本地
     /// 变量让 NamedTempFile 与 test 生命周期对齐（drop 时 unlink 干净）；
     /// 之前的 `std::mem::forget(_backing)` 会永久泄漏 /tmp 文件。
-    fn v5a_full_setup_qid1(
+    /// **V5-P5 refactor (review L-1)** — 共享的 qid=1 setup 流程，
+    /// 接受外部已构造的 controller（让测试用 pre-fill pattern / 自带 backing
+    /// path 等定制 NS）。spawn server thread + 走 ICReq → Connect admin
+    /// → Create IO CQ → Create IO SQ → Connect qid=1（4 cmds + setup_pumps
+    /// 中预留的 N 条 test cmd = sess_pumps 总数）。
+    ///
+    /// 返 (client TcpStream, server thread handle)。
+    fn setup_qid1_with_controller(
+        controller: NvmeController,
         sess_pumps: usize,
-    ) -> (
-        TcpStream,
-        std::thread::JoinHandle<anyhow::Result<()>>,
-        tempfile::NamedTempFile,
-    ) {
+    ) -> (TcpStream, std::thread::JoinHandle<anyhow::Result<()>>) {
         let (mut client, server) = tcp_pair();
-        let (controller, backing) = make_test_controller();
         let h = thread::spawn(move || -> anyhow::Result<()> {
             let mut sess = V2Session::accept_and_handshake(server, controller)?;
             for _ in 0..sess_pumps {
@@ -2141,6 +2144,18 @@ mod tests {
         // Connect qid=1
         send_connect_io(&mut client, 1);
         let _ = read_pdu(&mut client).unwrap();
+        (client, h)
+    }
+
+    fn v5a_full_setup_qid1(
+        sess_pumps: usize,
+    ) -> (
+        TcpStream,
+        std::thread::JoinHandle<anyhow::Result<()>>,
+        tempfile::NamedTempFile,
+    ) {
+        let (controller, backing) = make_test_controller();
+        let (client, h) = setup_qid1_with_controller(controller, sess_pumps);
         (client, h, backing)
     }
 
@@ -2309,29 +2324,8 @@ mod tests {
     /// 内容应 = backing file LBA 0 内容（0xAB pattern）。
     #[test]
     fn v5b_io_read_nlb1_emits_c2hdata_and_resp() {
-        let (mut client, server) = tcp_pair();
         let (controller, _backing) = make_test_controller_with_pattern(0xAB);
-        let h = thread::spawn(move || -> anyhow::Result<()> {
-            let mut sess = V2Session::accept_and_handshake(server, controller)?;
-            // setup 5 cmds: Connect admin + Create IO CQ + Create IO SQ +
-            // Connect qid=1 + 1 IO Read
-            for _ in 0..5 {
-                sess.pump_one()?;
-            }
-            Ok(())
-        });
-        send_icreq(&mut client);
-        let _ = read_pdu(&mut client).unwrap();
-        send_connect_admin(&mut client);
-        let _ = read_pdu(&mut client).unwrap();
-        let cdw10_cq = 1u32 | (15u32 << 16);
-        send_admin_sqe_cdw11(&mut client, 0x05, 0x0501, 0, cdw10_cq, 0x0000_0001);
-        let _ = read_pdu(&mut client).unwrap();
-        let cdw10_sq = 1u32 | (15u32 << 16);
-        send_admin_sqe_cdw11(&mut client, 0x01, 0x0502, 0, cdw10_sq, 0x0001_0001);
-        let _ = read_pdu(&mut client).unwrap();
-        send_connect_io(&mut client, 1);
-        let _ = read_pdu(&mut client).unwrap();
+        let (mut client, h) = setup_qid1_with_controller(controller, 5);
 
         // IO Read nsid=1 SLBA=0 nlb=1
         send_io_read(&mut client, 0x0700, 1, 0, 1);
@@ -2373,27 +2367,8 @@ mod tests {
     /// 内应 success，C2HData 含 4 KiB pattern。
     #[test]
     fn v5e_io_read_nlb8_4kib_single_prp_succeeds() {
-        let (mut client, server) = tcp_pair();
         let (controller, _backing) = make_test_controller_with_pattern(0xA8);
-        let h = thread::spawn(move || -> anyhow::Result<()> {
-            let mut sess = V2Session::accept_and_handshake(server, controller)?;
-            for _ in 0..5 {
-                sess.pump_one()?;
-            }
-            Ok(())
-        });
-        send_icreq(&mut client);
-        let _ = read_pdu(&mut client).unwrap();
-        send_connect_admin(&mut client);
-        let _ = read_pdu(&mut client).unwrap();
-        let cdw10_cq = 1u32 | (15u32 << 16);
-        send_admin_sqe_cdw11(&mut client, 0x05, 0x0501, 0, cdw10_cq, 0x0000_0001);
-        let _ = read_pdu(&mut client).unwrap();
-        let cdw10_sq = 1u32 | (15u32 << 16);
-        send_admin_sqe_cdw11(&mut client, 0x01, 0x0502, 0, cdw10_sq, 0x0001_0001);
-        let _ = read_pdu(&mut client).unwrap();
-        send_connect_io(&mut client, 1);
-        let _ = read_pdu(&mut client).unwrap();
+        let (mut client, h) = setup_qid1_with_controller(controller, 5);
 
         // IO Read nsid=1 SLBA=0 nlb=8 → 4 KiB
         send_io_read(&mut client, 0x0A88, 1, 0, 8);
@@ -2416,7 +2391,6 @@ mod tests {
     /// **V5e-1** — IO Write nlb=8 持久化校验：写 4 KiB 0xC8 → reopen 验内容。
     #[test]
     fn v5e_io_write_nlb8_4kib_round_trip() {
-        let (mut client, server) = tcp_pair();
         let f = tempfile::NamedTempFile::new().expect("tempfile");
         f.as_file().set_len(1024 * 1024).expect("set_len");
         let backing_path = f.path().to_str().expect("utf8").to_string();
@@ -2424,25 +2398,7 @@ mod tests {
         let _backing = f;
         let controller =
             NvmeController::open(&[backing_path], 0x1414, 0, &[]).expect("open controller");
-        let h = thread::spawn(move || -> anyhow::Result<()> {
-            let mut sess = V2Session::accept_and_handshake(server, controller)?;
-            for _ in 0..5 {
-                sess.pump_one()?;
-            }
-            Ok(())
-        });
-        send_icreq(&mut client);
-        let _ = read_pdu(&mut client).unwrap();
-        send_connect_admin(&mut client);
-        let _ = read_pdu(&mut client).unwrap();
-        let cdw10_cq = 1u32 | (15u32 << 16);
-        send_admin_sqe_cdw11(&mut client, 0x05, 0x0501, 0, cdw10_cq, 0x0000_0001);
-        let _ = read_pdu(&mut client).unwrap();
-        let cdw10_sq = 1u32 | (15u32 << 16);
-        send_admin_sqe_cdw11(&mut client, 0x01, 0x0502, 0, cdw10_sq, 0x0001_0001);
-        let _ = read_pdu(&mut client).unwrap();
-        send_connect_io(&mut client, 1);
-        let _ = read_pdu(&mut client).unwrap();
+        let (mut client, h) = setup_qid1_with_controller(controller, 5);
 
         send_io_write(&mut client, 0x0B88, 1, 0, 8);
         let p = read_pdu(&mut client).unwrap();
@@ -2474,27 +2430,8 @@ mod tests {
     /// dma_write → session drain captured.writes concat 成 8 KiB C2HData。
     #[test]
     fn v5e_io_read_nlb16_8kib_dual_prp_succeeds() {
-        let (mut client, server) = tcp_pair();
         let (controller, _backing) = make_test_controller_with_pattern(0xB8);
-        let h = thread::spawn(move || -> anyhow::Result<()> {
-            let mut sess = V2Session::accept_and_handshake(server, controller)?;
-            for _ in 0..5 {
-                sess.pump_one()?;
-            }
-            Ok(())
-        });
-        send_icreq(&mut client);
-        let _ = read_pdu(&mut client).unwrap();
-        send_connect_admin(&mut client);
-        let _ = read_pdu(&mut client).unwrap();
-        let cdw10_cq = 1u32 | (15u32 << 16);
-        send_admin_sqe_cdw11(&mut client, 0x05, 0x0501, 0, cdw10_cq, 0x0000_0001);
-        let _ = read_pdu(&mut client).unwrap();
-        let cdw10_sq = 1u32 | (15u32 << 16);
-        send_admin_sqe_cdw11(&mut client, 0x01, 0x0502, 0, cdw10_sq, 0x0001_0001);
-        let _ = read_pdu(&mut client).unwrap();
-        send_connect_io(&mut client, 1);
-        let _ = read_pdu(&mut client).unwrap();
+        let (mut client, h) = setup_qid1_with_controller(controller, 5);
 
         // 但 backing 只 pre-fill 前 4 KiB；剩 4 KiB 是 0。需要预先扩 pre-fill
         // 不容易（make_test_controller_with_pattern 只填 4 KiB）。
@@ -2528,7 +2465,6 @@ mod tests {
     /// 验 backing 前 8 KiB 内容 + 期望 2 个 R2T (offset 0/4096, length 4096)。
     #[test]
     fn v5e_io_write_nlb16_8kib_dual_prp_round_trip() {
-        let (mut client, server) = tcp_pair();
         let f = tempfile::NamedTempFile::new().expect("tempfile");
         f.as_file().set_len(1024 * 1024).expect("set_len");
         let backing_path = f.path().to_str().expect("utf8").to_string();
@@ -2536,25 +2472,7 @@ mod tests {
         let _backing = f;
         let controller =
             NvmeController::open(&[backing_path], 0x1414, 0, &[]).expect("open controller");
-        let h = thread::spawn(move || -> anyhow::Result<()> {
-            let mut sess = V2Session::accept_and_handshake(server, controller)?;
-            for _ in 0..5 {
-                sess.pump_one()?;
-            }
-            Ok(())
-        });
-        send_icreq(&mut client);
-        let _ = read_pdu(&mut client).unwrap();
-        send_connect_admin(&mut client);
-        let _ = read_pdu(&mut client).unwrap();
-        let cdw10_cq = 1u32 | (15u32 << 16);
-        send_admin_sqe_cdw11(&mut client, 0x05, 0x0501, 0, cdw10_cq, 0x0000_0001);
-        let _ = read_pdu(&mut client).unwrap();
-        let cdw10_sq = 1u32 | (15u32 << 16);
-        send_admin_sqe_cdw11(&mut client, 0x01, 0x0502, 0, cdw10_sq, 0x0001_0001);
-        let _ = read_pdu(&mut client).unwrap();
-        send_connect_io(&mut client, 1);
-        let _ = read_pdu(&mut client).unwrap();
+        let (mut client, h) = setup_qid1_with_controller(controller, 5);
 
         send_io_write(&mut client, 0x0F16, 1, 0, 16);
 
@@ -2612,27 +2530,8 @@ mod tests {
     /// PSDT bits 让 controller 走 PRP path；host 视角与 PSDT=00 无差。
     #[test]
     fn v5b_io_read_psdt01_transparent_to_host() {
-        let (mut client, server) = tcp_pair();
         let (controller, _backing) = make_test_controller_with_pattern(0xCD);
-        let h = thread::spawn(move || -> anyhow::Result<()> {
-            let mut sess = V2Session::accept_and_handshake(server, controller)?;
-            for _ in 0..5 {
-                sess.pump_one()?;
-            }
-            Ok(())
-        });
-        send_icreq(&mut client);
-        let _ = read_pdu(&mut client).unwrap();
-        send_connect_admin(&mut client);
-        let _ = read_pdu(&mut client).unwrap();
-        let cdw10_cq = 1u32 | (15u32 << 16);
-        send_admin_sqe_cdw11(&mut client, 0x05, 0x0501, 0, cdw10_cq, 0x0000_0001);
-        let _ = read_pdu(&mut client).unwrap();
-        let cdw10_sq = 1u32 | (15u32 << 16);
-        send_admin_sqe_cdw11(&mut client, 0x01, 0x0502, 0, cdw10_sq, 0x0001_0001);
-        let _ = read_pdu(&mut client).unwrap();
-        send_connect_io(&mut client, 1);
-        let _ = read_pdu(&mut client).unwrap();
+        let (mut client, h) = setup_qid1_with_controller(controller, 5);
 
         // IO Read with PSDT=01 in cdw0 bits 15:14
         let mut sqe = [0u8; 64];
