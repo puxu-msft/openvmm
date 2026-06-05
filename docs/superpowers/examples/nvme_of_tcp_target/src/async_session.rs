@@ -40,6 +40,7 @@
 //! V8e-5 加。
 
 use crate::SharedController;
+use crate::fabric::{self, ConnectData, fabric_sc, fctype};
 use crate::framing::{Pdu, read_pdu_async, write_pdu_async};
 use crate::pdu::{CommonHdr, IcPsh, pdu_type};
 use anyhow::Context as _;
@@ -47,7 +48,7 @@ use std::pin::Pin;
 use std::time::Duration;
 use tokio::net::TcpStream as TokioStream;
 use tokio::time::{Instant as TokioInstant, Sleep, sleep_until};
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 /// **V8e-3** — async session：握手完成后通过 [`pump_one_async`] 接 PDU
 /// 直到 shutdown 或 peer close。
@@ -71,17 +72,22 @@ pub struct AsyncSession {
     /// 唤醒后自检 `nvme_pending_aer_count_for_conn(conn_id)` 过滤 spurious
     /// wakeup。
     pub aen_notify: std::sync::Arc<tokio::sync::Notify>,
-    /// **V8e-5** — Keep-Alive Timeout (spec § 7.13)。Connect 成功后由 admin
-    /// cmd handler 调 [`Self::set_kato`] 注入；0 = 禁用 timer（spec § 7.13
-    /// "Keep Alive disabled"）。
+    /// **V8e-5** — Keep-Alive Timeout (spec § 7.13)。Connect 成功后由
+    /// handle_connect_async 注入；0 = 禁用 timer。
     pub kato_tmo: Duration,
-    /// **V8e-5** — 下一次 KATO 超时时刻。`Some(Pin<Box<Sleep>>)` 已 arm；
-    /// `None` = KATO 禁用（kato_tmo=0）或 Connect 未完成。每次 admin/IO cmd
-    /// 入口调 [`Self::reset_kato_deadline`] 原地 `Pin::as_mut.reset` 刷新。
-    ///
-    /// 设计依据：plan §3 Q2 — Sleep 比 Interval 语义更贴 deadline；Pin<Box>
-    /// 让 reset 不破坏已有 future state。
+    /// **V8e-5** — 下一次 KATO 超时时刻。
     kato_deadline: Option<Pin<Box<Sleep>>>,
+
+    // ============ V8e-7-2 新增：完整 dispatch 所需 session 端 state ============
+    /// **V8e-7-2** — Connect 分配的 CNTLID（写死 `fabric::TEACHING_CNTLID`；
+    /// 与 sync V2Session 等价）。
+    pub cntlid: u16,
+    /// **V8e-7-2** — admin queue 是否已 Connect (qid=0)；第二次 Connect qid=0 应拒。
+    pub admin_connected: bool,
+    /// **V8e-7-2** — 当前 SQ id（V5a 单 conn 单 IO SQ 模型；0 = admin）。
+    pub current_qid: u16,
+    /// **V8e-7-2** — IO queue 镜像（Create IO CQ/SQ 后填）。
+    pub io_queues: std::collections::HashMap<u16, crate::io_queue::IoQueueState>,
 }
 
 /// **V8e-3** — async 版 ICReq/ICResp handshake。语义与 sync
@@ -164,6 +170,10 @@ pub async fn accept_and_handshake_async(
         aen_notify,
         kato_tmo: Duration::from_secs(0),
         kato_deadline: None,
+        cntlid: fabric::TEACHING_CNTLID,
+        admin_connected: false,
+        current_qid: 0,
+        io_queues: std::collections::HashMap::new(),
     })
 }
 
@@ -306,27 +316,401 @@ pub enum PumpEvent {
 
 /// **V8c (security-reviewer H-1) + V8d** — conn drop 时清理 controller 端
 /// 本 conn 残留的 pending AER（与 sync `V2Session::drop` 等价）。
-/// V8e-3 `AsyncSession` 暂不持 IO queue 镜像（V8e-6 后加 dispatch 才有此
-/// 状态），故此处仅 AER cleanup；V8e-6 后补 IO queue sweep。
+///
+/// **V8e-7-2** — Drop 扩展也 sweep 本 conn `io_queues` 镜像里的 IO SQ/CQ
+/// （与 sync V2Session V8d Drop 1:1 等价；spec § 7.6.1 ordering 先 SQ 后 CQ）。
+/// peer close 路径（不发 Disconnect）也走这里兜底。
 impl Drop for AsyncSession {
     fn drop(&mut self) {
         if self.conn_id == 0 {
             return;
         }
         let conn_id = self.conn_id;
+        let qids: Vec<u16> = self.io_queues.keys().copied().filter(|&q| q != 0).collect();
         let shared = std::sync::Arc::clone(&self.controller);
-        let aer_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            shared.controller.lock().nvme_cleanup_conn_aers(conn_id)
+        // V8d M-3：拆两 catch_unwind 防 AER cleanup panic 阻塞 IO queue sweep
+        let aer_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let shared = std::sync::Arc::clone(&shared);
+            move || shared.controller.lock().nvme_cleanup_conn_aers(conn_id)
         }));
-        match aer_result {
-            Ok(n) if n > 0 => {
-                tracing::info!(conn_id, cleaned_aer = n, "V8e-3 AsyncSession Drop");
+        let qids2 = qids.clone();
+        let sweep_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut c = shared.controller.lock();
+            for &q in &qids2 {
+                c.nvme_delete_io_sq(q);
             }
-            Ok(_) => {}
-            Err(_) => tracing::error!(
+            for &q in &qids2 {
+                c.nvme_delete_io_cq(q);
+            }
+            qids2.len()
+        }));
+        match (aer_result, sweep_result) {
+            (Ok(cleaned_aer), Ok(n_qids)) if cleaned_aer > 0 || n_qids > 0 => {
+                tracing::info!(
+                    conn_id,
+                    cleaned_aer,
+                    n_qids,
+                    "V8e-7-2 AsyncSession Drop: cleaned conn state"
+                );
+            }
+            (Ok(_), Ok(_)) => {}
+            (Err(_), _) => tracing::error!(
                 conn_id,
-                "V8e-3 AsyncSession Drop: AER cleanup panic (suppressed)"
+                "V8e-7-2 AsyncSession Drop: AER cleanup panic (suppressed)"
+            ),
+            (_, Err(_)) => tracing::error!(
+                conn_id,
+                "V8e-7-2 AsyncSession Drop: IO queue sweep panic (suppressed)"
             ),
         }
+    }
+}
+
+// ============ V8e-7-2: dispatch_pdu_async + fabric handlers ============
+
+/// **V8e-7-2 / V8e-7-3** — `dispatch_pdu_async` 单次 PDU dispatch 的结果。
+///
+/// caller (handle_conn_async) 应：
+/// - `disconnected: true` → break loop（spec § 3.5 Disconnect 真清后正常关）
+/// - `disconnected: false` → 继续下次 pump_one_async
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DispatchOutcome {
+    /// 是否本 PDU 是 Disconnect 命令（已 ACK + 已清 IO queues + caller 应 break）。
+    pub disconnected: bool,
+}
+
+impl AsyncSession {
+    /// **V8e-7-2** — async PDU dispatch 入口。
+    ///
+    /// 行为与 sync `dispatch_capsule_cmd` 1:1 等价，但走 tokio async 路径
+    /// （`write_pdu_async` / `read_pdu_async`）。当前 V8e-7-2 实现 fabric 全
+    /// 部 (Connect/PropertyGet/PropertySet/Disconnect)；admin/IO 命令的完整
+    /// dispatch 在 V8e-7-3 继续补（与 sync V2Session handle_admin_cmd /
+    /// handle_io_cmd 对齐 + sync vs async byte-identical regression gate）。
+    ///
+    /// **V8e-7-2 reviewer R-2** — KATO reset 在函数体顶**统一调一次**，避免
+    /// 漏点（spec § 7.13 任一 cmd 都算 keep-alive；AER 排除性 minor）。
+    pub async fn dispatch_pdu_async(&mut self, pdu: Pdu) -> anyhow::Result<DispatchOutcome> {
+        // **V8e-7-2 R-2** — KATO reset
+        self.reset_kato_deadline();
+
+        // **V8e-7-1 决策核** — 用 dispatch_plan 分类
+        let state = self.state_snapshot();
+        match crate::dispatch_plan::decide_capsule_kind(&pdu.psh, state) {
+            crate::dispatch_plan::CapsuleKind::PshTooShort { psh_len } => {
+                self.send_c2h_term_async(crate::pdu::term_fes::INVALID_PDU_HDR)
+                    .await?;
+                anyhow::bail!("V8e-7-2 CapsuleCmd PSH too short: {psh_len} < 64");
+            }
+            crate::dispatch_plan::CapsuleKind::Fabric { cid } => {
+                let sqe = &pdu.psh[..64];
+                let ft = match fabric::sqe_fctype(sqe) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        self.send_capsule_resp_err_async(cid, 0x02).await?;
+                        return Ok(DispatchOutcome::default());
+                    }
+                };
+                match ft {
+                    fctype::CONNECT => {
+                        self.handle_connect_async(cid, sqe, &pdu.data).await?;
+                        Ok(DispatchOutcome::default())
+                    }
+                    fctype::PROPERTY_GET => {
+                        self.handle_property_get_async(cid, sqe).await?;
+                        Ok(DispatchOutcome::default())
+                    }
+                    fctype::PROPERTY_SET => {
+                        self.handle_property_set_async(cid, sqe).await?;
+                        Ok(DispatchOutcome::default())
+                    }
+                    fctype::DISCONNECT => {
+                        self.handle_disconnect_async(cid, sqe).await?;
+                        Ok(DispatchOutcome { disconnected: true })
+                    }
+                    other => {
+                        tracing::warn!(
+                            fctype = other,
+                            "V8e-7-2 unsupported fctype; reply INVALID_FIELD"
+                        );
+                        self.send_capsule_resp_err_async(cid, 0x02).await?;
+                        Ok(DispatchOutcome::default())
+                    }
+                }
+            }
+            crate::dispatch_plan::CapsuleKind::Admin { cid } => {
+                // V8e-7-3 加完整 admin dispatch；V8e-7-2 占位用 INVALID_OPCODE
+                tracing::debug!(cid, "V8e-7-2: admin cmd dispatch TODO V8e-7-3");
+                self.send_capsule_resp_err_async(cid, 0x01).await?;
+                Ok(DispatchOutcome::default())
+            }
+            crate::dispatch_plan::CapsuleKind::Io { cid } => {
+                // V8e-7-3 加完整 IO dispatch
+                tracing::debug!(cid, "V8e-7-2: IO cmd dispatch TODO V8e-7-3");
+                self.send_capsule_resp_err_async(cid, 0x01).await?;
+                Ok(DispatchOutcome::default())
+            }
+        }
+    }
+
+    /// **V8e-7-2** — 构造 `ConnStateSnapshot` 用于 `dispatch_plan` 决策。
+    pub(crate) fn state_snapshot(&self) -> crate::dispatch_plan::ConnStateSnapshot {
+        crate::dispatch_plan::ConnStateSnapshot {
+            current_qid: self.current_qid,
+            discovery_mode: self.discovery_mode,
+            pending_aers_len: 0, // V8e-7-3 加 pending_aers 字段后真填
+        }
+    }
+
+    /// **V8e-7-2** — async 版 fabric Connect 处理（与 sync `handle_connect`
+    /// 1:1 等价）。Connect 成功 → 调 `set_kato` 注入 KATO timer。
+    async fn handle_connect_async(
+        &mut self,
+        cid: u16,
+        sqe: &[u8],
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        if data.len() != fabric::CONNECT_DATA_SIZE {
+            return self
+                .send_capsule_resp_err_async(cid, fabric_sc::CONNECT_INVALID_PARAM)
+                .await;
+        }
+        let cd = match ConnectData::read_from_bytes(data) {
+            Ok(c) => c,
+            Err(_) => {
+                return self
+                    .send_capsule_resp_err_async(cid, fabric_sc::CONNECT_INVALID_PARAM)
+                    .await;
+            }
+        };
+        let fields = match fabric::decode_connect_fields(sqe) {
+            Ok(f) => f,
+            Err(_) => {
+                return self
+                    .send_capsule_resp_err_async(cid, fabric_sc::CONNECT_INVALID_PARAM)
+                    .await;
+            }
+        };
+        let qid = fields.qid;
+        let kato = fields.kato;
+        tracing::info!(
+            qid,
+            kato,
+            subnqn = cd.subnqn_str(),
+            hostnqn = cd.hostnqn_str(),
+            discovery = self.discovery_mode,
+            "V8e-7-2 Fabric Connect"
+        );
+
+        // **V7** discovery mode 校验 subnqn + reject IO queue
+        if self.discovery_mode {
+            if cd.subnqn_str() != crate::DISCOVERY_NQN {
+                tracing::warn!("V7 Connect 拒：discovery mode 下 subnqn 必须 = DISCOVERY_NQN");
+                return self
+                    .send_capsule_resp_err_async(cid, fabric_sc::CONNECT_INVALID_PARAM)
+                    .await;
+            }
+            if qid != 0 {
+                tracing::warn!(qid, "V7 Connect 拒：discovery mode 下不支持 IO queue");
+                return self
+                    .send_capsule_resp_err_async(cid, fabric_sc::CONNECT_INVALID_PARAM)
+                    .await;
+            }
+        }
+
+        if qid == 0 {
+            if self.admin_connected {
+                return self
+                    .send_capsule_resp_err_async(cid, fabric_sc::CONNECT_INVALID_PARAM)
+                    .await;
+            }
+            self.admin_connected = true;
+            self.current_qid = 0;
+            // **V8e-5 / V8e-7-2** — KATO timer 在 admin Connect 成功后真 arm
+            // （spec § 7.13；kato=0 disable）
+            if kato > 0 {
+                self.set_kato(kato);
+            }
+        } else {
+            if !self.admin_connected {
+                return self
+                    .send_capsule_resp_err_async(cid, fabric_sc::CONNECT_INVALID_PARAM)
+                    .await;
+            }
+            match self.io_queues.get_mut(&qid) {
+                Some(state @ crate::io_queue::IoQueueState::Sq { .. }) => {
+                    state.mark_connected();
+                    self.current_qid = qid;
+                }
+                _ => {
+                    tracing::warn!(qid, "V8e-7-2 Connect qid≥1 before Create IO SQ — reject");
+                    return self
+                        .send_capsule_resp_err_async(cid, fabric_sc::CONNECT_INVALID_PARAM)
+                        .await;
+                }
+            }
+        }
+        let cntlid = self.cntlid as u32;
+        self.send_capsule_resp_ok_async(cid, cntlid).await
+    }
+
+    async fn handle_property_get_async(&mut self, cid: u16, sqe: &[u8]) -> anyhow::Result<()> {
+        let pf = match fabric::decode_property_fields(sqe) {
+            Ok(p) => p,
+            Err(_) => return self.send_capsule_resp_err_async(cid, 0x02).await,
+        };
+        let size = match fabric::property_size_bytes(pf.attrib) {
+            Ok(s) => s,
+            Err(_) => return self.send_capsule_resp_err_async(cid, 0x02).await,
+        };
+        let ofst = pf.ofst;
+        // V8b / V8e §3 Q1：parking_lot 短锁 closure 内不跨 await；
+        // **V8e-7-2 R-4**：值先收完 → guard drop → 然后 await 写 wire
+        let value_opt = {
+            let mut c = self.controller.controller.lock();
+            c.nvme_property_get(ofst, size)
+        };
+        let value = match value_opt {
+            Some(v) => v,
+            None => return self.send_capsule_resp_err_async(cid, 0x02).await,
+        };
+        let lo = (value & 0xFFFF_FFFF) as u32;
+        let hi = (value >> 32) as u32;
+        let hi_for_dw1 = if size == 8 { hi } else { 0 };
+        self.send_capsule_resp_ok_with_dw1_async(cid, lo, hi_for_dw1)
+            .await
+    }
+
+    async fn handle_property_set_async(&mut self, cid: u16, sqe: &[u8]) -> anyhow::Result<()> {
+        let pf = match fabric::decode_property_fields(sqe) {
+            Ok(p) => p,
+            Err(_) => return self.send_capsule_resp_err_async(cid, 0x02).await,
+        };
+        let size = match fabric::property_size_bytes(pf.attrib) {
+            Ok(s) => s,
+            Err(_) => return self.send_capsule_resp_err_async(cid, 0x02).await,
+        };
+        let ofst = pf.ofst;
+        let value = pf.value;
+        let ok = {
+            let mut t = pcie_vfio_user_sdk::NoopTransport;
+            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut t);
+            self.controller
+                .controller
+                .lock()
+                .nvme_property_set(&mut ctx, ofst, size, value)
+        };
+        if !ok {
+            return self.send_capsule_resp_err_async(cid, 0x02).await;
+        }
+        self.send_capsule_resp_ok_async(cid, 0).await
+    }
+
+    /// **V8e-7-2** — async 版 fabric Disconnect (spec § 3.5)。
+    /// 与 sync `handle_disconnect` 1:1 等价，但走 PumpEvent / DispatchOutcome
+    /// 信号让 caller break（不 bail）。
+    async fn handle_disconnect_async(&mut self, cid: u16, sqe: &[u8]) -> anyhow::Result<()> {
+        if let Err(e) = fabric::decode_disconnect_fields(sqe) {
+            tracing::warn!(error = %e, "V8e-7-2 Disconnect decode 失败");
+            // SC=0x80 INVALID_CONNECT_FORMAT；之后 caller 收 outcome.disconnected
+            // = true 让 conn break（与 sync H-1 fix 一致：reject 也 bail/close）
+            self.send_capsule_resp_err_async(cid, 0x80).await?;
+            return Ok(());
+        }
+
+        // V8b/V8d 同模式：用 session io_queues 镜像决定要拆的 qid（**不能**
+        // nvme_list_io_sqs() 全拆会误删别 conn IO queue）
+        let qids: Vec<u16> = self.io_queues.keys().copied().filter(|&q| q != 0).collect();
+        let conn_id = self.conn_id;
+        tracing::info!(
+            conn_id,
+            n_qids = qids.len(),
+            qids = ?qids,
+            "V8e-7-2 async Disconnect: deleting IO queues"
+        );
+        {
+            let mut c = self.controller.controller.lock();
+            for &q in &qids {
+                let _ = c.nvme_delete_io_sq(q);
+            }
+            for &q in &qids {
+                let _ = c.nvme_delete_io_cq(q);
+            }
+        }
+        self.io_queues.clear();
+        self.current_qid = 0;
+
+        // ACK
+        self.send_capsule_resp_ok_async(cid, 0).await
+    }
+
+    // -------- async wire emit helpers --------
+
+    async fn send_capsule_resp_ok_async(
+        &mut self,
+        cid: u16,
+        result_dw0: u32,
+    ) -> anyhow::Result<()> {
+        self.send_capsule_resp_ok_with_dw1_async(cid, result_dw0, 0)
+            .await
+    }
+
+    async fn send_capsule_resp_ok_with_dw1_async(
+        &mut self,
+        cid: u16,
+        result_dw0: u32,
+        result_dw1: u32,
+    ) -> anyhow::Result<()> {
+        let mut cqe = [0u8; 16];
+        cqe[0..4].copy_from_slice(&result_dw0.to_le_bytes());
+        cqe[4..8].copy_from_slice(&result_dw1.to_le_bytes());
+        cqe[12..14].copy_from_slice(&cid.to_le_bytes());
+        let hdr = CommonHdr {
+            pdu_type: pdu_type::RSP,
+            flags: 0,
+            hlen: 24,
+            pdo: 0,
+            plen: 24,
+        };
+        write_pdu_async(&mut self.stream, &hdr, &cqe, &[])
+            .await
+            .context("V8e-7-2 async write CapsuleResp")
+    }
+
+    async fn send_capsule_resp_err_async(&mut self, cid: u16, sc: u8) -> anyhow::Result<()> {
+        let mut cqe = [0u8; 16];
+        cqe[12..14].copy_from_slice(&cid.to_le_bytes());
+        let sct: u8 = if (0x80..=0x9F).contains(&sc) {
+            0x07
+        } else {
+            0x00
+        };
+        let status: u16 = ((sct as u16) << 9) | ((sc as u16) << 1);
+        cqe[14..16].copy_from_slice(&status.to_le_bytes());
+        let hdr = CommonHdr {
+            pdu_type: pdu_type::RSP,
+            flags: 0,
+            hlen: 24,
+            pdo: 0,
+            plen: 24,
+        };
+        write_pdu_async(&mut self.stream, &hdr, &cqe, &[])
+            .await
+            .context("V8e-7-2 async write CapsuleResp err")
+    }
+
+    async fn send_c2h_term_async(&mut self, fes: u16) -> anyhow::Result<()> {
+        let hdr = CommonHdr {
+            pdu_type: pdu_type::C2H_TERM,
+            flags: 0,
+            hlen: 24,
+            pdo: 0,
+            plen: 24,
+        };
+        let mut psh = [0u8; 16];
+        psh[0..2].copy_from_slice(&fes.to_le_bytes());
+        write_pdu_async(&mut self.stream, &hdr, &psh, &[])
+            .await
+            .context("V8e-7-2 async write C2HTermReq")
     }
 }
