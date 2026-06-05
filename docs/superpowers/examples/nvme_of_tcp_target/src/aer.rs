@@ -23,7 +23,10 @@
 //! 把累积的 AEN CQE 真正发到 wire。
 
 /// admin opcode for Async Event Request (spec § 5.2)
-pub const ADMIN_OPC_AER: u8 = 0x0C;
+///
+/// **V6c-polish (review M-1)** — re-export controller `admin_opc` 模块的
+/// 同名常量，避免双源 magic number 漂移。
+pub use pcie_remote_nvme_userspace::cmd::admin_opc::ASYNC_EVENT_REQUEST as ADMIN_OPC_AER;
 
 /// session 镜像可同时持有的最多 pending AER 数。
 /// 与 controller `aen_pending` 容量协同；超过此值 session 直接返
@@ -71,5 +74,22 @@ mod tests {
     fn max_pending_aers_matches_spec_aerl() {
         // spec § 5.16.1.1 AERL field is 0-based → 3 means 4 outstanding
         assert_eq!(MAX_PENDING_AERS, 4);
+    }
+
+    /// **V6c-polish (review M-4)** — 锁死 controller Identify Controller
+    /// 默认 AERL=3（spec § 5.16.1.1 0-based → 4 outstanding）与 session
+    /// `MAX_PENDING_AERS=4` 一致。controller 默认 AERL 漂移立刻被该测试捕获。
+    #[test]
+    fn max_pending_aers_aligns_with_controller_identify_aerl() {
+        use pcie_remote_nvme_userspace::cmd::IdentifyController;
+        // Identify Controller bytes 259 = AERL field (spec § 5.15.2.1 Figure 312)
+        let id = IdentifyController::build_v2_bytes(0x1414, 0, 1);
+        let aerl_zero_based = id[259];
+        let aerl_outstanding = aerl_zero_based as usize + 1;
+        assert_eq!(
+            aerl_outstanding, MAX_PENDING_AERS,
+            "controller Identify AERL+1 ({aerl_outstanding}) 必须等于 session \
+             MAX_PENDING_AERS ({MAX_PENDING_AERS})；漂移会让 host 看到与实际不符的容量"
+        );
     }
 }

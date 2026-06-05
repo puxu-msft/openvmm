@@ -89,6 +89,55 @@ sudo nvme disconnect -n nqn.2026-06.io.openhcl:nvme.userspace
 Windows Server 2025 类似（`nvme-cli for Windows` 或 PowerShell `Connect-NvmeoFController`），
 spec § 8.13 TCP transport 行为一致。
 
+## V6 AER (Async Event Request)
+
+V6 在 V5 IO base 之上加入 spec § 5.2 AER 完整链路：
+
+- **V6a**：host 发 AER (opc=0x0C) 不再 bail；session 镜像 ≤ 4 (AERL+1) 个 pending
+- **V6b**：select-style `pump_one_with_events(tick)` 主循环；新 `inject_aen`
+  API 让事件源在 session ctx 内 fire_aen + capture CQE → wire CapsuleResp
+- **V6c**：端到端 e2e + 多事件 FIFO 顺序 + 超 pending 时 spec 允许的 drop
+
+### bin 默认行为
+
+`main.rs` 现在用 `pump_one_with_events(100ms)`：每 100 ms 至少调一次
+`sync_aer_mirror` 保 controller / session 状态一致。普通 CMD 路径不受
+timeout 影响（handshake 后 30s timeout 已 clear，dispatch 期间 stream
+timeout = None 不会被 100ms cap 截断 IO Write R2T 等待）。
+
+### 编程接口（V8 timer-driven 事件源用）
+
+```rust
+// 当外部 timer 决定温度阈值跨越 / SMART critical 等事件需投递时：
+let emitted = session.inject_aen(
+    /* aen_type */ 0x01, // 0=Error / 1=SMART / 2=Notice / 7=Vendor (spec 表)
+    /* aen_info */ 0x00, // Type-specific info byte
+    /* log_id */ 0x02,   // 应被 host 主动 Get Log Page 拉的 log id
+)?;
+// emitted = 0 → 无 pending AER 可弹（spec 允许 drop）
+// emitted = 1 → wire 上已 emit 1 条 CapsuleResp
+```
+
+### Linux nvme-cli 真机验证
+
+```bash
+# host 端持续监听 AER（dmesg 会出 NVME 事件 log）
+sudo dmesg -w &
+
+sudo nvme connect -t tcp -a 127.0.0.1 -s 4420 \
+  -n nqn.2026-06.io.openhcl:nvme.userspace
+
+# kernel 默认会自动 post 多条 AER；通过 nvme-cli aer 可显式 post 更多
+sudo nvme list
+
+# 触发事件需要 server 端调 inject_aen；当前 bin 没有 SIGUSR1 trigger
+# 接口（V6c-followup）。手动 trigger 通过 in-process integration test：
+cargo test -p nvme_of_tcp_target --test aer_e2e
+```
+
+V8 计划：timer-driven SMART threshold + 通过 ctrlc::set_handler 类机制让
+SIGUSR1 触发 inject_aen 用于 manual interop。
+
 ## V5 已知限制（V6+ 解除）
 
 | 限制 | 原因 | 解除阶段 |

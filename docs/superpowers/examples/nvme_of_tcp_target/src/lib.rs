@@ -28,7 +28,8 @@
 //! - **V5e-2** ✅ 多 PRP 直接指针：nlb 扩到 16 (8 KiB)；PRP2_SENTINEL + cmd 累计 R2T offset
 //! - **V6a** ✅ AER cmd fast-path (不 bail session) + ASYNC_LIMIT_EXCEEDED 上限保护 + Set FID 0x0B wire test
 //! - **V6b** ✅ select-style pump_one_with_events + inject_aen API + ReadTimeout framing variant
-//! - **V6c/V7/V8** 计划中
+//! - **V6c** ✅ AER 端到端 (FIFO 顺序 / 超 pending drop / Identify 交错) + README V6 章节
+//! - **V7/V8** 计划中
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

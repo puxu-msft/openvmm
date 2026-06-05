@@ -219,8 +219,8 @@ impl V2Session {
     /// 与 [`pump_one`] 行为差异：
     /// - 入口设 `set_read_timeout(Some(tick))`；read_pdu 撞 timeout 返
     ///   `FramingError::ReadTimeout` → continue 回 drain
-    /// - 每次 loop top **先**调 `drain_aer_completions()`：把 controller tick
-    ///   或外部 `nvme_fire_aen` 累积的 CQE 转 wire CapsuleResp
+    /// - 每次 loop top **先**调 [`sync_aer_mirror`](Self::sync_aer_mirror)：
+    ///   保持 session 镜像与 controller pending 一致（教学版无 wire emit）
     /// - 收到真 CMD 才返 Ok(true)（caller 重新调本函数继续 poll）
     /// - PeerClosed → Ok(false) 退出 loop
     ///
@@ -234,7 +234,8 @@ impl V2Session {
         self.stream.set_read_timeout(Some(tick)).ok();
         loop {
             // (1) drain pending AEN → wire CapsuleResp
-            self.drain_aer_completions()?;
+            // (1) sync session mirror to controller (no wire emit in V6b 教学版)
+            self.sync_aer_mirror();
 
             // (2) try read 一帧 PDU
             let pdu = match read_pdu(&mut self.stream) {
@@ -280,83 +281,27 @@ impl V2Session {
         }
     }
 
-    /// **Phase V6b** — drain controller 累积的 AEN CQE 转 wire CapsuleResp。
+    /// **Phase V6b → V6c-polish (review M-3)** — 同步 session 端 `pending_aers`
+    /// 镜像到 controller `aen_pending` 状态。
     ///
-    /// 内部用 fresh `TcpAdminTransport` capture 每次 `nvme_fire_aen` 产生
-    /// 的 16B CQE dma_write；把 captured.writes drain（按 FIFO 顺序）每条
-    /// 当作 CapsuleResp PSH 直接 emit。
+    /// 设计：本函数**不**自己 emit wire；外部事件源必须通过
+    /// [`Self::inject_aen`] 在 session ctx 内 fire，才能让 CQE 被 fresh
+    /// `TcpAdminTransport` capture。本函数只检测 controller `aen_pending`
+    /// 是否 shrunk，若是则 truncate session 镜像保持一致。
     ///
-    /// **不调 `nvme_fire_aen`**：fire 是外部事件源的责任（controller tick / 外部
-    /// API）。本函数只消费已经被 fire 的 AEN — 通过 `nvme_pending_aer_count`
-    /// 间接判断：当 `aen_pending` shrunk vs session 镜像 `pending_aers.len()`，
-    /// 差值 = 已被 fire 的 AER 数；session 也对应 truncate 镜像。
-    ///
-    /// 返 drain 出去的 CQE 条数（≤ `MAX_DRAIN_PER_TICK`）。
-    fn drain_aer_completions(&mut self) -> anyhow::Result<usize> {
-        // **review R-12** — cap 单 tick 最多 emit AEN 数；防 AER 风暴拖延
-        // 正常 cmd 处理。
-        const MAX_DRAIN_PER_TICK: usize = 4;
-
-        // 判断有无可 drain：controller pending_aer_count（被 fire 后会 pop_front）
-        // 与 session 镜像 pending_aers.len() 比，差值 = 已 fired 但 wire 没发的
+    /// V8 tokio refactor 后可改为 controller 持 wakeup channel + session
+    /// 主循环 `select!` 读 wakeup 后 fire_aen + emit；当前 V6b 教学版
+    /// pump_one_with_events 仅依赖 inject_aen 路径。
+    fn sync_aer_mirror(&mut self) {
         let ctrl_pending = self.controller.nvme_pending_aer_count();
-        let mirror = self.pending_aers.len();
-        if ctrl_pending >= mirror {
-            // 没有 fire 过的 AEN；fast path 返 0 不分配 transport
-            return Ok(0);
+        if ctrl_pending < self.pending_aers.len() {
+            tracing::trace!(
+                ctrl_pending,
+                mirror = self.pending_aers.len(),
+                "V6b sync_aer_mirror: truncate to match controller"
+            );
+            self.pending_aers.truncate(ctrl_pending);
         }
-        let fired_count = mirror - ctrl_pending;
-        let drain_count = fired_count.min(MAX_DRAIN_PER_TICK);
-
-        // 用 fresh TcpAdminTransport capture controller post_cqe 产生的 CQE write
-        let tcp_t = TcpAdminTransport::new_with_token_base(self.next_token);
-
-        // controller `fire_aen` 已经被外部（tick / fire_aen wrapper）调过；
-        // post_cqe 已经把 16B CQE bytes 写到 cq_sentinel(0)。但是 — 那是之前
-        // 用别的 ctx 调的！我们 drain 必须重新走一遍 fire/post，让 CQE 经过
-        // 我们的 transport。
-        //
-        // **关键设计**：V6b 教学版 drain 用"fire-and-capture"模式，即 drain
-        // 内部反过来调 `nvme_fire_aen` 把已经在 `aen_pending` 的 AER pop 出
-        // 用一个**dummy event type=0x07 (vendor-specific) info=0xFF**触发 post_cqe。
-        // **不对**：fire_aen 是消费 aen_pending；如果外部已经 fire 过那条
-        // AER 已经被 pop 了，aen_pending 不含；drain 再 fire 无 AER 可用。
-        //
-        // 真正模型：外部已 fire 过的 AER 16B CQE 早就被 dma_write 出去了 —
-        // 但写到了**另一个 ctx 的 transport**！session 在 pump_one_with_events
-        // 外部根本没机会 capture。
-        //
-        // 因此 V6b 真正的设计需求：**fire_aen 必须 session 内部触发**，
-        // session 在 drain_aer_completions 里调 `nvme_fire_aen` 才能 capture。
-        // 外部事件源（如真 timer-driven SMART threshold）必须先 push 一个
-        // "event request" 到 session（不直接调 fire_aen），session 在下次
-        // drain tick 时 fire + capture。
-        //
-        // 当前 V6b 教学版没有"外部事件源 → session 注入"通道；fire 全靠
-        // test fixture 显式调用。所以 drain 函数当前只有 *test-time event*
-        // 路径有意义。tests/aer_e2e.rs (V6c) 会显式调一个 session-side
-        // wrapper `inject_aen_for_test(type, info, log_id)`，它在 drain
-        // capture 期间调 nvme_fire_aen。
-        //
-        // 现在 fast path：mirror 和 ctrl_pending 不应不一致，因为 V6b
-        // 外部还没有 fire 通道。如果不一致说明有 test 走了 inject 路径
-        // 但 mirror 未同步 — 这是 test bug。
-        //
-        // 教学版 V6b 这里就只 truncate mirror 配合 controller，不实际 emit
-        // wire（因为 CQE 已被外部 ctx 截获）。V6c e2e 走 session 内部
-        // inject 路径才能真验 wire。
-        tracing::warn!(
-            ctrl_pending,
-            mirror,
-            fired_count,
-            "V6b drain_aer_completions: AEN 已 fire 但 V6b 教学版无 wire emit \
-             路径（外部 ctx 截获 CQE）；mirror 同步 controller 后返。\
-             V6c 用 inject_aen_for_test 走 session-side 才真发 wire"
-        );
-        self.pending_aers.truncate(ctrl_pending);
-        self.next_token = tcp_t.token_high_water();
-        let _ = drain_count;
-        Ok(0)
     }
 
     /// **Phase V6b test-only** — session-side AEN inject：在 session 上下文内
@@ -538,7 +483,7 @@ impl V2Session {
         // - 超 MAX_PENDING_AERS → 返 SC=0x05 ASYNC_LIMIT_EXCEEDED（spec §5.2 允许）
         // - 否则调 nvme_admin_dispatch 让 controller 累积；session 镜像 push；
         //   跳过 run_post_dispatch 直接返 Ok；wire 上**不**emit CapsuleResp，
-        //   等 V6b drain_aer_completions 在 controller `fire_aen` 后真发
+        //   等 V6b inject_aen / sync_aer_mirror 流程在 fire_aen 后真发
         let opc_peek = crate::aer::peek_admin_opc(sqe_bytes);
         if opc_peek == crate::aer::ADMIN_OPC_AER {
             if self.pending_aers.len() >= crate::aer::MAX_PENDING_AERS {
@@ -559,14 +504,26 @@ impl V2Session {
                 self.controller.nvme_admin_dispatch(&mut ctx, sqe, cid, 0)
             };
             self.next_token = tcp_t.token_high_water();
-            debug_assert!(
-                immediate.is_none(),
-                "AER dispatch 必返 None；spec § 5.2 controller stash 后不立 post"
-            );
-            debug_assert!(
-                tcp_t.writes.is_empty() && tcp_t.pending_reads.is_empty(),
-                "AER dispatch 不应产 dma_write / dma_read"
-            );
+            // **V6c-polish (review H-1)** — 升级 debug_assert → hard bail
+            // 防 release build 静默丢 captured 数据。当前 admin.rs:649 AER
+            // 分支保证 invariant，但未来若有人加 "AER 同时埋 SMART log_id
+            // dma_write" 之类扩展，release build 下会让 CQE 落 captured 后
+            // 被下一条 cmd 当孤儿写出 → wire 顺序错乱。AER 每 conn 仅 4 次，
+            // hot path cost 可忽略。
+            if immediate.is_some() {
+                anyhow::bail!(
+                    "AER invariant violation: dispatch returned Some(Cqe), \
+                     spec § 5.2 controller 必须 stash 后等 fire_aen post"
+                );
+            }
+            if !tcp_t.writes.is_empty() || !tcp_t.pending_reads.is_empty() {
+                anyhow::bail!(
+                    "AER invariant violation: dispatch produced dma_write({}) \
+                     or dma_read({}); 不应有任何 captured DMA",
+                    tcp_t.writes.len(),
+                    tcp_t.pending_reads.len()
+                );
+            }
             self.pending_aers.push(crate::aer::PendingAer {
                 cid,
                 sq_id: 0,
