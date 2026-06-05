@@ -46,6 +46,7 @@
 pub mod aer;
 pub mod async_session;
 pub mod digest;
+pub mod dispatch_plan;
 pub mod fabric;
 pub mod framing;
 pub mod h2c_reassembler;
