@@ -36,8 +36,15 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// **V8e-3 (plan R-2/R-3)** — `tokio::sync::Mutex` guard 持锁跨 await 编译过却
+// 死锁；`parking_lot::Mutex` guard 持锁跨 await 会卡 worker thread。两者都靠
+// `await_holding_lock` lint 编译期防御。`with_controller` API 故意 closure-only
+// 不传 future 强制锁作用域不跨 await（V8b plan R-1 在 async 下的强化）。
+#![deny(clippy::await_holding_lock)]
+#![warn(clippy::await_holding_refcell_ref)]
 
 pub mod aer;
+pub mod async_session;
 pub mod digest;
 pub mod fabric;
 pub mod framing;
@@ -49,6 +56,9 @@ pub mod session;
 pub mod tcp_transport;
 pub mod ttag;
 
+pub use async_session::AsyncSession;
+pub use async_session::accept_and_handshake_async;
+pub use async_session::ic_handshake_async;
 pub use digest::crc32c;
 pub use fabric::ConnectData;
 pub use fabric::ConnectFabricFields;
