@@ -515,6 +515,11 @@ impl V2Session {
         self.next_token = tcp_t.token_high_water();
 
         // ─── Phase 4：drain captured.writes → data + cqe ────────────
+        // **review M-1 doc**：IO Read dual-PRP 顺序 invariant 链：
+        //   controller `dma_write(prp1, b1); dma_write(prp2, b2)` (io.rs:840-841)
+        //   → TcpAdminTransport.writes push_back (FIFO)
+        //   → 本 Phase 4 pop_front 顺序 = b1, b2，concat 出 8 KiB C2HData。
+        // 若 controller 改 push 顺序或 transport 改成 LIFO，需同步改这里。
         let mut data_payload = Vec::new();
         let mut cqe_bytes: Option<Vec<u8>> = None;
         while let Some(w) = tcp_t.pop_write() {
@@ -2512,6 +2517,43 @@ mod tests {
             readback.iter().all(|&b| b == 0xD7),
             "backing 前 8 KiB 应为 0xD7"
         );
+    }
+
+    /// **V5e-2 (review M-2)** — IO Write nlb=10 (5 KiB) 触发 dual-PRP 但
+    /// PRP2 partial-page (1024 byte)。验 controller `dma_read(prp2, 1024)`
+    /// 边界 + session R2T #2 length=1024 + cmd cumulative offset=4096。
+    #[test]
+    fn v5e_io_write_nlb10_5kib_dual_prp_partial_page() {
+        let (controller, _backing) = make_test_controller();
+        let (mut client, h) = setup_qid1_with_controller(controller, 5);
+
+        send_io_write(&mut client, 0x0F10, 1, 0, 10);
+
+        let p1 = read_pdu(&mut client).unwrap();
+        assert_eq!(p1.header.pdu_type, pdu_type::R2T);
+        let r1: crate::pdu::R2tPsh = crate::pdu::decode_psh(&p1.psh).unwrap();
+        let ttag1 = r1.ttag;
+        let off1 = r1.r2t_offset;
+        let len1 = r1.r2t_length;
+        assert_eq!(off1, 0);
+        assert_eq!(len1, 4096, "R2T #1 length = 4 KiB (PRP1 full page)");
+        send_h2cdata_at(&mut client, 0x0F10, ttag1, 0, &vec![0xAAu8; 4096]);
+
+        let p2 = read_pdu(&mut client).unwrap();
+        assert_eq!(p2.header.pdu_type, pdu_type::R2T);
+        let r2: crate::pdu::R2tPsh = crate::pdu::decode_psh(&p2.psh).unwrap();
+        let ttag2 = r2.ttag;
+        let off2 = r2.r2t_offset;
+        let len2 = r2.r2t_length;
+        assert_eq!(off2, 4096, "R2T #2 offset = 4 KiB (cmd cumulative)");
+        assert_eq!(len2, 1024, "R2T #2 length = 1 KiB (PRP2 partial: 5K - 4K)");
+        assert!(ttag2 != ttag1);
+        send_h2cdata_at(&mut client, 0x0F10, ttag2, 4096, &vec![0xBBu8; 1024]);
+
+        let resp = read_pdu(&mut client).unwrap();
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(sc, 0, "nlb=10 dual-PRP partial-page Write 应 success");
+        h.join().unwrap().unwrap();
     }
 
     /// **V5b-3** — IO Read 非法 NSID → controller 返 INVALID_NAMESPACE (0x0B)。
