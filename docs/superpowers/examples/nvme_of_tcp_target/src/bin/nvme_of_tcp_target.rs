@@ -79,14 +79,16 @@ struct Cli {
     /// 注入的 portal 列表。
     #[arg(long, default_value_t = false)]
     discovery_mode: bool,
-    /// **V7** Discovery target NQN（discovery mode 必填）。例：
-    /// `nqn.2026-06.io.openhcl:nvme.userspace`
-    #[arg(long, required = false)]
-    discovery_target_nqn: Option<String>,
-    /// **V7** Discovery target 网络地址 `IP:PORT`（discovery mode 必填）。
-    /// 例：`127.0.0.1:4421`
-    #[arg(long, required = false)]
-    discovery_target_addr: Option<String>,
+    /// **V7 / V8a** Discovery target NQN（discovery mode 必填，重复指定 = 多 portal）。
+    /// 例：`--discovery-target-nqn nqn.foo --discovery-target-nqn nqn.bar`
+    /// 必须与 `--discovery-target-addr` 数量相同（zip 配对）。
+    #[arg(long)]
+    discovery_target_nqn: Vec<String>,
+    /// **V7 / V8a** Discovery target 网络地址 `IP:PORT`（discovery mode 必填，
+    /// 重复指定 = 多 portal）。例：`--discovery-target-addr 127.0.0.1:4421
+    /// --discovery-target-addr 127.0.0.1:4422`
+    #[arg(long)]
+    discovery_target_addr: Vec<String>,
 }
 
 fn parse_hex_u16(s: &str) -> Result<u16, String> {
@@ -168,31 +170,43 @@ fn main() -> Result<()> {
         "V5d/V7 nvme_of_tcp_target start"
     );
 
-    // **V7** — discovery mode 必填 target NQN + addr；构造 portals 列表
-    // 一次性，spawn 时 clone 给每条 conn handler
+    // **V7 / V8a** — discovery mode 必填 target NQN + addr 多 portal；
+    // zip 配对（必须等长且非空）；spawn 时 clone 给每条 conn handler
     let discovery_portals: Vec<
         pcie_remote_nvme_userspace::controller::discovery_log::DiscoveryPortal,
     > = if cli.discovery_mode {
-        let nqn = cli
+        if cli.discovery_target_nqn.is_empty() || cli.discovery_target_addr.is_empty() {
+            anyhow::bail!(
+                "--discovery-mode 必须配至少一对 --discovery-target-nqn + --discovery-target-addr"
+            );
+        }
+        if cli.discovery_target_nqn.len() != cli.discovery_target_addr.len() {
+            anyhow::bail!(
+                "--discovery-target-nqn ({}) 与 --discovery-target-addr ({}) 数量必须相同 (zip 配对)",
+                cli.discovery_target_nqn.len(),
+                cli.discovery_target_addr.len()
+            );
+        }
+        let mut portals = Vec::with_capacity(cli.discovery_target_nqn.len());
+        for (nqn, addr) in cli
             .discovery_target_nqn
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--discovery-mode 必须配 --discovery-target-nqn"))?;
-        let addr = cli
-            .discovery_target_addr
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--discovery-mode 必须配 --discovery-target-addr"))?;
-        let portal =
-            pcie_remote_nvme_userspace::controller::discovery_log::DiscoveryPortal::from_ipv4_addr(
+            .iter()
+            .zip(cli.discovery_target_addr.iter())
+        {
+            let portal = pcie_remote_nvme_userspace::controller::discovery_log::DiscoveryPortal::from_ipv4_addr(
                 nqn, addr,
             )
             .with_context(|| format!("parse --discovery-target-addr {addr:?}"))?;
-        tracing::info!(
-            nqn = portal.nqn.as_str(),
-            traddr = portal.traddr.as_str(),
-            trsvcid = portal.trsvcid.as_str(),
-            "V7 discovery mode active; 1 portal"
-        );
-        vec![portal]
+            tracing::info!(
+                nqn = portal.nqn.as_str(),
+                traddr = portal.traddr.as_str(),
+                trsvcid = portal.trsvcid.as_str(),
+                "V8a discovery portal"
+            );
+            portals.push(portal);
+        }
+        tracing::info!(count = portals.len(), "V8a discovery mode active");
+        portals
     } else {
         Vec::new()
     };

@@ -194,3 +194,33 @@ fn bin_smoke_full_admin_path_then_graceful_shutdown() {
     // === 4. graceful shutdown ===
     shutdown_and_check(child);
 }
+
+/// **V8a** — `--discovery-target-nqn` 数量与 `--discovery-target-addr` 不
+/// 匹配时 bin 启动应立刻 fail（exit code ≠ 0）。
+#[test]
+fn v8a_cli_mismatched_portal_args_fails_fast() {
+    let f = tempfile::NamedTempFile::new().unwrap();
+    f.as_file().set_len(1024 * 1024).unwrap();
+    let bin = std::env::var("CARGO_BIN_EXE_nvme_of_tcp_target")
+        .expect("CARGO_BIN_EXE_nvme_of_tcp_target env not set");
+    let port = alloc_ephemeral_port();
+    let listen = format!("127.0.0.1:{port}");
+    let status = Command::new(bin)
+        .arg("--listen")
+        .arg(&listen)
+        .arg("--backing-file")
+        .arg(f.path())
+        .arg("--discovery-mode")
+        .arg("--discovery-target-nqn")
+        .arg("nqn.a")
+        .arg("--discovery-target-nqn")
+        .arg("nqn.b")
+        .arg("--discovery-target-addr")
+        .arg("127.0.0.1:14421")
+        // 仅 1 个 addr 对 2 个 nqn → 应 fail-fast
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn bin");
+    assert!(!status.success(), "V8a bin 必拒 mismatched portal Vec 数量");
+}

@@ -497,7 +497,27 @@ impl IdentifyController {
     /// 到 spec-correct byte layout（含 RTD3R/RTD3E/OAES/CTRATT/CNTRLTYPE/
     /// FGUID/HMPRE/SANICAP/ANATT/SUBNQN/IOCCSZ/SGLS 等之前我们 padding
     /// 字段的位置）。
+    ///
+    /// **V8a** — 默认 CNTRLTYPE=0x01 (NVM IO Controller)；
+    /// Discovery Ctrl 用 [`build_v2_bytes_with_cntrltype`]。
     pub fn build_v2_bytes(vid: u16, ssvid: u16, nn: u32) -> Vec<u8> {
+        Self::build_v2_bytes_with_cntrltype(vid, ssvid, nn, 0x01)
+    }
+
+    /// **V8a** — builder 化的 Identify Controller，允许 caller 指定
+    /// CNTRLTYPE 字段（spec § 5.17.2.1 Figure 312 byte 111）：
+    /// - `0x01` = IO Controller（NVM Subsystem，常规 NVMe SSD）
+    /// - `0x02` = Discovery Controller（spec § 5.1.4）
+    /// - `0x03` = Admin Controller（无 IO queue，配置专用）— V-followup
+    ///
+    /// 替代 V7c-fix 在 `controller/admin.rs` 用 byte 111 post-hoc patch 的
+    /// 临时方案；wire data 全由 type 构造，更清洁。
+    pub fn build_v2_bytes_with_cntrltype(
+        vid: u16,
+        ssvid: u16,
+        nn: u32,
+        cntrltype: u8,
+    ) -> Vec<u8> {
         let mut id = SpecIdentifyController::new_zeroed();
         id.vid = vid;
         id.ssvid = ssvid;
@@ -513,7 +533,7 @@ impl IdentifyController {
         id.mdts = 5;
         id.cntlid = 1;
         id.ver = NVME_VERSION_2_0;
-        id.cntrltype = nvme_spec::ControllerType::IO_CONTROLLER;
+        id.cntrltype = nvme_spec::ControllerType(cntrltype);
         id.acl = 3;
         id.aerl = 3;
         id.frmw = nvme_spec::FirmwareUpdates::new()
@@ -779,5 +799,21 @@ mod tests {
         let lbaf0 = u32::from_le_bytes(buf[128..132].try_into().unwrap());
         let lbads = (lbaf0 >> 16) & 0xff;
         assert_eq!(lbads, 9, "LBAF[0].LBADS must be 9 (2^9=512B sectors)");
+    }
+
+    /// **V8a** — `build_v2_bytes` 默认 CNTRLTYPE=0x01 NVM IO Controller。
+    #[test]
+    fn v8a_builder_cntrltype_nvm_default() {
+        let buf = IdentifyController::build_v2_bytes(0x1414, 0xc0de, 1);
+        assert_eq!(buf[111], 0x01, "default CNTRLTYPE = 0x01 (IO Controller)");
+    }
+
+    /// **V8a** — `build_v2_bytes_with_cntrltype(0x02)` 产 Discovery Controller。
+    #[test]
+    fn v8a_builder_cntrltype_discovery_explicit() {
+        let buf = IdentifyController::build_v2_bytes_with_cntrltype(0x1414, 0, 0, 0x02);
+        assert_eq!(buf[111], 0x02, "explicit CNTRLTYPE = 0x02 (Discovery Controller)");
+        // Discovery 也保留 spec layout: VID/SSVID/VER 等
+        assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 0x1414);
     }
 }
