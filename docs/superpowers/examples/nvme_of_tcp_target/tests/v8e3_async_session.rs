@@ -25,7 +25,7 @@
 use nvme_of_tcp_target::framing::{read_pdu_async, write_pdu_async};
 use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
 use nvme_of_tcp_target::{
-    AsyncSession, SharedControllerInner, V2Session, accept_and_handshake_async,
+    AsyncSession, PumpEvent, SharedControllerInner, V2Session, accept_and_handshake_async,
 };
 use pcie_remote_nvme_userspace::NvmeController;
 use std::sync::Arc;
@@ -149,7 +149,10 @@ async fn v8e3_pump_one_async_returns_none_on_peer_close() {
     drop(client);
 
     let r = h.await.unwrap().unwrap();
-    assert!(r.is_none(), "peer close 应返 Ok(None)，得 {r:?}");
+    assert!(
+        matches!(r, PumpEvent::PeerClosed),
+        "peer close 应返 PumpEvent::PeerClosed，得 {r:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -175,7 +178,10 @@ async fn v8e3_pump_one_async_shutdown_signal_unblocks_immediately() {
     tx.send(true).unwrap();
 
     let (r, elapsed) = h.await.unwrap();
-    assert!(r.unwrap().is_none(), "shutdown 应返 Ok(None)");
+    assert!(
+        matches!(r.unwrap(), PumpEvent::Shutdown),
+        "shutdown 应返 PumpEvent::Shutdown"
+    );
     assert!(
         elapsed < std::time::Duration::from_secs(1),
         "shutdown signal 应立刻 unblock pump_one_async，实测 {elapsed:?}"

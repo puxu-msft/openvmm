@@ -63,6 +63,11 @@ pub struct AsyncSession {
     pub next_token: u64,
     /// discovery_mode 由 handshake 入口 derive。
     pub discovery_mode: bool,
+    /// **V8e-4** — controller-wide AER wakeup notify clone（plan §3 Q3）。
+    /// session select! 用 `aen_notify.notified().await` 替代 sync 100ms tick；
+    /// 唤醒后自检 `nvme_pending_aer_count_for_conn(conn_id)` 过滤 spurious
+    /// wakeup。
+    pub aen_notify: std::sync::Arc<tokio::sync::Notify>,
 }
 
 /// **V8e-3** — async 版 ICReq/ICResp handshake。语义与 sync
@@ -134,6 +139,7 @@ pub async fn accept_and_handshake_async(
     }
     let next_token = controller.allocate_token_slab();
     let conn_id = controller.allocate_conn_id();
+    let aen_notify = controller.aen_notify_handle();
     Ok(AsyncSession {
         stream,
         controller,
@@ -141,40 +147,49 @@ pub async fn accept_and_handshake_async(
         conn_id,
         next_token,
         discovery_mode,
+        aen_notify,
     })
 }
 
 impl AsyncSession {
-    /// **V8e-3** — async 主循环单次 tick。
+    /// **V8e-3 / V8e-4** — async 主循环单次 tick。
     ///
-    /// V8e-3 仅 2 arm：
-    /// 1. `read_pdu_async` → 占位 dispatch（V8e-4 加 AER Notify；V8e-5 加 KATO；
-    ///    V8e-6 加完整 admin/IO dispatch；本 phase 仅打 log + drop PDU 走通流程）
-    /// 2. `shutdown.changed()` → 返 `Ok(None)` 让 caller 退出 loop
+    /// 现有 3 arm（V8e-5 加 KATO 第 4 arm；V8e-6 后 dispatch 路径填充）：
+    /// 1. `shutdown.changed()` → 返 `Ok(PumpEvent::Shutdown)` 让 caller 退 loop
+    /// 2. `aen_notify.notified()` → 返 `Ok(PumpEvent::AenReady)` 让 caller drain AER
+    /// 3. `read_pdu_async` → 返 `Ok(PumpEvent::Pdu(pdu))` 让 caller dispatch
     ///
-    /// 返：
-    /// - `Ok(Some(pdu))` 收到一帧（V8e-3 后调用 caller 不动它；V8e-6 后改 dispatch）
-    /// - `Ok(None)` shutdown / peer close
-    /// - `Err(_)` 协议 / IO 错
+    /// V8e-3 时 PDU 仅打 log + drop；V8e-6 加完整 admin/IO dispatch。
     pub async fn pump_one_async(
         &mut self,
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
-    ) -> anyhow::Result<Option<Pdu>> {
+    ) -> anyhow::Result<PumpEvent> {
         tokio::select! {
             biased;
             _ = shutdown.changed() => {
                 tracing::info!(conn_id = self.conn_id, "V8e-3 session shutdown");
-                Ok(None)
+                Ok(PumpEvent::Shutdown)
+            }
+            _ = self.aen_notify.notified() => {
+                // V8e-4 spurious wakeup 过滤：自检本 conn 是否真有 pending AER
+                // 才让 caller drain。读 controller 短锁 (parking_lot 不跨 await)。
+                let cnt = self.controller.controller.lock()
+                    .nvme_pending_aer_count_for_conn(self.conn_id);
+                tracing::debug!(
+                    conn_id = self.conn_id,
+                    pending = cnt,
+                    "V8e-4 AER notify woke session"
+                );
+                Ok(PumpEvent::AenReady { pending: cnt })
             }
             r = read_pdu_async(&mut self.stream) => {
                 match r {
-                    Ok(pdu) => Ok(Some(pdu)),
+                    Ok(pdu) => Ok(PumpEvent::Pdu(pdu)),
                     Err(e) => {
-                        // PeerClosed 走 Ok(None)；其余 Err 上抛
                         if let Some(crate::framing::FramingError::PeerClosed { .. }) =
                             e.downcast_ref::<crate::framing::FramingError>()
                         {
-                            Ok(None)
+                            Ok(PumpEvent::PeerClosed)
                         } else {
                             Err(e)
                         }
@@ -193,6 +208,25 @@ impl AsyncSession {
     pub fn next_token(&self) -> u64 {
         self.next_token
     }
+}
+
+/// **V8e-3 / V8e-4** — `pump_one_async` 单次 tick 的结果。
+///
+/// `Shutdown` / `PeerClosed` caller 应退 loop；`AenReady` caller 应 drain AER；
+/// `Pdu(pdu)` caller 应 dispatch（V8e-6 后 admin/IO handler）。
+#[derive(Debug)]
+pub enum PumpEvent {
+    /// shutdown signal 触发，session 应退 loop。
+    Shutdown,
+    /// peer close stream（EOF），session 应退 loop。
+    PeerClosed,
+    /// AER wakeup 触发，session 应 drain；`pending` 是本 conn pending AER 数。
+    AenReady {
+        /// 本 conn 在 controller 端的 pending AER 计数（spurious wakeup 时 = 0）。
+        pending: usize,
+    },
+    /// 收到一帧 PDU 待 dispatch。
+    Pdu(Pdu),
 }
 
 /// **V8c (security-reviewer H-1) + V8d** — conn drop 时清理 controller 端

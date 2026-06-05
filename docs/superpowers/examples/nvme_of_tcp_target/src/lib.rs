@@ -57,6 +57,7 @@ pub mod tcp_transport;
 pub mod ttag;
 
 pub use async_session::AsyncSession;
+pub use async_session::PumpEvent;
 pub use async_session::accept_and_handshake_async;
 pub use async_session::ic_handshake_async;
 pub use digest::crc32c;
@@ -102,6 +103,16 @@ pub struct SharedControllerInner {
     /// 路由（`nvme_admin_dispatch_with_conn` / `nvme_fire_aen_for_conn` /
     /// `nvme_cleanup_conn_aers`）。
     pub next_conn_id: std::sync::atomic::AtomicU32,
+    /// **V8e-4 (plan Q3)** — AER wakeup channel：controller `aen_pending` 状态变
+    /// 化时（push 入队 / fire 出队）任何调 [`Self::notify_aer`] 的 caller 触发；
+    /// async session `pump_one_async` 在 select! 里 `notified().await` 拿 wakeup
+    /// 后再自检 `nvme_pending_aer_count_for_conn(self.conn_id)` 决定是否真
+    /// drain（plan §3 Q3：controller-wide 单 Notify + per-conn 自检；不需要
+    /// per-conn 多 Notify 因 spurious wakeup 成本 = 1 atomic load + 1 short lock）。
+    ///
+    /// sync `V2Session::pump_one_with_events` 不依赖此 channel（保 100ms tick
+    /// 兜底）；只有 `AsyncSession::pump_one_async` 受益。
+    pub aen_notify: std::sync::Arc<tokio::sync::Notify>,
 }
 
 /// per-conn token slab 起始 base（保 V3/V4 测试日志 `1<<48` 习惯）。
@@ -117,7 +128,26 @@ impl SharedControllerInner {
             controller: parking_lot::Mutex::new(controller),
             next_conn_token_base: std::sync::atomic::AtomicU64::new(TOKEN_SLAB_START),
             next_conn_id: std::sync::atomic::AtomicU32::new(1),
+            aen_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// **V8e-4** — 主动 wakeup 所有 `notified().await` 的 task 让其重新查
+    /// `nvme_pending_aer_count_for_conn(self.conn_id)`。
+    ///
+    /// 当 caller 通过 [`Self::with_aer_notify`] 调 controller 路径时自动调用；
+    /// 测试 / 直接 push 路径也可手调。`notify_waiters` 语义：只唤醒 **当前**
+    /// 在 wait 的 task；之前在 wait 的拿到一次性 permit。spurious wakeup 由
+    /// session 自检 conn 计数过滤（plan §3 Q3）。
+    pub fn notify_aer(&self) {
+        self.aen_notify.notify_waiters();
+    }
+
+    /// **V8e-4** — 拿 Notify 的 cloned Arc。session `accept_and_handshake_async`
+    /// 时 clone 给 `AsyncSession.aen_notify` 字段；后者 select! 里直接
+    /// `aen_notify.notified()`。
+    pub fn aen_notify_handle(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        std::sync::Arc::clone(&self.aen_notify)
     }
 
     /// 给一条新 conn 分配 disjoint token slab base；slab size = [`TOKEN_SLAB_SIZE`]。
