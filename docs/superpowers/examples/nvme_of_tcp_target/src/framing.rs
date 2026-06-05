@@ -1,11 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! **Phase V1** — 同步 TCP framing：阻塞从 `TcpStream` 读一帧完整 NVMe-oF
-//! TCP PDU；阻塞写一帧。
+//! **Phase V1 / V8e-1** — NVMe-oF TCP PDU framing：
 //!
-//! 与 pcie_vfio_user_sdk 同走 sync 模型（NVMe controller 是 parking_lot 同步），
-//! 避免引入 tokio。多客户端通过 `thread::spawn` per-connection 即可。
+//! - **V1 sync 路径**：`read_pdu` / `write_pdu` 阻塞 `std::net::TcpStream`，
+//!   多客户端通过 `thread::spawn` per-connection。
+//! - **V8e-1 async 路径**：`read_pdu_async` / `write_pdu_async` 走 tokio
+//!   `AsyncRead` / `AsyncWrite`，为 V8e-2/3 session async pump 提供 framing
+//!   底座（session select! 重构在后续 phase）。两版共享 `serialize_pdu` 保
+//!   byte-stream 完全等价（regression gate 见
+//!   `tests/v8e1_tokio_dep_smoke.rs::v8e1_sync_vs_async_serialize_bytes_identical`）。
 //!
 //! 完整流程：
 //! 1. read 8 byte CommonHdr → decode_common_hdr
@@ -148,6 +152,14 @@ pub fn write_pdu(
     psh: &[u8],
     data: &[u8],
 ) -> anyhow::Result<()> {
+    let buf = serialize_pdu(hdr, psh, data);
+    stream.write_all(&buf).context("TCP write_all")?;
+    Ok(())
+}
+
+/// **Phase V8e-1** — 共用 PDU 序列化逻辑（sync `write_pdu` / async
+/// `write_pdu_async` 都用），保证两路 byte-stream 100% 等价。
+fn serialize_pdu(hdr: &CommonHdr, psh: &[u8], data: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(hdr.plen as usize);
     buf.extend_from_slice(hdr.as_bytes());
     buf.extend_from_slice(psh);
@@ -162,8 +174,139 @@ pub fn write_pdu(
     if hdr.has_ddgst() {
         buf.extend_from_slice(&crate::digest::crc32c_le_bytes(data));
     }
-    stream.write_all(&buf).context("TCP write_all")?;
+    buf
+}
+
+/// **Phase V8e-1** — `read_pdu` 的 tokio async 版。
+///
+/// 设计与 sync 版 [`read_pdu`] 1:1 等价，逐 byte 读取顺序、digest 校验、
+/// PeerClosed/ReadTimeout 错误语义全一致；仅 backing IO 改 `AsyncReadExt`。
+/// 让 V8e-3 session async pump 直接对 `tokio::net::TcpStream` 用，避免
+/// `spawn_blocking` 桥造成的 100ms tick poll 退化。
+///
+/// 与 sync 版差异：
+/// - peer EOF 走 `io::ErrorKind::UnexpectedEof` 同样映射 `FramingError::PeerClosed`
+/// - **不**触发 `ReadTimeout` 路径（tokio 的 timeout 通过 `tokio::time::timeout`
+///   外层包，不依赖 OS-level `set_read_timeout`）。V8e-2/3 session select! 用
+///   `tokio::select!` 替代 sync `ReadTimeout` 信号。
+pub async fn read_pdu_async<S>(stream: &mut S) -> anyhow::Result<Pdu>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    // 1. read CommonHdr
+    let mut hbuf = [0u8; CH_LEN];
+    read_exact_or_eof_async(stream, &mut hbuf, "while reading CommonHdr").await?;
+    let header = decode_common_hdr(&hbuf).map_err(FramingError::Pdu)?;
+    let hlen = header.hlen as usize;
+    let plen = header.plen as usize;
+    let pdo = header.pdo as usize;
+
+    // 2. read PSH
+    let psh_len = hlen - CH_LEN;
+    let mut psh = vec![0u8; psh_len];
+    if psh_len > 0 {
+        read_exact_or_eof_async(stream, &mut psh, "while reading PSH").await?;
+    }
+
+    // 3. HDGST 校验
+    if header.has_hdgst() {
+        let mut hdgst = [0u8; 4];
+        read_exact_or_eof_async(stream, &mut hdgst, "while reading HDGST").await?;
+        let mut crc_input = Vec::with_capacity(hlen);
+        crc_input.extend_from_slice(&hbuf);
+        crc_input.extend_from_slice(&psh);
+        if !crate::digest::verify_crc32c(&crc_input, hdgst) {
+            return Err(FramingError::Pdu(PduError::HdgstMismatch).into());
+        }
+    }
+
+    // 4. data + pad + DDGST — 与 sync `read_pdu` 1:1 等价（V8e-1 reviewer M-1 + M-2）：
+    // 同 pad-zero 诊断 warn + 同 `PlenLessThanHlen` 显式校验路径，避免 hostile
+    // peer 在 sync/async 下拿不同 error variant。
+    let consumed = hlen + if header.has_hdgst() { 4 } else { 0 };
+    if pdo != 0 && pdo < consumed {
+        return Err(FramingError::Pdu(PduError::InvalidPdo {
+            pdo: header.pdo,
+            consumed,
+        })
+        .into());
+    }
+    let mut data = Vec::new();
+    if plen > consumed {
+        let ddgst_len = if header.has_ddgst() { 4 } else { 0 };
+        let pad_len = pdo.saturating_sub(consumed);
+        if pad_len > 0 {
+            let mut pad = vec![0u8; pad_len];
+            read_exact_or_eof_async(stream, &mut pad, "while reading pad").await?;
+            // **V8e-1 reviewer M-1** — 同 sync 版做 pad-zero 诊断（spec invariant）
+            if pad.iter().any(|&b| b != 0) {
+                tracing::warn!(pad_len, "non-zero pad bytes in PDU (spec says zero)");
+            }
+        }
+        let data_off = if pdo == 0 { consumed } else { pdo };
+        // **V8e-1 reviewer M-2** — `plen < data_off + ddgst_len` 显式 reject
+        // 不用 saturating_sub 静默走 data_len=0 走错路径
+        if plen < data_off + ddgst_len {
+            return Err(FramingError::Pdu(PduError::PlenLessThanHlen {
+                plen: header.plen,
+                hlen: header.hlen,
+            })
+            .into());
+        }
+        let data_len = plen - data_off - ddgst_len;
+        data = vec![0u8; data_len];
+        if data_len > 0 {
+            read_exact_or_eof_async(stream, &mut data, "while reading data").await?;
+        }
+        if header.has_ddgst() {
+            let mut ddgst = [0u8; 4];
+            read_exact_or_eof_async(stream, &mut ddgst, "while reading DDGST").await?;
+            if !crate::digest::verify_crc32c(&data, ddgst) {
+                return Err(FramingError::Pdu(PduError::DdgstMismatch).into());
+            }
+        }
+    }
+
+    Ok(Pdu { header, psh, data })
+}
+
+/// **Phase V8e-1** — `write_pdu` 的 tokio async 版。复用 [`serialize_pdu`]
+/// 共享 byte-stream 实现；仅 sink IO 改 `AsyncWriteExt`。
+pub async fn write_pdu_async<S>(
+    stream: &mut S,
+    hdr: &CommonHdr,
+    psh: &[u8],
+    data: &[u8],
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt as _;
+    let buf = serialize_pdu(hdr, psh, data);
+    stream
+        .write_all(&buf)
+        .await
+        .context("tokio async write_all")?;
     Ok(())
+}
+
+/// **Phase V8e-1** — `read_exact_or_eof` 的 async 版。
+async fn read_exact_or_eof_async<S>(
+    stream: &mut S,
+    buf: &mut [u8],
+    at: &'static str,
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    match stream.read_exact(buf).await {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(FramingError::PeerClosed { at }.into())
+        }
+        Err(e) => Err(anyhow::Error::new(e).context(format!("tokio read {at}"))),
+    }
 }
 
 fn read_exact_or_eof(

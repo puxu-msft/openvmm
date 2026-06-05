@@ -24,6 +24,29 @@ ctrlc = { version = "3", features = ["termination"] }
 # V8f reviewer H-2 — discovery controller 用独立 0-byte tempfile 作 backing 隔离
 # 主 backing；运行时也用到，从 dev-dependencies 提升到 dependencies。
 tempfile = "3"
+# V8e-1 — tokio async runtime。所有 feature 均已被 workspace 其它 crate
+# （OpenVMM 等）拉过，Cargo.lock 不新增 entry。
+# - rt-multi-thread: bin `#[tokio::main(flavor = "multi_thread")]` 默认（含 `rt`）
+# - macros: `#[tokio::main]` / `#[tokio::test]`
+# - net: `tokio::net::TcpListener / TcpStream`
+# - sync: `tokio::sync::{Mutex, Notify, watch}`（watch 用作 V8e-2 shutdown 信号）
+# - time: `tokio::time::{sleep, Sleep, Interval}`
+# - signal: `tokio::signal::ctrl_c`
+# - io-util: `AsyncReadExt` / `AsyncWriteExt`
+#
+# **V8e-1 设计选择**：用 `tokio::sync::watch` 实现 shutdown 信号而非
+# `tokio_util::sync::CancellationToken` — OpenVMM workspace 已 pin 的
+# tokio-util 0.7.16 不含 sync feature；watch 本身是 tokio 内置功能，
+# 语义等价且无新增 dep。
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "sync",
+    "time",
+    "signal",
+    "io-util",
+] }
 
 [[bin]]
 name = "nvme_of_tcp_target"
