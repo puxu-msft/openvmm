@@ -667,11 +667,16 @@ impl NvmeController {
                 // 暂未触发实际事件 → AER 永挂；在 disable() 清空。未来
                 // 加 fire_namespace_changed / fire_log_available 等时会调
                 // self.fire_aen()。
-                self.aen_pending.push_back((cid, 0, cq_id));
+                // **V8c** — push 带 conn_id（由 nvme_admin_dispatch_with_conn
+                // 设置；legacy nvme_admin_dispatch 调用时 = 0）。让 fire_aen
+                // 路径只投回原 conn 防 cross-conn AER 窃取（security H-1）。
+                self.aen_pending
+                    .push_back((cid, 0, cq_id, self.current_dispatch_conn_id));
                 tracing::debug!(
                     cid,
+                    conn_id = self.current_dispatch_conn_id,
                     queued = self.aen_pending.len(),
-                    "AsyncEventRequest queued (Phase F: real queue, fire on event)"
+                    "AsyncEventRequest queued (Phase F: real queue, fire on event; V8c per-conn)"
                 );
                 None
             }

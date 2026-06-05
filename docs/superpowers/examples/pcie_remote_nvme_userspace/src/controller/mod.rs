@@ -779,12 +779,23 @@ pub struct NvmeController {
     /// 累计错误命令数（CQE 携 non-zero status code 即计数）。
     pub(super) stat_num_err_log_entries: u64,
 
-    // ----- Phase F: AEN (Async Event Notification) -----
+    // ----- Phase F / V8c: AEN (Async Event Notification) per-conn -----
     /// AsyncEventRequest 已收到、待 fire 的 admin context FIFO。
     /// 当有事件触发时弹一条，构造 CQE 带 event info → post 到 admin CQ。
-    /// 元组：(cid, sq_id, cq_id)；sq_head 不存（fire 时取实时值，
+    /// 元组：(cid, sq_id, cq_id, conn_id)；sq_head 不存（fire 时取实时值，
     /// 避免 stale sqhd 触发 spec § 4.6.1.4 单调违规 — Phase F H2 修复）。
-    pub(super) aen_pending: std::collections::VecDeque<(u16, u16, u16)>,
+    ///
+    /// **Phase V8c (security-reviewer H-1)** — `conn_id` 字段把"AER 是 controller
+    /// 全局 FIFO"改为 per-conn 路由：session A AER 投到 conn A，conn B 不会
+    /// 误吃。0 = legacy 未关联（V6 路径，V8c 之前的测试 fixture）；非 0 =
+    /// session 通过 `accept_and_handshake_shared` 分配的 `conn_id`。
+    /// **Phase V8c** — `nvme_admin_dispatch_with_conn` 调用期间临时记录当前
+    /// dispatch 的 `conn_id`，让 admin handler 内部 `aen_pending.push_back`
+    /// 自动 stamp 正确 conn_id。**V8c reviewer H-1** — `_with_conn` 用
+    /// prev/restore 而非清 0：支持嵌套调用 + 防 BC wrapper 静默覆盖。
+    /// 0 = legacy (V6 路径 / 未带 conn_id)。
+    pub(super) current_dispatch_conn_id: u32,
+    pub(super) aen_pending: std::collections::VecDeque<(u16, u16, u16, u32)>,
 
     /// **Phase V7** — Discovery Log Page entries (spec § 5.16.1.20 / § 5.1.4)。
     /// session bin 启动时通过 `nvme_set_discovery_target` 注入；Discovery
@@ -1068,7 +1079,30 @@ impl NvmeController {
         cid: u16,
         cq_id: u16,
     ) -> Option<crate::cmd::Cqe> {
-        self.dispatch_admin(ctx, sqe, cid, /*sq_head*/ 0, cq_id)
+        // V8c BC：未带 conn_id 等价 conn_id=0（legacy 单 conn 路径）。
+        self.nvme_admin_dispatch_with_conn(ctx, sqe, cid, cq_id, 0)
+    }
+
+    /// **Phase V8c (reviewer H-1)** — 带 `conn_id` 的 admin dispatch。dispatch
+    /// 期间触发的 `aen_pending.push_back` 会带上本 conn_id；让
+    /// `nvme_fire_aen_for_conn` 只 fire 该 conn 的 pending AER；conn drop 时
+    /// `nvme_cleanup_conn_aers` 按 conn_id 抹掉所有 pending 防 leak。
+    ///
+    /// `current_dispatch_conn_id` 用 prev/restore 而非清 0，支持未来嵌套调用
+    /// 也防 BC wrapper 静默覆盖 caller 已设值。
+    pub fn nvme_admin_dispatch_with_conn(
+        &mut self,
+        ctx: &mut pcie_remote_userspace_sdk::DeviceCtx<'_>,
+        sqe: crate::cmd::Sqe,
+        cid: u16,
+        cq_id: u16,
+        conn_id: u32,
+    ) -> Option<crate::cmd::Cqe> {
+        let prev = self.current_dispatch_conn_id;
+        self.current_dispatch_conn_id = conn_id;
+        let r = self.dispatch_admin(ctx, sqe, cid, /*sq_head*/ 0, cq_id);
+        self.current_dispatch_conn_id = prev;
+        r
     }
 
     /// **Phase V5a** — 与 [`nvme_admin_dispatch`] 同形的 IO 队列 dispatch
@@ -1201,6 +1235,24 @@ impl NvmeController {
         self.aen_pending.len()
     }
 
+    /// **Phase V8c** — 指定 `conn_id` 当前 pending AER 数。session 用以判断
+    /// "是否该 sync_aer_mirror 对本 conn 做 truncate"。
+    pub fn nvme_pending_aer_count_for_conn(&self, conn_id: u32) -> usize {
+        self.aen_pending.iter().filter(|t| t.3 == conn_id).count()
+    }
+
+    /// **Phase V8c** — conn drop 时清理该 conn 在 controller 端残留的所有
+    /// pending AER，防 leak / 让其它 conn 误 fire（H-1 + R-12）。返清理数。
+    pub fn nvme_cleanup_conn_aers(&mut self, conn_id: u32) -> usize {
+        let before = self.aen_pending.len();
+        self.aen_pending.retain(|t| t.3 != conn_id);
+        let cleaned = before - self.aen_pending.len();
+        if cleaned > 0 {
+            tracing::info!(conn_id, cleaned, "V8c cleanup_conn_aers");
+        }
+        cleaned
+    }
+
     /// **Phase V6b** — 外部强制 fire 一条 AEN；返 true 表示 AER 已 fire
     /// （驱动 `aen_pending.pop_front` + post_cqe 已发 16B CQE 到 ctx.dma_write
     /// 哨值地址，caller 必须用 [`pcie_remote_userspace_sdk::DeviceCtx`] 接
@@ -1216,6 +1268,19 @@ impl NvmeController {
         log_id: u8,
     ) -> bool {
         self.fire_aen(ctx, aen_type, aen_info, log_id)
+    }
+
+    /// **Phase V8c** — fire 指定 `conn_id` 的最早 pending AER。其它 conn 的
+    /// AER 留在队列里不动。session V2 调本 wrapper 防 cross-conn AER 窃取。
+    pub fn nvme_fire_aen_for_conn(
+        &mut self,
+        ctx: &mut pcie_remote_userspace_sdk::DeviceCtx<'_>,
+        aen_type: u8,
+        aen_info: u8,
+        log_id: u8,
+        conn_id: u32,
+    ) -> bool {
+        self.fire_aen_for_conn(ctx, aen_type, aen_info, log_id, conn_id)
     }
 
     /// **Phase V6b** — 是否有待 fire 的 AEN event。session 主循环 cheap-check
@@ -1411,6 +1476,7 @@ impl NvmeController {
             power_on_instant: std::time::Instant::now(),
             stat_num_err_log_entries: 0,
             aen_pending: std::collections::VecDeque::new(),
+            current_dispatch_conn_id: 0,
             discovery_portals: Vec::new(),
             discovery_gen_ctr: 0,
             features: std::collections::HashMap::new(),
@@ -1895,14 +1961,48 @@ impl NvmeController {
         aen_info: u8,
         log_id: u8,
     ) -> bool {
+        // V6 路径仍 fire 任意 conn 的 head（legacy 行为，BC）；V8c 路径
+        // 用 `fire_aen_for_conn` 只 fire 指定 conn。
+        self.fire_aen_inner(ctx, aen_type, aen_info, log_id, /*filter*/ None)
+    }
+
+    /// **Phase V8c** — fire 指定 `conn_id` 的最早 pending AER。其它 conn 的
+    /// AER 留在队列里不动；返 true = fire 成功；false = 该 conn 无 pending AER。
+    pub(super) fn fire_aen_for_conn(
+        &mut self,
+        ctx: &mut DeviceCtx<'_>,
+        aen_type: u8,
+        aen_info: u8,
+        log_id: u8,
+        conn_id: u32,
+    ) -> bool {
+        self.fire_aen_inner(ctx, aen_type, aen_info, log_id, Some(conn_id))
+    }
+
+    fn fire_aen_inner(
+        &mut self,
+        ctx: &mut DeviceCtx<'_>,
+        aen_type: u8,
+        aen_info: u8,
+        log_id: u8,
+        conn_id_filter: Option<u32>,
+    ) -> bool {
         // M5：type 只占 3 bit，> 7 是 caller bug → 早 fail。
         debug_assert!(aen_type < 8, "AEN type must be < 8 (spec § 5.2 Figure 174)");
-        let Some((cid, sq_id, cq_id)) = self.aen_pending.pop_front() else {
+        // V8c：filter present 时找第一个 conn_id 匹配项；否则 pop_front。
+        let popped = if let Some(want) = conn_id_filter {
+            let pos = self.aen_pending.iter().position(|t| t.3 == want);
+            pos.and_then(|i| self.aen_pending.remove(i))
+        } else {
+            self.aen_pending.pop_front()
+        };
+        let Some((cid, sq_id, cq_id, _conn_id)) = popped else {
             tracing::debug!(
                 aen_type,
                 aen_info,
                 log_id,
-                "fire_aen: no pending AER, event dropped"
+                conn_id_filter,
+                "fire_aen: no pending AER (matching conn), event dropped"
             );
             return false;
         };

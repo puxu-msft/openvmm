@@ -79,9 +79,9 @@ fn prp_list_returns_all_entries_no_zero_termination() {
 #[test]
 fn aen_queue_fifo_order() {
     let mut c = make_ctrl_with_tmp("aen");
-    c.aen_pending.push_back((1, 0, 0));
-    c.aen_pending.push_back((2, 0, 0));
-    c.aen_pending.push_back((3, 0, 0));
+    c.aen_pending.push_back((1, 0, 0, 0));
+    c.aen_pending.push_back((2, 0, 0, 0));
+    c.aen_pending.push_back((3, 0, 0, 0));
     assert_eq!(c.aen_pending.len(), 3);
     assert_eq!(c.aen_pending.pop_front().unwrap().0, 1);
     assert_eq!(c.aen_pending.pop_front().unwrap().0, 2);
@@ -1834,7 +1834,7 @@ fn ana_state_change_triggers_aen() {
             last_fire: None,
         },
     );
-    c.aen_pending.push_back((0x42, 0, 0));
+    c.aen_pending.push_back((0x42, 0, 0, 0));
     assert_eq!(c.ana_state, 0x01);
     let initial_change = c.ana_change_count;
     let mut outbound: Vec<pcie_remote_userspace_sdk::ToOpenhcl> = Vec::new();

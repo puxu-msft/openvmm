@@ -60,6 +60,7 @@ pub use framing::write_pdu;
 pub use h2c_reassembler::{AcceptOutcome, H2cReassembler};
 pub use pdu::*;
 pub use r2t::encode_r2t;
+pub use session::ADMIN_CQ_SIZE;
 pub use session::CQ_BASE_GPA;
 pub use session::DISCOVERY_NQN;
 pub use session::MAXH2CDATA_BYTES;
@@ -84,6 +85,11 @@ pub struct SharedControllerInner {
     pub controller: parking_lot::Mutex<pcie_remote_nvme_userspace::NvmeController>,
     /// per-conn token slab base 全局原子分配。起值见 [`TOKEN_SLAB_START`]。
     pub next_conn_token_base: std::sync::atomic::AtomicU64,
+    /// **V8c** — per-conn ID 全局原子分配（1 起；0 保留为 legacy/无关联）。
+    /// `accept_and_handshake_shared` 内 `fetch_add(1)` 拿；用于 AER per-conn
+    /// 路由（`nvme_admin_dispatch_with_conn` / `nvme_fire_aen_for_conn` /
+    /// `nvme_cleanup_conn_aers`）。
+    pub next_conn_id: std::sync::atomic::AtomicU32,
 }
 
 /// per-conn token slab 起始 base（保 V3/V4 测试日志 `1<<48` 习惯）。
@@ -92,11 +98,13 @@ pub const TOKEN_SLAB_START: u64 = 1u64 << 48;
 pub const TOKEN_SLAB_SIZE: u64 = 1u64 << 40;
 
 impl SharedControllerInner {
-    /// 从 owned controller 构造 shared wrapper；token base 起 [`TOKEN_SLAB_START`]。
+    /// 从 owned controller 构造 shared wrapper；token base 起 [`TOKEN_SLAB_START`]，
+    /// conn_id 起 1（0 保留为 legacy/无关联）。
     pub fn new(controller: pcie_remote_nvme_userspace::NvmeController) -> Self {
         Self {
             controller: parking_lot::Mutex::new(controller),
             next_conn_token_base: std::sync::atomic::AtomicU64::new(TOKEN_SLAB_START),
+            next_conn_id: std::sync::atomic::AtomicU32::new(1),
         }
     }
 
@@ -105,6 +113,21 @@ impl SharedControllerInner {
     pub fn allocate_token_slab(&self) -> u64 {
         self.next_conn_token_base
             .fetch_add(TOKEN_SLAB_SIZE, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// **V8c** — 给一条新 conn 分配全局 `conn_id`（1 起；0 保留 legacy）。
+    /// **V8c reviewer H-2** — u32 wrap 后再 `fetch_add` 跳过 0；不去重活跃
+    /// id（理论 ~16M conn 后撞旧 id 风险，V9 应改 u64 或加 live HashSet）。
+    pub fn allocate_conn_id(&self) -> u32 {
+        loop {
+            let id = self
+                .next_conn_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if id != 0 {
+                return id;
+            }
+            // u32 wrap 到 0 → 再 fetch_add 拿下一个非 0 值
+        }
     }
 }
 

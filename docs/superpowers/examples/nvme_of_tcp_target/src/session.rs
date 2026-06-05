@@ -58,7 +58,10 @@ pub const CQ_BASE_GPA: u64 = 0xC0DE_0000_0000_0000;
 pub const DISCOVERY_NQN: &str = "nqn.2014-08.org.nvmexpress.discovery";
 
 /// **Phase V3** — admin CQ 容量（slot 数）。
-const ADMIN_CQ_SIZE: u32 = 64;
+/// **V3 / V8b / V8c** — admin CQ size。`accept_and_handshake_shared` 用此值
+/// install；多 conn 共享 controller 后必须固定一致（`AdminCqInstallError::MismatchedParams`
+/// 否则 hard-fail）。pub 是为了让 V8c 集成测试与 session 用同一值。
+pub const ADMIN_CQ_SIZE: u32 = 64;
 
 /// **Phase V3** — 每次 CapsuleCmd 给 SQE.prp1 填的哨值（让 controller
 /// `dma_write(prp1, data)` 时 session 能识别这是 admin data payload）。
@@ -152,7 +155,12 @@ pub struct V2Session {
     /// **V6a** — session 镜像的 pending AER 列表。controller `aen_pending`
     /// 是 source of truth；这里仅用于 cap (`MAX_PENDING_AERS=4`) + debug。
     /// V6b 后 `pump_one_with_events` drain 时同步刷此镜像。
+    /// **V8c** — 镜像现仅含本 conn 的 AER（per-conn 路由）。
     pub pending_aers: Vec<crate::aer::PendingAer>,
+    /// **V8c (security-reviewer H-1)** — 本 conn 在 controller 端的 conn_id
+    /// 标签。`accept_and_handshake_shared` 从 `SharedControllerInner` 原子
+    /// 分配；用于 AER per-conn 路由 / Drop cleanup 防 cross-conn 窃取。
+    pub conn_id: u32,
     /// **V7** — discovery mode：controller 启动时 `nvme_set_discovery_target`
     /// 注入 portals 后该字段在 `accept_and_handshake` 内自动 derive。
     /// 影响：
@@ -208,6 +216,9 @@ impl V2Session {
         // 不再依赖 controller pending_ios 高水位（会被 complete 跌回 0 → 并发
         // 起点撞 key → 跨 conn PendingIo 覆盖 → 数据破坏 / DoS）。
         let next_token = controller.allocate_token_slab();
+        // **V8c (security-reviewer H-1)** — 每条 conn 分配全局唯一 conn_id；
+        // 用于 AER per-conn 路由（防 cross-conn AER 窃取 / Drop 时 cleanup）。
+        let conn_id = controller.allocate_conn_id();
         Ok(Self {
             stream,
             controller,
@@ -222,10 +233,12 @@ impl V2Session {
             // **V5a** — IO queue 表初空，Create IO CQ/SQ 成功后填充。
             io_queues: HashMap::new(),
             current_qid: 0,
-            // **V6a** — pending AER 镜像，cap 由 aer::MAX_PENDING_AERS 限制
+            // **V6a / V8c** — pending AER 镜像（per-conn 路由后仅含本 conn 的）
             pending_aers: Vec::new(),
             // **V7** — discovery mode 在 fn 入口已 derive
             discovery_mode,
+            // **V8c** — per-conn AER 路由 conn_id 标签（fn 入口已分配）
+            conn_id,
         })
     }
 
@@ -359,12 +372,15 @@ impl V2Session {
     /// 主循环 `select!` 读 wakeup 后 fire_aen + emit；当前 V6b 教学版
     /// pump_one_with_events 仅依赖 inject_aen 路径。
     fn sync_aer_mirror(&mut self) {
-        let ctrl_pending = self.with_controller(|c| c.nvme_pending_aer_count());
+        // **V8c** — 仅看本 conn 的 AER 计数（per-conn 路由后跨 conn AER 互不影响）
+        let conn_id = self.conn_id;
+        let ctrl_pending = self.with_controller(|c| c.nvme_pending_aer_count_for_conn(conn_id));
         if ctrl_pending < self.pending_aers.len() {
             tracing::trace!(
+                conn_id,
                 ctrl_pending,
                 mirror = self.pending_aers.len(),
-                "V6b sync_aer_mirror: truncate to match controller"
+                "V6b sync_aer_mirror: truncate to match controller (per-conn V8c)"
             );
             self.pending_aers.truncate(ctrl_pending);
         }
@@ -380,9 +396,11 @@ impl V2Session {
     /// 返 emit 出去的 CapsuleResp 条数（0 或 1；0 表示无 pending AER 可弹）。
     pub fn inject_aen(&mut self, aen_type: u8, aen_info: u8, log_id: u8) -> anyhow::Result<usize> {
         let mut tcp_t = TcpAdminTransport::new_with_token_base(self.next_token);
+        // **V8c** — fire 仅本 conn 的最早 pending AER；其它 conn 的 AER 不动
+        let conn_id = self.conn_id;
         let fired = self.with_controller(|c| {
             let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
-            c.nvme_fire_aen(&mut ctx, aen_type, aen_info, log_id)
+            c.nvme_fire_aen_for_conn(&mut ctx, aen_type, aen_info, log_id, conn_id)
         });
         self.next_token = tcp_t.token_high_water();
         if !fired {
@@ -585,9 +603,10 @@ impl V2Session {
             sqe.prp1 = PRP1_SENTINEL;
             sqe.prp2 = 0;
             let mut tcp_t = TcpAdminTransport::new_with_token_base(self.next_token);
+            let conn_id = self.conn_id;
             let immediate = self.with_controller(|c| {
                 let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
-                c.nvme_admin_dispatch(&mut ctx, sqe, cid, 0)
+                c.nvme_admin_dispatch_with_conn(&mut ctx, sqe, cid, 0, conn_id)
             });
             self.next_token = tcp_t.token_high_water();
             // **V6c-polish (review H-1)** — 升级 debug_assert → hard bail
@@ -675,9 +694,10 @@ impl V2Session {
         let mut tcp_t = TcpAdminTransport::new_with_token_base(self.next_token);
 
         // ─── Phase 1：dispatch ─────────────────────────────────────────
+        let conn_id = self.conn_id;
         let immediate_cqe = self.with_controller(|c| {
             let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
-            c.nvme_admin_dispatch(&mut ctx, sqe, cid, 0)
+            c.nvme_admin_dispatch_with_conn(&mut ctx, sqe, cid, 0, conn_id)
         });
 
         // **V5a** — Create IO CQ/SQ 成功后镜像到 session.io_queues。
@@ -1162,6 +1182,41 @@ impl V2Session {
             rsvd: [0u8; 10],
         };
         write_pdu(&mut self.stream, &hdr, psh.as_bytes(), &[]).context("write C2HTermReq")
+    }
+}
+
+/// **Phase V8c (security-reviewer H-1 / R-12)** — V2Session 析构时清理 controller
+/// 端本 conn 残留的 pending AER，防 leak 让后续 conn 误吃事件 / 让 controller
+/// `aen_pending` 队列无限增长。BC 路径（V6 单元测试用 conn_id=0）跳过 cleanup。
+///
+/// **V8c reviewer M-2** — `catch_unwind` 包一层防 double panic abort：
+/// `parking_lot::Mutex` 无 poisoning 但 controller 内部 `unwrap()` 仍可能 panic；
+/// Drop 路径再 panic 会触发 process abort，比 leak 危险得多。
+impl Drop for V2Session {
+    fn drop(&mut self) {
+        if self.conn_id == 0 {
+            // legacy 路径（V6 单元测试 fixture）— 不持 conn_id 不清理。
+            return;
+        }
+        let conn_id = self.conn_id;
+        // 把 closure 移出 self.with_controller 直接持锁，让 catch_unwind 可 wrap
+        let shared = std::sync::Arc::clone(&self.controller);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut c = shared.controller.lock();
+            c.nvme_cleanup_conn_aers(conn_id)
+        }));
+        match result {
+            Ok(cleaned) if cleaned > 0 => {
+                tracing::info!(conn_id, cleaned, "V8c Drop: cleaned conn AERs");
+            }
+            Ok(_) => {}
+            Err(_) => {
+                tracing::error!(
+                    conn_id,
+                    "V8c Drop: panic during cleanup (suppressed to avoid double-panic)"
+                );
+            }
+        }
     }
 }
 
