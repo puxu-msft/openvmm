@@ -258,17 +258,24 @@ impl V2Session {
             ),
         };
 
-        // **V5b/V5c (R-4)** — IO Read/Write nlb=1 guard。cdw12 bits 15:0 = NLB
-        // (0-based) → nlb_real = +1。nlb_real > 1 → 拒 SC=0x18
-        // SGL_DATA_LENGTH_INVALID 让 driver 重发分片。当前 cmd 不进 dispatch
-        // （防 controller 已起 IO 后又 reject 的 wire 混乱）。
+        // **V5b/V5c/V5e-1 (R-4)** — IO Read/Write nlb 上限 guard。
+        // - controller LBADS 默认 9（512B/sector）；单 PRP1 可装 NVME_PAGE_SIZE
+        //   = 4 KiB 数据，即 nlb ≤ 8（io.rs:824 `bytes <= NVME_PAGE_SIZE` 走单 PRP1
+        //   path）。session sentinel scheme 只支持单 PRP1，所以 nlb_real > 8 reject。
+        // - cdw12 bits 15:0 = NLB (0-based) → nlb_real = +1。
+        // - 超出 → 拒 SC=0x18 SGL_DATA_LENGTH_INVALID 让 driver 拆分（Linux
+        //   nvme-tcp host 见此 sc 自动 retry 较小 io）。当前 cmd 不进 dispatch
+        //   防 controller 已起 IO 后又 reject 的 wire 混乱。
+        // - V5e-2 加多 PRP 直接指针扩到 nlb ≤ 16（4 KiB × 2）；后续 PRP list 解锁更大。
+        const V5_NLB_MAX: u32 = 8;
         if matches!(opc, 0x01 /* WRITE */ | 0x02 /* READ */) {
             let nlb_real = (sqe.cdw12 & 0xffff) + 1;
-            if nlb_real > 1 {
+            if nlb_real > V5_NLB_MAX {
                 tracing::warn!(
                     opc,
                     nlb_real,
-                    "V5 IO nlb>1 unsupported (单 PRP 上限)，回 SC=0x18 让 driver 拆"
+                    max = V5_NLB_MAX,
+                    "V5e-1 IO nlb>MAX 单 PRP1 上限，回 SC=0x18 让 driver 拆"
                 );
                 return self.send_capsule_resp_err(cid, /*SGL_DATA_LENGTH_INVALID=*/ 0x18);
             }
@@ -2252,20 +2259,120 @@ mod tests {
         h.join().unwrap().unwrap();
     }
 
-    /// **V5b-2** — IO Read nlb=2 → CapsuleResp SC=0x18，未发 C2HData。
+    /// **V5b-2 / V5e-1** — IO Read nlb=9 (>MAX=8) → CapsuleResp SC=0x18，未发 C2HData。
     #[test]
-    fn v5b_io_read_nlb2_rejected_with_sgl_data_length_invalid() {
+    fn v5b_io_read_nlb_over_max_rejected_with_sgl_data_length_invalid() {
         let (mut client, h, _backing) = v5a_full_setup_qid1(5);
-        send_io_read(&mut client, 0x0801, 1, 0, 2);
+        send_io_read(&mut client, 0x0801, 1, 0, 9);
         let resp = read_pdu(&mut client).unwrap();
         assert_eq!(
             resp.header.pdu_type,
             pdu_type::RSP,
-            "nlb>1 应直接 reject 不发 C2HData"
+            "nlb>MAX 应直接 reject 不发 C2HData"
         );
         let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
         assert_eq!(sc, 0x18, "应回 SGL_DATA_LENGTH_INVALID");
         h.join().unwrap().unwrap();
+    }
+
+    /// **V5e-1** — IO Read nlb=8 (= 4 KiB @ LBADS=9) 边界正确：单 PRP1 上限
+    /// 内应 success，C2HData 含 4 KiB pattern。
+    #[test]
+    fn v5e_io_read_nlb8_4kib_single_prp_succeeds() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller_with_pattern(0xA8);
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            for _ in 0..5 {
+                sess.pump_one()?;
+            }
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        let cdw10_cq = 1u32 | (15u32 << 16);
+        send_admin_sqe_cdw11(&mut client, 0x05, 0x0501, 0, cdw10_cq, 0x0000_0001);
+        let _ = read_pdu(&mut client).unwrap();
+        let cdw10_sq = 1u32 | (15u32 << 16);
+        send_admin_sqe_cdw11(&mut client, 0x01, 0x0502, 0, cdw10_sq, 0x0001_0001);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_io(&mut client, 1);
+        let _ = read_pdu(&mut client).unwrap();
+
+        // IO Read nsid=1 SLBA=0 nlb=8 → 4 KiB
+        send_io_read(&mut client, 0x0A88, 1, 0, 8);
+
+        let p = read_pdu(&mut client).unwrap();
+        assert_eq!(p.header.pdu_type, pdu_type::C2H_DATA);
+        assert_eq!(p.data.len(), 4096, "nlb=8 @ LBADS=9 = 4 KiB");
+        assert!(
+            p.data.iter().all(|&b| b == 0xA8),
+            "nlb=8 IO Read 内容必为 backing pattern"
+        );
+
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(sc, 0, "nlb=8 IO Read 应 success");
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V5e-1** — IO Write nlb=8 持久化校验：写 4 KiB 0xC8 → reopen 验内容。
+    #[test]
+    fn v5e_io_write_nlb8_4kib_round_trip() {
+        let (mut client, server) = tcp_pair();
+        let f = tempfile::NamedTempFile::new().expect("tempfile");
+        f.as_file().set_len(1024 * 1024).expect("set_len");
+        let backing_path = f.path().to_str().expect("utf8").to_string();
+        let backing_path_for_verify = backing_path.clone();
+        let _backing = f;
+        let controller =
+            NvmeController::open(&[backing_path], 0x1414, 0, &[]).expect("open controller");
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            for _ in 0..5 {
+                sess.pump_one()?;
+            }
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        let cdw10_cq = 1u32 | (15u32 << 16);
+        send_admin_sqe_cdw11(&mut client, 0x05, 0x0501, 0, cdw10_cq, 0x0000_0001);
+        let _ = read_pdu(&mut client).unwrap();
+        let cdw10_sq = 1u32 | (15u32 << 16);
+        send_admin_sqe_cdw11(&mut client, 0x01, 0x0502, 0, cdw10_sq, 0x0001_0001);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_io(&mut client, 1);
+        let _ = read_pdu(&mut client).unwrap();
+
+        send_io_write(&mut client, 0x0B88, 1, 0, 8);
+        let p = read_pdu(&mut client).unwrap();
+        assert_eq!(p.header.pdu_type, pdu_type::R2T);
+        let r: crate::pdu::R2tPsh = crate::pdu::decode_psh(&p.psh).unwrap();
+        let ttag = r.ttag;
+        let length = r.r2t_length;
+        assert_eq!(length, 4096, "R2T length 必 = 4096 (nlb=8 @ LBADS=9)");
+        send_h2cdata_at(&mut client, 0x0B88, ttag, 0, &vec![0xC8u8; 4096]);
+
+        let resp = read_pdu(&mut client).unwrap();
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(sc, 0, "nlb=8 IO Write 应 success");
+        h.join().unwrap().unwrap();
+
+        // 后置：reopen backing 验前 4 KiB = 0xC8
+        let mut readback = vec![0u8; 4096];
+        use std::io::Read as _;
+        let mut bf = std::fs::File::open(&backing_path_for_verify).unwrap();
+        bf.read_exact(&mut readback).unwrap();
+        assert!(
+            readback.iter().all(|&b| b == 0xC8),
+            "backing 前 4 KiB 应被 IO Write 改写为 0xC8"
+        );
     }
 
     /// **V5b-3** — IO Read 非法 NSID → controller 返 INVALID_NAMESPACE (0x0B)。
@@ -2423,16 +2530,16 @@ mod tests {
         );
     }
 
-    /// **V5c-2** — IO Write nlb=2 → reject SC=0x18，不发 R2T。
+    /// **V5c-2 / V5e-1** — IO Write nlb=9 (>MAX=8) → reject SC=0x18，不发 R2T。
     #[test]
-    fn v5c_io_write_nlb2_rejected() {
+    fn v5c_io_write_nlb_over_max_rejected() {
         let (mut client, h, _backing) = v5a_full_setup_qid1(5);
-        send_io_write(&mut client, 0x0D11, 1, 0, 2);
+        send_io_write(&mut client, 0x0D11, 1, 0, 9);
         let resp = read_pdu(&mut client).unwrap();
         assert_eq!(
             resp.header.pdu_type,
             pdu_type::RSP,
-            "nlb>1 应直接 reject 不发 R2T"
+            "nlb>MAX 应直接 reject 不发 R2T"
         );
         let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
         assert_eq!(sc, 0x18, "应回 SGL_DATA_LENGTH_INVALID");

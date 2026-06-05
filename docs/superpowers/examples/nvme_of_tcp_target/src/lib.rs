@@ -20,7 +20,11 @@
 //! - **V5a** ✅ IO queue 安装 + Fabric Connect qid≥1 + dispatch 二分
 //! - **V5b** ✅ IO Read nlb=1 走 C2HData 闭环
 //! - **V5c** ✅ IO Write nlb=1 走 R2T/H2CData 闭环（含数据持久化验证）
-//! - **V5d–V8** 计划中
+//! - **V5d** ✅ `main.rs` TcpListener:4420 + README + bin smoke test
+//! - **V5d-fix / V5d-fix-2** ✅ security hardening: max-conn cap / loopback
+//!   default / ctrlc graceful / handshake timeout / SIGPIPE invariant
+//! - **V5e-1** ✅ nlb 上限放宽到 8（单 PRP1 4 KiB；Linux dd bs=4k 单 cmd 完成）
+//! - **V5e-2–V8** 计划中
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

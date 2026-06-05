@@ -15,7 +15,9 @@
 //! 生产环境请绑 loopback 或 VPN 内网，并加 IP 层 ACL。
 //!
 //! 已知限制：
-//! - V5 教学版单 IO ≤ 512 byte (nlb=1)；driver 见 SC=0x18 自动拆，性能差
+//! - V5e-1 教学版单 IO ≤ 4 KiB（nlb ≤ 8 @ LBADS=9 单 PRP1 上限）；Linux
+//!   nvme-cli 默认 `dd bs=4k` 1 cmd 完成。bs > 4 KiB 时 driver 见 SC=0x18
+//!   自动拆分。
 //! - 单 backing file 同时仅一 active connection
 //! - 多 `--backing-file` 时仅 first file 受 R-8 互斥保护 → 启动 WARN
 //! - 无 Discovery subsystem（必须 `nvme connect -n nqn...`）

@@ -77,9 +77,9 @@ sudo nvme list                    # 期望见 /dev/nvme0n1
 sudo nvme id-ctrl /dev/nvme0      # VID = 0x1414
 sudo nvme id-ns /dev/nvme0n1
 
-# 4. IO 读写
-sudo dd if=/dev/zero of=/dev/nvme0n1 bs=512 count=1 oflag=direct
-sudo dd if=/dev/nvme0n1 of=/tmp/readback.bin bs=512 count=1 iflag=direct
+# 4. IO 读写（V5e-1 cap = 4 KiB / IO，Linux nvme-cli 默认 bs=4k 单 cmd 完成）
+sudo dd if=/dev/zero of=/dev/nvme0n1 bs=4k count=1 oflag=direct
+sudo dd if=/dev/nvme0n1 of=/tmp/readback.bin bs=4k count=1 iflag=direct
 hexdump -C /tmp/readback.bin | head -3
 
 # 5. 断开
@@ -93,7 +93,7 @@ spec § 8.13 TCP transport 行为一致。
 
 | 限制 | 原因 | 解除阶段 |
 |---|---|---|
-| 单 IO ≤ 512 byte（nlb=1） | session sentinel scheme 教学版只支持单 PRP1 | V5e（多 PRP / PRP list） |
+| 单 IO ≤ 4 KiB（nlb ≤ 8 @ LBADS=9） | session sentinel scheme 教学版只支持单 PRP1；controller `bytes <= NVME_PAGE_SIZE` 走单 PRP1 path | V5e-2（多 PRP 直接指针 → ≤ 8 KiB）/ V5e-3 PRP list |
 | 单 backing file 同时仅 1 active connection | 教学版 controller 无 `Arc<Mutex<>>` 共享 | V8.5 |
 | **R-8 锁基于 path 字符串**：symlink/hardlink 别名指向同 inode 仍能绕过锁 | clippy 禁 `Path::canonicalize`；inode-based key 需 unix-specific fd metadata | V8（fd-based key 配合 controller 共享） |
 | 无 Discovery subsystem | 必须 `nvme connect -n nqn...`，不能 `connect-all` | V7 |
