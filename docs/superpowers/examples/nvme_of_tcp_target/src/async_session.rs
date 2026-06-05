@@ -336,22 +336,24 @@ impl Drop for AsyncSession {
         }
         let conn_id = self.conn_id;
         let qids: Vec<u16> = self.io_queues.keys().copied().filter(|&q| q != 0).collect();
-        let shared = std::sync::Arc::clone(&self.controller);
         // V8d M-3：拆两 catch_unwind 防 AER cleanup panic 阻塞 IO queue sweep
-        let aer_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
-            let shared = std::sync::Arc::clone(&shared);
-            move || shared.controller.lock().nvme_cleanup_conn_aers(conn_id)
+        // **V8e-7-4 reviewer L-3/L-4**：AER cleanup 不需要 qids；sweep 直接
+        // move qids（无 clone）。Disconnect path 已 clear io_queues，所以
+        // 多数路径 qids 已空（vec 仅初分配）；peer close 路径才有真 qids。
+        let shared_aer = std::sync::Arc::clone(&self.controller);
+        let aer_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            shared_aer.controller.lock().nvme_cleanup_conn_aers(conn_id)
         }));
-        let qids2 = qids.clone();
+        let shared_sweep = std::sync::Arc::clone(&self.controller);
         let sweep_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let mut c = shared.controller.lock();
-            for &q in &qids2 {
+            let mut c = shared_sweep.controller.lock();
+            for &q in &qids {
                 c.nvme_delete_io_sq(q);
             }
-            for &q in &qids2 {
+            for &q in &qids {
                 c.nvme_delete_io_cq(q);
             }
-            qids2.len()
+            qids.len()
         }));
         match (aer_result, sweep_result) {
             (Ok(cleaned_aer), Ok(n_qids)) if cleaned_aer > 0 || n_qids > 0 => {
@@ -1175,6 +1177,12 @@ impl AsyncSession {
     /// **V8e-7-3 test-only** — 让测试 / V8e-followup 在 session 上下文内
     /// 触发 controller fire_aen + drain wire。与 V6b sync `inject_aen` 1:1
     /// 等价但走 async path。
+    ///
+    /// **V8e-7-4 reviewer M-2** — 本 API 不维护 `pending_aers` 镜像与 caller
+    /// stash 顺序的一致性（仅 `if !is_empty { remove(0) }` 兜底）；仅供
+    /// test 用。prod path 走 `dispatch_pdu_async` AER fast-path 让
+    /// `pending_aers` push → caller 收 `PumpEvent::AenReady` 后调
+    /// `drain_aers_async` 闭环。
     pub async fn inject_aen_async(
         &mut self,
         aen_type: u8,

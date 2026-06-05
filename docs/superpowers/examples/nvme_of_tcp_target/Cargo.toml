@@ -44,6 +44,10 @@ tokio = { version = "1", features = [
     "signal",
     "io-util",
 ] }
+# V8e-7-4 reviewer M-1 — `futures::FutureExt::catch_unwind` 让 bin 端
+# tokio::spawn handle_conn_async 内 panic 不静默 detach；tracing::error
+# 路径让运维可见。仅需 `executor` feature 默认 (catch_unwind 在 FutureExt)。
+futures = "0.3"
 
 [[bin]]
 name = "nvme_of_tcp_target"

@@ -498,12 +498,27 @@ async fn run_accept_loop(
         let inflight = Arc::clone(&inflight);
         let shared_ctrl = Arc::clone(&shared);
         let shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
-            let r = handle_conn_async(stream, shared_ctrl, shutdown_rx).await;
+        // **V8e-7-4 reviewer M-1** — detach `tokio::spawn` JoinHandle 但闭包
+        // 自身 catch panic：handle_conn_async 内若 panic（不该有，但保险），
+        // 这里至少把 panic message 转 tracing::error 让运维可见；inflight 计数
+        // 仍走 fetch_sub。`AssertUnwindSafe` 强行声明 future poll safe（教学
+        // 版接受单 conn panic 不污染其它 conn）。
+        // `let _handle = ...` 表明故意 detach（clippy `let_underscore_future` 要求）。
+        let _handle = tokio::spawn(async move {
+            let fut =
+                std::panic::AssertUnwindSafe(handle_conn_async(stream, shared_ctrl, shutdown_rx));
+            let r = futures::FutureExt::catch_unwind(fut).await;
             inflight.fetch_sub(1, Ordering::SeqCst);
             match r {
-                Ok(()) => tracing::info!(label, %peer, "connection closed normally"),
-                Err(e) => tracing::warn!(label, %peer, error = %e, "connection ended with error"),
+                Ok(Ok(())) => tracing::info!(label, %peer, "connection closed normally"),
+                Ok(Err(e)) => {
+                    tracing::warn!(label, %peer, error = %e, "connection ended with error")
+                }
+                Err(_) => tracing::error!(
+                    label,
+                    %peer,
+                    "V8e-7-4 handle_conn_async panic（已 catch；其它 conn 不受影响）"
+                ),
             }
         });
     }
