@@ -498,17 +498,26 @@ async fn run_accept_loop(
         let inflight = Arc::clone(&inflight);
         let shared_ctrl = Arc::clone(&shared);
         let shutdown_rx = shutdown_rx.clone();
-        // **V8e-7-4 reviewer M-1** — detach `tokio::spawn` JoinHandle 但闭包
-        // 自身 catch panic：handle_conn_async 内若 panic（不该有，但保险），
-        // 这里至少把 panic message 转 tracing::error 让运维可见；inflight 计数
-        // 仍走 fetch_sub。`AssertUnwindSafe` 强行声明 future poll safe（教学
-        // 版接受单 conn panic 不污染其它 conn）。
+        // **V8e-7-4 reviewer M-1 + security LOW-3** — detach `tokio::spawn`
+        // JoinHandle 但闭包内：
+        //   1. `InflightGuard` RAII：drop 时无条件 fetch_sub（即使 future panic）
+        //   2. `futures::FutureExt::catch_unwind` 把 handle_conn_async panic 转
+        //      Err 让 tracing::error 记录而非静默 detach
+        // 教学版接受单 conn panic 不污染其它 conn。
         // `let _handle = ...` 表明故意 detach（clippy `let_underscore_future` 要求）。
         let _handle = tokio::spawn(async move {
+            // RAII inflight 计数：保证 panic 路径也走 fetch_sub
+            struct InflightGuard(Arc<AtomicUsize>);
+            impl Drop for InflightGuard {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let _g = InflightGuard(inflight);
+
             let fut =
                 std::panic::AssertUnwindSafe(handle_conn_async(stream, shared_ctrl, shutdown_rx));
             let r = futures::FutureExt::catch_unwind(fut).await;
-            inflight.fetch_sub(1, Ordering::SeqCst);
             match r {
                 Ok(Ok(())) => tracing::info!(label, %peer, "connection closed normally"),
                 Ok(Err(e)) => {

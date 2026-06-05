@@ -1183,6 +1183,12 @@ impl AsyncSession {
     /// test 用。prod path 走 `dispatch_pdu_async` AER fast-path 让
     /// `pending_aers` push → caller 收 `PumpEvent::AenReady` 后调
     /// `drain_aers_async` 闭环。
+    ///
+    /// **V8e-7 security-reviewer MEDIUM-1** — 加 `#[doc(hidden)]` +
+    /// `#[deprecated]` 让任何 prod caller 调用产 warning；测试 + V-followup
+    /// 显式标注 `#[allow(deprecated)]` 即可。
+    #[doc(hidden)]
+    #[deprecated(note = "test-only; prod path 走 dispatch_pdu_async AER fast-path → drain_aers_async")]
     pub async fn inject_aen_async(
         &mut self,
         aen_type: u8,
