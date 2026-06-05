@@ -136,6 +136,12 @@ impl V2Session {
         mut controller: NvmeController,
     ) -> anyhow::Result<Self> {
         let negotiated = ic_handshake(&mut stream).context("ICReq/ICResp handshake")?;
+        // **V5d-fix-2 (review L-6)** — bin handshake 阶段强制了 30s read/write
+        // timeout 防 slowloris；握手成功后真业务流（KeepAlive 控）允许长 idle。
+        // 这里清除 timeout 让 pump_one read_pdu 无限阻塞，由 client KATO 控
+        // dead-conn 检测；ignore set 失败（FD 已 close 等罕见情况）。
+        let _ = stream.set_read_timeout(None);
+        let _ = stream.set_write_timeout(None);
         // **Phase V3** — 给 controller 装一个"假" admin CQ，让它能 post_cqe
         // 通过 ctx.dma_write(CQ_BASE_GPA + slot*16, cqe_16B)。session 后续
         // 通过 gpa ≥ CQ_BASE_GPA 识别这是 CQE bytes vs PRP1 data。

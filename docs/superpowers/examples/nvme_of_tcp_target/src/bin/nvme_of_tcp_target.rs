@@ -88,21 +88,15 @@ fn main() -> Result<()> {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
-    // **V5d-fix H-2** — ignore SIGPIPE，防 client 提前 RST 时整 bin abort。
-    // 用 signal-hook crate；如果不可用就 manual via libc::signal —— 但
-    // 仓库 forbids unsafe_code，所以 `nix`/`signal-hook` 必备。教学版
-    // 这里给出最简方案：单独 spawn 一个 thread 等 SIGPIPE 然后 ignore
-    // 实际上 Rust 没有 safe 接口直接 ignore SIGPIPE 信号。
-    // 折中方案：所有 socket write 都用 `MSG_NOSIGNAL`。但 std::net::TcpStream::write
-    // 不暴露 flags 选项。这里采用最简做法：依赖 broken-pipe 错误传播
-    // (Rust ErrorKind::BrokenPipe)，业务路径已用 `?` 上抛 + worker thread
-    // panic 不影响其他 thread。
+    // **V5d-fix-2 (review H-2)** — Rust std 在 unix startup 自动 SIG_IGN
+    // SIGPIPE（见 `library/std/src/sys/pal/unix/mod.rs::init`），所以
+    // `TcpStream::write` 撞 broken pipe 时返 `ErrorKind::BrokenPipe`
+    // 而非 process terminate。worker thread 的 `?` 把 Err 上抛，连接
+    // 终止但其他 worker 不受影响 —— 本 bin 不需要再加任何 SIGPIPE 处理。
     //
-    // **note**：完全 ignore SIGPIPE 需要 unsafe `libc::signal` 或额外 dep；
-    // 本 bin `#![forbid(unsafe_code)]` 不允许；workaround = worker thread
-    // panic 只杀 worker 不杀 process（Rust thread::spawn 的 unwind 隔离）。
-    // 如果未来上 prod，需要加 signal-hook = "0.3" dep + 干净 ignore。
-    // **TODO(V6-prod)**: signal-hook dep + 真 ignore SIGPIPE.
+    // 如果未来仓库 / 用户禁用此 std 默认行为（极端罕见），需要加
+    // signal-hook 或 nix dep 手动 SIG_IGN。当前 `forbid(unsafe_code)`
+    // 下无法 manual `libc::signal` —— 接受 std 默认即可。
 
     let cli = Cli::parse();
 
@@ -175,14 +169,18 @@ fn main() -> Result<()> {
     let inflight = Arc::new(AtomicUsize::new(0));
     let max_conn = cli.max_connections;
 
-    // **V5d-fix M-1** — SIGINT/SIGTERM graceful shutdown
+    // **V5d-fix-2 (review M-1)** — SIGINT/SIGTERM graceful shutdown via `ctrlc` crate
+    // （跨平台、无 unsafe）。flag flip → non-blocking listener 退 accept loop →
+    // 等 in-flight worker 最多 2s drain → exit。
     let running = Arc::new(AtomicBool::new(true));
     {
         let running = Arc::clone(&running);
-        ctrlc_set_handler(move || {
+        if let Err(e) = ctrlc::set_handler(move || {
             tracing::info!("SIGINT/SIGTERM received; stopping accept loop");
             running.store(false, Ordering::SeqCst);
-        });
+        }) {
+            tracing::warn!(error = %e, "ctrlc::set_handler failed; Ctrl-C will terminate immediately");
+        }
     }
 
     let listener =
@@ -201,7 +199,10 @@ fn main() -> Result<()> {
                 (s, addr)
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // non-blocking accept 没新连接；slight sleep 让 CPU 不打转
+                // non-blocking accept 没新连接；slight sleep 让 CPU 不打转。
+                // **V5d-fix-2 (review H-3)** — 同步 reset backoff 防上次真 Err
+                // 累加后第一次 retry 用陈旧大值。
+                accept_backoff_ms = 0;
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
@@ -252,20 +253,6 @@ fn main() -> Result<()> {
     }
     tracing::info!("exit");
     Ok(())
-}
-
-/// **V5d-fix M-1** — 装 SIGINT/SIGTERM handler。使用 `ctrlc` crate 不在
-/// 仓库 deps；这里用最小 fallback：派一个 thread 监 stdin EOF / 用 `ctrlc`
-/// 替换品。当前实现：only SIGINT via Ctrl-C 走 process exit；shutdown 仍
-/// 依赖 running flag。若 `signal-hook` 加入 dep 可替换为更稳实现。
-fn ctrlc_set_handler<F: FnMut() + Send + 'static>(_f: F) {
-    // 教学版 placeholder：当前 fallback 是依赖 process exit（runtime cleanup）
-    // 来 unblock。listener 是 non-blocking + running flag 会被设的方式只在
-    // 后续加 signal dep 后真生效。本函数留位 + 备注让 review/maintenance
-    // 容易接入。
-    //
-    // **TODO(V5d-followup)**: 加 ctrlc = "3" 或 signal-hook = "0.3"
-    // dep 后实现真信号回调。
 }
 
 /// 每条 TCP 连接的工作流：

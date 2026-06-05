@@ -95,11 +95,13 @@ spec § 8.13 TCP transport 行为一致。
 |---|---|---|
 | 单 IO ≤ 512 byte（nlb=1） | session sentinel scheme 教学版只支持单 PRP1 | V5e（多 PRP / PRP list） |
 | 单 backing file 同时仅 1 active connection | 教学版 controller 无 `Arc<Mutex<>>` 共享 | V8.5 |
+| **R-8 锁基于 path 字符串**：symlink/hardlink 别名指向同 inode 仍能绕过锁 | clippy 禁 `Path::canonicalize`；inode-based key 需 unix-specific fd metadata | V8（fd-based key 配合 controller 共享） |
 | 无 Discovery subsystem | 必须 `nvme connect -n nqn...`，不能 `connect-all` | V7 |
 | 无 TLS 1.3 / DH-HMAC-CHAP | spec § 8 独立模块 | V-followup |
 | 单 IO queue per session | per-qid 一 TCP conn（与 Linux nvme-tcp 真实行为一致） | V8 |
 | nlb > 1 单 IO → driver 自动拆 | 返 SC=0x18 SGL_DATA_LENGTH_INVALID 让 host 重发分片 | V5e |
 | 大块 IO 性能差 | 串行多 cmd，无 pipelining | V8 + tokio refactor |
+| Ctrl-C / SIGTERM graceful shutdown | 已通过 `ctrlc` crate 实现：flip running flag → accept loop 退 → 等 ≤ 2s in-flight worker drain → exit | V5d-fix-2 ✅ |
 
 ## 架构概览
 
