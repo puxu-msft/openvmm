@@ -85,6 +85,16 @@ pub fn cq_sentinel(qid: u16) -> u64 {
     CQ_BASE_GPA + (qid as u64) * CQ_SENTINEL_STRIDE
 }
 
+/// **Phase V5e-1** — 单条 IO Read/Write 允许的最大 NLB（0-based + 1 的真值）。
+///
+/// = `NVME_PAGE_SIZE (4 KiB) / sector_size (512B @ LBADS=9)` = 8。
+/// session sentinel scheme 教学版只支持单 PRP1，所以 nlb 实值不能超过此 cap。
+///
+/// **review M-4 / H-1**：当前 hard-coded 9 (LBADS=9) + 0 (no PI) 假设；
+/// session 已经 block 改 NS 形状的 admin opcodes (FORMAT_NVM / NS_MANAGEMENT)，
+/// 所以 lbads / pi_type 不会运行时漂变。V5e-2 加多 PRP 后扩到 16。
+pub const V5_NLB_MAX: u32 = 8;
+
 /// 握手后的协商参数。
 #[derive(Debug, Clone, Copy)]
 pub struct NegotiatedIc {
@@ -258,16 +268,12 @@ impl V2Session {
             ),
         };
 
-        // **V5b/V5c/V5e-1 (R-4)** — IO Read/Write nlb 上限 guard。
-        // - controller LBADS 默认 9（512B/sector）；单 PRP1 可装 NVME_PAGE_SIZE
-        //   = 4 KiB 数据，即 nlb ≤ 8（io.rs:824 `bytes <= NVME_PAGE_SIZE` 走单 PRP1
-        //   path）。session sentinel scheme 只支持单 PRP1，所以 nlb_real > 8 reject。
+        // **V5b/V5c/V5e-1 (R-4)** — IO Read/Write nlb 上限 = [`V5_NLB_MAX`]。
+        // - controller LBADS 默认 9（512B/sector）；单 PRP1 装 NVME_PAGE_SIZE=
+        //   4 KiB → nlb ≤ 8。**H-1 fix**: handle_admin_cmd block FORMAT_NVM /
+        //   NS_MANAGEMENT 防止 lbads 漂变让 cap 失效。
         // - cdw12 bits 15:0 = NLB (0-based) → nlb_real = +1。
-        // - 超出 → 拒 SC=0x18 SGL_DATA_LENGTH_INVALID 让 driver 拆分（Linux
-        //   nvme-tcp host 见此 sc 自动 retry 较小 io）。当前 cmd 不进 dispatch
-        //   防 controller 已起 IO 后又 reject 的 wire 混乱。
-        // - V5e-2 加多 PRP 直接指针扩到 nlb ≤ 16（4 KiB × 2）；后续 PRP list 解锁更大。
-        const V5_NLB_MAX: u32 = 8;
+        // - 超出 → 拒 SC=0x18 SGL_DATA_LENGTH_INVALID 让 driver 拆分。
         if matches!(opc, 0x01 /* WRITE */ | 0x02 /* READ */) {
             let nlb_real = (sqe.cdw12 & 0xffff) + 1;
             if nlb_real > V5_NLB_MAX {
@@ -322,6 +328,28 @@ impl V2Session {
     fn handle_admin_cmd(&mut self, cid: u16, sqe_bytes: &[u8]) -> anyhow::Result<()> {
         let mut sqe =
             Sqe::read_from_bytes(sqe_bytes).map_err(|_| anyhow::anyhow!("SQE 不是 64 byte"))?;
+
+        // **V5e-1-fix (review H-1)** — block opcode 会让 NS 形状漂变（LBADS /
+        // PI 切换），因为 session 的 V5_NLB_MAX 单 PRP1 假设直接挂钩
+        // `lbads=9 + pi_type=0`：一旦 host `nvme format --lbaf=1 --pi=1`，
+        // controller dual-PRP / PRP-list path 走 prp2=0 sentinel → dma_read
+        // 静默到非法 gpa → wire 破 / 数据 corruption。V8+ 真支持多 PRP 后解封。
+        //
+        // 黑名单：
+        // - 0x80 FORMAT_NVM       — 改 lbads / pi_type
+        // - 0x15 NS_ATTACHMENT    — V4b 已走 R2T 闭环，但 attach/detach 会
+        //   改变 active NS 集合，配合后续 cmd 重新计算 lbads；保守 block
+        // - 0x0D NAMESPACE_MANAGEMENT — 创建/删除 NS
+        let opc_peek = (sqe.cdw0 & 0xff) as u8;
+        if matches!(opc_peek, 0x80 | 0x0D) {
+            tracing::warn!(
+                opc = opc_peek,
+                "V5e-1 session rejecting admin opc that mutates NS shape; \
+                 V5 sentinel scheme assumes LBADS=9 + PI=0"
+            );
+            return self.send_capsule_resp_err(cid, /*INVALID_OPCODE=*/ 0x01);
+        }
+
         // 用哨值替换 client 给的 prp1，让 controller dma_write / dma_read
         // 都打到我们能识别的 gpa（V4b 单 read：复用同一哨值；V4c+ 多 read
         // 引入 per-ttag sentinel 池防撞）。
@@ -2169,6 +2197,37 @@ mod tests {
         assert_eq!(resp.header.pdu_type, pdu_type::RSP);
         let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
         assert_eq!(sc, 0);
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V5e-1-fix (review H-1)** — admin FORMAT_NVM (opcode 0x80) 必须被
+    /// session 拒，防止 host 改 NS 形状破坏 V5_NLB_MAX 单 PRP1 假设。
+    #[test]
+    fn v5e_format_nvm_rejected_at_session() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect admin
+            sess.pump_one()?; // FORMAT_NVM (应被拒)
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+
+        // FORMAT_NVM 0x80, nsid=1, cdw10: lbafl=1 (4 KiB) + pi=1
+        // bits 3:0 = LBAFL, bits 6:5 = MSET, bits 9:7 = PI
+        let cdw10: u32 = 0x01 /* LBAFL=1 */ | (0x1u32 << 7) /* PI=001 */;
+        send_admin_sqe_cdw11(&mut client, 0x80, 0x0F70, 1, cdw10, 0);
+
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        let resp_cid = u16::from_le_bytes(resp.psh[12..14].try_into().unwrap());
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(resp_cid, 0x0F70);
+        assert_eq!(sc, 0x01, "FORMAT_NVM 必被 session block 为 INVALID_OPCODE");
         h.join().unwrap().unwrap();
     }
 

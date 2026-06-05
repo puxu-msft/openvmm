@@ -171,18 +171,22 @@ fn main() -> Result<()> {
     let inflight = Arc::new(AtomicUsize::new(0));
     let max_conn = cli.max_connections;
 
-    // **V5d-fix-2 (review M-1)** — SIGINT/SIGTERM graceful shutdown via `ctrlc` crate
-    // （跨平台、无 unsafe）。flag flip → non-blocking listener 退 accept loop →
-    // 等 in-flight worker 最多 2s drain → exit。
+    // **V5d-fix-2 (review M-1) + V5e-1-fix (review H-2)** — SIGINT/SIGTERM
+    // graceful shutdown via `ctrlc` crate（跨平台、无 unsafe）。flag flip
+    // → non-blocking listener exit accept loop → 等 in-flight worker 最多
+    // 2s drain → exit 0。
+    //
+    // **H-2 fix**：startup 失败必须 hard-fail。本 bin 唯一 graceful shutdown
+    // 机制就是 ctrlc handler；silent degrade 到 "Ctrl-C 整 process 死" 与
+    // M-1 立意冲突。
     let running = Arc::new(AtomicBool::new(true));
     {
         let running = Arc::clone(&running);
-        if let Err(e) = ctrlc::set_handler(move || {
+        ctrlc::set_handler(move || {
             tracing::info!("SIGINT/SIGTERM received; stopping accept loop");
             running.store(false, Ordering::SeqCst);
-        }) {
-            tracing::warn!(error = %e, "ctrlc::set_handler failed; Ctrl-C will terminate immediately");
-        }
+        })
+        .context("install SIGINT/SIGTERM handler (V5e-1-fix H-2 require)")?;
     }
 
     let listener =
