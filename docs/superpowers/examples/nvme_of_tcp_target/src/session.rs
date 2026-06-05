@@ -85,15 +85,21 @@ pub fn cq_sentinel(qid: u16) -> u64 {
     CQ_BASE_GPA + (qid as u64) * CQ_SENTINEL_STRIDE
 }
 
-/// **Phase V5e-1** — 单条 IO Read/Write 允许的最大 NLB（0-based + 1 的真值）。
+/// **Phase V5e-1 / V5e-2** — 单条 IO Read/Write 允许的最大 NLB（0-based + 1 的真值）。
 ///
-/// = `NVME_PAGE_SIZE (4 KiB) / sector_size (512B @ LBADS=9)` = 8。
-/// session sentinel scheme 教学版只支持单 PRP1，所以 nlb 实值不能超过此 cap。
+/// 计算依据 `LBADS=9` (512B/sector)：
+/// - V5e-1：单 PRP1（≤ 4 KiB）→ nlb ≤ 8
+/// - V5e-2：双 PRP（PRP1 + PRP2 直接指针，≤ 8 KiB）→ nlb ≤ 16
 ///
-/// **review M-4 / H-1**：当前 hard-coded 9 (LBADS=9) + 0 (no PI) 假设；
-/// session 已经 block 改 NS 形状的 admin opcodes (FORMAT_NVM / NS_MANAGEMENT)，
-/// 所以 lbads / pi_type 不会运行时漂变。V5e-2 加多 PRP 后扩到 16。
-pub const V5_NLB_MAX: u32 = 8;
+/// **review M-4 / H-1**：当前 hard-coded LBADS=9 + no PI 假设；session 已经
+/// block FORMAT_NVM / NS_MANAGEMENT (handle_admin_cmd 入口) 防止 host 切换
+/// NS 形状破坏此假设。V5e-3 加 PRP list 后再扩到更大 MDTS。
+pub const V5_NLB_MAX: u32 = 16;
+
+/// **Phase V5e-2** — PRP1 sentinel 不变 (V3)；新加 PRP2 sentinel 让 controller
+/// 走 dual-PRP path 时 session 能识别第二段 dma_read/dma_write。
+/// 必须 < CQ_BASE_GPA 才能与 CQE write 区分。
+pub const PRP2_SENTINEL: u64 = 0x2000_0000;
 
 /// 握手后的协商参数。
 #[derive(Debug, Clone, Copy)]
@@ -254,10 +260,11 @@ impl V2Session {
         // 让 controller 用 prp1+prp2 走 PRP path（对 host 透明）。
         sqe.cdw0 &= !(0b11u32 << 14);
 
-        // sentinel 改写 prp1（V5 IO 单段 ≤ 4 KiB，prp2 不用）
+        // **V5e-2** — sentinel 改写 prp1 + 按 nlb 决定 prp2：
+        // - nlb ≤ 8 (单 PRP1 ≤ 4 KiB)：prp2 = 0（controller 走单 PRP1 path）
+        // - 8 < nlb ≤ 16 (双 PRP ≤ 8 KiB)：prp2 = PRP2_SENTINEL，controller
+        //   走 dual-PRP path 产 2 个 dma_read/dma_write，session 累计处理
         sqe.prp1 = PRP1_SENTINEL;
-        sqe.prp2 = 0;
-
         let opc = (sqe.cdw0 & 0xff) as u8;
         let sq_id = self.current_qid;
         // 查 sq_id → cq_id
@@ -268,11 +275,10 @@ impl V2Session {
             ),
         };
 
-        // **V5b/V5c/V5e-1 (R-4)** — IO Read/Write nlb 上限 = [`V5_NLB_MAX`]。
-        // - controller LBADS 默认 9（512B/sector）；单 PRP1 装 NVME_PAGE_SIZE=
-        //   4 KiB → nlb ≤ 8。**H-1 fix**: handle_admin_cmd block FORMAT_NVM /
-        //   NS_MANAGEMENT 防止 lbads 漂变让 cap 失效。
-        // - cdw12 bits 15:0 = NLB (0-based) → nlb_real = +1。
+        // **V5b/V5c/V5e-1/V5e-2 (R-4)** — IO Read/Write nlb 上限 = [`V5_NLB_MAX`]=16。
+        // - LBADS=9：单 PRP1 (≤4 KiB) → nlb ≤ 8；双 PRP (≤8 KiB) → nlb ≤ 16
+        // - prp2 sentinel 仅 IO Read/Write 设；其他 opc 走默认（多数 admin
+        //   只用 prp1）。session block FORMAT_NVM / NS_MANAGEMENT 防 lbads 漂变。
         // - 超出 → 拒 SC=0x18 SGL_DATA_LENGTH_INVALID 让 driver 拆分。
         if matches!(opc, 0x01 /* WRITE */ | 0x02 /* READ */) {
             let nlb_real = (sqe.cdw12 & 0xffff) + 1;
@@ -281,10 +287,14 @@ impl V2Session {
                     opc,
                     nlb_real,
                     max = V5_NLB_MAX,
-                    "V5e-1 IO nlb>MAX 单 PRP1 上限，回 SC=0x18 让 driver 拆"
+                    "V5e-2 IO nlb>MAX 双 PRP 上限，回 SC=0x18 让 driver 拆"
                 );
                 return self.send_capsule_resp_err(cid, /*SGL_DATA_LENGTH_INVALID=*/ 0x18);
             }
+            // 设 prp2 sentinel 让 controller 走 dual-PRP path
+            sqe.prp2 = if nlb_real > 8 { PRP2_SENTINEL } else { 0 };
+        } else {
+            sqe.prp2 = 0;
         }
 
         tracing::debug!(cid, opc, sq_id, cq_id, "V5b/V5c IO dispatch");
@@ -447,20 +457,32 @@ impl V2Session {
         let had_pending_reads = dispatch_pending_reads > 0;
 
         // ─── Phase 2：处理 captured pending_reads（V4b dma_read 闭环）───
+        // **V5e-2** — 跨 read_req 累积 cmd-cumulative offset，让 IO Write
+        // dual-PRP (controller `ctx.dma_read(prp1, 4 KiB) + dma_read(prp2, N)`)
+        // 的 2 个 R2T 也按 cmd 累计 data_offset 与 Linux nvme-tcp host 真实行为
+        // (req->data_sent) 对齐。同一 cmd 的多 read_req 顺序按 controller
+        // dispatch 时 push 顺序（PRP1 在前、PRP2 在后），dma_read_via_r2t 内部
+        // base_offset 直接用累计值。
+        let mut cmd_cumulative_offset: u32 = 0;
         while let Some(read_req) = tcp_t.pop_read() {
             tracing::debug!(
                 cid,
                 token = read_req.token,
                 len = read_req.len,
-                "V4b/V4c dispatch dma_read"
+                cumulative_offset = cmd_cumulative_offset,
+                "V4b/V4c/V5e-2 dispatch dma_read"
             );
-            let bytes = self.dma_read_via_r2t(cid, read_req.len).with_context(|| {
-                format!(
-                    "V4 dma_read failed (cid={cid}, token={tok}, len={l})",
-                    tok = read_req.token,
-                    l = read_req.len
-                )
-            })?;
+            let bytes = self
+                .dma_read_via_r2t(cid, cmd_cumulative_offset, read_req.len)
+                .with_context(|| {
+                    format!(
+                        "V4 dma_read failed (cid={cid}, token={tok}, len={l}, offset={off})",
+                        tok = read_req.token,
+                        l = read_req.len,
+                        off = cmd_cumulative_offset,
+                    )
+                })?;
+            cmd_cumulative_offset = cmd_cumulative_offset.saturating_add(read_req.len);
             let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
             self.controller
                 .nvme_admin_complete_dma(&mut ctx, read_req.token, true, bytes);
@@ -550,25 +572,38 @@ impl V2Session {
     /// **review H-2 fix**：单条 dma_read 长度 cap 到 [`V4_MAX_DMA_READ_BYTES`]
     /// （8 MiB，与 controller 内部 FW_MAX 对齐）。超出 → bail 防 R2T 循环
     /// 爆炸 + Vec::with_capacity 大块分配 OOM。
-    fn dma_read_via_r2t(&mut self, cid: u16, total_len: u32) -> anyhow::Result<Vec<u8>> {
-        if total_len > V4_MAX_DMA_READ_BYTES {
+    /// **Phase V4c / V5e-2** — 把 controller 一次 `dma_read(len)` 拆成多条
+    /// `MAXH2CDATA_BYTES` 大小的 R2T 串行拉回，拼接成 `Vec<u8>` 返。
+    ///
+    /// `base_offset` (V5e-2 新加) = 该 read_req 在 cmd 内的累计起始 offset。
+    /// 单 PRP cmd 调用方传 0；dual-PRP（V5e-2）调用方逐 read_req 累加
+    /// (4 KiB, ...)，与 Linux nvme-tcp host 的 `psh.data_offset = req->data_sent`
+    /// 累计语义对齐。
+    fn dma_read_via_r2t(
+        &mut self,
+        cid: u16,
+        base_offset: u32,
+        len: u32,
+    ) -> anyhow::Result<Vec<u8>> {
+        if len > V4_MAX_DMA_READ_BYTES {
             anyhow::bail!(
-                "V4c: dma_read total_len {} exceeds policy cap {} (防 R2T 循环爆炸 / OOM)",
-                total_len,
+                "V4c: dma_read len {} exceeds policy cap {} (防 R2T 循环爆炸 / OOM)",
+                len,
                 V4_MAX_DMA_READ_BYTES
             );
         }
         let max = MAXH2CDATA_BYTES;
-        let mut buf: Vec<u8> = Vec::with_capacity(total_len as usize);
-        let mut offset: u32 = 0;
-        while offset < total_len {
-            let remaining = total_len - offset;
+        let mut buf: Vec<u8> = Vec::with_capacity(len as usize);
+        let mut offset_in_this_read: u32 = 0;
+        while offset_in_this_read < len {
+            let remaining = len - offset_in_this_read;
             let chunk = remaining.min(max);
-            let bytes = self.dma_read_one_chunk(cid, offset, chunk)?;
+            let cmd_offset = base_offset.saturating_add(offset_in_this_read);
+            let bytes = self.dma_read_one_chunk(cid, cmd_offset, chunk)?;
             buf.extend_from_slice(&bytes);
-            offset += chunk;
+            offset_in_this_read += chunk;
         }
-        debug_assert_eq!(buf.len(), total_len as usize);
+        debug_assert_eq!(buf.len(), len as usize);
         Ok(buf)
     }
 
@@ -2322,7 +2357,7 @@ mod tests {
     #[test]
     fn v5b_io_read_nlb_over_max_rejected_with_sgl_data_length_invalid() {
         let (mut client, h, _backing) = v5a_full_setup_qid1(5);
-        send_io_read(&mut client, 0x0801, 1, 0, 9);
+        send_io_read(&mut client, 0x0801, 1, 0, 17);
         let resp = read_pdu(&mut client).unwrap();
         assert_eq!(
             resp.header.pdu_type,
@@ -2431,6 +2466,133 @@ mod tests {
         assert!(
             readback.iter().all(|&b| b == 0xC8),
             "backing 前 4 KiB 应被 IO Write 改写为 0xC8"
+        );
+    }
+
+    /// **V5e-2** — IO Read nlb=16 (= 8 KiB @ LBADS=9) 触发 controller
+    /// dual-PRP path：session 设 prp2=PRP2_SENTINEL → controller 产 2 个
+    /// dma_write → session drain captured.writes concat 成 8 KiB C2HData。
+    #[test]
+    fn v5e_io_read_nlb16_8kib_dual_prp_succeeds() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller_with_pattern(0xB8);
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            for _ in 0..5 {
+                sess.pump_one()?;
+            }
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        let cdw10_cq = 1u32 | (15u32 << 16);
+        send_admin_sqe_cdw11(&mut client, 0x05, 0x0501, 0, cdw10_cq, 0x0000_0001);
+        let _ = read_pdu(&mut client).unwrap();
+        let cdw10_sq = 1u32 | (15u32 << 16);
+        send_admin_sqe_cdw11(&mut client, 0x01, 0x0502, 0, cdw10_sq, 0x0001_0001);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_io(&mut client, 1);
+        let _ = read_pdu(&mut client).unwrap();
+
+        // 但 backing 只 pre-fill 前 4 KiB；剩 4 KiB 是 0。需要预先扩 pre-fill
+        // 不容易（make_test_controller_with_pattern 只填 4 KiB）。
+        // 改为：Write 0xB8 到 SLBA 0..16 然后 Read 验。
+        // 简化：本测验"链路通"+ "前 4 KiB 是 pattern" 即可。
+        send_io_read(&mut client, 0x0E16, 1, 0, 16);
+
+        let p = read_pdu(&mut client).unwrap();
+        assert_eq!(p.header.pdu_type, pdu_type::C2H_DATA);
+        assert_eq!(p.data.len(), 8192, "nlb=16 @ LBADS=9 = 8 KiB");
+        // 前 4 KiB 是 0xB8（make_test_controller_with_pattern 填的），
+        // 后 4 KiB 是 backing 默认 0。验链路 concat 正确：前后段都从
+        // 正确的 prp1/prp2 backing 来。
+        assert!(
+            p.data[..4096].iter().all(|&b| b == 0xB8),
+            "前 4 KiB (prp1 段) 应为 pattern 0xB8"
+        );
+        assert!(
+            p.data[4096..].iter().all(|&b| b == 0),
+            "后 4 KiB (prp2 段) 应为 backing 默认 0"
+        );
+
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(sc, 0, "nlb=16 dual-PRP Read 应 success");
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V5e-2** — IO Write nlb=16 dual-PRP roundtrip：写 8 KiB 0xD7 →
+    /// 验 backing 前 8 KiB 内容 + 期望 2 个 R2T (offset 0/4096, length 4096)。
+    #[test]
+    fn v5e_io_write_nlb16_8kib_dual_prp_round_trip() {
+        let (mut client, server) = tcp_pair();
+        let f = tempfile::NamedTempFile::new().expect("tempfile");
+        f.as_file().set_len(1024 * 1024).expect("set_len");
+        let backing_path = f.path().to_str().expect("utf8").to_string();
+        let backing_path_for_verify = backing_path.clone();
+        let _backing = f;
+        let controller =
+            NvmeController::open(&[backing_path], 0x1414, 0, &[]).expect("open controller");
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            for _ in 0..5 {
+                sess.pump_one()?;
+            }
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        let cdw10_cq = 1u32 | (15u32 << 16);
+        send_admin_sqe_cdw11(&mut client, 0x05, 0x0501, 0, cdw10_cq, 0x0000_0001);
+        let _ = read_pdu(&mut client).unwrap();
+        let cdw10_sq = 1u32 | (15u32 << 16);
+        send_admin_sqe_cdw11(&mut client, 0x01, 0x0502, 0, cdw10_sq, 0x0001_0001);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_io(&mut client, 1);
+        let _ = read_pdu(&mut client).unwrap();
+
+        send_io_write(&mut client, 0x0F16, 1, 0, 16);
+
+        // 期望 2 条 R2T：第一条 offset=0 length=4096，第二条 offset=4096 length=4096
+        let p1 = read_pdu(&mut client).unwrap();
+        assert_eq!(p1.header.pdu_type, pdu_type::R2T);
+        let r1: crate::pdu::R2tPsh = crate::pdu::decode_psh(&p1.psh).unwrap();
+        let ttag1 = r1.ttag;
+        let off1 = r1.r2t_offset;
+        let len1 = r1.r2t_length;
+        assert_eq!(off1, 0);
+        assert_eq!(len1, 4096, "R2T #1 length = 4 KiB (PRP1)");
+        send_h2cdata_at(&mut client, 0x0F16, ttag1, 0, &vec![0xD7u8; 4096]);
+
+        let p2 = read_pdu(&mut client).unwrap();
+        assert_eq!(p2.header.pdu_type, pdu_type::R2T);
+        let r2: crate::pdu::R2tPsh = crate::pdu::decode_psh(&p2.psh).unwrap();
+        let ttag2 = r2.ttag;
+        let off2 = r2.r2t_offset;
+        let len2 = r2.r2t_length;
+        assert_eq!(off2, 4096, "R2T #2 offset = 4 KiB（cmd 累计）");
+        assert_eq!(len2, 4096, "R2T #2 length = 4 KiB (PRP2)");
+        assert!(ttag2 != ttag1);
+        send_h2cdata_at(&mut client, 0x0F16, ttag2, 4096, &vec![0xD7u8; 4096]);
+
+        let resp = read_pdu(&mut client).unwrap();
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(sc, 0, "nlb=16 dual-PRP Write 应 success");
+        h.join().unwrap().unwrap();
+
+        // 后置验 backing 前 8 KiB 全 = 0xD7
+        let mut readback = vec![0u8; 8192];
+        use std::io::Read as _;
+        let mut bf = std::fs::File::open(&backing_path_for_verify).unwrap();
+        bf.read_exact(&mut readback).unwrap();
+        assert!(
+            readback.iter().all(|&b| b == 0xD7),
+            "backing 前 8 KiB 应为 0xD7"
         );
     }
 
@@ -2593,7 +2755,7 @@ mod tests {
     #[test]
     fn v5c_io_write_nlb_over_max_rejected() {
         let (mut client, h, _backing) = v5a_full_setup_qid1(5);
-        send_io_write(&mut client, 0x0D11, 1, 0, 9);
+        send_io_write(&mut client, 0x0D11, 1, 0, 17);
         let resp = read_pdu(&mut client).unwrap();
         assert_eq!(
             resp.header.pdu_type,

@@ -24,7 +24,9 @@
 //! - **V5d-fix / V5d-fix-2** ✅ security hardening: max-conn cap / loopback
 //!   default / ctrlc graceful / handshake timeout / SIGPIPE invariant
 //! - **V5e-1** ✅ nlb 上限放宽到 8（单 PRP1 4 KiB；Linux dd bs=4k 单 cmd 完成）
-//! - **V5e-2–V8** 计划中
+//! - **V5e-1-fix** ✅ session block FORMAT_NVM/NS_MANAGEMENT 防 lbads 漂变 + ctrlc hard-fail
+//! - **V5e-2** ✅ 多 PRP 直接指针：nlb 扩到 16 (8 KiB)；PRP2_SENTINEL + cmd 累计 R2T offset
+//! - **V5e-3–V8** 计划中
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

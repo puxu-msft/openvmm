@@ -93,7 +93,7 @@ spec § 8.13 TCP transport 行为一致。
 
 | 限制 | 原因 | 解除阶段 |
 |---|---|---|
-| 单 IO ≤ 4 KiB（nlb ≤ 8 @ LBADS=9，无 PI） | session sentinel scheme 教学版只支持单 PRP1；controller `bytes <= NVME_PAGE_SIZE` 走单 PRP1 path。**session block FORMAT_NVM / NS_MANAGEMENT 防止 host 切换 NS 形状破坏此假设**（V5e-1-fix review H-1） | V5e-2（多 PRP 直接指针 → ≤ 8 KiB）/ V5e-3 PRP list / V8 PI support |
+| 单 IO ≤ 8 KiB（nlb ≤ 16 @ LBADS=9，无 PI） | session sentinel scheme 教学版只支持 prp1+prp2 直接指针（≤ 8 KiB）；controller `bytes <= 2*NVME_PAGE_SIZE` 走 dual-PRP path。**session block FORMAT_NVM / NS_MANAGEMENT 防止 host 切换 NS 形状破坏此假设**（V5e-1-fix review H-1） | V5e-3（PRP list path → MDTS 上限）/ V8 PI support |
 | 单 backing file 同时仅 1 active connection | 教学版 controller 无 `Arc<Mutex<>>` 共享 | V8.5 |
 | **R-8 锁基于 path 字符串**：symlink/hardlink 别名指向同 inode 仍能绕过锁 | clippy 禁 `Path::canonicalize`；inode-based key 需 unix-specific fd metadata | V8（fd-based key 配合 controller 共享） |
 | 无 Discovery subsystem | 必须 `nvme connect -n nqn...`，不能 `connect-all` | V7 |
