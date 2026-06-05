@@ -46,9 +46,22 @@ use crate::pdu::{CommonHdr, IcPsh, pdu_type};
 use anyhow::Context as _;
 use std::pin::Pin;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream as TokioStream;
 use tokio::time::{Instant as TokioInstant, Sleep, sleep_until};
 use zerocopy::{FromBytes, IntoBytes};
+
+/// **V-followup-tls-1** — `AsyncSession` 接受的 stream trait bound。
+///
+/// 当前 (V-followup-tls-1) 实测的实现：`tokio::net::TcpStream` 与 in-memory
+/// `tokio::io::DuplexStream` 自动满足。V-followup-tls-3 引入
+/// `tokio_rustls::server::TlsStream<TcpStream>` 后将自动满足；bin 端
+/// `handle_conn_async` 届时根据是否 TLS 二分调用，由 monomorphize 各产一份代码。
+///
+/// `Send + 'static` 是 `tokio::spawn` 强制；`Unpin` 让我们能直接 `&mut self.stream`
+/// 不需要 Pin projection。
+pub trait AsyncSessionStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncSessionStream for T {}
 
 /// **V8e-3** — async session：握手完成后通过 [`pump_one_async`] 接 PDU
 /// 直到 shutdown 或 peer close。
@@ -56,8 +69,8 @@ use zerocopy::{FromBytes, IntoBytes};
 /// 字段集合刻意收得比 sync `V2Session` 少：V8e-3 只交付 ICReq/Connect/简单
 /// dispatch 骨架；V8e-4 加 AER Notify、V8e-5 加 KATO Sleep、V8e-6 加完整
 /// admin/IO dispatch。
-pub struct AsyncSession {
-    stream: TokioStream,
+pub struct AsyncSession<S: AsyncSessionStream = TokioStream> {
+    stream: S,
     controller: SharedController,
     /// 协商后参数（与 sync `NegotiatedIc` 等价）。
     pub negotiated: crate::NegotiatedIc,
@@ -100,7 +113,10 @@ pub struct AsyncSession {
 /// **V8e-3** — async 版 ICReq/ICResp handshake。语义与 sync
 /// [`crate::ic_handshake`] 1:1 等价（HDGST/DDGST 协商写死禁用；MAXH2CDATA
 /// = `MAXH2CDATA_BYTES`）。byte-stream 等价已被 V8e-1 regression gate 覆盖。
-pub async fn ic_handshake_async(stream: &mut TokioStream) -> anyhow::Result<crate::NegotiatedIc> {
+pub async fn ic_handshake_async<S>(stream: &mut S) -> anyhow::Result<crate::NegotiatedIc>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // 1. recv ICReq
     let pdu = read_pdu_async(stream).await.context("V8e-3: read ICReq")?;
     if pdu.header.pdu_type != pdu_type::ICREQ {
@@ -152,10 +168,13 @@ pub async fn ic_handshake_async(stream: &mut TokioStream) -> anyhow::Result<crat
 /// admin CQ + 分配 token slab + conn_id。语义与 sync
 /// [`V2Session::accept_and_handshake_shared`](crate::V2Session::accept_and_handshake_shared)
 /// 等价（共享 `SharedControllerInner` 同 atomic 计数器）。
-pub async fn accept_and_handshake_async(
-    mut stream: TokioStream,
+pub async fn accept_and_handshake_async<S>(
+    mut stream: S,
     controller: SharedController,
-) -> anyhow::Result<AsyncSession> {
+) -> anyhow::Result<AsyncSession<S>>
+where
+    S: AsyncSessionStream,
+{
     // **V7 / V8b** — derive discovery mode 于 handshake 前。短锁 read。
     let discovery_mode = controller.controller.lock().nvme_is_discovery_mode();
     let negotiated = ic_handshake_async(&mut stream).await?;
@@ -187,7 +206,7 @@ pub async fn accept_and_handshake_async(
     })
 }
 
-impl AsyncSession {
+impl<S: AsyncSessionStream> AsyncSession<S> {
     /// **V8e-3 / V8e-4 / V8e-5** — async 主循环单次 tick。
     ///
     /// 4 arm（V8e-6 后 dispatch 路径填充 PDU 处理）：
@@ -330,7 +349,7 @@ pub enum PumpEvent {
 /// **V8e-7-2** — Drop 扩展也 sweep 本 conn `io_queues` 镜像里的 IO SQ/CQ
 /// （与 sync V2Session V8d Drop 1:1 等价；spec § 7.6.1 ordering 先 SQ 后 CQ）。
 /// peer close 路径（不发 Disconnect）也走这里兜底。
-impl Drop for AsyncSession {
+impl<S: AsyncSessionStream> Drop for AsyncSession<S> {
     fn drop(&mut self) {
         if self.conn_id == 0 {
             return;
@@ -391,7 +410,7 @@ pub struct DispatchOutcome {
     pub disconnected: bool,
 }
 
-impl AsyncSession {
+impl<S: AsyncSessionStream> AsyncSession<S> {
     /// **V8e-7-2** — async PDU dispatch 入口。
     ///
     /// 行为与 sync `dispatch_capsule_cmd` 1:1 等价，但走 tokio async 路径
@@ -1226,13 +1245,16 @@ impl AsyncSession {
 }
 
 /// **V8e-7-3** — async 版 await_host_data（与 sync 等价）。
-async fn await_host_data_async(
-    stream: &mut TokioStream,
+async fn await_host_data_async<S>(
+    stream: &mut S,
     cid: u16,
     ttag: u16,
     base_offset: u32,
     expected_len: u32,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut r = crate::H2cReassembler::with_base_offset(cid, ttag, base_offset, expected_len);
     loop {
         let pdu = read_pdu_async(stream)

@@ -58,6 +58,7 @@ pub mod tcp_transport;
 pub mod ttag;
 
 pub use async_session::AsyncSession;
+pub use async_session::AsyncSessionStream;
 pub use async_session::DispatchOutcome;
 pub use async_session::PumpEvent;
 pub use async_session::accept_and_handshake_async;
