@@ -65,6 +65,9 @@ futures = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
 rustls-pemfile = "2"
+# **V-followup-auth-2** — leaf cert SAN / CN 解析，用于 NQN <-> TLS identity
+# binding (spec section 8.13 强制要求的 host NQN 认证基础)。
+x509-parser = "0.16"
 
 [[bin]]
 name = "nvme_of_tcp_target"

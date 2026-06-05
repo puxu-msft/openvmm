@@ -407,6 +407,58 @@ nvme_of_tcp_target \
 - ❌ 不绑 NQN ↔ TLS cert SAN（生产需要 cert SAN binding；留 V-followup-auth-2）
 - ❌ 不做 NQN ↔ DH-HMAC-CHAP shared secret（spec § 8.13.5；留 V-followup-dhchap）
 
+## NQN ↔ TLS cert SAN/CN binding（V-followup-auth-2）
+
+最强 host identity 校验：mTLS handshake 完成后从 client cert leaf 抽出
+SAN URI + SAN DNS + Subject CN 作为 host identity set；Connect 时
+`hostnqn` 必须 ∈ identity set，否则 SC=0x84。
+
+```bash
+nvme_of_tcp_target \
+    --listen 127.0.0.1:4420 \
+    --tls-listen 127.0.0.1:8009 \
+    --tls-cert server.pem --tls-key server.key \
+    --tls-i-trust-this-cert \
+    --tls-client-ca client-ca.pem \
+    --tls-bind-nqn-to-cert \
+    --backing-file disk.img
+```
+
+行为：
+- 仅当 mTLS 路径生效（`--tls-client-ca` 配套必填）
+- `--tls-bind-nqn-to-cert` 是 spec § 8.13 推荐的真正 host identity 认证机制
+- identity 提取顺序：SAN URI > SAN DNS > Subject CN
+- leaf cert 抽取失败 (无 SAN 也无 CN) 时直接关连接（防 hostnqn 自由声称）
+
+### 签 client cert 时把 NQN 放进 SAN URI
+
+```bash
+# OpenSSL CSR config 加 SAN URI
+cat > client.cnf <<EOF
+[req]
+distinguished_name = dn
+req_extensions = ext
+[dn]
+CN = host-a
+[ext]
+subjectAltName = URI:nqn.2014-08.org.nvmexpress:uuid:host-a, DNS:host-a.lab
+EOF
+openssl req -new -newkey ec:<(openssl ecparam -name prime256v1) \
+    -keyout client.key -out client.csr -nodes -config client.cnf
+openssl x509 -req -in client.csr -CA client-ca.pem -CAkey client-ca.key \
+    -extensions ext -extfile client.cnf \
+    -out client.pem -days 30 -CAcreateserial
+```
+
+### caveat 清单
+
+- ✅ 真正实现 spec § 8.13 强制的 NQN ↔ TLS identity binding
+- ✅ 三 fallback 来源（SAN URI > SAN DNS > CN）覆盖大多 ops 习惯
+- ❌ 不做 cert revocation 检查
+- ❌ 不做 NQN format 强校验（任何 SAN URI / DNS 都按字面对比）
+- ❌ 与 `--allow-host-nqn` 是**且**关系（同设两关都过才放行）；既要白名单也要
+  cert binding 时建议把白名单装满"允许的 NQN"，cert binding 再挡假冒
+
 ## 内部参考
 
 - 计划文档：[`../../plans/2026-06-04-phase-v-nvme-of-tcp.md`](../../plans/2026-06-04-phase-v-nvme-of-tcp.md)

@@ -114,6 +114,16 @@ pub struct AsyncSession<S: AsyncSessionStream = TokioStream> {
     /// 由 `accept_and_handshake_async_with_auth` 或后续 setter 注入；
     /// `accept_and_handshake_async` 仍按 V8 行为不限制。
     pub host_nqn_allowlist: Option<std::sync::Arc<std::collections::HashSet<String>>>,
+    /// **V-followup-auth-2** — TLS peer cert 抽出的 host identities（SAN URI /
+    /// DNS / CN）。
+    ///
+    /// `None` = 不强制 NQN ↔ identity 绑定（plaintext / server-auth-only TLS /
+    /// mTLS 但未启 binding）；`Some(set)` = Connect 的 `hostnqn` 必须 ∈ set，
+    /// 否则返 `fabric_sc::CONNECT_INVALID_HOST` (0x84) 关 conn。
+    ///
+    /// 由 bin 端 mTLS handshake 完成后调 [`AsyncSession::bind_host_identities`]
+    /// 注入；与 `host_nqn_allowlist` 是**且**关系（同时 enabled 时两关都过才能 Connect）。
+    pub bound_host_identities: Option<std::collections::HashSet<String>>,
 }
 
 /// **V8e-3** — async 版 ICReq/ICResp handshake。语义与 sync
@@ -210,6 +220,7 @@ where
         ttag_alloc: crate::TtagAllocator::default(),
         pending_aers: Vec::new(),
         host_nqn_allowlist: None,
+        bound_host_identities: None,
     })
 }
 
@@ -235,6 +246,18 @@ where
 }
 
 impl<S: AsyncSessionStream> AsyncSession<S> {
+    /// **V-followup-auth-2** — 在 mTLS handshake 完成后注入 host identity 集合
+    /// （SAN URI / DNS / CN），开启 NQN ↔ TLS identity binding 校验。
+    ///
+    /// 调用时机：bin 端拿 `TlsStream::get_ref().1.peer_certificates()` →
+    /// `extract_host_identities(leaf)` → `sess.bind_host_identities(ids)`。
+    ///
+    /// 后续 Connect 内 `cd.hostnqn_str()` 必须 ∈ `ids`，否则返
+    /// `fabric_sc::CONNECT_INVALID_HOST` (0x84)。
+    pub fn bind_host_identities(&mut self, identities: std::collections::HashSet<String>) {
+        self.bound_host_identities = Some(identities);
+    }
+
     /// **V8e-3 / V8e-4 / V8e-5** — async 主循环单次 tick。
     ///
     /// 4 arm（V8e-6 后 dispatch 路径填充 PDU 处理）：
@@ -566,6 +589,22 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
                 tracing::warn!(
                     hostnqn = %hostnqn,
                     "V-followup-auth Connect 拒：hostnqn 不在 --allow-host-nqn 白名单"
+                );
+                return self
+                    .send_capsule_resp_err_async(cid, fabric_sc::CONNECT_INVALID_HOST)
+                    .await;
+            }
+        }
+
+        // **V-followup-auth-2** — NQN ↔ TLS cert identity binding 校验
+        // （仅 mTLS 路径 bin 端注入后生效；plaintext / server-auth-only 不影响）
+        if let Some(ids) = self.bound_host_identities.as_ref() {
+            let hostnqn = cd.hostnqn_str().to_string();
+            if !ids.contains(&hostnqn) {
+                tracing::warn!(
+                    hostnqn = %hostnqn,
+                    bound_ids = ?ids,
+                    "V-followup-auth-2 Connect 拒：hostnqn 不在 TLS cert SAN/CN 列表"
                 );
                 return self
                     .send_capsule_resp_err_async(cid, fabric_sc::CONNECT_INVALID_HOST)

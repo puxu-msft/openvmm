@@ -45,6 +45,9 @@
 //! - **V-followup-auth** ✅ host NQN 白名单：`--allow-host-nqn` 可重复 +
 //!   `accept_and_handshake_async_with_auth` + Connect 时返
 //!   `CONNECT_INVALID_HOST` (0x84) 给未授权 hostnqn
+//! - **V-followup-auth-2** ✅ NQN ↔ TLS cert identity binding（spec section
+//!   8.13）：`--tls-bind-nqn-to-cert` 启 mTLS leaf cert SAN URI/DNS/CN 抽取
+//!   作为 host identity；Connect 时强制 hostnqn ∈ identities
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -68,6 +71,7 @@ pub mod r2t;
 pub mod session;
 pub mod tcp_transport;
 pub mod tls;
+pub mod tls_identity;
 pub mod ttag;
 
 pub use async_session::AsyncSession;
@@ -100,6 +104,7 @@ pub use session::V2Session;
 pub use session::V5_NLB_MAX;
 pub use session::ic_handshake;
 pub use tls::{build_acceptor_from_pem, build_acceptor_with_mtls};
+pub use tls_identity::extract_host_identities;
 
 /// **Phase V8b** — 多 conn 共享 controller 的 wrapper（reviewer C-1 / M-1）。
 ///

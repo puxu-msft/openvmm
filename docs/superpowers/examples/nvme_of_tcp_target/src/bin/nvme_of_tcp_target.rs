@@ -151,6 +151,15 @@ struct Cli {
     /// 仅当 `--tls-listen` 启用时生效。
     #[arg(long)]
     tls_client_ca: Option<PathBuf>,
+    /// **V-followup-auth-2** 强制 NQN ↔ TLS cert identity 绑定（spec section
+    /// 8.13 推荐做法）。一旦 set，每条 mTLS conn 在 Connect 时校验
+    /// `hostnqn` 必须出现在 client cert 的 SAN URI / SAN DNS / Subject CN
+    /// 之一；否则 SC=0x84 (CONNECT_INVALID_HOST) 关 conn。
+    /// 仅当 `--tls-listen + --tls-client-ca` 启用时有意义（plaintext / 无
+    /// mTLS 路径无 peer cert 可绑）。本 flag 自动开启不需 explicit consent
+    /// （越严越好）。
+    #[arg(long, default_value_t = false)]
+    tls_bind_nqn_to_cert: bool,
     /// **V-followup-auth** host NQN 白名单。可重复 (`--allow-host-nqn a
     /// --allow-host-nqn b`)。一旦至少给一个，所有 conn 的 Fabric Connect
     /// 必须出示在 set 内的 `hostnqn` 才能通过 (返 SC=0x84
@@ -456,14 +465,24 @@ async fn main() -> Result<()> {
                 || cli.tls_key.is_some()
                 || cli.tls_i_trust_this_cert
                 || cli.tls_client_ca.is_some()
+                || cli.tls_bind_nqn_to_cert
             {
                 anyhow::bail!(
-                    "--tls-cert / --tls-key / --tls-i-trust-this-cert / --tls-client-ca 仅在 --tls-listen 启用时生效"
+                    "--tls-cert / --tls-key / --tls-i-trust-this-cert / --tls-client-ca / --tls-bind-nqn-to-cert 仅在 --tls-listen 启用时生效"
                 );
             }
             None
         }
     };
+
+    // **V-followup-auth-2** — bind-nqn-to-cert 必须先 mTLS（无 client CA 就没
+    // peer cert 可绑）
+    if cli.tls_bind_nqn_to_cert && cli.tls_client_ca.is_none() {
+        anyhow::bail!(
+            "--tls-bind-nqn-to-cert 必须配 --tls-client-ca (V-followup-auth-2: 无 mTLS 则无 peer cert 可绑)"
+        );
+    }
+    let bind_nqn_to_cert = cli.tls_bind_nqn_to_cert;
 
     // **V-followup-tls-3 / V-followup-mtls** — TlsAcceptor build；PEM 错快速 abort
     let tls_acceptor: Option<tokio_rustls::TlsAcceptor> = if parsed_tls_listen.is_some() {
@@ -559,6 +578,7 @@ async fn main() -> Result<()> {
                 tls_inflight,
                 max_conn,
                 host_nqn_allowlist.clone(),
+                bind_nqn_to_cert,
             )))
         } else {
             drop(shutdown_rx_tls);
@@ -788,6 +808,7 @@ fn handle_conn(stream: TcpStream, shared_ctrl: nvme_of_tcp_target::SharedControl
 ///
 /// **TLS handshake 失败不 fallback plaintext**（plan R-5 downgrade 防护）：
 /// timeout / cert reject / IO err 直接 drop conn。
+#[allow(clippy::too_many_arguments)]
 async fn run_accept_loop_tls(
     listener: tokio::net::TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
@@ -796,6 +817,7 @@ async fn run_accept_loop_tls(
     inflight: Arc<AtomicUsize>,
     max_conn: usize,
     host_nqn_allowlist: Option<std::sync::Arc<std::collections::HashSet<String>>>,
+    bind_nqn_to_cert: bool,
 ) -> Result<()> {
     let label = "tls";
     let mut accept_backoff_ms: u64 = 0;
@@ -877,6 +899,7 @@ async fn run_accept_loop_tls(
                 shared_ctrl,
                 shutdown_rx,
                 allowlist,
+                bind_nqn_to_cert,
             ));
             let r = futures::FutureExt::catch_unwind(fut).await;
             match r {
@@ -913,7 +936,44 @@ async fn handle_conn_async_tls(
     shared_ctrl: nvme_of_tcp_target::SharedController,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     host_nqn_allowlist: Option<std::sync::Arc<std::collections::HashSet<String>>>,
+    bind_nqn_to_cert: bool,
 ) -> Result<()> {
+    // **V-followup-auth-2** — 在交给 AsyncSession 前抽 leaf cert SAN/CN
+    // identities（仅当 bind_nqn_to_cert + mTLS 拿到 peer certs 时）
+    let bound_ids: Option<std::collections::HashSet<String>> = if bind_nqn_to_cert {
+        let (_tcp, server_conn) = stream.get_ref();
+        let leaf = server_conn
+            .peer_certificates()
+            .and_then(|chain| chain.first())
+            .cloned();
+        match leaf {
+            Some(leaf) => match nvme_of_tcp_target::extract_host_identities(&leaf) {
+                Ok(ids) => {
+                    tracing::info!(
+                        identities = ?ids,
+                        "V-followup-auth-2 抽出 TLS peer identities (将强制 NQN binding)"
+                    );
+                    Some(ids)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "V-followup-auth-2 抽 identities 失败 — 关连接（防 hostnqn 伪造）"
+                    );
+                    return Err(e.context("V-followup-auth-2 leaf cert identity extract"));
+                }
+            },
+            None => {
+                // mTLS 配好的情况下应永远有 peer cert；空 chain 视作严重异常
+                anyhow::bail!(
+                    "V-followup-auth-2: mTLS 状态下 peer_certificates 为空（配置缺陷？关连接防伪造）"
+                );
+            }
+        }
+    } else {
+        None
+    };
+
     let mut sess = if let Some(allow) = host_nqn_allowlist {
         nvme_of_tcp_target::accept_and_handshake_async_with_auth(stream, shared_ctrl, allow)
             .await
@@ -923,6 +983,9 @@ async fn handle_conn_async_tls(
             .await
             .context("V-followup-tls-3 AsyncSession over TLS handshake")?
     };
+    if let Some(ids) = bound_ids {
+        sess.bind_host_identities(ids);
+    }
     loop {
         let event = sess.pump_one_async(&mut shutdown_rx).await?;
         match event {
