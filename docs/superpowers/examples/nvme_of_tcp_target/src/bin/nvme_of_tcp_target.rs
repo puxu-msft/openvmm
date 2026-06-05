@@ -73,6 +73,20 @@ struct Cli {
     /// 等于让任何能到达端口的人远程读写 backing file（无 auth / 无 TLS）。
     #[arg(long, default_value_t = false)]
     i_know_this_is_insecure: bool,
+    /// **V7** 启用 Discovery subsystem 模式（spec § 5.1.4）。bin 启动后
+    /// 不开放 IO，仅响应 Discovery Log Page (LID=0x70)。Linux nvme-cli
+    /// `nvme discover -t tcp -a <ip> -s <port>` 将列出 `--discovery-target-*`
+    /// 注入的 portal 列表。
+    #[arg(long, default_value_t = false)]
+    discovery_mode: bool,
+    /// **V7** Discovery target NQN（discovery mode 必填）。例：
+    /// `nqn.2026-06.io.openhcl:nvme.userspace`
+    #[arg(long, required = false)]
+    discovery_target_nqn: Option<String>,
+    /// **V7** Discovery target 网络地址 `IP:PORT`（discovery mode 必填）。
+    /// 例：`127.0.0.1:4421`
+    #[arg(long, required = false)]
+    discovery_target_addr: Option<String>,
 }
 
 fn parse_hex_u16(s: &str) -> Result<u16, String> {
@@ -150,8 +164,38 @@ fn main() -> Result<()> {
         ssvid = cli.ssvid,
         zns_nsids = ?cli.zns_nsids,
         max_connections = cli.max_connections,
-        "V5d nvme_of_tcp_target start"
+        discovery_mode = cli.discovery_mode,
+        "V5d/V7 nvme_of_tcp_target start"
     );
+
+    // **V7** — discovery mode 必填 target NQN + addr；构造 portals 列表
+    // 一次性，spawn 时 clone 给每条 conn handler
+    let discovery_portals: Vec<
+        pcie_remote_nvme_userspace::controller::discovery_log::DiscoveryPortal,
+    > = if cli.discovery_mode {
+        let nqn = cli
+            .discovery_target_nqn
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--discovery-mode 必须配 --discovery-target-nqn"))?;
+        let addr = cli
+            .discovery_target_addr
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--discovery-mode 必须配 --discovery-target-addr"))?;
+        let portal =
+            pcie_remote_nvme_userspace::controller::discovery_log::DiscoveryPortal::from_ipv4_addr(
+                nqn, addr,
+            )
+            .with_context(|| format!("parse --discovery-target-addr {addr:?}"))?;
+        tracing::info!(
+            nqn = portal.nqn.as_str(),
+            traddr = portal.traddr.as_str(),
+            trsvcid = portal.trsvcid.as_str(),
+            "V7 discovery mode active; 1 portal"
+        );
+        vec![portal]
+    } else {
+        Vec::new()
+    };
 
     // **V5d-fix C-2** — 启动时预 insert 所有 backing 的 lock entry，
     // 之后 worker 只读不写该 map → 杜绝动态增长 + path-aliasing race。
@@ -242,9 +286,19 @@ fn main() -> Result<()> {
         let zns_nsids = cli.zns_nsids.clone();
         let backing_locks = Arc::clone(&backing_locks);
         let inflight = Arc::clone(&inflight);
+        // V7: clone discovery portals per conn
+        let discovery_portals_for_conn = discovery_portals.clone();
 
         std::thread::spawn(move || {
-            let r = handle_conn(stream, backing_files, vid, ssvid, &zns_nsids, backing_locks);
+            let r = handle_conn(
+                stream,
+                backing_files,
+                vid,
+                ssvid,
+                &zns_nsids,
+                backing_locks,
+                discovery_portals_for_conn,
+            );
             inflight.fetch_sub(1, Ordering::SeqCst);
             match r {
                 Ok(()) => tracing::info!(%peer, "connection closed normally"),
@@ -272,6 +326,7 @@ fn handle_conn(
     ssvid: u16,
     zns_nsids: &[u32],
     backing_locks: Arc<HashMap<PathBuf, Arc<Mutex<()>>>>,
+    discovery_portals: Vec<pcie_remote_nvme_userspace::controller::discovery_log::DiscoveryPortal>,
 ) -> Result<()> {
     // R-8：只 lock first backing（V8 重构）
     let first = backing_files
@@ -296,8 +351,14 @@ fn handle_conn(
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
-    let controller = NvmeController::open(&backing_strs, vid, ssvid, zns_nsids)
+    let mut controller = NvmeController::open(&backing_strs, vid, ssvid, zns_nsids)
         .context("NvmeController::open")?;
+
+    // **V7** — discovery mode：每条 conn 都重新 inject portals（per-conn
+    // controller 实例，无跨 conn 状态共享）。空 vec 不进 discovery mode。
+    if !discovery_portals.is_empty() {
+        controller.nvme_set_discovery_target(discovery_portals);
+    }
 
     let mut sess =
         V2Session::accept_and_handshake(stream, controller).context("V2Session handshake")?;

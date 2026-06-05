@@ -29,7 +29,9 @@
 //! - **V6a** ✅ AER cmd fast-path (不 bail session) + ASYNC_LIMIT_EXCEEDED 上限保护 + Set FID 0x0B wire test
 //! - **V6b** ✅ select-style pump_one_with_events + inject_aen API + ReadTimeout framing variant
 //! - **V6c** ✅ AER 端到端 (FIFO 顺序 / 超 pending drop / Identify 交错) + README V6 章节
-//! - **V7/V8** 计划中
+//! - **V7a** ✅ Discovery Log Page (LID 0x70) builder + controller wrapper
+//! - **V7b** ✅ session `discovery_mode` derive + Connect NQN 校验 + admin opc 白名单 + bin `--discovery-mode`
+//! - **V8** 计划中
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -58,6 +60,7 @@ pub use h2c_reassembler::{AcceptOutcome, H2cReassembler};
 pub use pdu::*;
 pub use r2t::encode_r2t;
 pub use session::CQ_BASE_GPA;
+pub use session::DISCOVERY_NQN;
 pub use session::MAXH2CDATA_BYTES;
 pub use session::NegotiatedIc;
 pub use session::PRP1_SENTINEL;

@@ -53,6 +53,10 @@ use zerocopy::IntoBytes;
 /// CapsuleResp 路径"，否则即"PRP1 data，要走 C2HData PDU"。
 pub const CQ_BASE_GPA: u64 = 0xC0DE_0000_0000_0000;
 
+/// **Phase V7** — Discovery subsystem NQN（spec § 5.1.4，固定字符串）。
+/// session discovery_mode 下 Connect Data subnqn 必须严格等于此值。
+pub const DISCOVERY_NQN: &str = "nqn.2014-08.org.nvmexpress.discovery";
+
 /// **Phase V3** — admin CQ 容量（slot 数）。
 const ADMIN_CQ_SIZE: u32 = 64;
 
@@ -147,6 +151,15 @@ pub struct V2Session {
     /// 是 source of truth；这里仅用于 cap (`MAX_PENDING_AERS=4`) + debug。
     /// V6b 后 `pump_one_with_events` drain 时同步刷此镜像。
     pub pending_aers: Vec<crate::aer::PendingAer>,
+    /// **V7** — discovery mode：controller 启动时 `nvme_set_discovery_target`
+    /// 注入 portals 后该字段在 `accept_and_handshake` 内自动 derive。
+    /// 影响：
+    /// - Connect Data subnqn 必须 == `DISCOVERY_NQN`
+    /// - handle_admin_cmd 白名单 opc {Identify, Get Log Page, Keep Alive,
+    ///   Fabric, AER, Set/Get Features}；其余 SC=0x01 INVALID_OPCODE
+    /// - Identify Controller 后处理：patch CNTRLTYPE=0x02 (Discovery Ctrl)
+    ///   + 清 IO-related 字段（NN=0 等）
+    pub discovery_mode: bool,
 }
 
 impl V2Session {
@@ -155,6 +168,9 @@ impl V2Session {
         mut stream: TcpStream,
         mut controller: NvmeController,
     ) -> anyhow::Result<Self> {
+        // **V7** — derive discovery mode 于 handshake 前（controller 启动时
+        // 已 nvme_set_discovery_target 注入 portals 即视为 discovery ctrl）。
+        let discovery_mode = controller.nvme_is_discovery_mode();
         let negotiated = ic_handshake(&mut stream).context("ICReq/ICResp handshake")?;
         // **V5d-fix-2 (review L-6)** — bin handshake 阶段强制了 30s read/write
         // timeout 防 slowloris；握手成功后真业务流（KeepAlive 控）允许长 idle。
@@ -181,6 +197,8 @@ impl V2Session {
             current_qid: 0,
             // **V6a** — pending AER 镜像，cap 由 aer::MAX_PENDING_AERS 限制
             pending_aers: Vec::new(),
+            // **V7** — discovery mode 在 fn 入口已 derive
+            discovery_mode,
         })
     }
 
@@ -476,6 +494,29 @@ impl V2Session {
         let mut sqe =
             Sqe::read_from_bytes(sqe_bytes).map_err(|_| anyhow::anyhow!("SQE 不是 64 byte"))?;
 
+        let opc_peek = crate::aer::peek_admin_opc(sqe_bytes);
+
+        // **V7** — discovery mode 下 admin opc 白名单（spec § 5.1.4 列出的
+        // Discovery Controller allowed cmds）。其余 reject 防 host 误用
+        // Discovery Ctrl 当 IO Ctrl。
+        // 白名单：
+        // - 0x02 GET_LOG_PAGE          (含 LID 0x70 Discovery Log)
+        // - 0x06 IDENTIFY              (CNS=0x01 Identify Controller → V7 patch CNTRLTYPE)
+        // - 0x09 SET_FEATURES          (Async Event Config FID=0x0B)
+        // - 0x0A GET_FEATURES
+        // - 0x0C ASYNC_EVENT_REQUEST   (走 V6a AER fast-path)
+        // - 0x18 KEEP_ALIVE
+        if self.discovery_mode {
+            const DISCOVERY_ALLOWED: &[u8] = &[0x02, 0x06, 0x09, 0x0A, 0x0C, 0x18];
+            if !DISCOVERY_ALLOWED.contains(&opc_peek) {
+                tracing::warn!(
+                    opc = opc_peek,
+                    "V7 discovery mode rejecting non-discovery admin opc"
+                );
+                return self.send_capsule_resp_err(cid, /*INVALID_OPCODE=*/ 0x01);
+            }
+        }
+
         // **V6a (review R-1 fix)** — AER (opc=0x0C) fast-path：spec § 5.2
         // AER cmd 在 controller 内只 push `aen_pending` 返 None（不 post CQE）；
         // V5 `run_post_dispatch` Phase 4 会 bail "did not produce CQE" → 整条
@@ -484,7 +525,6 @@ impl V2Session {
         // - 否则调 nvme_admin_dispatch 让 controller 累积；session 镜像 push；
         //   跳过 run_post_dispatch 直接返 Ok；wire 上**不**emit CapsuleResp，
         //   等 V6b inject_aen / sync_aer_mirror 流程在 fire_aen 后真发
-        let opc_peek = crate::aer::peek_admin_opc(sqe_bytes);
         if opc_peek == crate::aer::ADMIN_OPC_AER {
             if self.pending_aers.len() >= crate::aer::MAX_PENDING_AERS {
                 tracing::warn!(
@@ -548,7 +588,6 @@ impl V2Session {
         // - 0x15 NS_ATTACHMENT    — V4b 已走 R2T 闭环，但 attach/detach 会
         //   改变 active NS 集合，配合后续 cmd 重新计算 lbads；保守 block
         // - 0x0D NAMESPACE_MANAGEMENT — 创建/删除 NS
-        let opc_peek = (sqe.cdw0 & 0xff) as u8;
         if matches!(opc_peek, 0x80 | 0x0D) {
             tracing::warn!(
                 opc = opc_peek,
@@ -892,8 +931,29 @@ impl V2Session {
             kato,
             subnqn = cd.subnqn_str(),
             hostnqn = cd.hostnqn_str(),
+            discovery = self.discovery_mode,
             "Fabric Connect"
         );
+
+        // **V7** — discovery mode 下严格校验 subnqn == DISCOVERY_NQN
+        // (spec § 5.1.4)。非 discovery mode 则不校验（继续 V6 行为）。
+        if self.discovery_mode {
+            let want = DISCOVERY_NQN;
+            let got = cd.subnqn_str();
+            if got != want {
+                tracing::warn!(
+                    got,
+                    want,
+                    "V7 Connect 拒：discovery mode 下 subnqn 必须 = {}",
+                    want
+                );
+                // SC=0x83 SubsystemNQNNotMatched 严格更准但 fabric_sc 表里
+                // 我们只有 CONNECT_INVALID_PARAM (0x02)；这里复用以保 spec
+                // 边界 - host 会清晰看到 INVALID_PARAM = NQN 不匹配。
+                return self.send_capsule_resp_err(cid, fabric_sc::CONNECT_INVALID_PARAM);
+            }
+        }
+
         if qid == 0 {
             if self.admin_connected {
                 return self.send_capsule_resp_err(cid, fabric_sc::CONNECT_INVALID_PARAM);
