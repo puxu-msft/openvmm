@@ -48,6 +48,9 @@
 //! - **V-followup-auth-2** ✅ NQN ↔ TLS cert identity binding（spec section
 //!   8.13）：`--tls-bind-nqn-to-cert` 启 mTLS leaf cert SAN URI/DNS/CN 抽取
 //!   作为 host identity；Connect 时强制 hostnqn ∈ identities
+//! - **V-followup-dhchap-1** ✅ DH-HMAC-CHAP 算法 building block (HMAC-only)：
+//!   challenge / response 计算 / constant-time verify / secret store；wire
+//!   集成 (AUTH_SEND/RECV state machine) 留 V-followup-dhchap-2
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -60,6 +63,7 @@
 
 pub mod aer;
 pub mod async_session;
+pub mod dhchap;
 pub mod digest;
 pub mod dispatch_plan;
 pub mod fabric;

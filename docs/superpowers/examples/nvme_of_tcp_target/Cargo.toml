@@ -68,6 +68,12 @@ rustls-pemfile = "2"
 # **V-followup-auth-2** — leaf cert SAN / CN 解析，用于 NQN <-> TLS identity
 # binding (spec section 8.13 强制要求的 host NQN 认证基础)。
 x509-parser = "0.16"
+# **V-followup-dhchap** — HMAC-SHA256 用于 in-band auth challenge-response
+# (spec section 8.13.5)。教学版只用 HMAC-only 模式 (无 DH 增量；DH 留生产)。
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"
 
 [[bin]]
 name = "nvme_of_tcp_target"
