@@ -156,11 +156,27 @@ impl NvmeController {
                     0x01 => {
                         // Identify Controller
                         /* Phase A: spec-correct 200+ fields via nvme_spec */
-                        IdentifyController::build_v2_bytes(
+                        let mut buf = IdentifyController::build_v2_bytes(
                             self.vid,
                             self.ssvid,
                             self.namespaces.len() as u32,
-                        )
+                        );
+                        // **Phase V7c-fix (review H-1)** — Discovery Controller
+                        // 必须报 CNTRLTYPE=0x02 (spec § 5.1.4 + 5.17.2.1 Figure 312
+                        // byte 111)。否则 Linux nvme-cli driver 按 IO Ctrl
+                        // fingerprint 走，要求 Create IO SQ 失败断 discover。
+                        if self.nvme_is_discovery_mode() {
+                            // byte 111 = CNTRLTYPE
+                            if let Some(b) = buf.get_mut(111) {
+                                *b = 0x02; // Discovery Controller
+                            }
+                            // NN (Number of Namespaces) @ bytes 516..520 = 0
+                            // 让 host 不去 enum NS（Discovery Ctrl 无 NS）。
+                            if buf.len() >= 520 {
+                                buf[516..520].copy_from_slice(&0u32.to_le_bytes());
+                            }
+                        }
+                        buf
                     }
                     0x02 => {
                         // Active NSID list — 列所有已注册 NSID（spec § 5.15.1）。

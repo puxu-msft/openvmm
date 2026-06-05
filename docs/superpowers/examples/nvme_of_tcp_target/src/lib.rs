@@ -31,6 +31,7 @@
 //! - **V6c** ✅ AER 端到端 (FIFO 顺序 / 超 pending drop / Identify 交错) + README V6 章节
 //! - **V7a** ✅ Discovery Log Page (LID 0x70) builder + controller wrapper
 //! - **V7b** ✅ session `discovery_mode` derive + Connect NQN 校验 + admin opc 白名单 + bin `--discovery-mode`
+//! - **V7c-fix** ✅ Identify Ctrl CNTRLTYPE=0x02 + NN=0 patch (review H-1) + IO Connect explicit reject (H-2) + dead code clean
 //! - **V8** 计划中
 
 #![forbid(unsafe_code)]

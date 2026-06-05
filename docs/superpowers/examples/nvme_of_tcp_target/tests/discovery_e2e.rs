@@ -227,3 +227,106 @@ fn v7_e2e_discovery_rejects_non_whitelisted_admin_opc() {
     assert_eq!(sc, 0x01, "非白名单 opc 应返 INVALID_OPCODE");
     h.join().unwrap().unwrap();
 }
+
+/// **V7c-fix (review H-1)** — Discovery mode 下 Identify Controller (CNS=0x01)
+/// 必须报 CNTRLTYPE=0x02 + NN=0；Linux nvme-cli driver 据此 fingerprint
+/// 走 Discovery 路径而非 IO 路径。
+#[test]
+fn v7c_e2e_identify_controller_cntrltype_discovery() {
+    let (mut client, server) = tcp_pair();
+    let (controller, _backing) = make_discovery_controller();
+    let h = thread::spawn(move || -> anyhow::Result<()> {
+        let mut sess = V2Session::accept_and_handshake(server, controller)?;
+        sess.pump_one()?; // Connect
+        sess.pump_one()?; // Identify Controller
+        Ok(())
+    });
+    send_icreq(&mut client);
+    let _ = read_pdu(&mut client).unwrap();
+    send_connect_with_subnqn(&mut client, 0x0001, DISCOVERY_NQN);
+    let _ = read_pdu(&mut client).unwrap();
+
+    // Identify Controller (opc=0x06, CNS=1)
+    let mut sqe = [0u8; 64];
+    sqe[0] = 0x06;
+    sqe[2..4].copy_from_slice(&0x00C1u16.to_le_bytes());
+    sqe[40..44].copy_from_slice(&0x0000_0001u32.to_le_bytes()); // CNS=1
+    let hdr = CommonHdr {
+        pdu_type: pdu_type::CMD,
+        flags: 0,
+        hlen: 72,
+        pdo: 0,
+        plen: 72,
+    };
+    write_pdu(&mut client, &hdr, &sqe, &[]).unwrap();
+
+    let data_pdu = read_pdu(&mut client).unwrap();
+    assert_eq!(data_pdu.header.pdu_type, pdu_type::C2H_DATA);
+    assert_eq!(data_pdu.data.len(), 4096);
+    // byte 111 = CNTRLTYPE (spec § 5.17.2.1 Figure 312)
+    assert_eq!(
+        data_pdu.data[111], 0x02,
+        "Discovery mode CNTRLTYPE 必须 = 0x02 (review H-1)"
+    );
+    // NN at offset 516..520 = 0
+    let nn = u32::from_le_bytes(data_pdu.data[516..520].try_into().unwrap());
+    assert_eq!(nn, 0, "Discovery mode NN 必须 = 0");
+    let resp = read_pdu(&mut client).unwrap();
+    assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+    let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+    assert_eq!(sc, 0);
+    h.join().unwrap().unwrap();
+}
+
+/// **V7c-fix (review H-2)** — Discovery mode 下 IO Connect (qid≥1)
+/// 必显式 reject CONNECT_INVALID_PARAM (0x82)。
+#[test]
+fn v7c_e2e_discovery_rejects_io_connect_qid() {
+    let (mut client, server) = tcp_pair();
+    let (controller, _backing) = make_discovery_controller();
+    let h = thread::spawn(move || -> anyhow::Result<()> {
+        let mut sess = V2Session::accept_and_handshake(server, controller)?;
+        sess.pump_one()?; // Connect admin
+        sess.pump_one()?; // Connect qid=1 (应被拒)
+        Ok(())
+    });
+    send_icreq(&mut client);
+    let _ = read_pdu(&mut client).unwrap();
+    send_connect_with_subnqn(&mut client, 0x0001, DISCOVERY_NQN);
+    let _ = read_pdu(&mut client).unwrap();
+
+    // 构造 Connect qid=1（discovery mode 应直接拒，不经过 io_queues check）
+    let mut sqe = [0u8; 64];
+    sqe[0] = fabric::NVME_OPC_FABRIC;
+    sqe[2..4].copy_from_slice(&0x0002u16.to_le_bytes());
+    sqe[4] = fctype::CONNECT;
+    let f = ConnectFabricFields {
+        recfmt: 0,
+        qid: 1,
+        sqsize: 31,
+        cattr: 0,
+        rsvd1: 0,
+        kato: 0,
+        rsvd2: [0u8; 12],
+    };
+    sqe[40..64].copy_from_slice(f.as_bytes());
+    let mut cd = ConnectData::default();
+    let want = DISCOVERY_NQN;
+    cd.subnqn[..want.len()].copy_from_slice(want.as_bytes());
+    let cmd_hdr = CommonHdr {
+        pdu_type: pdu_type::CMD,
+        flags: 0,
+        hlen: 72,
+        pdo: 72,
+        plen: 72 + 1024,
+    };
+    write_pdu(&mut client, &cmd_hdr, &sqe, cd.as_bytes()).unwrap();
+
+    let resp = read_pdu(&mut client).unwrap();
+    let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+    assert_eq!(
+        sc, 0x82,
+        "Discovery mode 下 IO Connect (qid≥1) 必返 CONNECT_INVALID_PARAM"
+    );
+    h.join().unwrap().unwrap();
+}

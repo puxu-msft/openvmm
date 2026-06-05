@@ -1154,27 +1154,25 @@ impl NvmeController {
         self.nvme_pending_aer_count() > 0
     }
 
-    /// **Phase V7** — 配置 Discovery target portals + 设置 Identify Ctrl
-    /// CNTRLTYPE=0x02 (Discovery)。bin 启动 `--discovery-mode` 时调用。
-    /// session `discovery_mode` flag 同步设；admin Get Log 0x70 即返此 vec
-    /// 的 byte-exact 序列化。
+    /// **Phase V7** — 配置 Discovery target portals。bin 启动 `--discovery-mode`
+    /// 时调用。session `discovery_mode` flag 同步 derive (`nvme_is_discovery_mode`)；
+    /// admin Get Log 0x70 即返此 vec 的 byte-exact 序列化；Identify Controller
+    /// (CNS=0x01) 在 admin.rs 已加 CNTRLTYPE=0x02 + NN=0 patch (spec § 5.1.4 +
+    /// § 5.17.2.1 byte 111)，让 Linux nvme-cli 把本 controller 当 Discovery
+    /// Ctrl 处理。
     ///
-    /// **review R-2 fix**：把 CNTRLTYPE patch 到 controller 自身字段，让
-    /// Identify Controller 既有路径自然产 0x02 → Linux nvme-cli 把本
-    /// controller 当 Discovery Ctrl 处理。
+    /// **V7c-fix (review R-2/H-1)** — CNTRLTYPE patch 已落 controller/admin.rs
+    /// Identify CNS=0x01 分支；之前 doc 声称的"session 反向 patch"是 stale
+    /// description，已删。
     ///
     /// 教学 V7 静态注入；TP4126 动态 registry V-followup 时再加 add/remove API。
     pub fn nvme_set_discovery_target(&mut self, portals: Vec<discovery_log::DiscoveryPortal>) {
         tracing::info!(
             count = portals.len(),
-            "V7 set_discovery_target: controller 切 Discovery mode + Identify CNTRLTYPE=0x02"
+            "V7 set_discovery_target: controller 切 Discovery mode + Identify CNTRLTYPE=0x02 patch (admin.rs CNS=0x01 分支)"
         );
         self.discovery_portals = portals;
         self.discovery_gen_ctr = self.discovery_gen_ctr.wrapping_add(1);
-        // CNTRLTYPE patch 在 IdentifyController::build_v2_bytes 内当前不暴露
-        // controller-level config；V7 教学版接受这一限制 — session 通过 Identify
-        // Ctrl 反向 patch CNTRLTYPE 字段（见 session.rs discovery_mode admin
-        // path）。真生产 (V8+) 应让 IdentifyController 持 builder pattern。
     }
 
     /// **Phase V7** — read-only 检查 controller 是否已配 Discovery target。

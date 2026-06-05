@@ -66,10 +66,12 @@ pub struct DiscoveryEntry {
     pub cntlid: u16,
     /// admin SQ size 推荐值
     pub asqsz: u16,
-    pub rsvd0: [u8; 22],
+    /// **review L-2** — reserved fields 改 `pub(crate)` 防 external mutate
+    /// 破 spec wire 兼容性。builder (本模块) 内部仍可读写。
+    pub(crate) rsvd0: [u8; 22],
     /// ASCII service id（端口号字符串，trailing zero-pad）
     pub trsvcid: [u8; 32],
-    pub rsvd1: [u8; 192],
+    pub(crate) rsvd1: [u8; 192],
     /// ASCII subsystem NQN
     pub subnqn: [u8; 256],
     /// ASCII transport address (IP 字符串)
@@ -169,11 +171,9 @@ pub fn build_discovery_log(gen_ctr: u64, portals: &[DiscoveryPortal], bytes: usi
         buf[entry_offset..entry_offset + entry_size].copy_from_slice(entry.as_bytes());
     }
 
-    // 按 host 请求的 bytes 截断或 zero-pad
+    // 按 host 请求的 bytes 截断；初始 vec! 已用 0 填，所以 zero-pad
+    // 由 vec! capacity 自然提供，不需 resize（**review M-1** 删 dead code）。
     buf.truncate(bytes);
-    if buf.len() < bytes {
-        buf.resize(bytes, 0);
-    }
     buf
 }
 

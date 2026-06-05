@@ -155,10 +155,11 @@ pub struct V2Session {
     /// 注入 portals 后该字段在 `accept_and_handshake` 内自动 derive。
     /// 影响：
     /// - Connect Data subnqn 必须 == `DISCOVERY_NQN`
+    /// - IO Connect qid≥1 显式 reject (spec § 5.1.4 Discovery Ctrl 无 IO queue)
     /// - handle_admin_cmd 白名单 opc {Identify, Get Log Page, Keep Alive,
     ///   Fabric, AER, Set/Get Features}；其余 SC=0x01 INVALID_OPCODE
-    /// - Identify Controller 后处理：patch CNTRLTYPE=0x02 (Discovery Ctrl)
-    ///   + 清 IO-related 字段（NN=0 等）
+    /// - Identify Controller CNTRLTYPE=0x02 patch 已落 controller/admin.rs
+    ///   CNS=0x01 分支（V7c-fix 修 reviewer H-1）
     pub discovery_mode: bool,
 }
 
@@ -950,6 +951,16 @@ impl V2Session {
                 // SC=0x83 SubsystemNQNNotMatched 严格更准但 fabric_sc 表里
                 // 我们只有 CONNECT_INVALID_PARAM (0x02)；这里复用以保 spec
                 // 边界 - host 会清晰看到 INVALID_PARAM = NQN 不匹配。
+                return self.send_capsule_resp_err(cid, fabric_sc::CONNECT_INVALID_PARAM);
+            }
+            // **V7c-fix (review H-2)** — Discovery Ctrl 不支持 IO queue
+            // (spec § 5.1.4)。除了依赖 Create IO SQ/CQ 白名单的 incidental
+            // rejection，这里显式 reject IO Connect qid≥1 防回归。
+            if qid != 0 {
+                tracing::warn!(
+                    qid,
+                    "V7 Connect 拒：discovery mode 下不支持 IO queue (spec § 5.1.4)"
+                );
                 return self.send_capsule_resp_err(cid, fabric_sc::CONNECT_INVALID_PARAM);
             }
         }
