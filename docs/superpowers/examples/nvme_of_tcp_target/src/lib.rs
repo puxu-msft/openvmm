@@ -55,6 +55,7 @@ pub mod pdu;
 pub mod r2t;
 pub mod session;
 pub mod tcp_transport;
+pub mod tls;
 pub mod ttag;
 
 pub use async_session::AsyncSession;
@@ -85,6 +86,7 @@ pub use session::PRP1_SENTINEL;
 pub use session::V2Session;
 pub use session::V5_NLB_MAX;
 pub use session::ic_handshake;
+pub use tls::build_acceptor_from_pem;
 
 /// **Phase V8b** — 多 conn 共享 controller 的 wrapper（reviewer C-1 / M-1）。
 ///
