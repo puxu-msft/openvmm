@@ -21,9 +21,6 @@
 //!    持续延后 expire（reset 每次刷）
 //! 9. `v8e7_2_psh_too_short_sends_c2h_term_and_errs` — PSH < 64 字节应发
 //!    C2HTerm 后 bail
-//! 10. `v8e7_2_admin_cmd_placeholder_returns_invalid_opcode` — V8e-7-3 未补
-//!     完整 admin dispatch；占位返 SC=0x01（regression guard 防 V8e-7-3 后
-//!     再删除占位）
 
 #![allow(missing_docs)]
 
@@ -413,42 +410,5 @@ async fn v8e7_2_psh_too_short_sends_c2h_term_and_errs() {
     // 应已发 C2HTerm
     let term = read_pdu_async(&mut client).await.unwrap();
     assert_eq!(term.header.pdu_type, pdu_type::C2H_TERM);
-    drop(client);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn v8e7_2_admin_cmd_placeholder_returns_invalid_opcode() {
-    // V8e-7-2 admin/IO cmd 还未补；占位返 SC=0x01 INVALID_OPCODE。
-    // V8e-7-3 后此测应改为真 admin dispatch 验证；regression guard 防 7-3 漏改。
-    let (shared, _backing) = make_shared();
-    let (mut client, mut sess) = handshake(shared).await;
-    // 先 Connect 让 current_qid=0
-    let _ = sess
-        .dispatch_pdu_async(build_connect_pdu(0x0001, 0, 0))
-        .await
-        .unwrap();
-    let _ = read_pdu_async(&mut client).await.unwrap();
-    // 发 Identify (opc=0x06) admin cmd
-    let mut sqe = vec![0u8; 64];
-    sqe[0] = 0x06;
-    sqe[2..4].copy_from_slice(&0x0020u16.to_le_bytes());
-    let pdu = nvme_of_tcp_target::framing::Pdu {
-        header: CommonHdr {
-            pdu_type: pdu_type::CMD,
-            flags: 0,
-            hlen: 72,
-            pdo: 0,
-            plen: 72,
-        },
-        psh: sqe,
-        data: vec![],
-    };
-    let _ = sess.dispatch_pdu_async(pdu).await.unwrap();
-    let resp = read_pdu_async(&mut client).await.unwrap();
-    assert_eq!(
-        sc_of(&resp.psh),
-        0x01,
-        "V8e-7-2 admin placeholder 应回 INVALID_OPCODE（V8e-7-3 后改真 dispatch）"
-    );
     drop(client);
 }

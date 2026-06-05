@@ -88,6 +88,13 @@ pub struct AsyncSession {
     pub current_qid: u16,
     /// **V8e-7-2** — IO queue 镜像（Create IO CQ/SQ 后填）。
     pub io_queues: std::collections::HashMap<u16, crate::io_queue::IoQueueState>,
+
+    // ============ V8e-7-3 新增：admin/IO/AER dispatch 所需 state ============
+    /// **V8e-7-3** — TTAG 分配器（V4b R2T；admin/IO dma_read 用）。
+    pub ttag_alloc: crate::TtagAllocator,
+    /// **V8e-7-3** — session 镜像 pending AER 列表（cap MAX_PENDING_AERS=4）。
+    /// controller `aen_pending` 是 source of truth；本字段仅做 cap + debug。
+    pub pending_aers: Vec<crate::aer::PendingAer>,
 }
 
 /// **V8e-3** — async 版 ICReq/ICResp handshake。语义与 sync
@@ -174,6 +181,8 @@ pub async fn accept_and_handshake_async(
         admin_connected: false,
         current_qid: 0,
         io_queues: std::collections::HashMap::new(),
+        ttag_alloc: crate::TtagAllocator::default(),
+        pending_aers: Vec::new(),
     })
 }
 
@@ -439,15 +448,13 @@ impl AsyncSession {
                 }
             }
             crate::dispatch_plan::CapsuleKind::Admin { cid } => {
-                // V8e-7-3 加完整 admin dispatch；V8e-7-2 占位用 INVALID_OPCODE
-                tracing::debug!(cid, "V8e-7-2: admin cmd dispatch TODO V8e-7-3");
-                self.send_capsule_resp_err_async(cid, 0x01).await?;
+                let sqe = &pdu.psh[..64];
+                self.handle_admin_cmd_async(cid, sqe).await?;
                 Ok(DispatchOutcome::default())
             }
             crate::dispatch_plan::CapsuleKind::Io { cid } => {
-                // V8e-7-3 加完整 IO dispatch
-                tracing::debug!(cid, "V8e-7-2: IO cmd dispatch TODO V8e-7-3");
-                self.send_capsule_resp_err_async(cid, 0x01).await?;
+                let sqe = &pdu.psh[..64];
+                self.handle_io_cmd_async(cid, sqe).await?;
                 Ok(DispatchOutcome::default())
             }
         }
@@ -458,7 +465,7 @@ impl AsyncSession {
         crate::dispatch_plan::ConnStateSnapshot {
             current_qid: self.current_qid,
             discovery_mode: self.discovery_mode,
-            pending_aers_len: 0, // V8e-7-3 加 pending_aers 字段后真填
+            pending_aers_len: self.pending_aers.len(),
         }
     }
 
@@ -712,5 +719,529 @@ impl AsyncSession {
         write_pdu_async(&mut self.stream, &hdr, &psh, &[])
             .await
             .context("V8e-7-2 async write C2HTermReq")
+    }
+
+    // ============ V8e-7-3 admin / IO async dispatch + AER drain ============
+
+    /// **V8e-7-3** — async 版 admin cmd dispatch（与 sync `handle_admin_cmd`
+    /// 1:1 等价）。
+    async fn handle_admin_cmd_async(&mut self, cid: u16, sqe_bytes: &[u8]) -> anyhow::Result<()> {
+        use crate::dispatch_plan::{
+            AdminAerDecision, AdminBlockedOpcDecision, DiscoveryWhitelistDecision,
+            decide_admin_aer_path, decide_admin_blocked_opc, decide_admin_discovery_whitelist,
+        };
+        use pcie_remote_nvme_userspace::cmd::Sqe;
+
+        let mut sqe = Sqe::read_from_bytes(sqe_bytes)
+            .map_err(|_| anyhow::anyhow!("V8e-7-3 admin SQE 不是 64 byte"))?;
+
+        let state = self.state_snapshot();
+
+        // V7 discovery 白名单
+        match decide_admin_discovery_whitelist(sqe_bytes, state) {
+            DiscoveryWhitelistDecision::Rejected => {
+                tracing::warn!(
+                    opc = crate::aer::peek_admin_opc(sqe_bytes),
+                    "V8e-7-3 discovery 拒非白名单 opc"
+                );
+                return self.send_capsule_resp_err_async(cid, 0x01).await;
+            }
+            DiscoveryWhitelistDecision::Allowed | DiscoveryWhitelistDecision::NotDiscoveryMode => {}
+        }
+
+        // V6a AER fast-path
+        match decide_admin_aer_path(sqe_bytes, state) {
+            AdminAerDecision::OverCap => {
+                tracing::warn!(cid, "V6a/V8e-7-3 AER over MAX_PENDING_AERS");
+                return self.send_capsule_resp_err_async(cid, 0x05).await;
+            }
+            AdminAerDecision::FastPath => {
+                return self.handle_admin_aer_fast_path_async(cid, sqe).await;
+            }
+            AdminAerDecision::NotAer => {}
+        }
+
+        // V5e-1-fix NS-shape 黑名单
+        if matches!(
+            decide_admin_blocked_opc(sqe_bytes),
+            AdminBlockedOpcDecision::Blocked
+        ) {
+            tracing::warn!(
+                opc = crate::aer::peek_admin_opc(sqe_bytes),
+                "V8e-7-3 session 拒 NS-shape mutating opc"
+            );
+            return self.send_capsule_resp_err_async(cid, 0x01).await;
+        }
+
+        // PRP sentinel 改写
+        sqe.prp1 = crate::PRP1_SENTINEL;
+        sqe.prp2 = 0;
+        let opc = (sqe.cdw0 & 0xff) as u8;
+
+        // Create IO CQ/SQ peek（V5a）
+        let create_io_cq_qid: Option<u16> = (opc == 0x05).then_some((sqe.cdw10 & 0xffff) as u16);
+        let create_io_sq_pair: Option<(u16, u16)> = (opc == 0x01).then(|| {
+            let sq_id = (sqe.cdw10 & 0xffff) as u16;
+            let cq_id = ((sqe.cdw11 >> 16) & 0xffff) as u16;
+            (sq_id, cq_id)
+        });
+        if let Some(qid) = create_io_cq_qid {
+            sqe.prp1 = crate::session::cq_sentinel(qid);
+        }
+
+        // dispatch in short lock
+        let mut tcp_t =
+            crate::tcp_transport::TcpAdminTransport::new_with_token_base(self.next_token);
+        let conn_id = self.conn_id;
+        let immediate_cqe = {
+            let mut c = self.controller.controller.lock();
+            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            c.nvme_admin_dispatch_with_conn(&mut ctx, sqe, cid, 0, conn_id)
+        };
+
+        // V5a：Create IO CQ/SQ success 后镜像
+        if let Some(cqe) = immediate_cqe.as_ref() {
+            let dw3 = cqe.dw3;
+            let sc = ((dw3 >> 17) & 0xff) as u8;
+            if sc == 0 {
+                if let Some(qid) = create_io_cq_qid {
+                    let sentinel = crate::session::cq_sentinel(qid);
+                    self.io_queues
+                        .insert(qid, crate::io_queue::IoQueueState::new_cq(sentinel));
+                }
+                if let Some((sq_id, cq_id)) = create_io_sq_pair {
+                    self.io_queues
+                        .insert(sq_id, crate::io_queue::IoQueueState::new_sq(cq_id));
+                }
+            }
+        }
+
+        self.run_post_dispatch_async(cid, immediate_cqe, tcp_t)
+            .await
+    }
+
+    /// **V8e-7-3** — AER fast-path：dispatch 让 controller `aen_pending`
+    /// push；session 镜像 push；跳过 run_post_dispatch；wire 上不 emit
+    /// CapsuleResp（等 drain_aers_async fire 时真发）。
+    async fn handle_admin_aer_fast_path_async(
+        &mut self,
+        cid: u16,
+        mut sqe: pcie_remote_nvme_userspace::cmd::Sqe,
+    ) -> anyhow::Result<()> {
+        sqe.prp1 = crate::PRP1_SENTINEL;
+        sqe.prp2 = 0;
+        let mut tcp_t =
+            crate::tcp_transport::TcpAdminTransport::new_with_token_base(self.next_token);
+        let conn_id = self.conn_id;
+        let immediate = {
+            let mut c = self.controller.controller.lock();
+            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            c.nvme_admin_dispatch_with_conn(&mut ctx, sqe, cid, 0, conn_id)
+        };
+        self.next_token = tcp_t.token_high_water();
+        if immediate.is_some() {
+            anyhow::bail!(
+                "V8e-7-3 AER invariant: dispatch returned Some(Cqe), spec § 5.2 must stash"
+            );
+        }
+        if !tcp_t.writes.is_empty() || !tcp_t.pending_reads.is_empty() {
+            anyhow::bail!(
+                "V8e-7-3 AER invariant: dispatch produced DMA writes/reads ({}/{})",
+                tcp_t.writes.len(),
+                tcp_t.pending_reads.len()
+            );
+        }
+        self.pending_aers.push(crate::aer::PendingAer {
+            cid,
+            sq_id: 0,
+            registered_at: std::time::Instant::now(),
+        });
+        tracing::debug!(cid, "V8e-7-3 AER stashed");
+        Ok(())
+    }
+
+    /// **V8e-7-3** — async 版 IO cmd dispatch（与 sync `handle_io_cmd` 1:1）。
+    async fn handle_io_cmd_async(&mut self, cid: u16, sqe_bytes: &[u8]) -> anyhow::Result<()> {
+        use crate::dispatch_plan::{IoNlbDecision, decide_io_nlb_check, prp2_sentinel_for_nlb};
+        use pcie_remote_nvme_userspace::cmd::Sqe;
+
+        let mut sqe = Sqe::read_from_bytes(sqe_bytes)
+            .map_err(|_| anyhow::anyhow!("V8e-7-3 IO SQE 不是 64 byte"))?;
+
+        // V5b R-5：清 PSDT bits
+        sqe.cdw0 &= !(0b11u32 << 14);
+        sqe.prp1 = crate::PRP1_SENTINEL;
+
+        let sq_id = self.current_qid;
+        let cq_id = match self.io_queues.get(&sq_id) {
+            Some(crate::io_queue::IoQueueState::Sq { cq_id, .. }) => *cq_id,
+            _ => anyhow::bail!(
+                "V8e-7-3 invariant: handle_io_cmd_async 但 current_qid={sq_id} 不是 IO SQ"
+            ),
+        };
+
+        // NLB + dual-PRP sentinel 决策
+        match decide_io_nlb_check(&sqe) {
+            IoNlbDecision::OverMax { nlb_real } => {
+                tracing::warn!(opc = (sqe.cdw0 & 0xff) as u8, nlb_real, "V5e-2 nlb>MAX");
+                return self.send_capsule_resp_err_async(cid, 0x18).await;
+            }
+            IoNlbDecision::Ok { nlb_real } => {
+                sqe.prp2 = prp2_sentinel_for_nlb(nlb_real);
+            }
+            IoNlbDecision::NotReadWrite => {
+                sqe.prp2 = 0;
+            }
+        }
+
+        let mut tcp_t =
+            crate::tcp_transport::TcpAdminTransport::new_with_token_base(self.next_token);
+        let immediate_cqe = {
+            let mut c = self.controller.controller.lock();
+            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            c.nvme_io_dispatch(&mut ctx, sq_id, sqe, cid, cq_id)
+        };
+        self.run_post_dispatch_async(cid, immediate_cqe, tcp_t)
+            .await
+    }
+
+    /// **V8e-7-3** — async run_post_dispatch（与 sync `run_post_dispatch`
+    /// 1:1 等价；R2T loop 走 V8e §3 Q5 三段式：lock-pop / unlock-await-wire /
+    /// lock-complete）。
+    async fn run_post_dispatch_async(
+        &mut self,
+        cid: u16,
+        immediate_cqe: Option<pcie_remote_nvme_userspace::cmd::Cqe>,
+        mut tcp_t: crate::tcp_transport::TcpAdminTransport,
+    ) -> anyhow::Result<()> {
+        // Phase 1.5: mixed-path guard
+        let dispatch_data_writes = tcp_t
+            .writes
+            .iter()
+            .filter(|w| w.gpa < crate::CQ_BASE_GPA)
+            .count();
+        let dispatch_pending_reads = tcp_t.pending_reads.len();
+        if dispatch_data_writes > 0 && dispatch_pending_reads > 0 {
+            anyhow::bail!(
+                "V4b/V5 invariant violation: cmd produced both data_write ({}) and dma_read ({})",
+                dispatch_data_writes,
+                dispatch_pending_reads
+            );
+        }
+        let had_pending_reads = dispatch_pending_reads > 0;
+
+        // Phase 2: dma_read 闭环走 R2T 三段式
+        let mut cmd_cumulative_offset: u32 = 0;
+        while let Some(read_req) = tcp_t.pop_read() {
+            tracing::debug!(
+                cid,
+                token = read_req.token,
+                len = read_req.len,
+                cumulative_offset = cmd_cumulative_offset,
+                "V8e-7-3 async dma_read R2T 三段式"
+            );
+            // 第 2 段：unlock-await-wire（dma_read_via_r2t_async 内部 read_pdu_async）
+            let bytes = self
+                .dma_read_via_r2t_async(cid, cmd_cumulative_offset, read_req.len)
+                .await
+                .with_context(|| {
+                    format!(
+                        "V8e-7-3 dma_read failed (cid={cid}, token={tok}, len={l}, offset={off})",
+                        tok = read_req.token,
+                        l = read_req.len,
+                        off = cmd_cumulative_offset,
+                    )
+                })?;
+            cmd_cumulative_offset = cmd_cumulative_offset.saturating_add(read_req.len);
+            // 第 3 段：lock-complete
+            {
+                let mut c = self.controller.controller.lock();
+                let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                c.nvme_admin_complete_dma(&mut ctx, read_req.token, true, bytes);
+            }
+        }
+
+        // Phase 3: 同步 / 异步 write-out
+        if let Some(cqe) = immediate_cqe {
+            let mut c = self.controller.controller.lock();
+            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            c.nvme_post_cqe(&mut ctx, cqe);
+        } else if !had_pending_reads {
+            let mut data_tokens = Vec::with_capacity(tcp_t.writes.len());
+            for w in tcp_t.writes.iter() {
+                if w.gpa >= crate::CQ_BASE_GPA {
+                    anyhow::bail!(
+                        "V3 invariant violation: async dispatch produced CQE write \
+                         before on_dma_complete (gpa={:#x})",
+                        { w.gpa }
+                    );
+                }
+                data_tokens.push(w.token);
+            }
+            for tok in data_tokens {
+                let mut c = self.controller.controller.lock();
+                let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                c.nvme_admin_complete_dma(&mut ctx, tok, true, Vec::new());
+            }
+        }
+
+        // 保存 token high water
+        self.next_token = tcp_t.token_high_water();
+
+        // Phase 4: drain captured.writes → data + cqe（与 sync 完全一致）
+        let mut data_payload = Vec::new();
+        let mut cqe_bytes: Option<Vec<u8>> = None;
+        while let Some(w) = tcp_t.pop_write() {
+            if w.gpa >= crate::CQ_BASE_GPA {
+                if cqe_bytes.is_some() {
+                    anyhow::bail!("V3 invariant violation: multiple CQE writes for single cmd");
+                }
+                if w.data.len() != 16 {
+                    anyhow::bail!("captured CQE write len={} != 16", w.data.len());
+                }
+                cqe_bytes = Some(w.data);
+            } else {
+                if cqe_bytes.is_some() {
+                    anyhow::bail!(
+                        "V3 invariant violation: data write after CQE write (gpa={:#x}, {}B)",
+                        { w.gpa },
+                        w.data.len()
+                    );
+                }
+                data_payload.extend_from_slice(&w.data);
+            }
+        }
+        let cqe_bytes = cqe_bytes
+            .ok_or_else(|| anyhow::anyhow!("V8e-7-3: controller did not produce CQE for cmd"))?;
+
+        // Phase 5: emit C2HData + CapsuleResp
+        if !data_payload.is_empty() {
+            self.send_c2h_data_async(cid, &data_payload).await?;
+        }
+        self.write_capsule_resp_bytes_async(&cqe_bytes).await
+    }
+
+    /// **V8e-7-3** — async 版 dma_read_via_r2t（V4c 多 R2T 串行；V5e-2
+    /// base_offset 累计）。
+    async fn dma_read_via_r2t_async(
+        &mut self,
+        cid: u16,
+        base_offset: u32,
+        len: u32,
+    ) -> anyhow::Result<Vec<u8>> {
+        if len > crate::session::V4_MAX_DMA_READ_BYTES {
+            anyhow::bail!(
+                "V8e-7-3 dma_read len {len} exceeds cap {}",
+                crate::session::V4_MAX_DMA_READ_BYTES
+            );
+        }
+        let max = crate::MAXH2CDATA_BYTES;
+        let mut buf: Vec<u8> = Vec::with_capacity(len as usize);
+        let mut offset_in_this_read: u32 = 0;
+        while offset_in_this_read < len {
+            let remaining = len - offset_in_this_read;
+            let chunk = remaining.min(max);
+            let cmd_offset = base_offset.saturating_add(offset_in_this_read);
+            let bytes = self
+                .dma_read_one_chunk_async(cid, cmd_offset, chunk)
+                .await?;
+            buf.extend_from_slice(&bytes);
+            offset_in_this_read += chunk;
+        }
+        debug_assert_eq!(buf.len(), len as usize);
+        Ok(buf)
+    }
+
+    /// **V8e-7-3** — 单片 R2T 子路径 (async)。
+    async fn dma_read_one_chunk_async(
+        &mut self,
+        cid: u16,
+        offset: u32,
+        chunk: u32,
+    ) -> anyhow::Result<Vec<u8>> {
+        let ttag = self.ttag_alloc.alloc();
+        let (hdr, psh) = crate::r2t::encode_r2t(cid, ttag, offset, chunk);
+        write_pdu_async(&mut self.stream, &hdr, psh.as_bytes(), &[])
+            .await
+            .context("V8e-7-3 async write R2T PDU")?;
+        await_host_data_async(&mut self.stream, cid, ttag, offset, chunk)
+            .await
+            .with_context(|| {
+                format!("V8e-7-3 await_host_data failed (ttag={ttag}, off={offset}, chunk={chunk})")
+            })
+    }
+
+    /// **V8e-7-3** — 发 C2HData PDU（一次性 + DATA_LAST）。
+    async fn send_c2h_data_async(&mut self, cid: u16, data: &[u8]) -> anyhow::Result<()> {
+        let hdr = CommonHdr {
+            pdu_type: pdu_type::C2H_DATA,
+            flags: crate::pdu::flags::DATA_LAST,
+            hlen: 24,
+            pdo: 24,
+            plen: 24 + data.len() as u32,
+        };
+        let psh = crate::pdu::DataPsh {
+            cccid: cid,
+            ttag_or_rsvd: 0,
+            data_offset: 0,
+            data_length: data.len() as u32,
+            rsvd: [0u8; 4],
+        };
+        write_pdu_async(&mut self.stream, &hdr, psh.as_bytes(), data)
+            .await
+            .context("V8e-7-3 async write C2HData")
+    }
+
+    /// **V8e-7-3** — 把 controller 已 dma_write 的 16-byte CQE bytes 当
+    /// CapsuleResp PSH 直接 emit（spec：RSP PDU PSH = CQE）。
+    async fn write_capsule_resp_bytes_async(&mut self, cqe_bytes: &[u8]) -> anyhow::Result<()> {
+        debug_assert_eq!(cqe_bytes.len(), 16);
+        let hdr = CommonHdr {
+            pdu_type: pdu_type::RSP,
+            flags: 0,
+            hlen: 24,
+            pdo: 0,
+            plen: 24,
+        };
+        write_pdu_async(&mut self.stream, &hdr, cqe_bytes, &[])
+            .await
+            .context("V8e-7-3 async write CapsuleResp raw CQE")
+    }
+
+    /// **V8e-7-3** — caller (handle_conn_async) 收到 `PumpEvent::AenReady`
+    /// 后调，把 controller 端 pending AER fire + capture CQE → wire CapsuleResp。
+    ///
+    /// 一次最多 drain `MAX_DRAIN_PER_PUMP=4` 条（与 V6b sync `pump_one_with_events`
+    /// fairness 等价）。返实际 emit 条数（0 = spurious wakeup / 无 pending）。
+    pub async fn drain_aers_async(&mut self) -> anyhow::Result<usize> {
+        const MAX_DRAIN_PER_PUMP: usize = 4;
+        let conn_id = self.conn_id;
+        let mut emitted = 0usize;
+        for _ in 0..MAX_DRAIN_PER_PUMP {
+            let mut tcp_t =
+                crate::tcp_transport::TcpAdminTransport::new_with_token_base(self.next_token);
+            let fired = {
+                let mut c = self.controller.controller.lock();
+                if c.nvme_pending_aer_count_for_conn(conn_id) == 0 {
+                    false
+                } else {
+                    let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                    c.nvme_fire_aen_for_conn(
+                        &mut ctx, /*type*/ 0, /*info*/ 0, /*log_id*/ 0, conn_id,
+                    )
+                }
+            };
+            self.next_token = tcp_t.token_high_water();
+            if !fired {
+                break;
+            }
+            // captured 应只含 1 条 CQE write（fire_aen 不产 data write）
+            let mut cqe_bytes: Option<Vec<u8>> = None;
+            while let Some(w) = tcp_t.pop_write() {
+                if w.gpa < crate::CQ_BASE_GPA {
+                    anyhow::bail!(
+                        "V8e-7-3 AER drain invariant: unexpected data write (gpa={:#x}, {}B)",
+                        { w.gpa },
+                        w.data.len()
+                    );
+                }
+                if cqe_bytes.is_some() {
+                    anyhow::bail!("V8e-7-3 AER drain invariant: multiple CQE writes per fire");
+                }
+                if w.data.len() != 16 {
+                    anyhow::bail!("V8e-7-3 AER drain captured CQE len={} != 16", w.data.len());
+                }
+                cqe_bytes = Some(w.data);
+            }
+            let Some(cqe_bytes) = cqe_bytes else {
+                break;
+            };
+            self.write_capsule_resp_bytes_async(&cqe_bytes).await?;
+            // session 镜像 pending_aers 同步 -1（front-pop = FIFO）
+            if !self.pending_aers.is_empty() {
+                self.pending_aers.remove(0);
+            }
+            emitted += 1;
+        }
+        tracing::debug!(
+            conn_id,
+            emitted,
+            mirror = self.pending_aers.len(),
+            "V8e-7-3 drain_aers_async"
+        );
+        Ok(emitted)
+    }
+
+    /// **V8e-7-3 test-only** — 让测试 / V8e-followup 在 session 上下文内
+    /// 触发 controller fire_aen + drain wire。与 V6b sync `inject_aen` 1:1
+    /// 等价但走 async path。
+    pub async fn inject_aen_async(
+        &mut self,
+        aen_type: u8,
+        aen_info: u8,
+        log_id: u8,
+    ) -> anyhow::Result<usize> {
+        let mut tcp_t =
+            crate::tcp_transport::TcpAdminTransport::new_with_token_base(self.next_token);
+        let conn_id = self.conn_id;
+        let fired = {
+            let mut c = self.controller.controller.lock();
+            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            c.nvme_fire_aen_for_conn(&mut ctx, aen_type, aen_info, log_id, conn_id)
+        };
+        self.next_token = tcp_t.token_high_water();
+        if !fired {
+            return Ok(0);
+        }
+        // 1 条 CQE
+        let mut emitted = 0usize;
+        while let Some(w) = tcp_t.pop_write() {
+            if w.gpa >= crate::CQ_BASE_GPA && w.data.len() == 16 {
+                self.write_capsule_resp_bytes_async(&w.data).await?;
+                emitted += 1;
+            }
+        }
+        if !self.pending_aers.is_empty() {
+            self.pending_aers.remove(0);
+        }
+        Ok(emitted)
+    }
+}
+
+/// **V8e-7-3** — async 版 await_host_data（与 sync 等价）。
+async fn await_host_data_async(
+    stream: &mut TokioStream,
+    cid: u16,
+    ttag: u16,
+    base_offset: u32,
+    expected_len: u32,
+) -> anyhow::Result<Vec<u8>> {
+    let mut r = crate::H2cReassembler::with_base_offset(cid, ttag, base_offset, expected_len);
+    loop {
+        let pdu = read_pdu_async(stream)
+            .await
+            .context("V8e-7-3 read H2CData")?;
+        let pt = pdu.header.pdu_type;
+        if pt == pdu_type::H2C_TERM {
+            anyhow::bail!("V8e-7-3 host sent H2CTermReq while awaiting H2CData");
+        }
+        match r.accept_pdu(&pdu) {
+            crate::AcceptOutcome::Continue => continue,
+            crate::AcceptOutcome::Done(bytes) => return Ok(bytes),
+            crate::AcceptOutcome::Error { fes, reason } => {
+                // emit C2HTerm
+                let term_hdr = CommonHdr {
+                    pdu_type: pdu_type::C2H_TERM,
+                    flags: 0,
+                    hlen: 24,
+                    pdo: 0,
+                    plen: 24,
+                };
+                let mut term_psh = [0u8; 16];
+                term_psh[0..2].copy_from_slice(&fes.to_le_bytes());
+                let _ = write_pdu_async(stream, &term_hdr, &term_psh, &[]).await;
+                anyhow::bail!("V8e-7-3 H2CData reassembly: fes={fes:#x} reason={reason}");
+            }
+        }
     }
 }
