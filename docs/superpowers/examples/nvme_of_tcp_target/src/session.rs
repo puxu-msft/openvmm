@@ -2029,16 +2029,19 @@ mod tests {
 
     /// 帮 V5a 跑前置：ICReq → Connect admin → Create IO CQ(qid=1, size=16)
     /// → Create IO SQ(sq=1, cq=1, size=16) → Connect qid=1。
-    /// 返还 (client, server-thread join handle)。pump_one 次数已正确同步。
+    /// 返还 (client, server-thread join handle, backing-tempfile guard)。
+    /// **V5-P9 fix**：调用者必须把 backing guard 绑到一个 `_` 前缀的本地
+    /// 变量让 NamedTempFile 与 test 生命周期对齐（drop 时 unlink 干净）；
+    /// 之前的 `std::mem::forget(_backing)` 会永久泄漏 /tmp 文件。
     fn v5a_full_setup_qid1(
         sess_pumps: usize,
-    ) -> (TcpStream, std::thread::JoinHandle<anyhow::Result<()>>) {
+    ) -> (
+        TcpStream,
+        std::thread::JoinHandle<anyhow::Result<()>>,
+        tempfile::NamedTempFile,
+    ) {
         let (mut client, server) = tcp_pair();
-        let (controller, _backing) = make_test_controller();
-        // _backing 必须保活到 session 结束；测试函数把它绑 _backing 让生命周期
-        // 与本 helper 调用方对齐。本 helper 内部 leak `_backing`（forget）让
-        // tempfile 不 unlink；测试结束 OS 清。
-        std::mem::forget(_backing);
+        let (controller, backing) = make_test_controller();
         let h = thread::spawn(move || -> anyhow::Result<()> {
             let mut sess = V2Session::accept_and_handshake(server, controller)?;
             for _ in 0..sess_pumps {
@@ -2062,7 +2065,7 @@ mod tests {
         // Connect qid=1
         send_connect_io(&mut client, 1);
         let _ = read_pdu(&mut client).unwrap();
-        (client, h)
+        (client, h, backing)
     }
 
     /// **V5a-1** — 完整 setup 流：4 步 admin 全 success + Connect qid=1 success。
@@ -2070,7 +2073,7 @@ mod tests {
     fn v5a_create_io_cq_sq_then_connect_io_qid1_succeeds() {
         // setup 跑 5 个 pump：Connect admin + Create IO CQ + Create IO SQ
         // + Connect qid=1 + 1 个 stub IO cmd 让 thread 不悬挂
-        let (mut client, h) = v5a_full_setup_qid1(5);
+        let (mut client, h, _backing) = v5a_full_setup_qid1(5);
         // 发一条 stub IO cmd（IO Read opc=0x02）让 thread 走 handle_io_cmd 后退出
         send_admin_sqe_cdw11(&mut client, 0xFE, 0x0AAA, 1, 0, 0);
         let resp = read_pdu(&mut client).unwrap();
@@ -2118,7 +2121,7 @@ mod tests {
     /// （与 V5a-1 合并验证；保留独立 named test 表意。）
     #[test]
     fn v5a_io_cmd_after_connect_returns_invalid_opcode() {
-        let (mut client, h) = v5a_full_setup_qid1(5);
+        let (mut client, h, _backing) = v5a_full_setup_qid1(5);
         send_admin_sqe_cdw11(&mut client, 0xFE, 0x0BBB, 1, 0, 0);
         let resp = read_pdu(&mut client).unwrap();
         let cid = u16::from_le_bytes(resp.psh[12..14].try_into().unwrap());
@@ -2201,7 +2204,6 @@ mod tests {
     fn v5b_io_read_nlb1_emits_c2hdata_and_resp() {
         let (mut client, server) = tcp_pair();
         let (controller, _backing) = make_test_controller_with_pattern(0xAB);
-        std::mem::forget(_backing);
         let h = thread::spawn(move || -> anyhow::Result<()> {
             let mut sess = V2Session::accept_and_handshake(server, controller)?;
             // setup 5 cmds: Connect admin + Create IO CQ + Create IO SQ +
@@ -2247,7 +2249,7 @@ mod tests {
     /// **V5b-2** — IO Read nlb=2 → CapsuleResp SC=0x18，未发 C2HData。
     #[test]
     fn v5b_io_read_nlb2_rejected_with_sgl_data_length_invalid() {
-        let (mut client, h) = v5a_full_setup_qid1(5);
+        let (mut client, h, _backing) = v5a_full_setup_qid1(5);
         send_io_read(&mut client, 0x0801, 1, 0, 2);
         let resp = read_pdu(&mut client).unwrap();
         assert_eq!(
@@ -2263,7 +2265,7 @@ mod tests {
     /// **V5b-3** — IO Read 非法 NSID → controller 返 INVALID_NAMESPACE (0x0B)。
     #[test]
     fn v5b_io_read_invalid_nsid_returns_invalid_namespace() {
-        let (mut client, h) = v5a_full_setup_qid1(5);
+        let (mut client, h, _backing) = v5a_full_setup_qid1(5);
         send_io_read(&mut client, 0x0902, /*nsid=*/ 999, 0, 1);
         let resp = read_pdu(&mut client).unwrap();
         assert_eq!(resp.header.pdu_type, pdu_type::RSP);
@@ -2278,7 +2280,6 @@ mod tests {
     fn v5b_io_read_psdt01_transparent_to_host() {
         let (mut client, server) = tcp_pair();
         let (controller, _backing) = make_test_controller_with_pattern(0xCD);
-        std::mem::forget(_backing);
         let h = thread::spawn(move || -> anyhow::Result<()> {
             let mut sess = V2Session::accept_and_handshake(server, controller)?;
             for _ in 0..5 {
@@ -2352,12 +2353,14 @@ mod tests {
     #[test]
     fn v5c_io_write_nlb1_round_trip() {
         let (mut client, server) = tcp_pair();
-        // 起一个 fresh tempfile 让 backing path 在 thread 外仍可读
+        // **V5-P9 fix** — backing tempfile 必须保活到 reopen verify 结束；
+        // 之前 `std::mem::forget(f)` 永久 leak。现在显式绑 `_backing` 让
+        // 测试 fn 结束 drop 时 unlink 干净。controller 已持 fd 不受影响。
         let f = tempfile::NamedTempFile::new().expect("tempfile");
         f.as_file().set_len(1024 * 1024).expect("set_len");
         let backing_path = f.path().to_str().expect("utf8").to_string();
         let backing_path_for_verify = backing_path.clone();
-        std::mem::forget(f); // 让文件不在 drop 时 unlink
+        let _backing = f; // 显式声明 lifetime 持有到 fn 末
         let controller =
             NvmeController::open(&[backing_path], 0x1414, 0, &[]).expect("open controller");
         let h = thread::spawn(move || -> anyhow::Result<()> {
@@ -2417,7 +2420,7 @@ mod tests {
     /// **V5c-2** — IO Write nlb=2 → reject SC=0x18，不发 R2T。
     #[test]
     fn v5c_io_write_nlb2_rejected() {
-        let (mut client, h) = v5a_full_setup_qid1(5);
+        let (mut client, h, _backing) = v5a_full_setup_qid1(5);
         send_io_write(&mut client, 0x0D11, 1, 0, 2);
         let resp = read_pdu(&mut client).unwrap();
         assert_eq!(
@@ -2438,7 +2441,7 @@ mod tests {
         let f = tempfile::NamedTempFile::new().expect("tempfile");
         f.as_file().set_len(1024 * 1024).expect("set_len");
         let path = f.path().to_str().expect("utf8").to_string();
-        std::mem::forget(f);
+        let _backing = f; // **V5-P9 fix** — 保活到 fn 末，drop 时 unlink 干净
         let controller = NvmeController::open(&[path], 0x1414, 0, &[]).expect("open controller");
         let h = thread::spawn(move || -> anyhow::Result<()> {
             let mut sess = V2Session::accept_and_handshake(server, controller)?;

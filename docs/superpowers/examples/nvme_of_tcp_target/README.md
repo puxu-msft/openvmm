@@ -24,13 +24,26 @@ Linux ≥ 5.0 / Windows Server 2025 上的标准 `nvme-cli` 可通过
 - ⏳ V7 — Discovery subsystem (Log Page 0x70)
 - ⏳ V8 — Multi-queue per session + 完整 Disconnect
 
+## ⛔ Security warning
+
+**本 bin 无 TLS / 无 in-band auth (DH-HMAC-CHAP) / 无 host NQN 白名单**。
+任何能到达监听端口的 host 都能远程读写所有 `--backing-file` 内容。
+
+- 默认 `--listen 127.0.0.1:4420` 只接受同机 connection
+- 非 loopback 地址（例 `0.0.0.0` / `192.168.x.x`）需显式 `--i-know-this-is-insecure`
+  才会启动；启动后 stderr 出 prominent WARN
+- 生产 / 共享 LAN 部署务必加 IP 层 ACL / WireGuard / Tailscale 隧道
+- 教学 / 本机演示推荐保留默认 loopback
+
+V-followup 计划加 TLS 1.3 + DH-HMAC-CHAP。
+
 ## Build & Run
 
 ```bash
 cd docs/superpowers/examples/nvme_of_tcp_target
 truncate -s 1G /tmp/ns1.img         # 1 GiB 空 backing file
 cargo run --release -- \
-  --listen 0.0.0.0:4420 \
+  --listen 127.0.0.1:4420 \
   --backing-file /tmp/ns1.img \
   --vid 0x1414
 ```
@@ -39,13 +52,15 @@ CLI 选项：
 
 | Flag | Default | 说明 |
 |---|---|---|
-| `--listen` | `0.0.0.0:4420` | 监听地址（4420 = NVMe-oF TCP IANA 端口） |
+| `--listen` | `127.0.0.1:4420` | 监听地址；非 loopback 需 `--i-know-this-is-insecure` |
 | `--backing-file PATH` | （必需） | 后端文件；重复指定 → 多 namespace（nsid 按命令行顺序 1, 2, …） |
-| `--vid 0xNNNN` | `0x1414` | PCIe Vendor ID（Identify Controller 用） |
+| `--vid 0xNNNN` | `0x1414` | PCIe Vendor ID（教学示例值，非 Microsoft 官方组件） |
 | `--ssvid 0xNNNN` | `0x0000` | Subsystem Vendor ID |
 | `--zns-nsid N` | （重复可选） | 把指定 NSID 标记为 ZNS（Zoned Namespace） |
+| `--max-connections N` | `16` | 并发连接上限（防 thread/fd 资源耗尽） |
+| `--i-know-this-is-insecure` | `false` | 显式确认绑非 loopback 地址 |
 
-环境变量：`RUST_LOG=info` 开 info 日志、`debug` 看每条 PDU。
+环境变量：默认 `RUST_LOG=info`；用 `RUST_LOG=debug` 看每条 PDU、`warn` 静音。
 
 ## Linux nvme-cli interop
 
