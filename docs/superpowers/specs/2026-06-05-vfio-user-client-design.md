@@ -157,6 +157,8 @@ pub trait Backend: Send + Sync {
 
 pub enum DmaChannel {
     /// SCM_RIGHTS fd 推送 + server mmap（OpenVMM host 走这条）。
+    /// 编译期 feature `fd-mmap` 必须启用；CVM build 关掉即在二进制层消掉 mmap 代码。
+    #[cfg(feature = "fd-mmap")]
     FdMmap(Box<dyn HostMemoryMapper>),
     /// 全部 DMA 走 wire 反向 RPC（OpenHCL Phase B CVM 场景）。
     MessageMediated,
@@ -170,6 +172,26 @@ pub enum DmaChannel {
 - IO reactor 不在 trait 里：reactor 由 Layer 2 持，Backend 仅被 callback。
   Phase B 若 paravisor 调度模型不同，可换 Layer 2 reactor 但 Backend
   shape 保留。
+- **编译期 feature `fd-mmap` 默认 ON**（rust-reviewer R2 caveat D）：
+
+  ```toml
+  # vfio_user_io/Cargo.toml
+  [features]
+  default = ["fd-passing"]
+  fd-passing = ["dep:nix"]   # SCM_RIGHTS + mmap 路径仅此 feature 启用
+
+  # vfio_user_client/Cargo.toml
+  [features]
+  default = ["fd-mmap"]
+  fd-mmap = ["vfio_user_io/fd-passing"]
+  ```
+
+  Phase B OpenHCL CVM build 关掉 default-features 即可在编译期消掉 fd
+  path 代码（`into_owned_fd` unsafe 也一并消失）。§7.2 `deny_fd_path`
+  runtime flag 保留为第二道闸。
+- **wire crate** (`vfio_user_wire/src/lib.rs`) 必须显式
+  `#![deny(unsafe_code)]`（rust-reviewer R2 caveat C1）— workspace
+  lints 通常不含此项，sans-IO crate 必须单独 deny 才能闭环 finding 8。
 
 ### 4.4 server crate (`pcie_vfio_user_sdk`) 关系
 
@@ -180,6 +202,13 @@ pub enum DmaChannel {
   改 wire 必须双向 golden 对齐；CI 跑 `cargo test -p vfio_user_wire -p
   pcie_vfio_user_sdk` 双绿。
 - server 的 79 tests 不动；wire 层"共享"是字节级 + 测试级，不是代码级。
+- **golden vector 单一 source of truth**（architect R2 caveat 3）：放
+  `vm/devices/pci/vfio_user_wire/tests/golden/*.bin`；server crate 通过
+  `path = "../vfio_user_wire/tests/golden"` 直接读，避免两侧各自
+  hardcode byte literal 后 diverge。
+- **CR 模板要求**（rust-reviewer R2 caveat B1 代价）：任何 wire 字段
+  增删，PR 描述模板必须勾选"golden vector 双向更新 + server
+  `proto.rs`/`framing.rs` 同步检查 + CI 双绿"三项。
 
 ---
 
@@ -198,30 +227,32 @@ pub enum DmaChannel {
 | W | 内容 | 验收门 |
 |---|---|---|
 | W1 | Layer 1 wire crate full + Layer 1.5 framing + VERSION/handshake + GET_INFO/GET_REGION_INFO | unit + socketpair fixture：client ↔ test server handshake 成功 |
-| W2 | REGION_READ/WRITE pump + cfg space + BAR0 shadow + 接入 `chipset_device` | guest UEFI / Linux kernel 看到 NVMe BDF（lspci 列出） |
-| W3 | DMA_MAP/UNMAP（**简单模式**：启动时一次性 map guest RAM；F1 JIT map 推到 P1） | nvme.ko Identify Controller 通过 |
+| W2 | REGION_READ/WRITE pump + cfg space + BAR0 shadow + 接入 `chipset_device`。**MMIO handler 返 `IoResult::Defer`，由 Layer 2 reactor 在 socket reply 到达时 complete deferred token；不允许同步阻塞 in-VP-thread**（复用 `pcie_remote_device` 已验证模式 — architect R2 caveat 1） | guest UEFI / Linux kernel 看到 NVMe BDF（lspci 列出）+ 非对齐 access (1/2/4/8B) 拆/合策略对齐 `vfio_assigned_device` 现有实现 |
+| W3 | DMA_MAP/UNMAP（**简单模式**：启动时一次性 map guest RAM；F1 JIT map 推到 P1）。**wire-level decode 必须能解析 `DMA_UNMAP + GET_DIRTY_BITMAP` flag 并合法回 reply**（即使 client 不真做 dirty 跟踪，回全 0 bitmap 也行 — architect R2 caveat 2，避免 P1 W8 上线时返工 wire crate） | nvme.ko Identify Controller 通过 |
 | W4 | SET_IRQS eventfd + Backend::inject_msix（**vector cap 推到 P1 F6**） | nvme.ko Create IO Queue + 中断到达 |
-| W5 | DEVICE_RESET 转发 + 本地短路 CSTS.RDY（red-team failure-mode-6 Windows reset timing 的预修） | nvme.ko unload/reload 通过 |
-| W6 | **reconnect-on-FIN**：socket close → 灌 0xFF + log，**P0 实装不留 P2** | 杀掉 server 进程后 guest 看到 device gone（lspci `--` 消失），重启 server 不自动重连（P1 W11 才做） |
-| W7 | **REGION_WRITE_MULTI batching**（接 SPDK 必备，提前到 P0） | mock multi-write fixture 测；本仓 server 不发，仅 client 编/解 正确 |
-| **P0 验收** | Linux guest `nvme list && fio --rw=randread --runtime=30s` 0 错；本仓 server 自闭环。**禁止**接第三方 server（D4 trade-off） | |
+| W5 | DEVICE_RESET 转发 + 本地短路 CSTS.RDY。**显式 KNOWN-BAD：本地短路 CSTS.RDY 仅覆盖 Linux nvme.ko unload/reload；Windows stornvme.sys 在 reset 后会走 REPORT LUNS / INQUIRY / sense buffer 查询，需要 W12 完整实现，P0 不验 Windows reset 路径** | nvme.ko unload/reload 通过；spec doc + W5 任务卡显式列 Windows reset retrofit 待 W12 |
+| W6 | **reconnect-on-FIN**：socket close → 灌 0xFF + log，**P0 实装不留 P2**。区分 `recv() == 0` (FIN) vs `EPIPE` (write 时半关) vs `SHUT_WR` (half-shutdown) 三种触发，记录到任务卡 | 杀掉 server 进程后 guest 看到 device gone（lspci `--` 消失），重启 server 不自动重连（P1 W11 才做）；**新增单测**：server 在 DMA in-flight 时 close socket，client 必须取消未完成 DMA（不悬挂、不 panic、不读到部分写入的 dst buffer） |
+| W7 | **REGION_WRITE_MULTI batching**（接 SPDK 必备，提前到 P0） | **socketpair fixture 内 mock server 发 ≥2 条 multi-write，client BAR shadow 正确合并**（不再只验 codec — red-team R2 caveat 1） |
+| **P0 验收** | 本仓 server 自闭环。**禁止**接第三方 server（D4 trade-off — 由 CLI 默认拒绝非白名单 socket 路径技术 enforce，见 §7.1）。fio 验收（red-team R2 caveat D — 单 randread 30s 是误绿门）：<br>① `fio --rw=randread --bs=4k --iodepth=32 --numjobs=4 --runtime=30s` 0 错<br>② `fio --rw=randwrite --bs=4k --iodepth=32 --numjobs=4 --runtime=30s` 0 错<br>③ `fio --rw=randrw --rwmixwrite=50 --bs=4k --iodepth=32 --numjobs=4 --runtime=60s` 0 错<br>④ guest 内强制 NVMe BAR0 重定位到 >4GiB（OVMF 配置或重映射）后重跑 ① 30s — 0 错（覆盖 64-bit BAR 路径） | |
 
-P0 期间最小安全前置（D4=B）：
+P0 期间最小安全前置（D4=B），由 security R2 caveat 加固：
 - **F2** REGION reply payload 长度 `len == count` 严格校验（W2 入口）
+- **F4-baseline** 提前到 P0 W1：SO_PEERCRED 取 peer uid/gid/pid + fd type validation（SCM_RIGHTS 收到 fd 经 `fstatfs`/`fcntl` 校验类型）+ socket parent dir 校验（owner == euid && mode & 0o022 == 0）
 - **F5** 复用 SDK `into_owned_fd` SAFETY 注释（W1 借由 vendor）
 - **F7** `SO_RCVTIMEO/SNDTIMEO` + handshake 5s timeout（W1）
+- **F8-基础** malformed message → close socket + `catch_unwind` 边界包裹 inbound 命令处理（W1）
 
 ### 5.3 P1 — 生产交付（W8…W13）
 
 | W | 内容 | 验收门 |
 |---|---|---|
-| W8 | **F1 JIT map**：W3 启动一次性 map → 改 NVMe IO 触发的 just-in-time MAP/UNMAP | fio 通；map 窗口 ≤ MDTS；DMA 完成立即 UNMAP；单测验证 server 不能看到非活动 IO 的页 |
+| W8 | **F1 JIT map**：W3 启动一次性 map → 改 NVMe IO 触发的 just-in-time MAP/UNMAP。**UNMAP reply 必须能合法响应 GET_DIRTY_BITMAP flag**（已在 P0 W3 准备 wire 解码；W8 落实生成空 bitmap reply 路径） | fio 通；map 窗口 ≤ MDTS；DMA 完成立即 UNMAP；**SLA：max in-flight unmapped GPA pages ≤ MDTS × max_qd × num_queues × 安全系数 2**（security R2 caveat 3，单测验证）；单测验证 server 不能看到非活动 IO 的页 |
 | W9 | **F3 client-side mirror region table** + DMA RPC fallback 路径完整 | mock 恶意 server 试图越界 DMA → client reject |
-| W10 | **F6 vector cap + token bucket** + INTx/MSI（非 MSI-X）支持 | fuzz vector 0..2^32 / 风暴注入 → client 拦截 |
-| W11 | **reconnect 自动重连**：socket 重建 + 重发 DMA_MAP + 重协商 | 杀 server + 重启 server，guest IO 暂停后恢复（带状态告警） |
-| W12 | Windows guest interop（stornvme.sys + DISKSPD）+ reset timing 已在 P0 W5 本地短路 | Windows IOPS baseline 不低于 Linux 90% |
-| W13 | SPDK NVMe vfio-user target interop + 反向 QEMU 挂本仓 server 验证 wire 双向 | interop matrix（{Linux/Win} × {本仓/SPDK} × {fd-mmap/RPC}）≥ 90% GREEN |
-| **P1 验收** | interop matrix 报告 + 文档化已知 SPDK 差异 + 安全 audit 通过（F1-F7 全做） | |
+| W10 | **F6 vector cap + token bucket** + **F9 MAX_MSG_FDS=16 + 进程级 fd 计数 + RLIMIT_NOFILE 启动 cap** + INTx/MSI（非 MSI-X）支持 | fuzz vector 0..2^32 / 风暴注入 → client 拦截；fd 计数器在恶意 server 灌满 fd 时触发 RLIMIT 拒收 |
+| W11 | **reconnect 自动重连**：socket 重建 + 重发 DMA_MAP + 重协商。区分 FIN / EPIPE / SHUT_WR 三路触发；**包含 circuit breaker：N 次连续失败后停止自动重连，等管理面介入** | 杀 server + 重启 server，guest IO 暂停后恢复（带状态告警） |
+| W12 | Windows guest interop（stornvme.sys + DISKSPD）+ **完整 reset 路径**（W5 仅本地短路 + Linux nvme.ko；W12 补 stornvme 在 reset 后的 REPORT LUNS / INQUIRY / sense buffer 走 IO 队列的 admin 重建路径） | Windows IOPS baseline 不低于 Linux 90%；reset/load/unload 在 Windows event log 无 disk error |
+| W13 | SPDK NVMe vfio-user target interop + 反向 QEMU 挂本仓 server 验证 wire 双向。**SPDK-specific 验证项**：① max_data_xfer_size=1MiB 单次 DMA 通；② GET_REGION_IO_FDS 命令 client 返 ENOTSUP 后 SPDK 不断连；③ PCIe ext caps (AER/PASID/PRI/ATS) filter 策略对齐 `vfio_assigned_device::parse_extended_capabilities` | interop matrix（{Linux/Win} × {本仓/SPDK} × {fd-mmap/RPC}）≥ 90% GREEN |
+| **P1 验收** | interop matrix 报告 + 文档化已知 SPDK 差异 + 安全 audit 通过（F1-F9 全做）。**Hard gate（security R2 caveat 4）**：F1+F3+F6 必须在 W13 SPDK interop 首次执行**之前**完成 merge & security-reviewer signed-off；W13 不得以 hardening 未完为由跳过 | |
 
 ### 5.4 P2（推后，本 spec 仅占位）
 
@@ -266,10 +297,11 @@ DMA_MAP region，对该 GPA 段 R/W 不受协议约束。这意味着：
 | F1 | JIT DMA_MAP（不一次性 map 整 guest RAM） | P1 W8 |
 | F3 | client-side mirror DmaTable 校验 server-initiated DMA gpa+perm | P1 W9 |
 | F6 | MSI-X vector ≤ describe num_vectors + per-vector token bucket | P1 W10 |
-| F4 | socket path / parent owner / SO_PEERCRED 校验 | P1 W13 |
+| F4-baseline | SO_PEERCRED + fd type validation + socket parent dir mode 检查 | **P0 W1**（security R2 caveat 1） |
+| F4-full | socket path TOCTOU 完整防御（mkdir + bind + chmod 原子序列） | P1 W13 |
 | F8 | malformed message → close socket + catch_unwind 边界 | P0 W1（基础）+ P2 fuzz harness |
 | F9 | MAX_MSG_FDS=16 + 进程级 fd 计数 + RLIMIT_NOFILE | P1 W10 |
-| F10 | CLI 暴露 → 文档化 ENV/config-file 替代路径 | P2 |
+| F10 | CLI 暴露 → 文档化 ENV/config-file 替代路径 + `--help` 含"DO NOT pass socket path via shell history"提示 | P0 W0（CLI 提示）+ P2（ENV/config 替代） |
 
 ### 6.3 部署 README 必含警告
 
@@ -298,14 +330,30 @@ in-tree. Production deployments must wait for P1 completion (F1+F3+F6).
 
 ```
 openvmm \
-    --vfio-user-client /run/foo.sock,bdf=0000:00:08.0 \
-    --vfio-user-client /run/bar.sock,bdf=0000:00:09.0 \
+    --vfio-user-client /run/openvmm/trusted/foo.sock,bdf=0000:00:08.0 \
+    --vfio-user-client /run/openvmm/trusted/bar.sock,bdf=0000:00:09.0 \
+    [--allow-untrusted-vfio-user]   # 显式 opt-in 才能用白名单外路径
     [其它选项...]
 ```
 
 `--vfio-user-client SOCKET[,bdf=BDF]`，与
 `--vfio-cdev` / `--vfio` 同位置注册（`openvmm_entry/src/lib.rs` L850-925
 附近）。一次可重复多次。
+
+**默认白名单 enforce**（security R2 caveat 2，把 D4=B 的"禁止接第三方
+server"从纯文档升级为技术约束）：
+- 默认只接受 `socket_path` 在 `/run/openvmm/trusted/*.sock` 下
+- 越出白名单需要显式 `--allow-untrusted-vfio-user` flag
+- 命中后 stderr 一次性打 RED warning：
+  ```
+  WARNING: --allow-untrusted-vfio-user enables connections to socket
+  paths outside /run/openvmm/trusted/. The peer process gains FULL R/W
+  access to guest memory via DMA_MAP. Only enable if you own & audit
+  the server end-to-end.
+  ```
+- `--help` 文本含一行："SOCKET path will appear in /proc/<pid>/cmdline;
+  prefer ENV var or config file (P2) for stricter deployments."（F10
+  P0 部分）
 
 ### 7.2 Resource handle
 
@@ -351,31 +399,74 @@ VfioUserClientHandle>`，返回 `Box<dyn PciDevice>`，与
 | # | 风险 | 概率 | 影响 | 缓解 |
 |---|---|---|---|---|
 | R1 | MSI-X coalescing / vector routing 错位（red-team P0 失败点 #1） | 高 | 高 | P0 W4 单测：mock server 触发任意 vec → guest 端验证 routing；接入既有 `MsixEmulator` 自检 |
-| R2 | DMA fence / 顺序（fastpath 一致性） | 中 | 高 | 默认 message-mediated（server 主动 pull），仅 P1 W8 fd-mmap fastpath 加内存屏障文档 |
-| R3 | SPDK 发 REGION_WRITE_MULTI 把 P0 demo 打挂 | 高 | 中 | WRITE_MULTI 已提到 P0 W7 |
-| R4 | reset timing 在 Windows 上 BSOD | 中 | 高 | W5 本地 CSTS.RDY 短路 + W12 Windows 专项测试 |
-| R5 | Layer 1 wire 与 server 字节定义 diverge | 低 | 高 | 双向 golden vector + CI 双绿 gate |
+| R2 | DMA fence / 顺序（fd-mmap fastpath 一致性） | 中 | 高 | OpenVMM host P0 默认走 `DmaChannel::FdMmap`（性能首选，与 §4.3 一致）；fd-mmap 路径明文要求：server 端 mmap region 后第一次写前依赖 PCIe ordering，由 client 端文档化禁止 `MAP_POPULATE` 之外的 stale-page lazy fault 行为；可疑场景加 `msync(MS_SYNC)` 兜底（red-team R2 caveat 3） |
+| R3 | SPDK 发 REGION_WRITE_MULTI / max_xfer 1MiB / GET_REGION_IO_FDS / AER ext caps 把 P0 demo 打挂 | 高 | 中 | WRITE_MULTI 已提到 P0 W7；其余三项在 P1 W13 SPDK 任务卡专项验证 + ext caps filter 对齐 `vfio_assigned_device::parse_extended_capabilities` |
+| R4 | reset timing 在 Windows 上 BSOD | 中 | 高 | W5 本地 CSTS.RDY 短路（Linux 路径），KNOWN-BAD 显式标记 Windows 留 W12；W12 完整实现 stornvme reset 序列 |
+| R5 | Layer 1 wire 与 server 字节定义 diverge | 中 | 高 | 双向 golden vector 单一 source-of-truth (`vfio_user_wire/tests/golden/`) + CI 双绿 gate + CR 模板勾选项（rust-reviewer R2 caveat B3：概率由"低"升"中"，长期两份代码 diverge 是经验事件） |
 | R6 | OpenVMM Windows host build 因新 crate 红 | 中 | 中 | Layer 1 跨平台 + W0 CI 加 Windows build smoke |
-| R7 | server compromise → guest RAM 全面泄露 | 低（P0 仅本仓 server） / 中（P1 SPDK） | 致命 | P0 文档警告 + P1 F1+F3+F6 完整 hardening |
+| R7 | server compromise → guest RAM 全面泄露 | 低（P0 仅本仓 server 且白名单 enforce） / 中（P1 SPDK） | 致命 | P0 README 警告 + CLI 默认白名单 + P1 F1+F3+F6 完整 hardening |
+| R8 | SELinux/AppArmor profile 缺失 | 中 | 中 | P2 决策项；plan 任务卡含"我们是否发 profile"决议 |
+| R9 | NUMA 亲和缺失导致 SPDK interop 性能退化 | 中 | 中 | P1 W13 实验时记录 client/server 不同 NUMA node IOPS 退化数据 |
 
 ---
 
 ## 10. 验收 & 退出标准
 
-- **W0 退出**：4 新 crate 全平台 build 绿；79 server tests 不变；workspace lint 全绿。
-- **P0 退出**：Linux guest `nvme list && fio --rw=randread --runtime=30s --filename=/dev/nvme0n1 --bs=4k` 0 错；F2/F5/F7 hardening 落地；本 spec 自带 smoke test bin（参考 `nvme_of_tcp_target` 风格）。
-- **P1 退出**：interop matrix（{Linux, Win} × {本仓, SPDK} × {fd-mmap, RPC}）覆盖 ≥ 90% GREEN；F1+F3+F4+F6+F9 hardening 落地；安全 audit 报告归档。
+- **W0 退出**：4 新 crate 全平台 build 绿；79 server tests 不变；workspace lint 全绿；`vfio_user_wire/src/lib.rs` 含 `#![deny(unsafe_code)]`；CLI `--help` 含 socket path 警告行（F10 P0 部分）。
+- **P0 退出**：F2 / F4-baseline / F5 / F7 / F8-基础 hardening 落地；本 spec 自带 smoke test bin（参考 `nvme_of_tcp_target` 风格）；fio 4 项门全绿（见 §5.2 P0 验收）；CLI 白名单 enforce 工作（mock 非白名单路径 → 默认 reject）。
+- **P1 退出**：interop matrix（{Linux, Win} × {本仓, SPDK} × {fd-mmap, RPC}）覆盖 ≥ 90% GREEN；F1+F3+F4-full+F6+F9 hardening 落地；安全 audit 报告归档；**Hard gate**：F1+F3+F6 必须在 W13 SPDK interop 首次执行*之前*完成 merge + security-reviewer signed-off（security R2 caveat 4）。
 - **P2 开门条件**：另开 spec；不阻塞 P0/P1 合并。
 
 ---
 
-## 11. 待用户审阅项
+## 11. Plan-stage Open Issues（writing-plans 必须吸收）
 
-1. CLI 形态：`--vfio-user-client SOCKET[,bdf=BDF]` — 是否与你预期一致？
-2. resource handle 字段：`socket_path` / `pci_slot` / `deny_fd_path` /
-   `max_data_xfer_size`，缺什么？
-3. P0 验收最低 fio 时长 30s — 要不要拉长到 300s 看长期稳定性？
-4. 文档警告语气 — 是否同意 P0 build "禁止接第三方 server" 写进 README？
+来自第二轮 review 的非 spec-blocking caveat，必须写入 plan 头部：
+
+- **A1**（architect B.3）：plan 指定 golden vector 物理位置 `vm/devices/pci/vfio_user_wire/tests/golden/*.bin`；server crate `path = "../vfio_user_wire/tests/golden"` 共享读取。
+- **R1**（rust-reviewer C2）：PR 模板加"wire 字段增删 → golden vector 双向 + server proto 同步"勾选项。
+- **R2-a**（red-team B2-a）：SELinux/AppArmor profile 决策（发 / 不发）。
+- **R2-b**（red-team B2-b）：P1 W13 SPDK NUMA 亲和退化数据采集。
+- **R2-c**（red-team B2-c）：W6 reconnect trigger 三路触发明确（FIN / EPIPE / SHUT_WR）。
+- **R2-d**（red-team B2-d）：max_data_xfer_size 协商失败 fallback 决策。
+- **R2-e**（red-team B2-e）：W13 验证 GET_REGION_IO_FDS 返 ENOTSUP 不断连。
+- **R2-f**（red-team B2-f）：W2 BAR shadow 非自然对齐访问拆/合策略对齐 `vfio_assigned_device`。
+
+---
+
+## 12. 已批准 / 待用户审阅项
+
+1. ✅ CLI 形态：`--vfio-user-client SOCKET[,bdf=BDF]` + 默认白名单 + `--allow-untrusted-vfio-user` opt-in（security R2 caveat 2）
+2. ✅ resource handle 字段：`socket_path` / `pci_slot` / `deny_fd_path` / `max_data_xfer_size`
+3. **待审**：P0 fio 时长 — §5.2 已升级为 4 个 30-60s 多模式 fio。要不要其中一项拉长到 300s 看长期稳定？
+4. ✅ README 警告 + CLI 默认白名单 — D4=B 的"禁止接第三方"由文档 + 技术双层 enforce
+
+---
+
+## 13. Round-2 Review 收敛记录
+
+第二轮 4 路独立 review 全部给出 **YES with caveats**。本 spec 已合并所有
+"必须改 spec"项：
+
+| 来源 | caveat | 落地位置 |
+|---|---|---|
+| architect B.1 | W2 MMIO 必须 `IoResult::Defer` | §5.2 W2 |
+| architect B.2 | W3 wire 必须解 `DMA_UNMAP + DIRTY_BITMAP` flag | §5.2 W3 + §5.3 W8 |
+| architect B.3 | golden vector 单一 source-of-truth 路径 | §4.4 |
+| rust-reviewer C1 | wire crate `#![deny(unsafe_code)]` 显式 | §4.3 + §10 W0 |
+| rust-reviewer C2 | PR 模板 wire 同步勾选项 | §4.4 + §11 R1 |
+| rust-reviewer D | `fd-mmap` 编译期 feature | §4.3 |
+| security 1 | F4-baseline 提前 P0 W1 | §5.2 + §6.2 |
+| security 2 | CLI 白名单 + `--allow-untrusted-vfio-user` | §7.1 + §10 P0 |
+| security 3 | W8 JIT map SLA 量化 | §5.3 W8 |
+| security 4 | F1+F3+F6 必须在 W13 之前 signed-off | §5.3 P1 + §10 P1 |
+| security 5 | W6 FIN-during-DMA 单测 | §5.2 W6 |
+| red-team B1-a | W7 mock server 真发 WRITE_MULTI | §5.2 W7 |
+| red-team B1-b | W5 Windows reset KNOWN-BAD 显式 + W12 完整 | §5.2 W5 + §5.3 W12 |
+| red-team B1-c | R2 与 §4.3 `FdMmap` 默认路径口径统一 | §9 R2 |
+| red-team D | P0 fio 验收门补 3 行（randwrite/randrw/64-bit BAR） | §5.2 P0 验收 |
+
+剩余 plan-stage open issues 列在 §11。
 
 ---
 
