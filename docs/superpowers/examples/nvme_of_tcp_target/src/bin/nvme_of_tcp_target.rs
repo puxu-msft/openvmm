@@ -151,6 +151,15 @@ struct Cli {
     /// 仅当 `--tls-listen` 启用时生效。
     #[arg(long)]
     tls_client_ca: Option<PathBuf>,
+    /// **V-followup-auth** host NQN 白名单。可重复 (`--allow-host-nqn a
+    /// --allow-host-nqn b`)。一旦至少给一个，所有 conn 的 Fabric Connect
+    /// 必须出示在 set 内的 `hostnqn` 才能通过 (返 SC=0x84
+    /// CONNECT_INVALID_HOST 否则)。未设此 flag 时行为 100% 同 V8 (不限制)。
+    /// **教学/生产边界**：未配合 mTLS / DH-HMAC-CHAP 时 hostnqn 是明文自报
+    /// (spec § 5.2 Fabrics Connect.HOSTNQN)，任何 peer 都可声称自己是任意
+    /// NQN；本白名单只挡 "拿错 NQN 配置" 类误用，**不是** 身份认证。
+    #[arg(long = "allow-host-nqn")]
+    allow_host_nqns: Vec<String>,
 }
 
 fn parse_hex_u16(s: &str) -> Result<u16, String> {
@@ -484,6 +493,24 @@ async fn main() -> Result<()> {
         None
     };
 
+    // **V-followup-auth** — host NQN 白名单：build 一次 Arc<HashSet>，所有
+    // accept loop / 每条 conn 共享 clone。None = 不限制（V8 行为）。
+    let host_nqn_allowlist: Option<std::sync::Arc<std::collections::HashSet<String>>> =
+        if cli.allow_host_nqns.is_empty() {
+            None
+        } else {
+            let set: std::collections::HashSet<String> =
+                cli.allow_host_nqns.iter().cloned().collect();
+            tracing::warn!(
+                count = set.len(),
+                "🔒 V-followup-auth host NQN 白名单生效：仅放行集合内 hostnqn 的 Connect"
+            );
+            for nqn in &set {
+                tracing::info!(allow = %nqn, "V-followup-auth allow-host-nqn");
+            }
+            Some(std::sync::Arc::new(set))
+        };
+
     // **V8f / V8e-2** — 若 dual-listener 模式，先 spawn discovery accept loop
     // （独立 tokio task），主 task 跑主 IO listener。两个 loop 共享 watch
     // shutdown channel，SIGINT 同时停。
@@ -503,6 +530,7 @@ async fn main() -> Result<()> {
                 disc_inflight,
                 max_conn,
                 "discovery",
+                host_nqn_allowlist.clone(),
             )))
         } else {
             drop(shutdown_rx_disc);
@@ -530,6 +558,7 @@ async fn main() -> Result<()> {
                 shutdown_rx_tls,
                 tls_inflight,
                 max_conn,
+                host_nqn_allowlist.clone(),
             )))
         } else {
             drop(shutdown_rx_tls);
@@ -545,6 +574,7 @@ async fn main() -> Result<()> {
         Arc::clone(&inflight),
         max_conn,
         "main",
+        host_nqn_allowlist.clone(),
     )
     .await;
     let _ = shutdown_tx.send(true);
@@ -593,6 +623,7 @@ async fn run_accept_loop(
     inflight: Arc<AtomicUsize>,
     max_conn: usize,
     label: &'static str,
+    host_nqn_allowlist: Option<std::sync::Arc<std::collections::HashSet<String>>>,
 ) -> Result<()> {
     let mut accept_backoff_ms: u64 = 0;
     loop {
@@ -640,6 +671,7 @@ async fn run_accept_loop(
         let inflight = Arc::clone(&inflight);
         let shared_ctrl = Arc::clone(&shared);
         let shutdown_rx = shutdown_rx.clone();
+        let allowlist = host_nqn_allowlist.clone();
         // **V8e-7-4 reviewer M-1 + security LOW-3** — detach `tokio::spawn`
         // JoinHandle 但闭包内：
         //   1. `InflightGuard` RAII：drop 时无条件 fetch_sub（即使 future panic）
@@ -657,8 +689,12 @@ async fn run_accept_loop(
             }
             let _g = InflightGuard(inflight);
 
-            let fut =
-                std::panic::AssertUnwindSafe(handle_conn_async(stream, shared_ctrl, shutdown_rx));
+            let fut = std::panic::AssertUnwindSafe(handle_conn_async(
+                stream,
+                shared_ctrl,
+                shutdown_rx,
+                allowlist,
+            ));
             let r = futures::FutureExt::catch_unwind(fut).await;
             match r {
                 Ok(Ok(())) => tracing::info!(label, %peer, "connection closed normally"),
@@ -699,10 +735,17 @@ async fn handle_conn_async(
     stream: tokio::net::TcpStream,
     shared_ctrl: nvme_of_tcp_target::SharedController,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    host_nqn_allowlist: Option<std::sync::Arc<std::collections::HashSet<String>>>,
 ) -> Result<()> {
-    let mut sess = nvme_of_tcp_target::accept_and_handshake_async(stream, shared_ctrl)
-        .await
-        .context("V8e-7-4 AsyncSession handshake")?;
+    let mut sess = if let Some(allow) = host_nqn_allowlist {
+        nvme_of_tcp_target::accept_and_handshake_async_with_auth(stream, shared_ctrl, allow)
+            .await
+            .context("V8e-7-4 AsyncSession handshake (with NQN allowlist)")?
+    } else {
+        nvme_of_tcp_target::accept_and_handshake_async(stream, shared_ctrl)
+            .await
+            .context("V8e-7-4 AsyncSession handshake")?
+    };
     loop {
         let event = sess.pump_one_async(&mut shutdown_rx).await?;
         match event {
@@ -752,6 +795,7 @@ async fn run_accept_loop_tls(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     inflight: Arc<AtomicUsize>,
     max_conn: usize,
+    host_nqn_allowlist: Option<std::sync::Arc<std::collections::HashSet<String>>>,
 ) -> Result<()> {
     let label = "tls";
     let mut accept_backoff_ms: u64 = 0;
@@ -795,6 +839,7 @@ async fn run_accept_loop_tls(
         let shared_ctrl = Arc::clone(&shared);
         let shutdown_rx = shutdown_rx.clone();
         let acceptor = acceptor.clone();
+        let allowlist = host_nqn_allowlist.clone();
         let _handle = tokio::spawn(async move {
             struct InflightGuard(Arc<AtomicUsize>);
             impl Drop for InflightGuard {
@@ -831,6 +876,7 @@ async fn run_accept_loop_tls(
                 tls_stream,
                 shared_ctrl,
                 shutdown_rx,
+                allowlist,
             ));
             let r = futures::FutureExt::catch_unwind(fut).await;
             match r {
@@ -866,10 +912,17 @@ async fn handle_conn_async_tls(
     stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     shared_ctrl: nvme_of_tcp_target::SharedController,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    host_nqn_allowlist: Option<std::sync::Arc<std::collections::HashSet<String>>>,
 ) -> Result<()> {
-    let mut sess = nvme_of_tcp_target::accept_and_handshake_async(stream, shared_ctrl)
-        .await
-        .context("V-followup-tls-3 AsyncSession over TLS handshake")?;
+    let mut sess = if let Some(allow) = host_nqn_allowlist {
+        nvme_of_tcp_target::accept_and_handshake_async_with_auth(stream, shared_ctrl, allow)
+            .await
+            .context("V-followup-tls-3 AsyncSession over TLS handshake (with NQN allowlist)")?
+    } else {
+        nvme_of_tcp_target::accept_and_handshake_async(stream, shared_ctrl)
+            .await
+            .context("V-followup-tls-3 AsyncSession over TLS handshake")?
+    };
     loop {
         let event = sess.pump_one_async(&mut shutdown_rx).await?;
         match event {

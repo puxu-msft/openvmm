@@ -42,6 +42,9 @@
 //!   + README "TLS 教学开关" 章节
 //! - **V-followup-mtls** ✅ `build_acceptor_with_mtls` + `--tls-client-ca`
 //!   CLI；`WebPkiClientVerifier` 强制 client cert chain 锚到 trust roots
+//! - **V-followup-auth** ✅ host NQN 白名单：`--allow-host-nqn` 可重复 +
+//!   `accept_and_handshake_async_with_auth` + Connect 时返
+//!   `CONNECT_INVALID_HOST` (0x84) 给未授权 hostnqn
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -72,6 +75,7 @@ pub use async_session::AsyncSessionStream;
 pub use async_session::DispatchOutcome;
 pub use async_session::PumpEvent;
 pub use async_session::accept_and_handshake_async;
+pub use async_session::accept_and_handshake_async_with_auth;
 pub use async_session::ic_handshake_async;
 pub use digest::crc32c;
 pub use fabric::ConnectData;

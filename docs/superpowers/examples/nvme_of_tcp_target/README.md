@@ -380,6 +380,33 @@ sudo nvme connect -t tcp -a 127.0.0.1 -s 8009 \
 - ❌ 不做 SAN / CN whitelist
 - ✅ `WebPkiClientVerifier` 由 rustls 默认 webpki crate 实现，audit 自动覆盖
 
+## host NQN 白名单（V-followup-auth）
+
+最轻量的 "拿错 NQN 配置" 防护。可重复 `--allow-host-nqn`：
+
+```bash
+nvme_of_tcp_target \
+    --listen 127.0.0.1:4420 \
+    --backing-file disk.img \
+    --allow-host-nqn nqn.2014-08.org.nvmexpress:uuid:host-a \
+    --allow-host-nqn nqn.2014-08.org.nvmexpress:uuid:host-b
+```
+
+行为：
+- 若至少给一个 `--allow-host-nqn`，所有 Fabric Connect 必须出示 set 内的
+  `hostnqn` 才能通过；否则返 SC=0x84 `CONNECT_INVALID_HOST` 关连接
+- 若未给（默认）行为 100% 同 V8（不限制）
+- 与 TLS / mTLS 正交，可叠加（实际生产**必须**叠 mTLS：纯白名单挡不住
+  恶意 peer 伪造 hostnqn）
+
+### 教学/生产边界
+
+- ✅ 挡 "host 配错 NQN" 类误用
+- ❌ **不是** 身份认证：未叠 mTLS / DH-HMAC-CHAP 时 hostnqn 是明文自报
+  （spec § 5.2 Fabrics Connect.HOSTNQN），任何 peer 都可声称自己是任意 NQN
+- ❌ 不绑 NQN ↔ TLS cert SAN（生产需要 cert SAN binding；留 V-followup-auth-2）
+- ❌ 不做 NQN ↔ DH-HMAC-CHAP shared secret（spec § 8.13.5；留 V-followup-dhchap）
+
 ## 内部参考
 
 - 计划文档：[`../../plans/2026-06-04-phase-v-nvme-of-tcp.md`](../../plans/2026-06-04-phase-v-nvme-of-tcp.md)

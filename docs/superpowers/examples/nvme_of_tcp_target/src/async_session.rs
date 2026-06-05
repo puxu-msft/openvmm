@@ -108,6 +108,12 @@ pub struct AsyncSession<S: AsyncSessionStream = TokioStream> {
     /// **V8e-7-3** — session 镜像 pending AER 列表（cap MAX_PENDING_AERS=4）。
     /// controller `aen_pending` 是 source of truth；本字段仅做 cap + debug。
     pub pending_aers: Vec<crate::aer::PendingAer>,
+    /// **V-followup-auth** — host NQN 白名单（None = 关闭白名单，等价 V8 行为；
+    /// Some = 任何 Connect 的 `hostnqn` 必须在集合内，否则返
+    /// `fabric_sc::CONNECT_INVALID_HOST` 关连接）。
+    /// 由 `accept_and_handshake_async_with_auth` 或后续 setter 注入；
+    /// `accept_and_handshake_async` 仍按 V8 行为不限制。
+    pub host_nqn_allowlist: Option<std::sync::Arc<std::collections::HashSet<String>>>,
 }
 
 /// **V8e-3** — async 版 ICReq/ICResp handshake。语义与 sync
@@ -203,7 +209,29 @@ where
         io_queues: std::collections::HashMap::new(),
         ttag_alloc: crate::TtagAllocator::default(),
         pending_aers: Vec::new(),
+        host_nqn_allowlist: None,
     })
+}
+
+/// **V-followup-auth** — `accept_and_handshake_async` 的带白名单变体。
+///
+/// 行为同 [`accept_and_handshake_async`]，但 session 内带 host NQN 白名单。
+/// 后续 Connect 校验 `hostnqn` 必须在 set 内，否则返
+/// `fabric_sc::CONNECT_INVALID_HOST` 关连接。
+///
+/// `allowlist` 为空 `HashSet` 等价于 "全拒"（教学版强警告）；调用者要么
+/// 用 [`accept_and_handshake_async`] 保留旧行为，要么 set 非空。
+pub async fn accept_and_handshake_async_with_auth<S>(
+    stream: S,
+    controller: SharedController,
+    allowlist: std::sync::Arc<std::collections::HashSet<String>>,
+) -> anyhow::Result<AsyncSession<S>>
+where
+    S: AsyncSessionStream,
+{
+    let mut sess = accept_and_handshake_async(stream, controller).await?;
+    sess.host_nqn_allowlist = Some(allowlist);
+    Ok(sess)
 }
 
 impl<S: AsyncSessionStream> AsyncSession<S> {
@@ -530,6 +558,20 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             discovery = self.discovery_mode,
             "V8e-7-2 Fabric Connect"
         );
+
+        // **V-followup-auth** — host NQN 白名单校验（None=不限制；Some=必须在 set 内）
+        if let Some(allow) = self.host_nqn_allowlist.as_ref() {
+            let hostnqn = cd.hostnqn_str().to_string();
+            if !allow.contains(&hostnqn) {
+                tracing::warn!(
+                    hostnqn = %hostnqn,
+                    "V-followup-auth Connect 拒：hostnqn 不在 --allow-host-nqn 白名单"
+                );
+                return self
+                    .send_capsule_resp_err_async(cid, fabric_sc::CONNECT_INVALID_HOST)
+                    .await;
+            }
+        }
 
         // **V7** discovery mode 校验 subnqn + reject IO queue
         if self.discovery_mode {
