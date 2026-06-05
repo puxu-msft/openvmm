@@ -254,6 +254,80 @@ spawn_blocking thread pool 阻塞）；controller 端仍 `parking_lot::Mutex` �
 串行化（plan §3 Q1 决策；async-aware lock 留 V-followup），但 wire 层 4 conn
 真并发握手 + AER + KATO timer 全 tokio 调度。
 
+## TLS 教学开关（V-followup-tls）
+
+> ⚠️ **教学版警示**：本 TLS 实现仅适合 dev / lab / CTF / 教学。
+> 它 **不做** cert chain validation，也 **不做** host NQN ↔ TLS identity
+> binding（spec § 8.13 强制要求）。生产请等：
+> - **V-followup-auth** — NQN ↔ TLS identity 绑定
+> - **V-followup-mtls** — 强制 client cert
+> - **V-followup-tls-PSK** — TP-8011 PSK + HKDF-Expand-Label NVMe labels
+> - **DH-HMAC-CHAP** — in-band auth (spec § 8.13.5)
+
+### 启用步骤
+
+1. **生成自签 cert + key**（仅教学；生产请用 CA 签发并配 chain）：
+
+   ```bash
+   # rcgen-cli / openssl 都可；下例用 openssl
+   openssl req -x509 -newkey ec:<(openssl ecparam -name prime256v1) \
+       -keyout server.key -out server.pem \
+       -days 7 -nodes -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost"
+   chmod 600 server.key
+   ```
+
+2. **启 bin（plaintext + TLS dual-listener）**：
+
+   ```bash
+   nvme_of_tcp_target \
+       --listen 127.0.0.1:4420 \
+       --tls-listen 127.0.0.1:8009 \
+       --tls-cert server.pem \
+       --tls-key  server.key \
+       --tls-i-trust-this-cert \
+       --backing-file disk.img
+   ```
+
+   - `--tls-listen` 必须配 `--tls-cert + --tls-key + --tls-i-trust-this-cert`
+   - 缺一即 hard-fail 并打中文红色 stderr 解释
+   - TLS handshake 30s 超时防 ClientHello slowloris (`TLS_HANDSHAKE_TIMEOUT_SECS`)
+   - TLS port 不 fallback plaintext（plan R-5 防 downgrade）
+
+3. **client（Linux nvme-cli ≥ 2.6 支持 `--tls`）**：
+
+   ```bash
+   sudo nvme connect -t tcp -a 127.0.0.1 -s 8009 \
+       -n nqn.2014-08.org.nvmexpress:teaching:disk \
+       --tls --tls-key=server.key
+   ```
+
+### 设计要点
+
+- **stream 抽象泛化** (V-followup-tls-1)：`AsyncSession<S>` 接任意
+  `AsyncRead + AsyncWrite + Unpin + Send + 'static`；既有 `TcpStream` /
+  in-memory `DuplexStream` / 新的 `TlsStream<TcpStream>` 全部 0 改动复用
+- **TlsAcceptor 构造** (V-followup-tls-2)：`build_acceptor_from_pem` 接受
+  X.509 cert chain + PKCS#8 / PKCS#1 / SEC1 key，rustls 0.23 + tokio-rustls
+  0.26，默认 ring crypto provider
+- **dual-listener** (V-followup-tls-3)：plaintext + TLS 共享同 controller 同
+  shutdown watch；TLS 端 monomorphize 给 `AsyncSession<TlsStream<TcpStream>>`
+- **byte-identical gate** (V-followup-tls-4)：TLS 路径与 plaintext 路径对同样
+  PDU 输入序列产生**解密后字节完全等价的应用层 wire**；防未来给 TLS 偷偷加
+  in-band transformation
+
+### TLS-related caveat 清单
+
+- ❌ 不验 client cert（mTLS 留 V-followup-mtls）
+- ❌ 不绑 host NQN ↔ TLS identity（spec § 8.13 强制要求；留 V-followup-auth）
+- ❌ 不强制 TLS 1.3（教学版接 TLS 1.2 让老 client 可连；生产应用
+  `with_protocol_versions(&[&rustls::version::TLS13])`）
+- ❌ 不做 cert chain validation（self-signed 直通）
+- ❌ 不做 PSK / DH-HMAC-CHAP
+- ✅ TLS handshake 30s 超时防 slowloris
+- ✅ TLS handshake 失败不 fallback plaintext（防 downgrade）
+- ✅ 双 explicit consent CLI flag 强制
+- ✅ `#![forbid(unsafe_code)]` 保留；rustls 内部 unsafe 由 upstream audit
+
 ## 内部参考
 
 - 计划文档：[`../../plans/2026-06-04-phase-v-nvme-of-tcp.md`](../../plans/2026-06-04-phase-v-nvme-of-tcp.md)

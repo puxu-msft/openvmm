@@ -33,6 +33,13 @@
 //! - **V7b** ✅ session `discovery_mode` derive + Connect NQN 校验 + admin opc 白名单 + bin `--discovery-mode`
 //! - **V7c-fix** ✅ Identify Ctrl CNTRLTYPE=0x02 + NN=0 patch (review H-1) + IO Connect explicit reject (H-2) + dead code clean
 //! - **V8** 计划中
+//! - **V-followup-tls-1** ✅ stream 抽象泛化 `AsyncSession<S: AsyncSessionStream>`；
+//!   default type param 保兼容
+//! - **V-followup-tls-2** ✅ rustls 0.23 + tokio-rustls 0.26 dep + `build_acceptor_from_pem`
+//! - **V-followup-tls-3** ✅ bin TLS dual-listener（`--tls-listen` + 双 explicit consent
+//!   + `TLS_HANDSHAKE_TIMEOUT_SECS=30` 防 slowloris + 不 fallback plaintext 防 downgrade）
+//! - **V-followup-tls-4** ✅ 应用层 byte-identical gate（plaintext vs TLS 解密后等价）
+//!   + README "TLS 教学开关" 章节
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
