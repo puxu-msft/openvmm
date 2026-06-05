@@ -301,6 +301,7 @@ fn handle_conn(
 
     let mut sess =
         V2Session::accept_and_handshake(stream, controller).context("V2Session handshake")?;
-    while sess.pump_one()? {}
+    // **V6b** — pump_one_with_events 每 100ms drain pending AEN + try read_pdu
+    while sess.pump_one_with_events(std::time::Duration::from_millis(100))? {}
     Ok(())
 }

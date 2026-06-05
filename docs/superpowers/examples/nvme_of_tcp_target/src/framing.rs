@@ -46,6 +46,15 @@ pub enum FramingError {
         /// "while reading header" 等。
         at: &'static str,
     },
+    /// **V6b** — read 超时（caller 用 `set_read_timeout(Some(...))` 后撞上）。
+    /// session select-style 主循环 (`pump_one_with_events`) 用这个信号
+    /// 跳回 drain AER + 再 try read。注意：partial-PDU 已被 OS TCP buffer
+    /// 保留，下次 `read_exact` 会自然 resume。
+    #[error("NVMe-oF TCP read timeout {at}")]
+    ReadTimeout {
+        /// "while reading header" 等。
+        at: &'static str,
+    },
     /// PDU 解析失败。
     #[error("PDU decode: {0}")]
     Pdu(#[from] PduError),
@@ -166,6 +175,17 @@ fn read_exact_or_eof(
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
             Err(FramingError::PeerClosed { at }.into())
+        }
+        // **V6b** — set_read_timeout 后撞上：unix 给 WouldBlock，
+        // windows 给 TimedOut。注意 partial-PDU 已被 OS TCP buffer 保留，
+        // 下次 `read_exact` 会自然从断点 resume。
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Err(FramingError::ReadTimeout { at }.into())
         }
         Err(e) => Err(anyhow::anyhow!("TCP read_exact ({at}): {e}")),
     }

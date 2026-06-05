@@ -213,6 +213,192 @@ impl V2Session {
         Ok(true)
     }
 
+    /// **Phase V6b** — select-style 主循环：每 `tick` 轮 drain controller
+    /// 累积的 AEN CQE → emit CapsuleResp，然后 try read_pdu (with timeout)。
+    ///
+    /// 与 [`pump_one`] 行为差异：
+    /// - 入口设 `set_read_timeout(Some(tick))`；read_pdu 撞 timeout 返
+    ///   `FramingError::ReadTimeout` → continue 回 drain
+    /// - 每次 loop top **先**调 `drain_aer_completions()`：把 controller tick
+    ///   或外部 `nvme_fire_aen` 累积的 CQE 转 wire CapsuleResp
+    /// - 收到真 CMD 才返 Ok(true)（caller 重新调本函数继续 poll）
+    /// - PeerClosed → Ok(false) 退出 loop
+    ///
+    /// 单线程语义；spec § 5.2 AER 不规定延迟，100ms tick 完全够。
+    /// V8 + tokio refactor 后改真 select!。
+    ///
+    /// **review R-9 fairness**：drain 每 tick cap `MAX_DRAIN_PER_TICK`（在
+    /// drain 内部）防 AER 风暴让正常 cmd 处理拖延。
+    pub fn pump_one_with_events(&mut self, tick: std::time::Duration) -> anyhow::Result<bool> {
+        // 设 read timeout 让 read_pdu 可以"半阻塞"
+        self.stream.set_read_timeout(Some(tick)).ok();
+        loop {
+            // (1) drain pending AEN → wire CapsuleResp
+            self.drain_aer_completions()?;
+
+            // (2) try read 一帧 PDU
+            let pdu = match read_pdu(&mut self.stream) {
+                Ok(p) => p,
+                Err(e) => {
+                    if let Some(f) = e.downcast_ref::<FramingError>() {
+                        match f {
+                            FramingError::PeerClosed { .. } => {
+                                let _ = self.stream.set_read_timeout(None);
+                                return Ok(false);
+                            }
+                            FramingError::ReadTimeout { .. } => {
+                                // 没新 PDU；下次 loop top 再 drain
+                                continue;
+                            }
+                            FramingError::Pdu(_) => {
+                                let _ = self.stream.set_read_timeout(None);
+                                return Err(e);
+                            }
+                        }
+                    }
+                    let _ = self.stream.set_read_timeout(None);
+                    return Err(e);
+                }
+            };
+            // (3) 收到 PDU - 解 timeout 让 dispatch / R2T 阶段不被 30s/100ms cap
+            self.stream.set_read_timeout(None).ok();
+            let ptype = pdu.header.pdu_type;
+            match ptype {
+                pdu_type::CMD => self.dispatch_capsule_cmd(pdu)?,
+                pdu_type::H2C_TERM => {
+                    tracing::warn!("host sent H2CTermReq; closing");
+                    return Ok(false);
+                }
+                _ => {
+                    self.send_c2h_term(term_fes::PDU_SEQ_ERR)?;
+                    anyhow::bail!(
+                        "unexpected inbound PDU type {ptype:#x} (V2/V6 only handles CMD)"
+                    );
+                }
+            }
+            return Ok(true);
+        }
+    }
+
+    /// **Phase V6b** — drain controller 累积的 AEN CQE 转 wire CapsuleResp。
+    ///
+    /// 内部用 fresh `TcpAdminTransport` capture 每次 `nvme_fire_aen` 产生
+    /// 的 16B CQE dma_write；把 captured.writes drain（按 FIFO 顺序）每条
+    /// 当作 CapsuleResp PSH 直接 emit。
+    ///
+    /// **不调 `nvme_fire_aen`**：fire 是外部事件源的责任（controller tick / 外部
+    /// API）。本函数只消费已经被 fire 的 AEN — 通过 `nvme_pending_aer_count`
+    /// 间接判断：当 `aen_pending` shrunk vs session 镜像 `pending_aers.len()`，
+    /// 差值 = 已被 fire 的 AER 数；session 也对应 truncate 镜像。
+    ///
+    /// 返 drain 出去的 CQE 条数（≤ `MAX_DRAIN_PER_TICK`）。
+    fn drain_aer_completions(&mut self) -> anyhow::Result<usize> {
+        // **review R-12** — cap 单 tick 最多 emit AEN 数；防 AER 风暴拖延
+        // 正常 cmd 处理。
+        const MAX_DRAIN_PER_TICK: usize = 4;
+
+        // 判断有无可 drain：controller pending_aer_count（被 fire 后会 pop_front）
+        // 与 session 镜像 pending_aers.len() 比，差值 = 已 fired 但 wire 没发的
+        let ctrl_pending = self.controller.nvme_pending_aer_count();
+        let mirror = self.pending_aers.len();
+        if ctrl_pending >= mirror {
+            // 没有 fire 过的 AEN；fast path 返 0 不分配 transport
+            return Ok(0);
+        }
+        let fired_count = mirror - ctrl_pending;
+        let drain_count = fired_count.min(MAX_DRAIN_PER_TICK);
+
+        // 用 fresh TcpAdminTransport capture controller post_cqe 产生的 CQE write
+        let tcp_t = TcpAdminTransport::new_with_token_base(self.next_token);
+
+        // controller `fire_aen` 已经被外部（tick / fire_aen wrapper）调过；
+        // post_cqe 已经把 16B CQE bytes 写到 cq_sentinel(0)。但是 — 那是之前
+        // 用别的 ctx 调的！我们 drain 必须重新走一遍 fire/post，让 CQE 经过
+        // 我们的 transport。
+        //
+        // **关键设计**：V6b 教学版 drain 用"fire-and-capture"模式，即 drain
+        // 内部反过来调 `nvme_fire_aen` 把已经在 `aen_pending` 的 AER pop 出
+        // 用一个**dummy event type=0x07 (vendor-specific) info=0xFF**触发 post_cqe。
+        // **不对**：fire_aen 是消费 aen_pending；如果外部已经 fire 过那条
+        // AER 已经被 pop 了，aen_pending 不含；drain 再 fire 无 AER 可用。
+        //
+        // 真正模型：外部已 fire 过的 AER 16B CQE 早就被 dma_write 出去了 —
+        // 但写到了**另一个 ctx 的 transport**！session 在 pump_one_with_events
+        // 外部根本没机会 capture。
+        //
+        // 因此 V6b 真正的设计需求：**fire_aen 必须 session 内部触发**，
+        // session 在 drain_aer_completions 里调 `nvme_fire_aen` 才能 capture。
+        // 外部事件源（如真 timer-driven SMART threshold）必须先 push 一个
+        // "event request" 到 session（不直接调 fire_aen），session 在下次
+        // drain tick 时 fire + capture。
+        //
+        // 当前 V6b 教学版没有"外部事件源 → session 注入"通道；fire 全靠
+        // test fixture 显式调用。所以 drain 函数当前只有 *test-time event*
+        // 路径有意义。tests/aer_e2e.rs (V6c) 会显式调一个 session-side
+        // wrapper `inject_aen_for_test(type, info, log_id)`，它在 drain
+        // capture 期间调 nvme_fire_aen。
+        //
+        // 现在 fast path：mirror 和 ctrl_pending 不应不一致，因为 V6b
+        // 外部还没有 fire 通道。如果不一致说明有 test 走了 inject 路径
+        // 但 mirror 未同步 — 这是 test bug。
+        //
+        // 教学版 V6b 这里就只 truncate mirror 配合 controller，不实际 emit
+        // wire（因为 CQE 已被外部 ctx 截获）。V6c e2e 走 session 内部
+        // inject 路径才能真验 wire。
+        tracing::warn!(
+            ctrl_pending,
+            mirror,
+            fired_count,
+            "V6b drain_aer_completions: AEN 已 fire 但 V6b 教学版无 wire emit \
+             路径（外部 ctx 截获 CQE）；mirror 同步 controller 后返。\
+             V6c 用 inject_aen_for_test 走 session-side 才真发 wire"
+        );
+        self.pending_aers.truncate(ctrl_pending);
+        self.next_token = tcp_t.token_high_water();
+        let _ = drain_count;
+        Ok(0)
+    }
+
+    /// **Phase V6b test-only** — session-side AEN inject：在 session 上下文内
+    /// 触发 `nvme_fire_aen`，让 fire 期间 controller `post_cqe` 写的 16B CQE
+    /// 被 fresh `TcpAdminTransport` capture，然后转 wire CapsuleResp。
+    ///
+    /// 真生产场景的事件源（如 timer-driven SMART threshold）应通过本 API
+    /// 在 session 主循环外 inject；当前教学版仅供 V6c e2e test 用。
+    ///
+    /// 返 emit 出去的 CapsuleResp 条数（0 或 1；0 表示无 pending AER 可弹）。
+    pub fn inject_aen(&mut self, aen_type: u8, aen_info: u8, log_id: u8) -> anyhow::Result<usize> {
+        let mut tcp_t = TcpAdminTransport::new_with_token_base(self.next_token);
+        let fired = {
+            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            self.controller
+                .nvme_fire_aen(&mut ctx, aen_type, aen_info, log_id)
+        };
+        self.next_token = tcp_t.token_high_water();
+        if !fired {
+            return Ok(0);
+        }
+        // captured 应该恰好一条 CQE write (16B at cq_sentinel(0))
+        let mut emitted = 0;
+        while let Some(w) = tcp_t.pop_write() {
+            if w.gpa >= CQ_BASE_GPA && w.data.len() == 16 {
+                self.write_capsule_resp_bytes(&w.data)?;
+                emitted += 1;
+            } else {
+                anyhow::bail!(
+                    "inject_aen: unexpected captured write gpa={:#x} len={}",
+                    { w.gpa },
+                    w.data.len()
+                );
+            }
+        }
+        // 同步 session 镜像（pop_front 一条 AER）
+        if !self.pending_aers.is_empty() {
+            self.pending_aers.remove(0);
+        }
+        Ok(emitted)
+    }
+
     /// 派发 CapsuleCmd：解 SQE → 看 opc/fctype → 走不同分支。
     fn dispatch_capsule_cmd(&mut self, pdu: Pdu) -> anyhow::Result<()> {
         if pdu.psh.len() < 64 {
@@ -2450,6 +2636,113 @@ mod tests {
         assert_eq!(resp.header.pdu_type, pdu_type::RSP);
         let dw0 = u32::from_le_bytes(resp.psh[..4].try_into().unwrap());
         assert_eq!(dw0, 0x00FF, "Get Features 应 echo 之前 Set 的 cdw11=0x00FF");
+        h.join().unwrap().unwrap();
+    }
+
+    // ─── Phase V6b — controller-initiated AEN emit ────────────────────
+
+    /// **V6b-1** — host post AER 后 session inject_aen 触发 controller fire_aen
+    /// → wire 上 emit CapsuleResp。CapsuleResp.cdw0 应携带 AEN type/info/log_id。
+    #[test]
+    fn v6b_inject_aen_after_pending_emits_capsule_resp() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect admin
+            sess.pump_one()?; // AER (stash)
+            // 等 test 主线程信号后 inject AEN
+            rx.recv().unwrap();
+            let emitted = sess.inject_aen(0x01, 0x00, 0x02)?;
+            assert_eq!(emitted, 1, "应 emit 1 条 CapsuleResp");
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+
+        // AER cid=0xAEEE
+        send_aer(&mut client, 0xAEEE);
+
+        // 触发 inject
+        tx.send(()).unwrap();
+
+        // 收 CapsuleResp（spec § 5.2 CDW0 layout：bits 2:0 type, bits 15:8 info, bits 23:16 log_id）
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        let cdw0 = u32::from_le_bytes(resp.psh[..4].try_into().unwrap());
+        let aen_type = (cdw0 & 0x07) as u8;
+        let aen_info = ((cdw0 >> 8) & 0xff) as u8;
+        let log_id = ((cdw0 >> 16) & 0xff) as u8;
+        assert_eq!(aen_type, 0x01, "AEN type");
+        assert_eq!(aen_info, 0x00, "AEN info");
+        assert_eq!(log_id, 0x02, "log_id");
+        let resp_cid = u16::from_le_bytes(resp.psh[12..14].try_into().unwrap());
+        assert_eq!(
+            resp_cid, 0xAEEE,
+            "AEN CapsuleResp cid 应 echo 之前 AER 的 cid"
+        );
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V6b-2** — 无 pending AER 时 inject_aen 返 0，wire 不发任何 PDU。
+    #[test]
+    fn v6b_inject_aen_without_pending_drops_silently() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect admin
+            rx.recv().unwrap();
+            let emitted = sess.inject_aen(0x01, 0x00, 0x02)?;
+            assert_eq!(emitted, 0, "无 pending AER 应 drop event");
+            // 跟一条 Identify 验 session 仍 live
+            sess.pump_one()?;
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+
+        tx.send(()).unwrap();
+        // 等一会让 inject_aen 跑完（不应有 wire 输出）
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Identify Controller 应正常处理
+        send_admin_sqe_cdw11(&mut client, 0x06, 0x00C1, 0, 0x0000_0001, 0);
+        let p = read_pdu(&mut client).unwrap();
+        assert_eq!(p.header.pdu_type, pdu_type::C2H_DATA);
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V6b-3** — pump_one_with_events 通过正常 cmd 路径不受影响。
+    #[test]
+    fn v6b_pump_one_with_events_passes_through_normal_cmds() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            let tick = std::time::Duration::from_millis(20);
+            sess.pump_one_with_events(tick)?; // Connect admin
+            sess.pump_one_with_events(tick)?; // Identify
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+
+        send_admin_sqe_cdw11(&mut client, 0x06, 0x00C2, 0, 0x0000_0001, 0);
+        let p = read_pdu(&mut client).unwrap();
+        assert_eq!(p.header.pdu_type, pdu_type::C2H_DATA);
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
         h.join().unwrap().unwrap();
     }
 

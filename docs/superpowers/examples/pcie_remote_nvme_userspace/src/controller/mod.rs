@@ -1111,6 +1111,38 @@ impl NvmeController {
     pub fn nvme_pending_aer_count(&self) -> usize {
         self.aen_pending.len()
     }
+
+    /// **Phase V6b** — 外部强制 fire 一条 AEN；返 true 表示 AER 已 fire
+    /// （驱动 `aen_pending.pop_front` + post_cqe 已发 16B CQE 到 ctx.dma_write
+    /// 哨值地址，caller 必须用 [`pcie_remote_userspace_sdk::DeviceCtx`] 接
+    /// 着上 `TcpAdminTransport` capture 那条 CQE write）。
+    /// false 表示无 pending AER 可弹（事件按 spec drop）。
+    ///
+    /// `aen_type` < 8 (spec § 5.2 Figure 174 bits 2:0)。
+    pub fn nvme_fire_aen(
+        &mut self,
+        ctx: &mut pcie_remote_userspace_sdk::DeviceCtx<'_>,
+        aen_type: u8,
+        aen_info: u8,
+        log_id: u8,
+    ) -> bool {
+        self.fire_aen(ctx, aen_type, aen_info, log_id)
+    }
+
+    /// **Phase V6b** — 是否有待 fire 的 AEN event。session 主循环 cheap-check
+    /// 避免空 drain 时分配 transport。
+    ///
+    /// 注意：当前 controller 没有真自然事件源（tick 内 SMART/Self-Test/
+    /// Sanitize 仍依赖 mock），所以本函数返回值实际等价 "controller 有 AER
+    /// pending + 测试代码已显式 fire_aen 或 tick 触发过"。返 true 不保证
+    /// drain 一定有 CQE 输出（race window：caller 调本函数后另一 path 又消费）。
+    /// session 应在 false 时跳过 drain，true 时 try drain 但容忍 0 结果。
+    ///
+    /// V6b 教学版策略：drain 函数自己内部用 `nvme_pending_aer_count` 决定是
+    /// 否真 fire；本函数仅作"是否有 AER pending 可消费"的 fast hint。
+    pub fn nvme_has_pending_aen_event(&self) -> bool {
+        self.nvme_pending_aer_count() > 0
+    }
 }
 
 impl NvmeController {
