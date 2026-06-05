@@ -128,10 +128,11 @@ pub async fn ic_handshake_async(stream: &mut TokioStream) -> anyhow::Result<crat
         pfv: 0,
         hpda_or_cpda: 0,
         digest: 0,
-        // ICResp 的 `maxh2cdata` 字段是 u32 PDU offset bits；这里写 0 让 host
-        // fallback 默认值（与 sync ic_handshake 当前实现一致；V8e-6 完整 Connect
-        // 路径会真正暴露 MAXH2CDATA_BYTES 给 host）
-        maxr2t_or_maxh2cdata: 0,
+        // **V8e-7-followup byte-identical gate** — sync `ic_handshake` 在
+        // session.rs:1399 处填 `MAXH2CDATA_BYTES`（64 KiB）；之前 V8e-3 这里
+        // 写 0 是 bug（"让 host fallback" 的注释错误）— host 看 ICResp 时
+        // maxh2cdata 字段是 spec 必填项，sync/async 两路径必须 byte-identical。
+        maxr2t_or_maxh2cdata: crate::MAXH2CDATA_BYTES,
         rsvd: [0u8; 112],
     };
     write_pdu_async(stream, &resp_hdr, resp_psh.as_bytes(), &[])
@@ -1188,7 +1189,9 @@ impl AsyncSession {
     /// `#[deprecated]` 让任何 prod caller 调用产 warning；测试 + V-followup
     /// 显式标注 `#[allow(deprecated)]` 即可。
     #[doc(hidden)]
-    #[deprecated(note = "test-only; prod path 走 dispatch_pdu_async AER fast-path → drain_aers_async")]
+    #[deprecated(
+        note = "test-only; prod path 走 dispatch_pdu_async AER fast-path → drain_aers_async"
+    )]
     pub async fn inject_aen_async(
         &mut self,
         aen_type: u8,
