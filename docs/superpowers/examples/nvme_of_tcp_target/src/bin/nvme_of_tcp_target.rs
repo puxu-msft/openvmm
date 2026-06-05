@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! **Phase V5d / V8b** — NVMe-over-Fabrics TCP target 长跑入口。
+//! **Phase V5d / V8b / V8f** — NVMe-over-Fabrics TCP target 长跑入口。
 //!
 //! 监听 4420（NVMe-oF TCP 常用端口），accept 一条 TCP 连接 → 在 thread
 //! pool（最多 `--max-connections`）spawn 一个工作线程跑
@@ -11,6 +11,11 @@
 //! `SharedControllerInner` (内含 `parking_lot::Mutex<NvmeController>` +
 //! `AtomicU64` per-conn token slab 分配器) wrap，每条 conn `Arc::clone` 共享
 //! 同一 controller 实例。V5d R-8 per-backing Mutex 已拆除。
+//!
+//! **V8f** — 可选 `--discovery-listen` 开 dual-listener：主 `--listen` 跑 IO
+//! controller，第二端口跑独立 Discovery controller (0-byte tempfile backing，
+//! 不接 IO)。两个 controller 实例 AER / qid 状态隔离防串扰。共享 SIGINT
+//! `running` flag 让 SIGINT/SIGTERM 同时停两 loop。
 //!
 //! # 安全 (V5d-fix security review)
 //!
@@ -90,6 +95,14 @@ struct Cli {
     /// --discovery-target-addr 127.0.0.1:4422`
     #[arg(long)]
     discovery_target_addr: Vec<String>,
+    /// **V8f** 额外开 Discovery listener 监听独立端口。同进程内起两个 accept
+    /// loop：主 `--listen` 跑 IO controller，本字段端口跑 discovery controller
+    /// （独立 `NvmeController` 实例，AER / qid 状态隔离防串扰）。配合
+    /// `--discovery-target-nqn/-addr` 注入 portal 列表。
+    /// 不设此字段时 V8f 路径不启用，行为同 V8a（单 listener；`--discovery-mode`
+    /// 仍可让主 listener 切 Discovery，但不再支持"同时 IO + Discovery"）。
+    #[arg(long)]
+    discovery_listen: Option<String>,
 }
 
 fn parse_hex_u16(s: &str) -> Result<u16, String> {
@@ -233,6 +246,68 @@ fn main() -> Result<()> {
         nvme_of_tcp_target::SharedControllerInner::new(shared_ctrl_inner),
     );
 
+    // **V8f (reviewer M-1/M-2)** — 早期校验 `--discovery-listen` 字符串 +
+    // `--discovery-target-*` 配对，把 cheap validation 抬到 controller open 之前
+    // 防 disc_ctrl 白白开起再 drop；parsed addr 用变量缓存避免后续 .expect()。
+    let parsed_discovery_listen: Option<SocketAddr> =
+        match cli.discovery_listen.as_deref() {
+            Some(addr_str) => {
+                if cli.discovery_target_nqn.is_empty() {
+                    anyhow::bail!("--discovery-listen 需配 --discovery-target-nqn/-addr (V8f Q6)");
+                }
+                Some(addr_str.parse().with_context(|| {
+                    format!("--discovery-listen {addr_str:?} 不是合法 SocketAddr")
+                })?)
+            }
+            None => None,
+        };
+
+    // **V8f** — 可选 discovery listener：独立 NvmeController + 独立 SharedControllerInner，
+    // AER / qid 状态不与主 IO controller 串扰（plan §6 Q6）。
+    // **V8f reviewer H-2** — discovery controller 用独立 0-byte tempfile 作 backing：
+    // 不复用主 backing 文件防同文件双 open 跨 controller race；discovery 路径走
+    // session.discovery_mode 拒 IO，0-byte 文件足矣。
+    // **V8f reviewer H-2** — discovery controller 用独立最小 tempfile 作 backing：
+    // 不复用主 backing 文件防同文件双 open 跨 controller race；512B（1 LBA）足
+    // 让 NvmeController::open 通过最小校验，discovery 路径走 session.discovery_mode
+    // 拒 IO，文件实际不会被读写。
+    let _disc_backing_keepalive: Option<tempfile::NamedTempFile>;
+    let discovery_shared: Option<nvme_of_tcp_target::SharedController> = if let Some(disc_addr) =
+        parsed_discovery_listen
+    {
+        // 512B tempfile（1 LBA @ LBADS=9）：drop 后被自动清；持有到 main 退出
+        let f = tempfile::NamedTempFile::new()
+            .context("V8f: 创建 discovery controller 最小 tempfile")?;
+        f.as_file()
+            .set_len(512)
+            .context("V8f: discovery tempfile set_len(512)")?;
+        let path = f.path().to_string_lossy().into_owned();
+        let mut disc_ctrl =
+            NvmeController::open(std::slice::from_ref(&path), cli.vid, cli.ssvid, &[])
+                .context("NvmeController::open (V8f discovery, isolated backing)")?;
+        let mut ps = Vec::with_capacity(cli.discovery_target_nqn.len());
+        for (nqn, addr) in cli
+            .discovery_target_nqn
+            .iter()
+            .zip(cli.discovery_target_addr.iter())
+        {
+            let p = pcie_remote_nvme_userspace::controller::discovery_log::DiscoveryPortal::from_ipv4_addr(
+                    nqn, addr,
+                )
+                .with_context(|| format!("parse V8f discovery_target_addr {addr:?}"))?;
+            ps.push(p);
+        }
+        disc_ctrl.nvme_set_discovery_target(ps);
+        tracing::info!(addr = %disc_addr, "V8f 启用 dual-listener 模式 (discovery)");
+        _disc_backing_keepalive = Some(f);
+        Some(Arc::new(nvme_of_tcp_target::SharedControllerInner::new(
+            disc_ctrl,
+        )))
+    } else {
+        _disc_backing_keepalive = None;
+        None
+    };
+
     // **V5d-fix C-1** — 并发上限信号量
     let inflight = Arc::new(AtomicUsize::new(0));
     let max_conn = cli.max_connections;
@@ -262,6 +337,76 @@ fn main() -> Result<()> {
         .context("set listener non-blocking")?;
     tracing::info!("listening on {}", listener.local_addr()?);
 
+    // **V8f** — 若 dual-listener 模式，先 spawn discovery accept loop（独立 thread），
+    // 主 thread 跑主 IO listener。两个 loop 共享 `running` flag，SIGINT 同时停。
+    let disc_thread: Option<std::thread::JoinHandle<Result<()>>> =
+        if let (Some(disc_shared), Some(disc_addr)) =
+            (discovery_shared.clone(), parsed_discovery_listen)
+        {
+            let disc_listener = TcpListener::bind(disc_addr)
+                .with_context(|| format!("bind discovery {disc_addr}"))?;
+            disc_listener
+                .set_nonblocking(true)
+                .context("set discovery listener non-blocking")?;
+            tracing::info!("V8f discovery listening on {}", disc_listener.local_addr()?);
+            let running_clone = Arc::clone(&running);
+            let disc_inflight = Arc::new(AtomicUsize::new(0));
+            Some(std::thread::spawn(move || -> Result<()> {
+                run_accept_loop(
+                    disc_listener,
+                    disc_shared,
+                    running_clone,
+                    disc_inflight,
+                    max_conn,
+                    "discovery",
+                )
+            }))
+        } else {
+            None
+        };
+
+    // **V8f reviewer H-1** — 不论 main loop 成功还是 Err 都先 flip running 通知
+    // discovery thread 停，防 main 早 Err return 留下僵尸 discovery thread。
+    let main_result = run_accept_loop(
+        listener,
+        Arc::clone(&shared_controller),
+        Arc::clone(&running),
+        Arc::clone(&inflight),
+        max_conn,
+        "main",
+    );
+    running.store(false, Ordering::SeqCst);
+
+    // **V8f reviewer H-3** — discovery thread Err 应让 process exit code != 0。
+    let disc_result: Result<()> = if let Some(t) = disc_thread {
+        match t.join() {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!("V8f discovery thread panic")),
+        }
+    } else {
+        Ok(())
+    };
+
+    tracing::info!("exit");
+    // 优先返 main Err（启动后主路径失败更关键）；main OK 时返 disc Err。
+    match (main_result, disc_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), _) => Err(e),
+        (Ok(()), Err(e)) => Err(e.context("V8f discovery listener failed")),
+    }
+}
+
+/// **V8f** — accept loop 抽出复用（主 IO listener 与 discovery listener 共用）。
+/// 与 V5d 原 inline 实现 1:1 等价；只把 `&listener` / `shared_ctrl` / 标签提
+/// 成参数。`label` 出现在日志，便于区分两 loop。
+fn run_accept_loop(
+    listener: TcpListener,
+    shared: nvme_of_tcp_target::SharedController,
+    running: Arc<AtomicBool>,
+    inflight: Arc<AtomicUsize>,
+    max_conn: usize,
+    label: &'static str,
+) -> Result<()> {
     // **V5d-fix H-3** — accept Err 指数退避
     let mut accept_backoff_ms: u64 = 0;
     while running.load(Ordering::SeqCst) {
@@ -271,9 +416,6 @@ fn main() -> Result<()> {
                 (s, addr)
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // non-blocking accept 没新连接；slight sleep 让 CPU 不打转。
-                // **V5d-fix-2 (review H-3)** — 同步 reset backoff 防上次真 Err
-                // 累加后第一次 retry 用陈旧大值。
                 accept_backoff_ms = 0;
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
@@ -281,7 +423,7 @@ fn main() -> Result<()> {
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
                 let dur = Duration::from_millis(accept_backoff_ms.max(10));
-                tracing::warn!(error = %e, backoff_ms = dur.as_millis(), "accept failed");
+                tracing::warn!(label, error = %e, backoff_ms = dur.as_millis(), "accept failed");
                 std::thread::sleep(dur);
                 accept_backoff_ms = (accept_backoff_ms.max(10) * 2).min(ACCEPT_BACKOFF_MAX_MS);
                 continue;
@@ -291,36 +433,34 @@ fn main() -> Result<()> {
         let cur = inflight.fetch_add(1, Ordering::SeqCst);
         if cur >= max_conn {
             inflight.fetch_sub(1, Ordering::SeqCst);
-            tracing::warn!(%peer, max_conn, "rejecting: max-connections reached");
+            tracing::warn!(label, %peer, max_conn, "rejecting: max-connections reached");
             drop(stream);
             continue;
         }
 
-        // **V5d-fix L-6** — handshake 阶段强 read/write timeout 防 slowloris
         let _ = stream.set_read_timeout(Some(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS)));
-
-        tracing::info!(%peer, "accepted connection");
+        tracing::info!(label, %peer, "accepted connection");
 
         let inflight = Arc::clone(&inflight);
-        // **V8b** — 每条 conn Arc::clone 共享同一 controller 实例
-        let shared_ctrl = Arc::clone(&shared_controller);
-
+        let shared_ctrl = Arc::clone(&shared);
         std::thread::spawn(move || {
             let r = handle_conn(stream, shared_ctrl);
             inflight.fetch_sub(1, Ordering::SeqCst);
             match r {
-                Ok(()) => tracing::info!(%peer, "connection closed normally"),
-                Err(e) => tracing::warn!(%peer, error = %e, "connection ended with error"),
+                Ok(()) => tracing::info!(label, %peer, "connection closed normally"),
+                Err(e) => tracing::warn!(label, %peer, error = %e, "connection ended with error"),
             }
         });
     }
-    tracing::info!("accept loop stopped; waiting up to 2s for in-flight workers");
+    tracing::info!(
+        label,
+        "accept loop stopped; waiting up to 2s for in-flight workers"
+    );
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while inflight.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
-    tracing::info!("exit");
     Ok(())
 }
 
