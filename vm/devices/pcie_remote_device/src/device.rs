@@ -392,11 +392,7 @@ mod tests {
     fn mmio_write_lost_returns_err() {
         let mut dev = build_test_device(DeviceState::Lost);
         // 即使 BAR 没分配（Lost 状态优先检查），mmio_write 都直接 Err。
-        let r = <PcieRemoteDevice as MmioIntercept>::mmio_write(
-            &mut dev,
-            0x4000_0000,
-            &[0; 4],
-        );
+        let r = <PcieRemoteDevice as MmioIntercept>::mmio_write(&mut dev, 0x4000_0000, &[0; 4]);
         assert!(
             matches!(r, IoResult::Err(IoError::InvalidRegister)),
             "Lost state must return Err, got {r:?}"
