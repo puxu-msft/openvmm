@@ -1,12 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! **Phase V5d** — NVMe-over-Fabrics TCP target 长跑入口。
+//! **Phase V5d / V8b** — NVMe-over-Fabrics TCP target 长跑入口。
 //!
 //! 监听 4420（NVMe-oF TCP 常用端口），accept 一条 TCP 连接 → 在 thread
 //! pool（最多 `--max-connections`）spawn 一个工作线程跑
-//! `V2Session::accept_and_handshake` + `pump_one` 循环。每个 backing
-//! file 一把 `Mutex`，同一文件同时只允许 1 个 active conn（V5d R-8）。
+//! `V2Session::accept_and_handshake_shared` + `pump_one` 循环。
+//!
+//! **V8b** — startup 一次 `NvmeController::open` → 用
+//! `SharedControllerInner` (内含 `parking_lot::Mutex<NvmeController>` +
+//! `AtomicU64` per-conn token slab 分配器) wrap，每条 conn `Arc::clone` 共享
+//! 同一 controller 实例。V5d R-8 per-backing Mutex 已拆除。
 //!
 //! # 安全 (V5d-fix security review)
 //!
@@ -18,9 +22,8 @@
 //! - V5e-1 教学版单 IO ≤ 4 KiB（nlb ≤ 8 @ LBADS=9 单 PRP1 上限）；Linux
 //!   nvme-cli 默认 `dd bs=4k` 1 cmd 完成。bs > 4 KiB 时 driver 见 SC=0x18
 //!   自动拆分。
-//! - 单 backing file 同时仅一 active connection
-//! - 多 `--backing-file` 时仅 first file 受 R-8 互斥保护 → 启动 WARN
-//! - 无 Discovery subsystem（必须 `nvme connect -n nqn...`）
+//! - V8c 待办：per-conn AER 路由 + per-conn IO queue 命名空间隔离；当前并发
+//!   同 qid IO 会撞 controller 单 qid 表（教学版）。
 //! - 无 TLS / DH-HMAC-CHAP
 
 #![forbid(unsafe_code)]
@@ -29,9 +32,7 @@
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use nvme_of_tcp_target::V2Session;
-use parking_lot::Mutex;
 use pcie_remote_nvme_userspace::NvmeController;
-use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -150,14 +151,9 @@ fn main() -> Result<()> {
         );
     }
 
-    // **V5d-fix C-3** — 多 backing 配置仅 first file 受 R-8 互斥保护
-    if cli.backing_files.len() > 1 {
-        tracing::warn!(
-            count = cli.backing_files.len(),
-            "V5d R-8 教学版仅对 first --backing-file 加并发互斥锁；\
-             其余 backing 不受跨 conn race 保护（V8 重构解除）"
-        );
-    }
+    // **V8b** — V5d-fix C-3 多 backing R-8 限制已拆除；现单 controller 实例
+    // open 所有 backing files，多 conn 通过 `Arc<Mutex<NvmeController>>` 共享。
+    // 多 namespace = 多 backing 现可全部并发访问（spec 兼容）。
 
     tracing::info!(
         listen = %parsed_listen,
@@ -211,19 +207,31 @@ fn main() -> Result<()> {
         Vec::new()
     };
 
-    // **V5d-fix C-2** — 启动时预 insert 所有 backing 的 lock entry，
-    // 之后 worker 只读不写该 map → 杜绝动态增长 + path-aliasing race。
-    // 用 std::path::absolute (不是 canonicalize) 因为 repo clippy 禁；
-    // 在 path 真正存在前不解 symlink，与 NvmeController::open 真实行为一致。
-    let backing_locks: HashMap<PathBuf, Arc<Mutex<()>>> = cli
+    // **V8b** — 拆 V5d R-8 per-backing Mutex；改为 startup 一次性 open
+    // NvmeController 并 wrap into Arc<Mutex<>>，每条 conn `Arc::clone` 共享。
+    // Linux nvme-cli 默认 4 IO queue（= 4 TCP conn）现可全连同一 controller，
+    // 多 conn 之间通过 controller 一把 parking_lot::Mutex 序列化（短锁 dispatch
+    // 模型，session.rs `with_controller` helper 已实现 R-1 死锁规避）。
+    // **V8b reviewer C-1** — per-conn token slab 通过 `SharedControllerInner` 内
+    // `AtomicU64` 原子分配，避免多 conn 共享 `pending_ios` 全局 token 池撞 key。
+    //
+    // NvmeController::open 不是 thread-safe internal state；必须 startup 仅
+    // 调一次。后续 spawn 每条 conn 只 Arc::clone 共享同一实例。
+    let backing_strs: Vec<String> = cli
         .backing_files
         .iter()
-        .map(|p| {
-            let canon = std::path::absolute(p).unwrap_or_else(|_| p.clone());
-            (canon, Arc::new(Mutex::new(())))
-        })
+        .map(|p| p.to_string_lossy().into_owned())
         .collect();
-    let backing_locks = Arc::new(backing_locks);
+    let mut shared_ctrl_inner =
+        NvmeController::open(&backing_strs, cli.vid, cli.ssvid, &cli.zns_nsids)
+            .context("NvmeController::open (startup, V8b shared)")?;
+    // **V7 / V8a** — discovery_portals 在 controller share 时 startup 注入一次。
+    if !discovery_portals.is_empty() {
+        shared_ctrl_inner.nvme_set_discovery_target(discovery_portals);
+    }
+    let shared_controller: nvme_of_tcp_target::SharedController = Arc::new(
+        nvme_of_tcp_target::SharedControllerInner::new(shared_ctrl_inner),
+    );
 
     // **V5d-fix C-1** — 并发上限信号量
     let inflight = Arc::new(AtomicUsize::new(0));
@@ -294,25 +302,12 @@ fn main() -> Result<()> {
 
         tracing::info!(%peer, "accepted connection");
 
-        let backing_files = cli.backing_files.clone();
-        let vid = cli.vid;
-        let ssvid = cli.ssvid;
-        let zns_nsids = cli.zns_nsids.clone();
-        let backing_locks = Arc::clone(&backing_locks);
         let inflight = Arc::clone(&inflight);
-        // V7: clone discovery portals per conn
-        let discovery_portals_for_conn = discovery_portals.clone();
+        // **V8b** — 每条 conn Arc::clone 共享同一 controller 实例
+        let shared_ctrl = Arc::clone(&shared_controller);
 
         std::thread::spawn(move || {
-            let r = handle_conn(
-                stream,
-                backing_files,
-                vid,
-                ssvid,
-                &zns_nsids,
-                backing_locks,
-                discovery_portals_for_conn,
-            );
+            let r = handle_conn(stream, shared_ctrl);
             inflight.fetch_sub(1, Ordering::SeqCst);
             match r {
                 Ok(()) => tracing::info!(%peer, "connection closed normally"),
@@ -329,53 +324,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// 每条 TCP 连接的工作流：
-/// 1. acquire per-backing Mutex（R-8 教学版限制）
-/// 2. open NvmeController over backing files
-/// 3. V2Session::accept_and_handshake → pump_one loop 直至 peer close 或 Err
-fn handle_conn(
-    stream: TcpStream,
-    backing_files: Vec<PathBuf>,
-    vid: u16,
-    ssvid: u16,
-    zns_nsids: &[u32],
-    backing_locks: Arc<HashMap<PathBuf, Arc<Mutex<()>>>>,
-    discovery_portals: Vec<pcie_remote_nvme_userspace::controller::discovery_log::DiscoveryPortal>,
-) -> Result<()> {
-    // R-8：只 lock first backing（V8 重构）
-    let first = backing_files
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("--backing-file required"))?;
-    let canon = std::path::absolute(first).unwrap_or_else(|_| first.clone());
-    let lock = backing_locks
-        .get(&canon)
-        .ok_or_else(|| anyhow::anyhow!("backing lock entry missing (bin startup bug)"))?;
-    let _guard = match lock.try_lock() {
-        Some(g) => g,
-        None => {
-            tracing::warn!(
-                backing = ?canon,
-                "拒绝连接：同一 backing file 已有 active conn (V5d R-8 教学版限制)"
-            );
-            anyhow::bail!("backing file busy: another conn already holds the lock");
-        }
-    };
-
-    let backing_strs: Vec<String> = backing_files
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    let mut controller = NvmeController::open(&backing_strs, vid, ssvid, zns_nsids)
-        .context("NvmeController::open")?;
-
-    // **V7** — discovery mode：每条 conn 都重新 inject portals（per-conn
-    // controller 实例，无跨 conn 状态共享）。空 vec 不进 discovery mode。
-    if !discovery_portals.is_empty() {
-        controller.nvme_set_discovery_target(discovery_portals);
-    }
-
-    let mut sess =
-        V2Session::accept_and_handshake(stream, controller).context("V2Session handshake")?;
+/// **V8b** — 每条 TCP 连接的工作流（多 conn 共享 controller）：
+/// 1. 走 `V2Session::accept_and_handshake_shared` 把已 wrap 的 controller
+///    Arc clone 给 session
+/// 2. `pump_one_with_events` loop 直至 peer close 或 Err
+///
+/// V5d R-8 per-backing Mutex 已拆；多 conn 通过 `Arc<Mutex<NvmeController>>`
+/// 共享同一 controller 实例（短锁 dispatch + R-1 死锁规避在 session 端）。
+fn handle_conn(stream: TcpStream, shared_ctrl: nvme_of_tcp_target::SharedController) -> Result<()> {
+    let mut sess = V2Session::accept_and_handshake_shared(stream, shared_ctrl)
+        .context("V2Session handshake (V8b shared)")?;
     // **V6b** — pump_one_with_events 每 100ms drain pending AEN + try read_pdu
     while sess.pump_one_with_events(std::time::Duration::from_millis(100))? {}
     Ok(())

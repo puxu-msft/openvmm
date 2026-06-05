@@ -83,6 +83,45 @@ pub(super) struct ReservationNotification {
     pub nsid: u32,
 }
 
+/// **Phase V8b reviewer C-2** — `nvme_install_admin_cq` 错误类型。
+///
+/// caller（V2Session::accept_and_handshake_shared）拿到 `MismatchedParams` 必须
+/// hard-fail 该条 conn 的握手，不允许静默继续使用旧 CQ；否则后续 sentinel-based
+/// 路径（`gpa >= CQ_BASE_GPA` 判 CQE bytes vs data write）会错位 → 协议越权。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminCqInstallError {
+    /// admin CQ (cq_id=0) 已存在但 base_gpa 或 size 与新请求不一致。
+    MismatchedParams {
+        /// 已 install 的 base GPA。
+        old_base_gpa: u64,
+        /// 已 install 的 qsize。
+        old_size: u32,
+        /// 新请求的 base GPA。
+        new_base_gpa: u64,
+        /// 新请求的 qsize。
+        new_size: u32,
+    },
+}
+
+impl std::fmt::Display for AdminCqInstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdminCqInstallError::MismatchedParams {
+                old_base_gpa,
+                old_size,
+                new_base_gpa,
+                new_size,
+            } => write!(
+                f,
+                "nvme_install_admin_cq: admin CQ already exists with DIFFERENT params: \
+                 old=(base={old_base_gpa:#x}, size={old_size}) vs new=(base={new_base_gpa:#x}, size={new_size})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AdminCqInstallError {}
+
 impl NvmeController {
     /// **Phase S6** — push 一条 Reservation Notification 到 ring buffer。
     /// 保留末 32 条；log_page_count 单调递增。
@@ -1071,15 +1110,35 @@ impl NvmeController {
     ///
     /// **V3-polish (review L-3)** — warn 时打印 old/new base_gpa + qsize，
     /// 让维护者一眼看出"同 base 重装（无害）"vs"base 漂移（潜在 bug）"。
-    pub fn nvme_install_admin_cq(&mut self, base_gpa: u64, qsize: u32) {
+    /// **V8b** — multi-conn 共享 controller 后，第 2..N 条 conn 都会调
+    /// `accept_and_handshake` → install admin CQ。修改为 idempotent：
+    /// 若 cq_id=0 已存在且 `base_gpa` + `qsize` **同值**，silently no-op；
+    /// 不同值返回 `Err(AdminCqInstallError::MismatchedParams)`（reviewer C-2）
+    /// 让 caller hard-fail，不再静默拒覆盖 — 防止后续 V8 系列任何 const 改动
+    /// 引入静默协议越权。
+    ///
+    /// **V8b reviewer M-1** — 同值判断仅看 `base_gpa` + `qsize`；其余 CQ
+    /// 字段（`interrupt_vector` / `interrupt_enabled` / `tail` / `phase` /
+    /// `head` / `pending_completions` / `last_fire`）由本函数固定 default
+    /// 初始化，不属可变 input。caller（V2Session::accept_and_handshake_shared）
+    /// 也固定传 `CQ_BASE_GPA` + `ADMIN_CQ_SIZE`，所以"same params"判断够用。
+    /// 未来若暴露 `interrupt_vector` 等可变 input，需扩判断条件。
+    pub fn nvme_install_admin_cq(
+        &mut self,
+        base_gpa: u64,
+        qsize: u32,
+    ) -> Result<(), AdminCqInstallError> {
         if let Some(old) = self.cqs.get(&0) {
-            tracing::warn!(
-                old_base = format_args!("{:#x}", old.base_gpa),
-                old_size = old.size,
-                new_base = format_args!("{base_gpa:#x}"),
-                new_size = qsize,
-                "nvme_install_admin_cq: admin CQ already exists, overwriting"
-            );
+            if old.base_gpa == base_gpa && old.size == qsize {
+                // V8b idempotent fast-path — 同值重 install 不 warn 不动
+                return Ok(());
+            }
+            return Err(AdminCqInstallError::MismatchedParams {
+                old_base_gpa: old.base_gpa,
+                old_size: old.size,
+                new_base_gpa: base_gpa,
+                new_size: qsize,
+            });
         }
         let cq = crate::regs::CompletionQueue {
             base_gpa,
@@ -1093,6 +1152,26 @@ impl NvmeController {
             last_fire: None,
         };
         self.cqs.insert(0, cq);
+        Ok(())
+    }
+
+    /// **V8b** — 检查 admin CQ (cq_id=0) 是否已 install。
+    /// session 端 multi-conn 共享时 cheap-check 避免重复 install。
+    pub fn nvme_has_admin_cq(&self) -> bool {
+        self.cqs.contains_key(&0)
+    }
+
+    /// **Phase V8b** — controller 端当前在用 / 留痕的最高 dma_read token。
+    /// 多 conn 共享同一 controller 时，每条新 conn 的 `next_token` 起点不应
+    /// 撞已注册 pending_ios 的 token（spec V8b plan §6 R-2 / reviewer M-3）。
+    /// session 端在 `accept_and_handshake_shared` 起手用本 getter 计算新
+    /// conn 的 token 起始（高水位 + 1）防 conn A 残留的 pending_ios 与
+    /// conn B 起点撞 key。
+    ///
+    /// 返 0 = 当前 controller 无 pending dma_read（typical clean steady state）。
+    /// 返非 0 = 当前 keys 最大值，caller 应 `+1` 作为新 conn 起点。
+    pub fn nvme_token_high_water(&self) -> u64 {
+        self.pending_ios.keys().max().copied().unwrap_or(0)
     }
 
     /// **Phase V3** — 让 caller 自己 post_cqe，用于把同步返的 `Some(Cqe)`

@@ -68,5 +68,52 @@ pub use session::PRP1_SENTINEL;
 pub use session::V2Session;
 pub use session::V5_NLB_MAX;
 pub use session::ic_handshake;
+
+/// **Phase V8b** — 多 conn 共享 controller 的 wrapper（reviewer C-1 / M-1）。
+///
+/// - `controller`: 整 controller 一把 `parking_lot::Mutex`（仓库 clippy 禁
+///   std::sync::Mutex；parking_lot 无 poisoning）。
+/// - `next_conn_token_base`: per-conn token slab 起点的原子计数器。每条新 conn
+///   在 `accept_and_handshake_shared` 内 `fetch_add(TOKEN_SLAB_SIZE)` 拿到自己
+///   disjoint 的 token 段（slab 大小 1<<40，64-bit 空间够 ~16M conn）；
+///   解决 reviewer C-1：多 conn 并发握手或稳态都不会因 controller `pending_ios`
+///   高水位"被 complete 跌回 0"而起点撞 key → 跨 conn `PendingIo` 覆盖 →
+///   数据破坏 / DoS。
+pub struct SharedControllerInner {
+    /// controller 整把短锁。
+    pub controller: parking_lot::Mutex<pcie_remote_nvme_userspace::NvmeController>,
+    /// per-conn token slab base 全局原子分配。起值见 [`TOKEN_SLAB_START`]。
+    pub next_conn_token_base: std::sync::atomic::AtomicU64,
+}
+
+/// per-conn token slab 起始 base（保 V3/V4 测试日志 `1<<48` 习惯）。
+pub const TOKEN_SLAB_START: u64 = 1u64 << 48;
+/// per-conn token slab 大小（1<<40 ≈ 1T tokens / conn；64-bit 空间 ~16M conn）。
+pub const TOKEN_SLAB_SIZE: u64 = 1u64 << 40;
+
+impl SharedControllerInner {
+    /// 从 owned controller 构造 shared wrapper；token base 起 [`TOKEN_SLAB_START`]。
+    pub fn new(controller: pcie_remote_nvme_userspace::NvmeController) -> Self {
+        Self {
+            controller: parking_lot::Mutex::new(controller),
+            next_conn_token_base: std::sync::atomic::AtomicU64::new(TOKEN_SLAB_START),
+        }
+    }
+
+    /// 给一条新 conn 分配 disjoint token slab base；slab size = [`TOKEN_SLAB_SIZE`]。
+    /// 返回的 base 已是本 conn 第一条 cmd 的 `next_token` 起点。
+    pub fn allocate_token_slab(&self) -> u64 {
+        self.next_conn_token_base
+            .fetch_add(TOKEN_SLAB_SIZE, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// **Phase V8b** — `Arc<SharedControllerInner>` 别名让多 conn 共享 controller +
+/// per-conn token slab 分配器。bin startup 一次 `NvmeController::open` →
+/// `Arc::new(SharedControllerInner::new(...))` → 每条 conn `Arc::clone` 给
+/// `V2Session::accept_and_handshake_shared`。
+///
+/// V8e tokio refactor 时改 controller field 为 `tokio::sync::Mutex<NvmeController>`。
+pub type SharedController = std::sync::Arc<SharedControllerInner>;
 pub use tcp_transport::TcpAdminTransport;
 pub use ttag::TtagAllocator;

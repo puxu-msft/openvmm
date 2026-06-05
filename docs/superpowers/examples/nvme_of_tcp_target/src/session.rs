@@ -125,9 +125,11 @@ pub struct NegotiatedIc {
 /// V2 server-side session：握手完成后 pump 一条条 fabric cmd 直到 peer 关。
 pub struct V2Session {
     stream: TcpStream,
-    /// 当前 controller 实例。整个 session 共享一个 controller；多连接
-    /// 多 controller 留 V8 加 Arc<Mutex<...>>。
-    controller: NvmeController,
+    /// **V8b** — controller 改为 `Arc<Mutex<>>` 让多 conn 共享同一实例
+    /// （V5d R-8 per-backing 单 conn 限制拆除）。所有 wrapper 调用通过
+    /// `with_controller` helper 走"短锁"作用域；R2T loop 在锁外跑 wire I/O
+    /// 避免持锁跨 read_pdu 死锁（V8b plan R-1）。
+    controller: crate::SharedController,
     /// 握手后的协商参数。
     pub negotiated: NegotiatedIc,
     /// Connect 后分配的 CNTLID（写死 1，单 controller 教学版）。
@@ -165,33 +167,57 @@ pub struct V2Session {
 
 impl V2Session {
     /// 给一个已 accept 的 [`TcpStream`] + 一个 fresh [`NvmeController`] 跑握手。
+    ///
+    /// **V8b BC wrapper** — caller 持单个 controller 实例：本函数自动包成
+    /// `Arc<SharedControllerInner>`。多 conn 共享同一 controller 的真生产
+    /// 路径请用 [`Self::accept_and_handshake_shared`]。
     pub fn accept_and_handshake(
-        mut stream: TcpStream,
-        mut controller: NvmeController,
+        stream: TcpStream,
+        controller: NvmeController,
     ) -> anyhow::Result<Self> {
-        // **V7** — derive discovery mode 于 handshake 前（controller 启动时
-        // 已 nvme_set_discovery_target 注入 portals 即视为 discovery ctrl）。
-        let discovery_mode = controller.nvme_is_discovery_mode();
+        let shared: crate::SharedController =
+            std::sync::Arc::new(crate::SharedControllerInner::new(controller));
+        Self::accept_and_handshake_shared(stream, shared)
+    }
+
+    /// **V8b** — 接 `Arc<Mutex<NvmeController>>` 让多 conn 共享同一 controller。
+    /// V5d R-8 per-backing Mutex 拆除后 bin startup 一次 open + Arc::clone
+    /// 给每条 conn。
+    pub fn accept_and_handshake_shared(
+        mut stream: TcpStream,
+        controller: crate::SharedController,
+    ) -> anyhow::Result<Self> {
+        // **V7 / V8b** — derive discovery mode 于 handshake 前。短锁 read。
+        // parking_lot::Mutex 无 poisoning；lock() 不返回 Result。
+        let discovery_mode = controller.controller.lock().nvme_is_discovery_mode();
         let negotiated = ic_handshake(&mut stream).context("ICReq/ICResp handshake")?;
         // **V5d-fix-2 (review L-6)** — bin handshake 阶段强制了 30s read/write
         // timeout 防 slowloris；握手成功后真业务流（KeepAlive 控）允许长 idle。
-        // 这里清除 timeout 让 pump_one read_pdu 无限阻塞，由 client KATO 控
-        // dead-conn 检测；ignore set 失败（FD 已 close 等罕见情况）。
         let _ = stream.set_read_timeout(None);
         let _ = stream.set_write_timeout(None);
-        // **Phase V3** — 给 controller 装一个"假" admin CQ，让它能 post_cqe
-        // 通过 ctx.dma_write(CQ_BASE_GPA + slot*16, cqe_16B)。session 后续
-        // 通过 gpa ≥ CQ_BASE_GPA 识别这是 CQE bytes vs PRP1 data。
-        controller.nvme_install_admin_cq(CQ_BASE_GPA, ADMIN_CQ_SIZE);
+        // **Phase V3 / V8b** — 给 controller 装一个"假" admin CQ。idempotent：
+        // 第二条 conn 调时 controller 端 `nvme_install_admin_cq` 见 cq[0]
+        // 已存在则 Ok(()) silent no-op。**V8b reviewer C-2** — 若参数不匹配
+        // 返 `MismatchedParams`，session hard-fail 该条 conn 握手防协议越权。
+        {
+            let mut c = controller.controller.lock();
+            c.nvme_install_admin_cq(CQ_BASE_GPA, ADMIN_CQ_SIZE)
+                .context("V8b: admin CQ install failed (params mismatch with existing share)")?;
+        }
+        // **V8b reviewer C-1** — token 起点用 per-conn 原子分配的 disjoint slab，
+        // 不再依赖 controller pending_ios 高水位（会被 complete 跌回 0 → 并发
+        // 起点撞 key → 跨 conn PendingIo 覆盖 → 数据破坏 / DoS）。
+        let next_token = controller.allocate_token_slab();
         Ok(Self {
             stream,
             controller,
             negotiated,
             cntlid: fabric::TEACHING_CNTLID,
             admin_connected: false,
-            // **V4b** — token 起点用 1<<48 保持与 V3 测试日志一致；后续每条
-            // cmd 通过 token_high_water 累加。
-            next_token: 1u64 << 48,
+            // **V4b / V8b reviewer M-3** — token 起点由 controller token
+            // high-water +1 决定（至少 1<<48 保兼容旧 V3/V4 测试日志），防多
+            // conn 共享 controller 时 conn B 起点撞 conn A 残留 pending_ios。
+            next_token,
             ttag_alloc: TtagAllocator::default(),
             // **V5a** — IO queue 表初空，Create IO CQ/SQ 成功后填充。
             io_queues: HashMap::new(),
@@ -201,6 +227,27 @@ impl V2Session {
             // **V7** — discovery mode 在 fn 入口已 derive
             discovery_mode,
         })
+    }
+
+    /// **V8b** — 短锁封装：把对 controller 的一次调用包在 `lock + closure`
+    /// 内，保证锁作用域不跨越 wire I/O。**plan R-1 死锁规避**的关键 helper。
+    ///
+    /// 用法：
+    /// ```ignore
+    /// let cqe = self.with_controller(|c| c.nvme_admin_dispatch(ctx, sqe, cid, 0));
+    /// ```
+    /// **不要**在 closure 内调用任何阻塞 I/O（read_pdu / write_pdu / sleep）；
+    /// 那会持锁跨 syscall，多 conn 死锁。
+    ///
+    /// `parking_lot::Mutex` 无 poisoning 概念：lock() 不返回 Result。教学版限制：
+    /// 单条 conn 在 closure 内 panic 不会污染锁但可能让 controller state 处于
+    /// half-mutated（reviewer H-3）；生产版应整 process 重启。
+    fn with_controller<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut NvmeController) -> R,
+    {
+        let mut guard = self.controller.controller.lock();
+        f(&mut guard)
     }
 
     /// 阻塞拿一条 CapsuleCmd PDU + 派发。返回 false 表示 peer 关，caller 应退出 loop。
@@ -312,7 +359,7 @@ impl V2Session {
     /// 主循环 `select!` 读 wakeup 后 fire_aen + emit；当前 V6b 教学版
     /// pump_one_with_events 仅依赖 inject_aen 路径。
     fn sync_aer_mirror(&mut self) {
-        let ctrl_pending = self.controller.nvme_pending_aer_count();
+        let ctrl_pending = self.with_controller(|c| c.nvme_pending_aer_count());
         if ctrl_pending < self.pending_aers.len() {
             tracing::trace!(
                 ctrl_pending,
@@ -333,11 +380,10 @@ impl V2Session {
     /// 返 emit 出去的 CapsuleResp 条数（0 或 1；0 表示无 pending AER 可弹）。
     pub fn inject_aen(&mut self, aen_type: u8, aen_info: u8, log_id: u8) -> anyhow::Result<usize> {
         let mut tcp_t = TcpAdminTransport::new_with_token_base(self.next_token);
-        let fired = {
+        let fired = self.with_controller(|c| {
             let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
-            self.controller
-                .nvme_fire_aen(&mut ctx, aen_type, aen_info, log_id)
-        };
+            c.nvme_fire_aen(&mut ctx, aen_type, aen_info, log_id)
+        });
         self.next_token = tcp_t.token_high_water();
         if !fired {
             return Ok(0);
@@ -458,11 +504,10 @@ impl V2Session {
         let mut tcp_t = TcpAdminTransport::new_with_token_base(self.next_token);
 
         // ─── Phase 1：dispatch ─────────────────────────────────────────
-        let immediate_cqe = {
+        let immediate_cqe = self.with_controller(|c| {
             let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
-            self.controller
-                .nvme_io_dispatch(&mut ctx, sq_id, sqe, cid, cq_id)
-        };
+            c.nvme_io_dispatch(&mut ctx, sq_id, sqe, cid, cq_id)
+        });
 
         // ─── Phase 1.5..5 → shared helper ──────────────────────────────
         self.run_post_dispatch(cid, immediate_cqe, tcp_t)
@@ -540,10 +585,10 @@ impl V2Session {
             sqe.prp1 = PRP1_SENTINEL;
             sqe.prp2 = 0;
             let mut tcp_t = TcpAdminTransport::new_with_token_base(self.next_token);
-            let immediate = {
+            let immediate = self.with_controller(|c| {
                 let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
-                self.controller.nvme_admin_dispatch(&mut ctx, sqe, cid, 0)
-            };
+                c.nvme_admin_dispatch(&mut ctx, sqe, cid, 0)
+            });
             self.next_token = tcp_t.token_high_water();
             // **V6c-polish (review H-1)** — 升级 debug_assert → hard bail
             // 防 release build 静默丢 captured 数据。当前 admin.rs:649 AER
@@ -630,10 +675,10 @@ impl V2Session {
         let mut tcp_t = TcpAdminTransport::new_with_token_base(self.next_token);
 
         // ─── Phase 1：dispatch ─────────────────────────────────────────
-        let immediate_cqe = {
+        let immediate_cqe = self.with_controller(|c| {
             let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
-            self.controller.nvme_admin_dispatch(&mut ctx, sqe, cid, 0)
-        };
+            c.nvme_admin_dispatch(&mut ctx, sqe, cid, 0)
+        });
 
         // **V5a** — Create IO CQ/SQ 成功后镜像到 session.io_queues。
         // 同步路径 (Some(Cqe))：Cqe.dw3 bits 17..32 是 SF (SC/SCT/...)，
@@ -721,15 +766,21 @@ impl V2Session {
                     )
                 })?;
             cmd_cumulative_offset = cmd_cumulative_offset.saturating_add(read_req.len);
-            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
-            self.controller
-                .nvme_admin_complete_dma(&mut ctx, read_req.token, true, bytes);
+            // **V8b R-1 死锁规避** — read_req 已 pop（锁外），bytes 已收齐
+            // （锁外 R2T+H2CData wire I/O），现在用 with_controller 短锁
+            // 调 complete_dma，让 controller post_cqe + 推进 pending_ios。
+            self.with_controller(|c| {
+                let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                c.nvme_admin_complete_dma(&mut ctx, read_req.token, true, bytes);
+            });
         }
 
         // ─── Phase 3：同步 / 异步 write-out 路径 ─────────────────────
         if let Some(cqe) = immediate_cqe {
-            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
-            self.controller.nvme_post_cqe(&mut ctx, cqe);
+            self.with_controller(|c| {
+                let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                c.nvme_post_cqe(&mut ctx, cqe);
+            });
         } else if !had_pending_reads {
             let mut data_tokens = Vec::with_capacity(tcp_t.writes.len());
             for w in tcp_t.writes.iter() {
@@ -743,9 +794,10 @@ impl V2Session {
                 data_tokens.push(w.token);
             }
             for tok in data_tokens {
-                let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
-                self.controller
-                    .nvme_admin_complete_dma(&mut ctx, tok, true, Vec::new());
+                self.with_controller(|c| {
+                    let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                    c.nvme_admin_complete_dma(&mut ctx, tok, true, Vec::new());
+                });
             }
         }
 
@@ -1004,7 +1056,7 @@ impl V2Session {
         };
         // **review H2** — 用 narrow wrapper 强制 NVMe-oF spec 白名单
         let ofst = pf.ofst;
-        let value = match self.controller.nvme_property_get(ofst, size) {
+        let value = match self.with_controller(|c| c.nvme_property_get(ofst, size)) {
             Some(v) => v,
             None => return self.send_capsule_resp_err(cid, 0x02),
         };
@@ -1034,10 +1086,10 @@ impl V2Session {
         let mut t = pcie_vfio_user_sdk::NoopTransport;
         let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut t);
         // **review H2** — 用 narrow wrapper；offset 不在白名单时返 false。
-        if !self
-            .controller
-            .nvme_property_set(&mut ctx, ofst, size, value)
-        {
+        // **V8b** — 短锁；NoopTransport ctx.dma_* / fire_interrupt 都是 no-op，
+        // closure 内不会触发 read_pdu，安全持锁。
+        let ok = self.with_controller(|c| c.nvme_property_set(&mut ctx, ofst, size, value));
+        if !ok {
             return self.send_capsule_resp_err(cid, 0x02);
         }
         self.send_capsule_resp_ok(cid, 0)
