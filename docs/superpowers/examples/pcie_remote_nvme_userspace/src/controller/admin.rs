@@ -670,6 +670,43 @@ impl NvmeController {
                 // **V8c** — push 带 conn_id（由 nvme_admin_dispatch_with_conn
                 // 设置；legacy nvme_admin_dispatch 调用时 = 0）。让 fire_aen
                 // 路径只投回原 conn 防 cross-conn AER 窃取（security H-1）。
+                // **V8d (V8c reviewer H-3 + V8d reviewer H-4)** — 双层 cap：
+                //   - per-conn 8（= session MAX_PENDING_AERS=4 的 2× 兜底，
+                //     防 cross-tenant：恶意 conn 灌满不影响别 conn 的 4 slot）
+                //   - 全 controller 256（防 controller 视角 fire_aen O(n) DoS）
+                // session 端 per-conn cap=4 已是 first line；本 cap 是 controller
+                // 视角的 defense-in-depth。conn_id=0（legacy 路径）不参与 per-conn
+                // 限制（避免老测试 fixture 误触发）；仍受全局 256 cap 约束。
+                const CTRL_AER_HARD_CAP: usize = 256;
+                const PER_CONN_AER_CAP: usize = 8;
+                if self.aen_pending.len() >= CTRL_AER_HARD_CAP {
+                    tracing::warn!(
+                        cid,
+                        pending = self.aen_pending.len(),
+                        cap = CTRL_AER_HARD_CAP,
+                        "AsyncEventRequest rejected: controller-side global hard cap exceeded"
+                    );
+                    return Some(Cqe::error(cid, 0, sq_head, phase, 0x05, 0));
+                }
+                let conn_id = self.current_dispatch_conn_id;
+                if conn_id != 0 {
+                    let per_conn_count = self
+                        .aen_pending
+                        .iter()
+                        .filter(|t| t.3 == conn_id)
+                        .count();
+                    if per_conn_count >= PER_CONN_AER_CAP {
+                        tracing::warn!(
+                            cid,
+                            conn_id,
+                            per_conn_count,
+                            cap = PER_CONN_AER_CAP,
+                            "AsyncEventRequest rejected: per-conn hard cap exceeded \
+                             (V8d反 cross-tenant AER squat)"
+                        );
+                        return Some(Cqe::error(cid, 0, sq_head, phase, 0x05, 0));
+                    }
+                }
                 self.aen_pending
                     .push_back((cid, 0, cq_id, self.current_dispatch_conn_id));
                 tracing::debug!(

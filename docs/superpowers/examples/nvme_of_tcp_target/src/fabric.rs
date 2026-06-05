@@ -129,6 +129,38 @@ pub struct PropertyFabricFields {
     pub rsvd2: [u8; 8],
 }
 
+/// **Phase V8d** — Disconnect SQE 的 fabric-specific 部分（SQE byte 40..64 = 24 byte）。
+///
+/// Spec § 3.5 Figure 26 layout：byte 40..42 = RECFMT（must = 0），byte 42..64 = 保留 22B。
+/// 比 Connect 简单很多 — Disconnect 拆整条 association，不传 qid（spec 强制
+/// 走 admin queue，且 controller 端拆所有该 association 的 IO queue）。
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[repr(C, packed)]
+pub struct DisconnectFabricFields {
+    /// Record Format；must = 0。
+    pub recfmt: u16,
+    /// 保留 22 byte。
+    pub rsvd: [u8; 22],
+}
+
+/// **Phase V8d** — 解 Disconnect SQE 24-byte fabric section。校验 `recfmt = 0`
+/// 否则返 `Err` 让 caller 回 SC=0x80 INVALID_CONNECT_FORMAT（spec § 3.5 status）。
+pub fn decode_disconnect_fields(sqe_bytes: &[u8]) -> Result<DisconnectFabricFields, FabricError> {
+    if sqe_bytes.len() != 64 {
+        return Err(FabricError::SqeLen {
+            got: sqe_bytes.len(),
+        });
+    }
+    let fields = DisconnectFabricFields::read_from_bytes(&sqe_bytes[40..64])
+        .map_err(|_| FabricError::MalformedDisconnect)?;
+    // spec § 3.5：RECFMT 必须 = 0，否则 SC=0x80 INVALID_CONNECT_FORMAT
+    let recfmt = fields.recfmt;
+    if recfmt != 0 {
+        return Err(FabricError::InvalidDisconnectRecfmt(recfmt));
+    }
+    Ok(fields)
+}
+
 /// NVMe controller property offset（与 BAR0 reg offset 一致）。
 pub mod property_offset {
     /// Controller Capabilities (8 byte)。
@@ -167,6 +199,13 @@ pub enum FabricError {
     /// Property attrib 不支持的 size（仅 0=4B / 1=8B 合法）。
     #[error("Property attrib size {0} unsupported (only 0=4B, 1=8B)")]
     InvalidPropertySize(u8),
+    /// **V8d** — Disconnect 的 RECFMT 字段不为 0（spec § 3.5 要求 = 0）。
+    #[error("Disconnect RECFMT {0:#x} unsupported (must be 0)")]
+    InvalidDisconnectRecfmt(u16),
+    /// **V8d reviewer H-2** — Disconnect SQE byte slice 24B 解码失败（理论
+    /// 不该出现，因为长度已校验；保留专属变体让日志不漂到"unknown fctype"）。
+    #[error("Disconnect fabric section decode failed")]
+    MalformedDisconnect,
 }
 
 /// 抽 SQE byte 4 = fctype。

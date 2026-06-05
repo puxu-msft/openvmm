@@ -445,11 +445,7 @@ impl V2Session {
                 fctype::CONNECT => self.handle_connect(cid, sqe, &pdu.data),
                 fctype::PROPERTY_GET => self.handle_property_get(cid, sqe),
                 fctype::PROPERTY_SET => self.handle_property_set(cid, sqe),
-                fctype::DISCONNECT => {
-                    tracing::info!("Disconnect (V8 完整实现；V2 ack + close)");
-                    self.send_capsule_resp_ok(cid, 0)?;
-                    anyhow::bail!("disconnect received");
-                }
+                fctype::DISCONNECT => self.handle_disconnect(cid, sqe),
                 other => {
                     tracing::warn!(fctype = other, "unsupported fctype; reply INVALID_FIELD");
                     self.send_capsule_resp_err(cid, 0x02)
@@ -1115,6 +1111,57 @@ impl V2Session {
         self.send_capsule_resp_ok(cid, 0)
     }
 
+    /// **Phase V8d (plan §6)** — Disconnect fabric cmd (fctype=0x08) 真实现。
+    ///
+    /// spec § 3.5 行为：
+    /// 1. 校验 SQE.RECFMT=0；否则 SC=0x80 INVALID_CONNECT_FORMAT
+    /// 2. controller 端拆所有本 association 的 IO queue（先 SQ 后 CQ；spec § 7.6.1）
+    /// 3. session 端清 self.io_queues 镜像
+    /// 4. 回 SC=0 success CapsuleResp
+    /// 5. bail 让 pump_one 退出 → V2Session Drop 触发 AER cleanup
+    ///
+    /// 多 conn 共享 controller 后，Disconnect 必须用 session 的 `io_queues`
+    /// 镜像决定要拆哪些 qid（**不能** `nvme_list_io_sqs()` 全拆 — 那会误删
+    /// 其它 conn 的 IO queue）。
+    fn handle_disconnect(&mut self, cid: u16, sqe: &[u8]) -> anyhow::Result<()> {
+        // 1. 校验 SQE
+        if let Err(e) = fabric::decode_disconnect_fields(sqe) {
+            tracing::warn!(error = %e, "Disconnect decode 失败");
+            // SC=0x80 INVALID_CONNECT_FORMAT (spec § 3.5)
+            // **V8d reviewer H-1** — 失败也立 bail，spec 视 RECFMT 错为终止性失败；
+            // 不让 conn 继续发命令（防 "0x80 ping" 探测放大）。
+            self.send_capsule_resp_err(cid, 0x80)?;
+            anyhow::bail!("V8d disconnect: RECFMT 非法，终止 session");
+        }
+
+        // 2/3. 收集本 conn IO queue id（先 SQ 后 CQ 一起拆，spec § 7.6.1 ordering）
+        let qids: Vec<u16> = self.io_queues.keys().copied().filter(|&q| q != 0).collect();
+        let conn_id = self.conn_id;
+        tracing::info!(
+            conn_id,
+            n_qids = qids.len(),
+            qids = ?qids,
+            "V8d Disconnect: deleting IO queues"
+        );
+        self.with_controller(|c| {
+            // spec § 7.6.1：先删 SQ（防 CQ 删了 SQ 仍 reference）
+            for &q in &qids {
+                let _ = c.nvme_delete_io_sq(q);
+            }
+            for &q in &qids {
+                let _ = c.nvme_delete_io_cq(q);
+            }
+        });
+        self.io_queues.clear();
+        self.current_qid = 0;
+
+        // 4. ACK
+        self.send_capsule_resp_ok(cid, 0)?;
+
+        // 5. 让 pump_one 退出 → Drop 触发 AER cleanup (V8c)
+        anyhow::bail!("V8d disconnect: session terminated by client")
+    }
+
     /// 写一条 CapsuleResp CQE（16 byte）回 client。`status_sf` = SF 字段
     /// （bits 1..15 of status；phase bit 我们填 0 — NVMe-oF spec 不用 phase）。
     fn send_capsule_resp_ok(&mut self, cid: u16, result_dw0: u32) -> anyhow::Result<()> {
@@ -1185,9 +1232,12 @@ impl V2Session {
     }
 }
 
-/// **Phase V8c (security-reviewer H-1 / R-12)** — V2Session 析构时清理 controller
-/// 端本 conn 残留的 pending AER，防 leak 让后续 conn 误吃事件 / 让 controller
-/// `aen_pending` 队列无限增长。BC 路径（V6 单元测试用 conn_id=0）跳过 cleanup。
+/// **Phase V8c (security-reviewer H-1 / R-12) + V8d** — V2Session 析构时清理：
+/// 1. 本 conn 残留的 pending AER（V8c）
+/// 2. 本 conn 残留的 IO SQ/CQ（V8d Disconnect 真清；peer close 路径也走这里）
+///
+/// 防 leak 让后续 conn 误吃事件 / 让 controller `aen_pending` + cqs/sqs 无限
+/// 增长。BC 路径（V6 单元测试用 conn_id=0）跳过 cleanup。
 ///
 /// **V8c reviewer M-2** — `catch_unwind` 包一层防 double panic abort：
 /// `parking_lot::Mutex` 无 poisoning 但 controller 内部 `unwrap()` 仍可能 panic；
@@ -1199,21 +1249,46 @@ impl Drop for V2Session {
             return;
         }
         let conn_id = self.conn_id;
-        // 把 closure 移出 self.with_controller 直接持锁，让 catch_unwind 可 wrap
-        let shared = std::sync::Arc::clone(&self.controller);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut c = shared.controller.lock();
-            c.nvme_cleanup_conn_aers(conn_id)
+        let qids: Vec<u16> = self.io_queues.keys().copied().filter(|&q| q != 0).collect();
+        // **V8d reviewer M-3** — 拆两个独立 catch_unwind，让 AER cleanup
+        // panic 不阻塞 IO queue sweep（IO queue leak 影响更严重）。
+        let shared_a = std::sync::Arc::clone(&self.controller);
+        let aer_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            shared_a.controller.lock().nvme_cleanup_conn_aers(conn_id)
         }));
-        match result {
-            Ok(cleaned) if cleaned > 0 => {
-                tracing::info!(conn_id, cleaned, "V8c Drop: cleaned conn AERs");
+        let shared_b = std::sync::Arc::clone(&self.controller);
+        let qids2 = qids.clone();
+        let sweep_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut c = shared_b.controller.lock();
+            // spec § 7.6.1：先 SQ 后 CQ（幂等）
+            for &q in &qids2 {
+                c.nvme_delete_io_sq(q);
             }
-            Ok(_) => {}
-            Err(_) => {
+            for &q in &qids2 {
+                c.nvme_delete_io_cq(q);
+            }
+            qids2.len()
+        }));
+        match (aer_result, sweep_result) {
+            (Ok(cleaned_aer), Ok(n_qids)) if cleaned_aer > 0 || n_qids > 0 => {
+                tracing::info!(
+                    conn_id,
+                    cleaned_aer,
+                    n_qids,
+                    "V8c/V8d Drop: cleaned conn state"
+                );
+            }
+            (Ok(_), Ok(_)) => {}
+            (Err(_), _) => {
                 tracing::error!(
                     conn_id,
-                    "V8c Drop: panic during cleanup (suppressed to avoid double-panic)"
+                    "V8c Drop: AER cleanup panic (suppressed to avoid double-panic)"
+                );
+            }
+            (_, Err(_)) => {
+                tracing::error!(
+                    conn_id,
+                    "V8d Drop: IO queue sweep panic (suppressed; possible IO queue leak)"
                 );
             }
         }

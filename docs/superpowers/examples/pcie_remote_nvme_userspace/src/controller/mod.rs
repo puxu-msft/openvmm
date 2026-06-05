@@ -1253,6 +1253,48 @@ impl NvmeController {
         cleaned
     }
 
+    /// **Phase V8d** — 删除 IO SQ（qid ≥ 1）。spec § 7.6.1 ordering 要求先
+    /// 删 SQ 后删 CQ；本函数仅删 SQ。返 true = 找到并删；false = qid 不存在
+    /// 或是 admin (qid=0)，session 当 idempotent 处理。
+    pub fn nvme_delete_io_sq(&mut self, qid: u16) -> bool {
+        if qid == 0 {
+            return false;
+        }
+        let removed = self.sqs.remove(&qid).is_some();
+        if removed {
+            tracing::debug!(qid, "V8d nvme_delete_io_sq");
+        }
+        removed
+    }
+
+    /// **Phase V8d** — 删除 IO CQ（qid ≥ 1）。caller 必须先 `nvme_delete_io_sq`
+    /// 同 qid 防 spec § 7.6.1 ordering 违规（删了正在用的 CQ 让 SQ 悬挂）。
+    pub fn nvme_delete_io_cq(&mut self, qid: u16) -> bool {
+        if qid == 0 {
+            return false;
+        }
+        let removed = self.cqs.remove(&qid).is_some();
+        if removed {
+            tracing::debug!(qid, "V8d nvme_delete_io_cq");
+        }
+        removed
+    }
+
+    /// **Phase V8d** — 列出所有 IO SQ id（qid ≥ 1，过滤掉 admin 0）。
+    /// session Drop sweep 用以拿到要清的 qid 列表，避免漏。
+    pub fn nvme_list_io_sqs(&self) -> Vec<u16> {
+        let mut v: Vec<u16> = self.sqs.keys().copied().filter(|&q| q != 0).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// **Phase V8d** — 同 [`Self::nvme_list_io_sqs`] 但列 CQ。
+    pub fn nvme_list_io_cqs(&self) -> Vec<u16> {
+        let mut v: Vec<u16> = self.cqs.keys().copied().filter(|&q| q != 0).collect();
+        v.sort_unstable();
+        v
+    }
+
     /// **Phase V6b** — 外部强制 fire 一条 AEN；返 true 表示 AER 已 fire
     /// （驱动 `aen_pending.pop_front` + post_cqe 已发 16B CQE 到 ctx.dma_write
     /// 哨值地址，caller 必须用 [`pcie_remote_userspace_sdk::DeviceCtx`] 接
