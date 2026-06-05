@@ -1104,6 +1104,13 @@ impl NvmeController {
         );
         self.post_cqe(ctx, 0, cqe);
     }
+
+    /// **Phase V6a** — controller 当前 pending AER 数量（host post 但未弹）。
+    /// session 用来 cap 自己镜像的 pending_aers 容量 + AER 越界保护。
+    /// read-only；不外泄 `aen_pending` 内部 VecDeque。
+    pub fn nvme_pending_aer_count(&self) -> usize {
+        self.aen_pending.len()
+    }
 }
 
 impl NvmeController {

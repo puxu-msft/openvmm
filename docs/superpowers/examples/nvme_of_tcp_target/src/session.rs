@@ -143,6 +143,10 @@ pub struct V2Session {
     /// 真实行为：per-qid 一 TCP conn）。初始 0=未 Connect；admin Connect
     /// 后 = 0；IO Connect 后 = N。`dispatch_capsule_cmd` 根据它区分 admin/IO。
     pub current_qid: u16,
+    /// **V6a** — session 镜像的 pending AER 列表。controller `aen_pending`
+    /// 是 source of truth；这里仅用于 cap (`MAX_PENDING_AERS=4`) + debug。
+    /// V6b 后 `pump_one_with_events` drain 时同步刷此镜像。
+    pub pending_aers: Vec<crate::aer::PendingAer>,
 }
 
 impl V2Session {
@@ -175,6 +179,8 @@ impl V2Session {
             // **V5a** — IO queue 表初空，Create IO CQ/SQ 成功后填充。
             io_queues: HashMap::new(),
             current_qid: 0,
+            // **V6a** — pending AER 镜像，cap 由 aer::MAX_PENDING_AERS 限制
+            pending_aers: Vec::new(),
         })
     }
 
@@ -338,6 +344,55 @@ impl V2Session {
     fn handle_admin_cmd(&mut self, cid: u16, sqe_bytes: &[u8]) -> anyhow::Result<()> {
         let mut sqe =
             Sqe::read_from_bytes(sqe_bytes).map_err(|_| anyhow::anyhow!("SQE 不是 64 byte"))?;
+
+        // **V6a (review R-1 fix)** — AER (opc=0x0C) fast-path：spec § 5.2
+        // AER cmd 在 controller 内只 push `aen_pending` 返 None（不 post CQE）；
+        // V5 `run_post_dispatch` Phase 4 会 bail "did not produce CQE" → 整条
+        // TCP 断 → 致命 regression。这里 peek opc=0x0C：
+        // - 超 MAX_PENDING_AERS → 返 SC=0x05 ASYNC_LIMIT_EXCEEDED（spec §5.2 允许）
+        // - 否则调 nvme_admin_dispatch 让 controller 累积；session 镜像 push；
+        //   跳过 run_post_dispatch 直接返 Ok；wire 上**不**emit CapsuleResp，
+        //   等 V6b drain_aer_completions 在 controller `fire_aen` 后真发
+        let opc_peek = crate::aer::peek_admin_opc(sqe_bytes);
+        if opc_peek == crate::aer::ADMIN_OPC_AER {
+            if self.pending_aers.len() >= crate::aer::MAX_PENDING_AERS {
+                tracing::warn!(
+                    cid,
+                    pending = self.pending_aers.len(),
+                    "V6a AER over MAX_PENDING_AERS, 返 ASYNC_LIMIT_EXCEEDED"
+                );
+                return self.send_capsule_resp_err(cid, /*ASYNC_LIMIT_EXCEEDED=*/ 0x05);
+            }
+            // dispatch 让 controller `aen_pending.push_back`；不 capture CQE
+            // 因为 dispatch 返 None 没产 dma_write
+            sqe.prp1 = PRP1_SENTINEL;
+            sqe.prp2 = 0;
+            let mut tcp_t = TcpAdminTransport::new_with_token_base(self.next_token);
+            let immediate = {
+                let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                self.controller.nvme_admin_dispatch(&mut ctx, sqe, cid, 0)
+            };
+            self.next_token = tcp_t.token_high_water();
+            debug_assert!(
+                immediate.is_none(),
+                "AER dispatch 必返 None；spec § 5.2 controller stash 后不立 post"
+            );
+            debug_assert!(
+                tcp_t.writes.is_empty() && tcp_t.pending_reads.is_empty(),
+                "AER dispatch 不应产 dma_write / dma_read"
+            );
+            self.pending_aers.push(crate::aer::PendingAer {
+                cid,
+                sq_id: 0,
+                registered_at: std::time::Instant::now(),
+            });
+            tracing::debug!(
+                cid,
+                pending = self.pending_aers.len(),
+                "V6a AER stashed, awaiting controller event"
+            );
+            return Ok(());
+        }
 
         // **V5e-1-fix (review H-1)** — block opcode 会让 NS 形状漂变（LBADS /
         // PI 切换），因为 session 的 V5_NLB_MAX 单 PRP1 假设直接挂钩
@@ -2283,6 +2338,118 @@ mod tests {
         let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
         assert_eq!(resp_cid, 0x0F70);
         assert_eq!(sc, 0x01, "FORMAT_NVM 必被 session block 为 INVALID_OPCODE");
+        h.join().unwrap().unwrap();
+    }
+
+    // ─── Phase V6a — AER (Async Event Request) 不 bail + Set FID 0x0B ─
+
+    /// 发一条 AER cmd (opc=0x0C)。
+    fn send_aer(client: &mut TcpStream, cid: u16) {
+        send_admin_sqe_cdw11(client, 0x0C, cid, 0, 0, 0);
+    }
+
+    /// **V6a-1** — host post AER → session 不 bail；wire 不回 CapsuleResp。
+    #[test]
+    fn v6a_aer_cmd_does_not_bail_session() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect admin
+            sess.pump_one()?; // AER (不 bail，不发 CapsuleResp)
+            sess.pump_one()?; // 跟一条 Identify 验证 session 仍活着
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+
+        send_aer(&mut client, 0xAE01);
+        // **关键 invariant**：session 不发任何 CapsuleResp；下一条 cmd 应正常处理
+
+        // 跟一条 Identify Controller 验 session 仍 live
+        send_admin_sqe_cdw11(&mut client, 0x06, 0x00C1, 0, 0x0000_0001, 0);
+        // 期望先收 C2HData 然后 CapsuleResp
+        let p = read_pdu(&mut client).unwrap();
+        assert_eq!(p.header.pdu_type, pdu_type::C2H_DATA);
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(sc, 0, "Identify 应 success（证明 session 没被 AER bail）");
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V6a-2** — 累积到 MAX_PENDING_AERS=4 仍 OK；第 5 条返 SC=0x05 ASYNC_LIMIT_EXCEEDED。
+    #[test]
+    fn v6a_multiple_aers_accumulate_to_aerl_plus_one() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect admin
+            for _ in 0..5 {
+                sess.pump_one()?; // 5 AERs
+            }
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+
+        // 前 4 条不应有 wire 响应
+        for i in 0..4 {
+            send_aer(&mut client, 0xAE10 + i);
+        }
+        // 第 5 条 → SC=0x05
+        send_aer(&mut client, 0xAE15);
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        let resp_cid = u16::from_le_bytes(resp.psh[12..14].try_into().unwrap());
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(resp_cid, 0xAE15);
+        assert_eq!(sc, 0x05, "第 5 条 AER 应 ASYNC_LIMIT_EXCEEDED");
+        h.join().unwrap().unwrap();
+    }
+
+    /// **V6a-3** — Set Features FID 0x0B ASYNC_EVENT_CONFIG wire roundtrip。
+    #[test]
+    fn v6a_set_features_async_event_config_roundtrip() {
+        let (mut client, server) = tcp_pair();
+        let (controller, _backing) = make_test_controller();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut sess = V2Session::accept_and_handshake(server, controller)?;
+            sess.pump_one()?; // Connect admin
+            sess.pump_one()?; // Set Features FID=0x0B
+            sess.pump_one()?; // Get Features FID=0x0B
+            Ok(())
+        });
+        send_icreq(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+        send_connect_admin(&mut client);
+        let _ = read_pdu(&mut client).unwrap();
+
+        // Set Features FID=0x0B cdw11=0x00FF (enable all AER event masks)
+        send_admin_sqe_cdw11(
+            &mut client,
+            0x09, /*SET_FEATURES*/
+            0x0B01,
+            0,
+            0x0B,
+            0x00FF,
+        );
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(sc, 0, "Set Features FID=0x0B 应 success");
+
+        // Get Features FID=0x0B → cdw0 应回 0x00FF
+        send_admin_sqe_cdw11(&mut client, 0x0A /*GET_FEATURES*/, 0x0B02, 0, 0x0B, 0);
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        let dw0 = u32::from_le_bytes(resp.psh[..4].try_into().unwrap());
+        assert_eq!(dw0, 0x00FF, "Get Features 应 echo 之前 Set 的 cdw11=0x00FF");
         h.join().unwrap().unwrap();
     }
 
