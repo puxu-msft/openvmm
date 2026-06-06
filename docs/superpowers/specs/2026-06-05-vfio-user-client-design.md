@@ -1,6 +1,17 @@
 # vfio-user Client Backend — 设计 Spec
 
-> **✅ SHIPPED (2026-06-06 audit)** — 本 design 经 2 轮 reviewer (`9b2e1dca` round-2 合并 14 条 caveat)；OpenVMM client 侧已落地，本仓 NVMe demo 可作 server 让 QEMU 接管。Phase B (OpenHCL paravisor 侧) 未实施 — 留待 Hyper-V 真机 vfio-user 需要时再开。
+> **📐 DESIGN-ONLY (2026-06-06 audit 修正)** — 本 spec 已完成 3 轮 4-路 reviewer
+> 收敛（commit `9b2e1dca` 合并 14 条 caveat，第三轮 4 路全 YES）；但
+> **OpenVMM client 侧代码尚未实施**。已落地的相邻工作是 `2d284030`
+> (Phase U-followup)：本仓 NVMe controller 作 *server* 让 QEMU 接管，方向
+> 相反；本 spec 描述的是反向 — OpenVMM 当 *client* 去消费外部 vfio-user
+> server。
+>
+> 当前优先级状态见 [PROJECT_VISION.md](../plans/PROJECT_VISION.md) +
+> [ROADMAP.md](../plans/ROADMAP.md)：Tier 1 HIGH 是
+> `V-followup-vfio-user-qemu-harness`（验现有 server 侧路径），本 spec 的
+> client 实施未在 Tier 1/2/3 显式列表中。是否启动实施请由用户重新拍板。
+> Phase B (OpenHCL paravisor 侧) 同样未实施。
 
 > 在 OpenVMM 内新增 *client*-side vfio-user backend，让任意外部 vfio-user
 > server（本仓 NVMe demo / SPDK / 未来其他）暴露的 PCIe 设备成为 guest 可见
