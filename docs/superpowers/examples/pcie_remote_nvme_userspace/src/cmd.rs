@@ -524,13 +524,16 @@ impl IdentifyController {
         id.sn = ascii_padded::<20>(b"PCIE-REMOTE-USRSPACE");
         id.mn = ascii_padded::<40>(b"OpenHCL Userspace NVMe v2.0");
         id.fr = ascii_padded::<8>(b"v2.0    ");
-        // MDTS = 5 → max single transfer = 2^5 * MPSMIN(4 KiB) = 128 KiB。
-        // Phase E 实现 PRP list (NVMe spec § 4.4) 后支持 > 2 page IO：
-        //   ≤ 1 page: 单 PRP1
-        //   ≤ 2 page: PRP1 + PRP2 直接指针
-        //   > 2 page: PRP2 指向 PRP list（u64 数组，1 page=512 entry）
-        // 128 KiB = 32 page 远小于单 PRP list 容量。
-        id.mdts = 5;
+        // MDTS = Maximum Data Transfer Size，2^MDTS * MPSMIN page (= 4 KiB)。
+        // **V-followup-interop-3 修复** — 之前 MDTS=5 (=128 KiB=256 LBA)
+        // 与 NVMe-oF 路径 `V5_NLB_MAX=16 LBA (=8 KiB)` 大幅不一致；Linux
+        // nvme-tcp 看 MDTS=5 按 128 KiB 发 IO，被 session 端反复 INVALID
+        // reject (`nlb>MAX` warn 一片)。dd 4K 通过但 block layer 大 prefetch
+        // / fio 多 jobs 都会撞墙。
+        // 8 KiB = 2 page → MDTS=1 (2^1 * 4 KiB)。这是教学版当前 NVMe-oF
+        // 路径真实上限；放大 MDTS 等价于 lying to host，触发 5xx KiB IO 后
+        // SC=0x18 INVALID_FIELD 灾难。生产版应支持多 PRP list 后再升 MDTS。
+        id.mdts = 1;
         id.cntlid = 1;
         id.ver = NVME_VERSION_2_0;
         id.cntrltype = nvme_spec::ControllerType(cntrltype);
@@ -946,5 +949,28 @@ mod tests {
         assert!(ioccsz >= 4, "Discovery IOCCSZ >= 4");
         let msdbd = buf[1803];
         assert!(msdbd > 0, "Discovery MSDBD > 0");
+    }
+
+    /// **V-followup-interop-3 regression gate** — MDTS advertised 必须与
+    /// NVMe-oF session 的 `V5_NLB_MAX` 上限一致。MDTS=N → max IO = 2^N *
+    /// 4 KiB；V5_NLB_MAX=16 LBA @ LBADS=9 → 8 KiB = 2 page → MDTS=1。
+    ///
+    /// 如果 MDTS 比真实上限大，Linux nvme-tcp 会按大值发 IO，被 session 反复
+    /// SC=0x18 reject，触发 dmesg 警告 + 性能塌方 / fio 失败。
+    ///
+    /// 当前 V5e-2 双 PRP 路径上限 = 16 LBA @ 512B = 8 KiB → 强制 MDTS=1。
+    /// 未来支持 PRP list 后可同步升 V5_NLB_MAX + MDTS。
+    #[test]
+    fn v_interop_3_mdts_matches_nvme_of_v5_nlb_max() {
+        let buf = IdentifyController::build_v2_bytes(0x1414, 0xc0de, 1);
+        // MDTS @ offset 77 (NVMe spec Figure 312)
+        let mdts = buf[77];
+        // V5_NLB_MAX=16 LBA @ 512B = 8 KiB = 2 page → MDTS=1
+        // 1 page = MPSMIN 默认 4 KiB
+        assert!(
+            mdts <= 1,
+            "MDTS ({mdts}) 必须 <= 1 (= 8 KiB) 与 V5_NLB_MAX=16 LBA 一致，\
+             否则 Linux nvme-tcp 按大值发 IO 被反复 reject"
+        );
     }
 }
