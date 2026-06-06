@@ -933,16 +933,30 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             .context("V8e-7-2 async write C2HTermReq")
     }
 
-    /// **V-followup-dhchap-3-wire** — 处理 AUTH_RECV：host 来拉 challenge。
+    /// **V-followup-dhchap-3-wire / V-followup-dhchap-4** — 处理 AUTH_RECV：
+    /// host 来拉 challenge / success1。
     ///
-    /// 教学版简化 wire：
+    /// 两种 wire 自动路由（基于 `chap.wire_mode`，由首个 AUTH_SEND 锁定）：
+    ///
+    /// **Simplified wire** (V-followup-dhchap-3 + Python tests 路径):
     /// - host 发 capsule cmd fctype=AUTH_RECV，无 data
     /// - target 抽 challenge（推进 `ChallengeNeeded -> ChallengeSent`）
     /// - target 发 C2HData(challenge 32B) + CapsuleResp SC=0
     ///
-    /// 状态非 `ChallengeNeeded` / 未启 CHAP / store 不含 host → SC=0x83
-    /// （AUTHENTICATION_REQUIRED）关 conn-style 错误响应。
+    /// **Spec § 8.13.5 4-msg wire** (Linux nvme-cli 路径):
+    /// - 第一次 AUTH_RECV (state == `ChallengeNeeded`): 调 issue_challenge →
+    ///   `ChallengeSent`, 回 CHALLENGE wire 包 (16B header + 32B cval), 内含
+    ///   t_id / hashid=SHA-256 / dhgid=NULL
+    /// - 第二次 AUTH_RECV (state == `Authenticated`): 回 SUCCESS1 wire 包
+    ///   (16B, rvalid=0 unidirectional)
+    ///
+    /// reviewer H-1/M-5 修：Spec 路径所有非 OK 分支都额外发 FAILURE1 wire
+    /// (16B) C2HData，让 Linux nvme-cli 拿到 rescode_exp 诊断信息。若
+    /// `spec_tid == 0` (host 未跑 NEGOTIATE)，FAILURE1 t_id 也为 0，host 会
+    /// 报 mismatch 但能识别失败。
     async fn handle_auth_recv_async(&mut self, cid: u16) -> anyhow::Result<()> {
+        use crate::dhchap::{ChapStage, ChapWireMode};
+
         let neg = match self.chap.as_mut() {
             Some(n) => n,
             None => {
@@ -950,6 +964,52 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
                 return self.send_capsule_resp_err_async(cid, 0x83).await;
             }
         };
+
+        // V-followup-dhchap-4: spec 4-msg 路径
+        if neg.wire_mode == ChapWireMode::Spec4Msg {
+            // 当前 stage 决定回 CHALLENGE 还是 SUCCESS1
+            match &neg.stage {
+                ChapStage::ChallengeNeeded { .. } => {
+                    let tid = neg.spec_tid;
+                    let challenge = match neg.issue_challenge() {
+                        Some(c) => c,
+                        None => {
+                            tracing::warn!("AUTH_RECV (spec): issue_challenge 失败");
+                            let fw = crate::dhchap::build_failure(
+                                tid,
+                                true,
+                                crate::dhchap::wire::FAIL_EXP_FAILED,
+                            );
+                            self.send_c2h_data_async(cid, &fw).await?;
+                            return self.send_capsule_resp_err_async(cid, 0x83).await;
+                        }
+                    };
+                    let wire = crate::dhchap::build_challenge(tid, &challenge);
+                    self.send_c2h_data_async(cid, &wire).await?;
+                    return self.send_capsule_resp_ok_async(cid, 0).await;
+                }
+                ChapStage::Authenticated => {
+                    // host 验过 REPLY 后第二次 AUTH_RECV 拉 SUCCESS1。
+                    // 注：spec 双向 auth 时 SUCCESS1 携带 host-verify rval；本实现
+                    // 仅 unidirectional，hl=32 但 rvalid=0 (Linux kernel 同此)。
+                    let wire = crate::dhchap::build_success1(neg.spec_tid);
+                    self.send_c2h_data_async(cid, &wire).await?;
+                    return self.send_capsule_resp_ok_async(cid, 0).await;
+                }
+                other => {
+                    tracing::warn!(stage = ?other, "AUTH_RECV (spec): state 不允许");
+                    let fw = crate::dhchap::build_failure(
+                        neg.spec_tid,
+                        true,
+                        crate::dhchap::wire::FAIL_EXP_INCORRECT_MESSAGE,
+                    );
+                    self.send_c2h_data_async(cid, &fw).await?;
+                    return self.send_capsule_resp_err_async(cid, 0x83).await;
+                }
+            }
+        }
+
+        // Simplified wire (Unknown / Simplified)
         let challenge = match neg.issue_challenge() {
             Some(c) => c,
             None => {
@@ -965,42 +1025,226 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         self.send_capsule_resp_ok_async(cid, 0).await
     }
 
-    /// **V-followup-dhchap-3-wire** — 处理 AUTH_SEND：host 提交 HMAC response。
+    /// **V-followup-dhchap-3-wire / V-followup-dhchap-4** — 处理 AUTH_SEND：
+    /// host 提交 NEGOTIATE / REPLY / HMAC response。
     ///
-    /// 教学版简化 wire：
-    /// - host 发 capsule cmd fctype=AUTH_SEND，data 段 = HMAC-SHA256 response (32B)
-    /// - target 调 `verify_host_response`；通过 → CapsuleResp SC=0，state ->
-    ///   `Authenticated`；失败 → SC=0x83，state -> `Failed`
+    /// **Wire 模式自动识别 (首个 AUTH_SEND, reviewer L-3 加严)**:
+    /// - data.len() ≥ 12 且 `[0x01, 0x00]` 起头 且 `sc_c=0` 且 `napd ≥ 1`
+    ///   → Spec4Msg (NEGOTIATE 最短合法 wire 是 12 B：8B header + 4B descriptor
+    ///   header + 0 ids — 实际再加 idlist 才有意义。raw HMAC 32B 不可能满足
+    ///   "起头 0x01,0x00 + 第 7 B = 0 + 第 8 B ≥ 1" 四条同时，碰撞 ≈ 2^-32)
+    /// - 其他 → Simplified (老 V-followup-dhchap-3 路径，data = 32B HMAC)
     ///
-    /// data 段长度 ≠ 32B → SC=0x02 INVALID_FIELD。
+    /// 一旦锁定，后续 AUTH_SEND 必须沿用同一 wire。
+    ///
+    /// reviewer H-1 修：Spec 路径所有解析错误现在都先发 FAILURE1 wire C2HData
+    /// 再回 capsule 错，让 Linux nvme-cli 拿到 rescode_exp 诊断信息。
     async fn handle_auth_send_async(&mut self, cid: u16, data: &[u8]) -> anyhow::Result<()> {
-        let neg = match self.chap.as_mut() {
-            Some(n) => n,
-            None => {
-                tracing::warn!("AUTH_SEND 拒：session 未 enable_chap");
-                return self.send_capsule_resp_err_async(cid, 0x83).await;
-            }
-        };
-        if data.len() != crate::dhchap::HMAC_SHA256_LEN {
-            tracing::warn!(
-                got = data.len(),
-                expect = crate::dhchap::HMAC_SHA256_LEN,
-                "AUTH_SEND 拒：response 长度非法"
-            );
-            return self.send_capsule_resp_err_async(cid, 0x02).await;
+        use crate::dhchap::{ChapStage, ChapWireMode};
+
+        // V-followup-dhchap-4 reviewer borrow-fix: 所有 `chap` 借用集中于一个
+        // scope；scope 退出后再做 async wire I/O，避免对 self 的 reborrow 冲突。
+        // 返回 (Option<wire_failure_bytes>, capsule_sc, log_done)。
+        enum AuthSendDecision {
+            CapsuleErr(u8),                         // 简单 capsule err，无 wire
+            WireFailThenCapsule(Vec<u8>, u8),       // 先发 wire，再 capsule_sc
+            CapsuleOk,                              // 简单 OK
         }
-        let mut resp = [0u8; crate::dhchap::HMAC_SHA256_LEN];
-        resp.copy_from_slice(data);
-        let ok = neg.verify_host_response(&resp);
-        if ok {
-            tracing::info!("V-followup-dhchap-3-wire CHAP 通过");
-            self.send_capsule_resp_ok_async(cid, 0).await
-        } else {
-            tracing::warn!(
-                stage = ?neg.stage,
-                "V-followup-dhchap-3-wire CHAP 校验失败"
-            );
-            self.send_capsule_resp_err_async(cid, 0x83).await
+
+        let decision = {
+            let neg = match self.chap.as_mut() {
+                Some(n) => n,
+                None => {
+                    tracing::warn!("AUTH_SEND 拒：session 未 enable_chap");
+                    return self.send_capsule_resp_err_async(cid, 0x83).await;
+                }
+            };
+
+            // V-followup-dhchap-4 reviewer L-3: 4 条同时满足才认 Spec4Msg
+            if neg.wire_mode == ChapWireMode::Unknown {
+                let looks_spec = data.len() >= 12
+                    && data[0] == crate::dhchap::wire::AUTH_TYPE_DHCHAP
+                    && data[1] == crate::dhchap::wire::MSG_NEGOTIATE
+                    && data[6] == 0           // sc_c == 0
+                    && data[7] >= 1;          // napd >= 1
+                if looks_spec {
+                    neg.wire_mode = ChapWireMode::Spec4Msg;
+                    tracing::info!("V-dhchap-4: 锁定 Spec4Msg wire (host 发 NEGOTIATE)");
+                } else {
+                    neg.wire_mode = ChapWireMode::Simplified;
+                    tracing::info!("V-dhchap-3-wire: 锁定 Simplified wire");
+                }
+            }
+
+            // Spec 4-msg 路径
+            if neg.wire_mode == ChapWireMode::Spec4Msg {
+                if data.len() < 2 || data[0] != crate::dhchap::wire::AUTH_TYPE_DHCHAP {
+                    tracing::warn!(
+                        len = data.len(),
+                        "AUTH_SEND (spec): auth_type 错或 truncated"
+                    );
+                    let fw = crate::dhchap::build_failure(
+                        neg.spec_tid,
+                        true,
+                        crate::dhchap::wire::FAIL_EXP_INCORRECT_PAYLOAD,
+                    );
+                    AuthSendDecision::WireFailThenCapsule(fw, 0x02)
+                } else {
+                    match data[1] {
+                        crate::dhchap::wire::MSG_NEGOTIATE => {
+                            match crate::dhchap::parse_negotiate(data) {
+                                Ok((tid, _, _)) => {
+                                    neg.spec_tid = tid;
+                                    tracing::info!(tid, "V-dhchap-4 NEGOTIATE accepted");
+                                    AuthSendDecision::CapsuleOk
+                                }
+                                Err(e) => {
+                                    let emsg = format!("{e:#}");
+                                    let exp = if emsg.contains("SHA-256") {
+                                        crate::dhchap::wire::FAIL_EXP_HASH_UNUSABLE
+                                    } else if emsg.contains("DH NULL") {
+                                        crate::dhchap::wire::FAIL_EXP_DHGROUP_UNUSABLE
+                                    } else {
+                                        crate::dhchap::wire::FAIL_EXP_INCORRECT_PAYLOAD
+                                    };
+                                    tracing::warn!(error = %e, exp, "V-dhchap-4 NEGOTIATE rejected");
+                                    let fw = crate::dhchap::build_failure(0, true, exp);
+                                    neg.stage = ChapStage::Failed;
+                                    AuthSendDecision::WireFailThenCapsule(fw, 0x83)
+                                }
+                            }
+                        }
+                        crate::dhchap::wire::MSG_REPLY => {
+                            // reviewer M-1: REPLY 必须在 ChallengeSent
+                            if !matches!(&neg.stage, ChapStage::ChallengeSent { .. }) {
+                                tracing::warn!(
+                                    stage = ?neg.stage,
+                                    "V-dhchap-4 REPLY 在非 ChallengeSent state，拒"
+                                );
+                                let fw = crate::dhchap::build_failure(
+                                    neg.spec_tid,
+                                    true,
+                                    crate::dhchap::wire::FAIL_EXP_INCORRECT_MESSAGE,
+                                );
+                                neg.stage = ChapStage::Failed;
+                                AuthSendDecision::WireFailThenCapsule(fw, 0x83)
+                            } else {
+                                match crate::dhchap::parse_reply(data) {
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "V-dhchap-4 REPLY parse fail");
+                                        let fw = crate::dhchap::build_failure(
+                                            neg.spec_tid,
+                                            true,
+                                            crate::dhchap::wire::FAIL_EXP_INCORRECT_PAYLOAD,
+                                        );
+                                        AuthSendDecision::WireFailThenCapsule(fw, 0x02)
+                                    }
+                                    Ok((tid, rval)) => {
+                                        if tid != neg.spec_tid {
+                                            tracing::warn!(
+                                                got = tid,
+                                                expect = neg.spec_tid,
+                                                "V-dhchap-4 REPLY tid mismatch"
+                                            );
+                                            let fw = crate::dhchap::build_failure(
+                                                neg.spec_tid,
+                                                true,
+                                                crate::dhchap::wire::FAIL_EXP_INCORRECT_PAYLOAD,
+                                            );
+                                            neg.stage = ChapStage::Failed;
+                                            AuthSendDecision::WireFailThenCapsule(fw, 0x83)
+                                        } else {
+                                            let mut resp =
+                                                [0u8; crate::dhchap::HMAC_SHA256_LEN];
+                                            resp.copy_from_slice(&rval);
+                                            let ok = neg.verify_host_response(&resp);
+                                            if ok {
+                                                tracing::info!("V-dhchap-4 REPLY verified");
+                                                AuthSendDecision::CapsuleOk
+                                            } else {
+                                                tracing::warn!("V-dhchap-4 REPLY verify failed");
+                                                let fw = crate::dhchap::build_failure(
+                                                    neg.spec_tid,
+                                                    true,
+                                                    crate::dhchap::wire::FAIL_EXP_FAILED,
+                                                );
+                                                AuthSendDecision::WireFailThenCapsule(fw, 0x83)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        crate::dhchap::wire::MSG_SUCCESS2 => {
+                            if !neg.stage.is_authenticated() {
+                                tracing::warn!(
+                                    stage = ?neg.stage,
+                                    "V-dhchap-4 SUCCESS2 在未认证 state，拒"
+                                );
+                                let fw = crate::dhchap::build_failure(
+                                    neg.spec_tid,
+                                    true,
+                                    crate::dhchap::wire::FAIL_EXP_INCORRECT_MESSAGE,
+                                );
+                                neg.stage = ChapStage::Failed;
+                                AuthSendDecision::WireFailThenCapsule(fw, 0x83)
+                            } else {
+                                tracing::info!(
+                                    "V-dhchap-4 SUCCESS2 received (unidirectional ack)"
+                                );
+                                AuthSendDecision::CapsuleOk
+                            }
+                        }
+                        crate::dhchap::wire::MSG_FAILURE2 => {
+                            tracing::warn!("V-dhchap-4 FAILURE2 received → state Failed");
+                            neg.stage = ChapStage::Failed;
+                            AuthSendDecision::CapsuleErr(0x83)
+                        }
+                        other => {
+                            tracing::warn!(msg = other, "V-dhchap-4 unknown auth_id");
+                            let fw = crate::dhchap::build_failure(
+                                neg.spec_tid,
+                                true,
+                                crate::dhchap::wire::FAIL_EXP_INCORRECT_MESSAGE,
+                            );
+                            AuthSendDecision::WireFailThenCapsule(fw, 0x02)
+                        }
+                    }
+                }
+            } else {
+                // Simplified wire
+                if data.len() != crate::dhchap::HMAC_SHA256_LEN {
+                    tracing::warn!(
+                        got = data.len(),
+                        expect = crate::dhchap::HMAC_SHA256_LEN,
+                        "AUTH_SEND 拒：response 长度非法"
+                    );
+                    AuthSendDecision::CapsuleErr(0x02)
+                } else {
+                    let mut resp = [0u8; crate::dhchap::HMAC_SHA256_LEN];
+                    resp.copy_from_slice(data);
+                    let ok = neg.verify_host_response(&resp);
+                    if ok {
+                        tracing::info!("V-followup-dhchap-3-wire CHAP 通过");
+                        AuthSendDecision::CapsuleOk
+                    } else {
+                        tracing::warn!(
+                            stage = ?neg.stage,
+                            "V-followup-dhchap-3-wire CHAP 校验失败"
+                        );
+                        AuthSendDecision::CapsuleErr(0x83)
+                    }
+                }
+            }
+        }; // ← `neg` borrow ends here
+
+        match decision {
+            AuthSendDecision::CapsuleOk => self.send_capsule_resp_ok_async(cid, 0).await,
+            AuthSendDecision::CapsuleErr(sc) => self.send_capsule_resp_err_async(cid, sc).await,
+            AuthSendDecision::WireFailThenCapsule(fw, sc) => {
+                self.send_c2h_data_async(cid, &fw).await?;
+                self.send_capsule_resp_err_async(cid, sc).await
+            }
         }
     }
 

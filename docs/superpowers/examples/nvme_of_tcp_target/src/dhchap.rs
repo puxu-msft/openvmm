@@ -198,6 +198,29 @@ pub struct ChapNegotiation {
     pub stage: ChapStage,
     /// 共享 secret store；多 session 共享同一 Arc，避免 clone 整张表。
     pub store: std::sync::Arc<ChapSecretStore>,
+    /// **V-followup-dhchap-4** — wire 协议模式（首个 AUTH_SEND 检测后锁定）。
+    pub wire_mode: ChapWireMode,
+    /// **V-followup-dhchap-4** — spec NEGOTIATE 携带的 transaction id；
+    /// target 在 CHALLENGE / SUCCESS1 / FAILURE 中需回填。
+    pub spec_tid: u16,
+}
+
+/// **V-followup-dhchap-4** — CHAP wire 协议模式。
+///
+/// 教学库支持两套 wire：
+/// - `Unknown`: 首个 AUTH_SEND 还没到，未确定
+/// - `Simplified`: 老 V-followup-dhchap-3 路径，AUTH_RECV → 32B challenge raw
+///   bytes，AUTH_SEND → 32B HMAC response raw bytes
+/// - `Spec4Msg`: spec § 8.13.5 4-message 路径，AUTH_SEND data 以
+///   `[0x01, MSG_NEGOTIATE]` 起头，target 用 spec wire 回 CHALLENGE / SUCCESS1
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChapWireMode {
+    /// 还没识别（无 AUTH_SEND 收到）
+    Unknown,
+    /// 教学版简化 wire（兼容 V-followup-dhchap-3 + Python test）
+    Simplified,
+    /// spec § 8.13.5 4-message wire (Linux nvme-cli compatible)
+    Spec4Msg,
 }
 
 impl ChapNegotiation {
@@ -216,7 +239,12 @@ impl ChapNegotiation {
                 subnqn: subnqn.to_string(),
             }
         };
-        Self { stage, store }
+        Self {
+            stage,
+            store,
+            wire_mode: ChapWireMode::Unknown,
+            spec_tid: 0,
+        }
     }
 
     /// target 端 issue challenge；调用者随后通过 wire 把 challenge 发回 host。
@@ -232,9 +260,9 @@ impl ChapNegotiation {
                 };
                 Some(challenge)
             }
-            other => {
-                self.stage = other;
-                // 非法状态：置 Failed 让 caller 关连接
+            _ => {
+                // V-dhchap-4 reviewer H-3 修：之前误写 `self.stage = other` 再被
+                // 覆盖；明确语义为"非 ChallengeNeeded 一律 Failed (caller 关连接)"。
                 self.stage = ChapStage::Failed;
                 None
             }
@@ -474,5 +502,370 @@ mod tests {
         let fake = [0u8; HMAC_SHA256_LEN];
         assert!(!neg.verify_host_response(&fake));
         assert!(neg.stage.is_failed());
+    }
+}
+
+// ============================================================================
+// V-followup-dhchap-4 — spec NVMe Base 2.0c § 8.13.5 wire format
+// (DH-HMAC-CHAP 4-message: NEGOTIATE → CHALLENGE → REPLY → SUCCESS1 → SUCCESS2)
+// ============================================================================
+//
+// 参 Linux kernel include/linux/nvme.h struct nvmf_auth_dhchap_*
+// 实测兼容 Linux nvme-cli `--dhchap-secret` 路径。
+//
+// 教学限制 (相对完整 spec):
+// - 不实现 DH ephemeral key exchange (dhgid=0 NULL = HMAC-only)
+// - 不实现 bidirectional / mutual auth (SUCCESS1 不带 host-verify rval；
+//   host 不会再发 SUCCESS2 — 我们当 SUCCESS1 SC=0 即终结)
+// - 不实现 secure channel concat (sc_c=0 forced)
+// - 只支持 SHA-256 hash (hashid=0x01)
+
+/// V-dhchap-4 wire 常量 (spec § 8.13.5 + Linux include/linux/nvme.h)
+pub mod wire {
+    /// Auth Type: DHCHAP_MESSAGES (1 = DHCHAP family)
+    pub const AUTH_TYPE_DHCHAP: u8 = 0x01;
+    /// Message ID: NEGOTIATE (host → target, AUTH_SEND)
+    pub const MSG_NEGOTIATE: u8 = 0x00;
+    /// Message ID: CHALLENGE (target → host, AUTH_RECV)
+    pub const MSG_CHALLENGE: u8 = 0x01;
+    /// Message ID: REPLY (host → target, AUTH_SEND)
+    pub const MSG_REPLY: u8 = 0x02;
+    /// Message ID: SUCCESS1 (target → host, AUTH_RECV)
+    pub const MSG_SUCCESS1: u8 = 0x03;
+    /// Message ID: SUCCESS2 (host → target, mutual auth final ack)
+    pub const MSG_SUCCESS2: u8 = 0x04;
+    /// Message ID: FAILURE2 (host → target, abort)
+    pub const MSG_FAILURE2: u8 = 0xf0;
+    /// Message ID: FAILURE1 (target → host, abort)
+    pub const MSG_FAILURE1: u8 = 0xf1;
+
+    /// Protocol descriptor auth_id (in NEGOTIATE.auth_protocol[].authid)
+    pub const AUTH_DHCHAP_AUTH_ID: u8 = 0x01;
+
+    /// HMAC hash ID: SHA-256 (32 byte digest)
+    pub const HASH_SHA256: u8 = 0x01;
+    /// HMAC hash ID: SHA-384 (48 byte digest, 教学版不支持)
+    pub const HASH_SHA384: u8 = 0x02;
+    /// HMAC hash ID: SHA-512 (64 byte digest, 教学版不支持)
+    pub const HASH_SHA512: u8 = 0x03;
+
+    /// DH group IDs (NULL = no DH exchange, HMAC-only mode)
+    pub const DHGROUP_NULL: u8 = 0x00;
+
+    /// FAILURE rescode_exp: 通用 auth failure
+    pub const FAIL_EXP_FAILED: u8 = 0x01;
+    /// FAILURE rescode_exp: 没有可用的 protocol
+    pub const FAIL_EXP_NOT_USABLE: u8 = 0x02;
+    /// FAILURE rescode_exp: hash 算法不支持
+    pub const FAIL_EXP_HASH_UNUSABLE: u8 = 0x04;
+    /// FAILURE rescode_exp: DH group 不支持
+    pub const FAIL_EXP_DHGROUP_UNUSABLE: u8 = 0x05;
+    /// FAILURE rescode_exp: payload 解析失败
+    pub const FAIL_EXP_INCORRECT_PAYLOAD: u8 = 0x06;
+    /// FAILURE rescode_exp: 消息类型/顺序不对
+    pub const FAIL_EXP_INCORRECT_MESSAGE: u8 = 0x07;
+}
+
+/// V-dhchap-4 — 解析 host 发来的 NEGOTIATE 消息 (AUTH_SEND data)。
+///
+/// 教学版限制 (reviewer H-2 备注):
+/// - **只检查第一个 `auth_protocol[]` descriptor**。spec 允许 host 列多组
+///   descriptors (e.g. DH-2048 + DH-NULL)；本实现拒掉第一个 descriptor 没
+///   同时包含 SHA-256 + DHGROUP_NULL 的请求。Linux nvme-cli 默认只发一组，
+///   所以实测可 interop；多 descriptor host 将被错拒。
+/// - 不解析 napd > 1 的后续 descriptors (TODO(spec-full))。
+///
+/// wire layout (spec):
+/// ```text
+/// 0    auth_type   u8  = 0x01 (DHCHAP)
+/// 1    auth_id     u8  = 0x00 (NEGOTIATE)
+/// 2-3  rsvd        u16
+/// 4-5  t_id        u16le (transaction id)
+/// 6    sc_c        u8  (secure channel concat, 教学版要求 0)
+/// 7    napd        u8  (number of auth protocol descriptors, >= 1)
+/// 8+   auth_protocol[napd]
+///   每个 protocol descriptor (≥ 8 byte):
+///     0    authid    u8  (= 0x01 DHCHAP)
+///     1    rsvd      u8
+///     2    halen     u8  (number of hash IDs)
+///     3    dhlen     u8  (number of DH group IDs)
+///     4    idlist[halen + dhlen]   按 halen hash ids 后跟 dhlen dh ids
+///     padding 到下一个 8-byte 边界
+/// ```
+///
+/// 返 (t_id, has_sha256, has_dhnull)。我们只用 SHA-256 + DHGROUP_NULL。
+pub fn parse_negotiate(data: &[u8]) -> anyhow::Result<(u16, bool, bool)> {
+    use anyhow::{anyhow, bail};
+    if data.len() < 8 {
+        bail!("NEGOTIATE too short: {}", data.len());
+    }
+    if data[0] != wire::AUTH_TYPE_DHCHAP {
+        bail!("auth_type {:#x} != DHCHAP (0x01)", data[0]);
+    }
+    if data[1] != wire::MSG_NEGOTIATE {
+        bail!("auth_id {:#x} != NEGOTIATE (0x00)", data[1]);
+    }
+    let t_id = u16::from_le_bytes([data[4], data[5]]);
+    let sc_c = data[6];
+    let napd = data[7];
+    if sc_c != 0 {
+        bail!("sc_c = {sc_c}, 教学版仅支持 0 (no secure channel concat)");
+    }
+    if napd == 0 {
+        bail!("napd = 0, 至少需 1 个 auth protocol descriptor");
+    }
+    // 解第一个 protocol descriptor (我们只看第一个; spec 允许 host 列多个)
+    if data.len() < 8 + 4 {
+        bail!("NEGOTIATE auth_protocol[0] header truncated");
+    }
+    let off = 8;
+    let authid = data[off];
+    let halen = data[off + 2] as usize;
+    let dhlen = data[off + 3] as usize;
+    if authid != wire::AUTH_DHCHAP_AUTH_ID {
+        bail!("protocol authid {:#x} != DHCHAP (0x01)", authid);
+    }
+    if data.len() < off + 4 + halen + dhlen {
+        bail!("auth_protocol idlist truncated");
+    }
+    let idlist = &data[off + 4..off + 4 + halen + dhlen];
+    let hash_ids = &idlist[..halen];
+    let dh_ids = &idlist[halen..];
+    let has_sha256 = hash_ids.contains(&wire::HASH_SHA256);
+    let has_dhnull = dh_ids.contains(&wire::DHGROUP_NULL);
+    if !has_sha256 {
+        return Err(anyhow!(
+            "host 未列 SHA-256 (我们只支持此 hash)；提供 hash IDs = {hash_ids:?}"
+        ));
+    }
+    if !has_dhnull {
+        return Err(anyhow!(
+            "host 未列 DH NULL (我们只支持 HMAC-only)；提供 DH IDs = {dh_ids:?}"
+        ));
+    }
+    Ok((t_id, has_sha256, has_dhnull))
+}
+
+/// V-dhchap-4 — 构造 CHALLENGE 消息 (target 回 host AUTH_RECV C2HData)。
+///
+/// wire (spec):
+/// ```text
+/// 0    auth_type   = 0x01
+/// 1    auth_id     = 0x01 CHALLENGE
+/// 2-3  rsvd1       u16
+/// 4-5  t_id        u16le
+/// 6    hl          u8  (challenge bytes, = 32 for SHA-256)
+/// 7    rsvd2       u8
+/// 8    hashid      u8  (= 0x01 SHA-256)
+/// 9    dhgid       u8  (= 0x00 NULL DH)
+/// 10-11 dhvlen     u16le (= 0 for NULL DH)
+/// 12-15 seqnum     u32le (我们用 1)
+/// 16..16+hl  cval (challenge bytes)
+/// ```
+pub fn build_challenge(t_id: u16, challenge: &[u8; CHAP_CHALLENGE_LEN]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + CHAP_CHALLENGE_LEN);
+    out.push(wire::AUTH_TYPE_DHCHAP);
+    out.push(wire::MSG_CHALLENGE);
+    out.extend_from_slice(&[0, 0]); // rsvd1
+    out.extend_from_slice(&t_id.to_le_bytes());
+    out.push(CHAP_CHALLENGE_LEN as u8); // hl
+    out.push(0); // rsvd2
+    out.push(wire::HASH_SHA256);
+    out.push(wire::DHGROUP_NULL);
+    out.extend_from_slice(&0u16.to_le_bytes()); // dhvlen = 0
+    out.extend_from_slice(&1u32.to_le_bytes()); // seqnum = 1
+    out.extend_from_slice(challenge);
+    out
+}
+
+/// V-dhchap-4 — 解析 REPLY 消息 (host 发 AUTH_SEND data)。
+///
+/// wire (spec):
+/// ```text
+/// 0    auth_type   = 0x01
+/// 1    auth_id     = 0x02 REPLY
+/// 2-3  rsvd1       u16
+/// 4-5  t_id        u16le
+/// 6    hl          u8 (response bytes, = 32)
+/// 7    rsvd2       u8
+/// 8    cvalid      u8 bit0 = host-challenge response present (mutual auth)
+/// 9    rsvd3       u8
+/// 10-11 dhvlen     u16le (= 0 for NULL DH)
+/// 12-15 seqnum     u32le
+/// 16..16+hl  rval (HMAC response to target challenge)
+/// 16+hl..  if cvalid: host-challenge (hl bytes) + dh_value (dhvlen bytes)
+/// ```
+pub fn parse_reply(data: &[u8]) -> anyhow::Result<(u16, Vec<u8>)> {
+    use anyhow::bail;
+    if data.len() < 16 + HMAC_SHA256_LEN {
+        bail!("REPLY too short: {}", data.len());
+    }
+    if data[0] != wire::AUTH_TYPE_DHCHAP {
+        bail!("auth_type != DHCHAP");
+    }
+    if data[1] != wire::MSG_REPLY {
+        bail!("auth_id != REPLY");
+    }
+    let t_id = u16::from_le_bytes([data[4], data[5]]);
+    let hl = data[6] as usize;
+    if hl != HMAC_SHA256_LEN {
+        bail!("REPLY hl={hl} != {}", HMAC_SHA256_LEN);
+    }
+    let rval = data[16..16 + HMAC_SHA256_LEN].to_vec();
+    Ok((t_id, rval))
+}
+
+/// V-dhchap-4 — 构造 SUCCESS1 (target 回 host AUTH_RECV C2HData 第 2 次)。
+///
+/// 教学版 unidirectional auth: rvalid=0 (不带 mutual auth response)。
+/// 完整 spec 双向时 rvalid=1 + 16+hl bytes of host-challenge verify response。
+pub fn build_success1(t_id: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    out.push(wire::AUTH_TYPE_DHCHAP);
+    out.push(wire::MSG_SUCCESS1);
+    out.extend_from_slice(&[0, 0]); // rsvd1
+    out.extend_from_slice(&t_id.to_le_bytes());
+    out.push(HMAC_SHA256_LEN as u8); // hl
+    out.push(0); // rsvd2
+    out.push(0); // rvalid = 0 (no mutual auth)
+    out.extend_from_slice(&[0u8; 7]); // rsvd3[7]
+    debug_assert_eq!(out.len(), 16);
+    out
+}
+
+/// V-dhchap-4 — 构造 FAILURE1/FAILURE2 (target 回 host wire-level fail)。
+pub fn build_failure(t_id: u16, is_first: bool, rescode_exp: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    out.push(wire::AUTH_TYPE_DHCHAP);
+    out.push(if is_first {
+        wire::MSG_FAILURE1
+    } else {
+        wire::MSG_FAILURE2
+    });
+    out.extend_from_slice(&[0, 0]); // rsvd1
+    out.extend_from_slice(&t_id.to_le_bytes());
+    out.push(0x01); // rescode = 1 (FAILED)
+    out.push(rescode_exp);
+    out.extend_from_slice(&[0u8; 8]); // rsvd
+    debug_assert_eq!(out.len(), 16);
+    out
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    fn build_negotiate(t_id: u16, hash_ids: &[u8], dh_ids: &[u8]) -> Vec<u8> {
+        let mut out = vec![
+            wire::AUTH_TYPE_DHCHAP,
+            wire::MSG_NEGOTIATE,
+            0,
+            0,
+            t_id as u8,
+            (t_id >> 8) as u8,
+            0,
+            1, // napd=1
+        ];
+        // protocol descriptor
+        out.extend_from_slice(&[
+            wire::AUTH_DHCHAP_AUTH_ID,
+            0,                  // rsvd
+            hash_ids.len() as u8,
+            dh_ids.len() as u8,
+        ]);
+        out.extend_from_slice(hash_ids);
+        out.extend_from_slice(dh_ids);
+        out
+    }
+
+    #[test]
+    fn vt_dhchap4_negotiate_parse_happy() {
+        let data = build_negotiate(0x1234, &[wire::HASH_SHA256], &[wire::DHGROUP_NULL]);
+        let (tid, sha, dh) = parse_negotiate(&data).unwrap();
+        assert_eq!(tid, 0x1234);
+        assert!(sha);
+        assert!(dh);
+    }
+
+    #[test]
+    fn vt_dhchap4_negotiate_rejects_no_sha256() {
+        let data = build_negotiate(0x1234, &[wire::HASH_SHA512], &[wire::DHGROUP_NULL]);
+        let err = parse_negotiate(&data).unwrap_err();
+        assert!(format!("{err:#}").contains("SHA-256"));
+    }
+
+    #[test]
+    fn vt_dhchap4_negotiate_rejects_no_dhnull() {
+        // 教学版需 DHGROUP_NULL (HMAC-only)
+        let data = build_negotiate(0x1234, &[wire::HASH_SHA256], &[0x01 /* DH 2048 */]);
+        let err = parse_negotiate(&data).unwrap_err();
+        assert!(format!("{err:#}").contains("DH NULL"));
+    }
+
+    #[test]
+    fn vt_dhchap4_negotiate_rejects_sc_c() {
+        let mut data = build_negotiate(0x1234, &[wire::HASH_SHA256], &[wire::DHGROUP_NULL]);
+        data[6] = 1; // sc_c = 1
+        let err = parse_negotiate(&data).unwrap_err();
+        assert!(format!("{err:#}").contains("sc_c"));
+    }
+
+    #[test]
+    fn vt_dhchap4_challenge_roundtrip() {
+        let ch = [0xAAu8; CHAP_CHALLENGE_LEN];
+        let wire = build_challenge(0xABCD, &ch);
+        assert_eq!(wire[0], wire::AUTH_TYPE_DHCHAP);
+        assert_eq!(wire[1], wire::MSG_CHALLENGE);
+        assert_eq!(u16::from_le_bytes([wire[4], wire[5]]), 0xABCD);
+        assert_eq!(wire[6], CHAP_CHALLENGE_LEN as u8);
+        assert_eq!(wire[8], wire::HASH_SHA256);
+        assert_eq!(wire[9], wire::DHGROUP_NULL);
+        assert_eq!(u16::from_le_bytes([wire[10], wire[11]]), 0); // dhvlen=0
+        assert_eq!(&wire[16..16 + CHAP_CHALLENGE_LEN], &ch);
+    }
+
+    #[test]
+    fn vt_dhchap4_reply_parse_happy() {
+        // 构造 REPLY: 16B header + 32B rval
+        let mut data = vec![
+            wire::AUTH_TYPE_DHCHAP,
+            wire::MSG_REPLY,
+            0,
+            0,
+            0xCD,
+            0xAB,
+            HMAC_SHA256_LEN as u8,
+            0, // rsvd2
+            0, // cvalid
+            0, // rsvd3
+            0,
+            0, // dhvlen
+            1,
+            0,
+            0,
+            0, // seqnum
+        ];
+        data.extend_from_slice(&[0xFFu8; HMAC_SHA256_LEN]);
+        let (tid, rval) = parse_reply(&data).unwrap();
+        assert_eq!(tid, 0xABCD);
+        assert_eq!(rval, vec![0xFFu8; HMAC_SHA256_LEN]);
+    }
+
+    #[test]
+    fn vt_dhchap4_success1_builds_16_bytes_unidirectional() {
+        let wire = build_success1(0x1234);
+        assert_eq!(wire.len(), 16);
+        assert_eq!(wire[1], wire::MSG_SUCCESS1);
+        assert_eq!(wire[8], 0, "rvalid=0 unidirectional");
+    }
+
+    #[test]
+    fn vt_dhchap4_failure_builds_16_bytes() {
+        let f1 = build_failure(0xCAFE, true, wire::FAIL_EXP_HASH_UNUSABLE);
+        assert_eq!(f1.len(), 16);
+        assert_eq!(f1[1], wire::MSG_FAILURE1);
+        assert_eq!(f1[7], wire::FAIL_EXP_HASH_UNUSABLE);
+        let f2 = build_failure(0xCAFE, false, wire::FAIL_EXP_INCORRECT_PAYLOAD);
+        assert_eq!(f2[1], wire::MSG_FAILURE2);
     }
 }
