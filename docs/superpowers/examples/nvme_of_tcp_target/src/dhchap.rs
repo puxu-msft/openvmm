@@ -568,12 +568,10 @@ pub mod wire {
 
 /// V-dhchap-4 — 解析 host 发来的 NEGOTIATE 消息 (AUTH_SEND data)。
 ///
-/// 教学版限制 (reviewer H-2 备注):
-/// - **只检查第一个 `auth_protocol[]` descriptor**。spec 允许 host 列多组
-///   descriptors (e.g. DH-2048 + DH-NULL)；本实现拒掉第一个 descriptor 没
-///   同时包含 SHA-256 + DHGROUP_NULL 的请求。Linux nvme-cli 默认只发一组，
-///   所以实测可 interop；多 descriptor host 将被错拒。
-/// - 不解析 napd > 1 的后续 descriptors (TODO(spec-full))。
+/// **V-followup-dhchap-4d (reviewer H-2 fix)**：扫所有 `napd` descriptors，挑
+/// 出第一个同时含 SHA-256 + DHGROUP_NULL 的 DHCHAP descriptor。Linux nvme-cli
+/// 在某些发行版会先列 DH-2048/4096，再 NULL；之前只看 [0] 会被错拒。现在
+/// 整段 spec § 8.13.5.1 兼容。
 ///
 /// wire layout (spec):
 /// ```text
@@ -584,16 +582,18 @@ pub mod wire {
 /// 6    sc_c        u8  (secure channel concat, 教学版要求 0)
 /// 7    napd        u8  (number of auth protocol descriptors, >= 1)
 /// 8+   auth_protocol[napd]
-///   每个 protocol descriptor (≥ 8 byte):
-///     0    authid    u8  (= 0x01 DHCHAP)
+///   每个 protocol descriptor (4B header + idlist + pad 到 8B align):
+///     0    authid    u8
 ///     1    rsvd      u8
 ///     2    halen     u8  (number of hash IDs)
 ///     3    dhlen     u8  (number of DH group IDs)
 ///     4    idlist[halen + dhlen]   按 halen hash ids 后跟 dhlen dh ids
-///     padding 到下一个 8-byte 边界
+///     ...padding 到下一个 8-byte 边界
 /// ```
 ///
-/// 返 (t_id, has_sha256, has_dhnull)。我们只用 SHA-256 + DHGROUP_NULL。
+/// 返 (t_id, has_sha256, has_dhnull)。我们只支持 SHA-256 + DHGROUP_NULL；任一
+/// descriptor 含此组合即接受；napd 全扫无匹配 → 按"最后一个 descriptor 的
+/// 缺失项"给错（HASH_UNUSABLE 优先于 DHGROUP_UNUSABLE）。
 pub fn parse_negotiate(data: &[u8]) -> anyhow::Result<(u16, bool, bool)> {
     use anyhow::{anyhow, bail};
     if data.len() < 8 {
@@ -614,36 +614,64 @@ pub fn parse_negotiate(data: &[u8]) -> anyhow::Result<(u16, bool, bool)> {
     if napd == 0 {
         bail!("napd = 0, 至少需 1 个 auth protocol descriptor");
     }
-    // 解第一个 protocol descriptor (我们只看第一个; spec 允许 host 列多个)
-    if data.len() < 8 + 4 {
-        bail!("NEGOTIATE auth_protocol[0] header truncated");
+    let mut off = 8usize;
+    let mut any_dhchap_descriptor = false;
+    // V-dhchap-4d 累积"最后扫到的 DHCHAP descriptor 缺什么"，全 napd 走完无
+    // 匹配时给最贴近的错。
+    let mut last_missing_sha256 = false;
+    let mut last_missing_dhnull = false;
+    for i in 0..napd {
+        if data.len() < off + 4 {
+            bail!(
+                "auth_protocol[{i}] header truncated (need 4 B @ off {off}, have {})",
+                data.len().saturating_sub(off)
+            );
+        }
+        let authid = data[off];
+        let halen = data[off + 2] as usize;
+        let dhlen = data[off + 3] as usize;
+        let idlist_end = off + 4 + halen + dhlen;
+        if data.len() < idlist_end {
+            bail!(
+                "auth_protocol[{i}] idlist truncated (halen={halen} dhlen={dhlen})"
+            );
+        }
+        // 非 DHCHAP descriptor 跳过 (spec 允许 host 列其他 family)
+        if authid == wire::AUTH_DHCHAP_AUTH_ID {
+            any_dhchap_descriptor = true;
+            let hash_ids = &data[off + 4..off + 4 + halen];
+            let dh_ids = &data[off + 4 + halen..idlist_end];
+            let has_sha256 = hash_ids.contains(&wire::HASH_SHA256);
+            let has_dhnull = dh_ids.contains(&wire::DHGROUP_NULL);
+            if has_sha256 && has_dhnull {
+                return Ok((t_id, true, true));
+            }
+            last_missing_sha256 = !has_sha256;
+            last_missing_dhnull = !has_dhnull;
+        }
+        // 推到下一 descriptor，8 byte 对齐
+        let raw = 4 + halen + dhlen;
+        let padded = raw.div_ceil(8) * 8;
+        off += padded;
     }
-    let off = 8;
-    let authid = data[off];
-    let halen = data[off + 2] as usize;
-    let dhlen = data[off + 3] as usize;
-    if authid != wire::AUTH_DHCHAP_AUTH_ID {
-        bail!("protocol authid {:#x} != DHCHAP (0x01)", authid);
-    }
-    if data.len() < off + 4 + halen + dhlen {
-        bail!("auth_protocol idlist truncated");
-    }
-    let idlist = &data[off + 4..off + 4 + halen + dhlen];
-    let hash_ids = &idlist[..halen];
-    let dh_ids = &idlist[halen..];
-    let has_sha256 = hash_ids.contains(&wire::HASH_SHA256);
-    let has_dhnull = dh_ids.contains(&wire::DHGROUP_NULL);
-    if !has_sha256 {
+    if !any_dhchap_descriptor {
         return Err(anyhow!(
-            "host 未列 SHA-256 (我们只支持此 hash)；提供 hash IDs = {hash_ids:?}"
+            "host 未列任何 DHCHAP (authid=0x01) descriptor (napd={napd})"
         ));
     }
-    if !has_dhnull {
+    // 全扫无匹配：hash 缺失优先 (Linux kernel 习惯)
+    if last_missing_sha256 {
         return Err(anyhow!(
-            "host 未列 DH NULL (我们只支持 HMAC-only)；提供 DH IDs = {dh_ids:?}"
+            "host 未列 SHA-256 (我们只支持此 hash)，扫了 {napd} 个 descriptor 都没匹配"
         ));
     }
-    Ok((t_id, has_sha256, has_dhnull))
+    if last_missing_dhnull {
+        return Err(anyhow!(
+            "host 未列 DH NULL (我们只支持 HMAC-only)，扫了 {napd} 个 descriptor 都没匹配"
+        ));
+    }
+    // 不应到达：要么 found 要么 missing 至少一个
+    bail!("NEGOTIATE 未匹配但缺失字段无法定位，data 可能损坏")
 }
 
 /// V-dhchap-4 — 构造 CHALLENGE 消息 (target 回 host AUTH_RECV C2HData)。
@@ -808,6 +836,133 @@ mod wire_tests {
         data[6] = 1; // sc_c = 1
         let err = parse_negotiate(&data).unwrap_err();
         assert!(format!("{err:#}").contains("sc_c"));
+    }
+
+    // V-followup-dhchap-4d: 多 descriptor 支持的 helper + 测试
+    fn build_negotiate_multi(
+        t_id: u16,
+        descriptors: &[(u8, &[u8], &[u8])], // (authid, hash_ids, dh_ids)
+    ) -> Vec<u8> {
+        let mut out = vec![
+            wire::AUTH_TYPE_DHCHAP,
+            wire::MSG_NEGOTIATE,
+            0,
+            0,
+            t_id as u8,
+            (t_id >> 8) as u8,
+            0,
+            descriptors.len() as u8,
+        ];
+        for (authid, hash_ids, dh_ids) in descriptors {
+            out.extend_from_slice(&[*authid, 0, hash_ids.len() as u8, dh_ids.len() as u8]);
+            out.extend_from_slice(hash_ids);
+            out.extend_from_slice(dh_ids);
+            // pad 到 8B 边界 (相对 descriptor 起头)
+            let raw = 4 + hash_ids.len() + dh_ids.len();
+            let pad = raw.div_ceil(8) * 8 - raw;
+            out.extend(std::iter::repeat_n(0u8, pad));
+        }
+        out
+    }
+
+    #[test]
+    fn vt_dhchap4d_negotiate_accepts_multi_descriptor_match_in_second() {
+        // [DH-2048-only, SHA-256+DH-NULL] → 接受第二个
+        let data = build_negotiate_multi(
+            0x1111,
+            &[
+                (wire::AUTH_DHCHAP_AUTH_ID, &[wire::HASH_SHA384], &[0x01]),
+                (
+                    wire::AUTH_DHCHAP_AUTH_ID,
+                    &[wire::HASH_SHA256],
+                    &[wire::DHGROUP_NULL],
+                ),
+            ],
+        );
+        let (tid, sha, dh) = parse_negotiate(&data).expect("应接受第二个 descriptor");
+        assert_eq!(tid, 0x1111);
+        assert!(sha && dh);
+    }
+
+    #[test]
+    fn vt_dhchap4d_negotiate_skips_non_dhchap_descriptor() {
+        // [non-DHCHAP authid=0xff, DHCHAP SHA-256+DH-NULL] → 跳过非 DHCHAP，接受第二个
+        let data = build_negotiate_multi(
+            0x2222,
+            &[
+                (0xff, &[wire::HASH_SHA256], &[wire::DHGROUP_NULL]),
+                (
+                    wire::AUTH_DHCHAP_AUTH_ID,
+                    &[wire::HASH_SHA256],
+                    &[wire::DHGROUP_NULL],
+                ),
+            ],
+        );
+        let (tid, sha, dh) = parse_negotiate(&data).expect("应跳过非 DHCHAP");
+        assert_eq!(tid, 0x2222);
+        assert!(sha && dh);
+    }
+
+    #[test]
+    fn vt_dhchap4d_negotiate_rejects_when_no_dhchap_descriptor() {
+        let data = build_negotiate_multi(
+            0x3333,
+            &[(0xff, &[wire::HASH_SHA256], &[wire::DHGROUP_NULL])],
+        );
+        let err = parse_negotiate(&data).unwrap_err();
+        assert!(format!("{err:#}").contains("未列任何 DHCHAP"));
+    }
+
+    #[test]
+    fn vt_dhchap4d_negotiate_rejects_all_descriptors_no_match() {
+        // 全 DHCHAP 但没有同时 SHA-256 + DH-NULL 的
+        let data = build_negotiate_multi(
+            0x4444,
+            &[
+                (wire::AUTH_DHCHAP_AUTH_ID, &[wire::HASH_SHA384], &[0x01]),
+                (wire::AUTH_DHCHAP_AUTH_ID, &[wire::HASH_SHA512], &[0x02]),
+            ],
+        );
+        let err = parse_negotiate(&data).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("SHA-256") || msg.contains("DH NULL"));
+    }
+
+    #[test]
+    fn vt_dhchap4d_negotiate_descriptor_padding_aligned() {
+        // halen=1 + dhlen=1 → raw=6 → padded to 8。第二个 descriptor 必须读对位置。
+        let data = build_negotiate_multi(
+            0x5555,
+            &[
+                (wire::AUTH_DHCHAP_AUTH_ID, &[wire::HASH_SHA384], &[0x01]),
+                (
+                    wire::AUTH_DHCHAP_AUTH_ID,
+                    &[wire::HASH_SHA256],
+                    &[wire::DHGROUP_NULL],
+                ),
+            ],
+        );
+        // verify padding 落对位 (header 8 + desc0 padded 8 + desc1 header start)
+        assert_eq!(data[8 + 8], wire::AUTH_DHCHAP_AUTH_ID);
+        let (tid, _, _) = parse_negotiate(&data).unwrap();
+        assert_eq!(tid, 0x5555);
+    }
+
+    #[test]
+    fn vt_dhchap4d_negotiate_rejects_descriptor_header_truncated() {
+        // napd=2 但只够 1 个 descriptor + 2 byte (< 4 byte header)
+        let mut data = build_negotiate_multi(
+            0x6666,
+            &[(
+                wire::AUTH_DHCHAP_AUTH_ID,
+                &[wire::HASH_SHA384],
+                &[0x01],
+            )],
+        );
+        data[7] = 2; // 谎称 napd=2
+        data.extend_from_slice(&[0u8; 2]); // 只够 2 B 而非 4 B descriptor header
+        let err = parse_negotiate(&data).unwrap_err();
+        assert!(format!("{err:#}").contains("truncated"));
     }
 
     #[test]
