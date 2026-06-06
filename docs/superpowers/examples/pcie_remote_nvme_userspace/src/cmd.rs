@@ -581,13 +581,11 @@ impl IdentifyController {
         id.cqes = nvme_spec::QueueEntrySize::new().with_min(4).with_max(4);
         id.maxcmd = 64;
         id.nn = nn;
-        // **V-followup-interop-1 + interop-4** — MNAN = Maximum Number of
-        // Allowed Namespaces (spec § 5.17.2.21 byte 524..528)。Linux nvme-tcp
-        // `nvme_init_subsystem` 见 MNAN < NN 时报 'Invalid MNAN value 0' reject
-        // Connect。Discovery Controller (NN=0) 时 Linux 仍要 MNAN > 0 — 用
-        // `nn.max(1)` 兼容两路径 (NVM IO Ctrl NN>=1 时 MNAN=NN；Discovery NN=0
-        // 时 MNAN=1)。生产可 > NN 给 NS Management room。
-        id.mnan = nn.max(1);
+        // **V-followup-interop-1** — MNAN = Maximum Number of Allowed Namespaces
+        // (spec § 5.17.2.21 byte 524..528)。Linux nvme-tcp `nvme_init_subsystem`
+        // 见 MNAN < NN 时报 "Invalid MNAN value 0"。教学版让 MNAN=NN 保证
+        // host 不 reject (生产可 > NN 给 NS Management room)。
+        id.mnan = nn;
         // ONCS — NVM optional command support。Phase D 后 Dataset
         // Management (DSM/TRIM) / Write Zeroes / Verify 都已 dispatch。
         // Phase H3：Compare 真实现。Phase H6：Reservations 真实现。
@@ -926,12 +924,11 @@ mod tests {
 
         // NN @ offset 516..520
         let nn = u32::from_le_bytes(buf[516..520].try_into().unwrap());
-        // MNAN @ offset 524..528 — Linux nvme-tcp 报 "Invalid MNAN value 0"
-        // 当 MNAN < NN **或** MNAN == 0 (即便 NN=0 也要 MNAN >= 1)。
+        // MNAN @ offset 524..528 — Linux nvme-tcp 报 "Invalid MNAN value 0" 当 < NN
         let mnan = u32::from_le_bytes(buf[524..528].try_into().unwrap());
         assert!(
-            mnan >= nn.max(1),
-            "MNAN ({mnan}) 必须 >= max(NN, 1) (NN={nn}) 否则 Linux nvme-tcp reject"
+            mnan >= nn,
+            "MNAN ({mnan}) 必须 >= NN ({nn}) 否则 Linux nvme-tcp reject"
         );
 
         // VID/SSVID/CNTLID/VER sanity
@@ -952,13 +949,6 @@ mod tests {
         assert!(ioccsz >= 4, "Discovery IOCCSZ >= 4");
         let msdbd = buf[1803];
         assert!(msdbd > 0, "Discovery MSDBD > 0");
-        // **V-followup-interop-4** — Discovery 即便 NN=0 也要 MNAN >= 1
-        // (Linux nvme-tcp `Invalid MNAN value 0` 触发 discover 失败)
-        let mnan = u32::from_le_bytes(buf[524..528].try_into().unwrap());
-        assert!(
-            mnan >= 1,
-            "Discovery Controller MNAN ({mnan}) 必须 >= 1 (Linux nvme-tcp 拒 0)"
-        );
     }
 
     /// **V-followup-interop-3 regression gate** — MDTS advertised 必须与
