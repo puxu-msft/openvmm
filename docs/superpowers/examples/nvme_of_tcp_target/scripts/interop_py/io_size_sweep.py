@@ -163,6 +163,7 @@ def io_write(s, cid, slba, payload):
 
 
 def io_read(s, cid, slba, byte_len):
+    """V-followup-prp-list aware: 收多个 C2HData PDU 直到 RSP."""
     nlb = (byte_len // 512) - 1
     sqe = bytearray(64)
     sqe[0] = 0x02
@@ -171,27 +172,28 @@ def io_read(s, cid, slba, byte_len):
     sqe[40:48] = slba.to_bytes(8, "little")
     sqe[48:52] = nlb.to_bytes(4, "little")
     write_pdu(s, PDU_CMD, bytes(sqe))
-    pt1, _, data = read_pdu(s)
-    if pt1 == PDU_RSP:
-        return cqe_sc(_), b""  # noqa - error path
-    if pt1 != PDU_C2H_DATA:
-        return -1, b""
-    pt2, psh, _ = read_pdu(s)
-    if pt2 != PDU_RSP:
-        return -1, b""
-    return cqe_sc(psh), data
+    data = b""
+    while True:
+        pt, psh, chunk = read_pdu(s)
+        if pt == PDU_C2H_DATA:
+            data += chunk
+        elif pt == PDU_RSP:
+            return cqe_sc(psh), data
+        else:
+            return -1, data
 
 
 def main():
-    print("=== V-interop-7 IO size sweep (V5_NLB_MAX=16, 8 KiB cap) ===")
+    print("=== V-interop-7 IO size sweep (V-followup-prp-list: chunking 16→256 LBA) ===")
     admin, io = setup_admin_and_io()
 
-    # 测每个 nlb 1..=17
+    # 测关键 nlb: 1..16 (单 chunk), 17/32/33/64/128/256 (multi-chunk), 257 (reject)
+    test_nlbs = [1, 2, 4, 8, 16, 17, 32, 33, 64, 128, 256, 257]
     cid = 0x500
     base_slba = 1000
-    print("\nLBA  bytes  Write    Read     match")
+    print("\nLBA  bytes   Write    Read     match")
     print("-" * 50)
-    for nlb in range(1, 18):  # 1..17
+    for nlb in test_nlbs:
         cid += 1
         payload = bytes(((b * 7 + nlb) & 0xFF) for b in range(nlb * 512))
         w_sc = io_write(io, cid, base_slba + nlb * 20, payload)
@@ -199,21 +201,23 @@ def main():
         if w_sc == 0:
             r_sc, data = io_read(io, cid, base_slba + nlb * 20, nlb * 512)
             match = "✓" if data == payload else "✗"
-            print(f"  {nlb:2d} {nlb * 512:5d}  SC={w_sc:#04x}  SC={r_sc:#04x}  {match}")
+            kib = nlb * 512 // 1024
+            print(f"  {nlb:3d} {nlb*512:6d}B  SC={w_sc:#04x}  SC={r_sc:#04x}  {match} ({kib} KiB)")
             if data != payload:
-                fail(f"nlb={nlb} byte mismatch")
+                fail(f"nlb={nlb} byte mismatch (size {nlb*512} B)")
         else:
-            # nlb > 16 expected SC=0x18 SGL_DATA_LENGTH_INVALID
-            print(f"  {nlb:2d} {nlb * 512:5d}  SC={w_sc:#04x}  (skip)  -")
-            if nlb <= 16:
-                fail(f"nlb={nlb} 应通过 (V5_NLB_MAX=16) but got SC={w_sc:#x}")
-            if nlb == 17 and w_sc != 0x18:
-                fail(f"nlb=17 应 SC=0x18 (SGL_DATA_LENGTH_INVALID), got {w_sc:#x}")
+            print(f"  {nlb:3d} {nlb*512:6d}B  SC={w_sc:#04x}  (skip)  -")
+            if nlb <= 256:
+                fail(f"nlb={nlb} 应通过 (V_HOST_IO_NLB_MAX=256) but got SC={w_sc:#x}")
+            if nlb == 257 and w_sc != 0x18:
+                fail(f"nlb=257 应 SC=0x18, got {w_sc:#x}")
 
     admin.close()
     io.close()
-    print("\n✅ V-interop-7 IO size sweep: 1..16 LBA byte-equal, 17 LBA SC=0x18")
-    print("    confirms V5_NLB_MAX=16 cap + V-followup-prp-list 未实现")
+    print("\n✅ V-interop-7 + V-prp-list IO sweep:")
+    print("    1..16 LBA: 单 chunk byte-equal")
+    print("    17..256 LBA: multi-chunk byte-equal (透明 chunking)")
+    print("    257 LBA: SC=0x18 reject (V_HOST_IO_NLB_MAX cap)")
 
 
 if __name__ == "__main__":
