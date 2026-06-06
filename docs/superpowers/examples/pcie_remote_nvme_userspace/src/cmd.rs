@@ -578,6 +578,11 @@ impl IdentifyController {
         id.cqes = nvme_spec::QueueEntrySize::new().with_min(4).with_max(4);
         id.maxcmd = 64;
         id.nn = nn;
+        // **V-followup-interop-1** — MNAN = Maximum Number of Allowed Namespaces
+        // (spec § 5.17.2.21 byte 524..528)。Linux nvme-tcp `nvme_init_subsystem`
+        // 见 MNAN < NN 时报 "Invalid MNAN value 0"。教学版让 MNAN=NN 保证
+        // host 不 reject (生产可 > NN 给 NS Management room)。
+        id.mnan = nn;
         // ONCS — NVM optional command support。Phase D 后 Dataset
         // Management (DSM/TRIM) / Write Zeroes / Verify 都已 dispatch。
         // Phase H3：Compare 真实现。Phase H6：Reservations 真实现。
@@ -913,6 +918,15 @@ mod tests {
 
         // CNTRLTYPE @ offset 111
         assert_eq!(buf[111], 0x01, "默认 CNTRLTYPE = 0x01 (NVM IO Controller)");
+
+        // NN @ offset 516..520
+        let nn = u32::from_le_bytes(buf[516..520].try_into().unwrap());
+        // MNAN @ offset 524..528 — Linux nvme-tcp 报 "Invalid MNAN value 0" 当 < NN
+        let mnan = u32::from_le_bytes(buf[524..528].try_into().unwrap());
+        assert!(
+            mnan >= nn,
+            "MNAN ({mnan}) 必须 >= NN ({nn}) 否则 Linux nvme-tcp reject"
+        );
 
         // VID/SSVID/CNTLID/VER sanity
         assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 0x1414);

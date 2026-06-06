@@ -290,6 +290,13 @@ async fn v_interop_1_full_linux_nvme_tcp_sequence_to_identify_succeeds() {
     assert!(iorcsz >= 1);
     let msdbd = id_data[1803];
     assert!(msdbd > 0);
+    // NN / MNAN — Linux nvme-tcp `nvme_init_subsystem` 见 MNAN < NN reject
+    let nn = u32::from_le_bytes(id_data[516..520].try_into().unwrap());
+    let mnan = u32::from_le_bytes(id_data[524..528].try_into().unwrap());
+    assert!(
+        mnan >= nn,
+        "wire MNAN ({mnan}) 必须 >= NN ({nn})"
+    );
 
     c.shutdown().await.unwrap();
     let _ = server.await;
