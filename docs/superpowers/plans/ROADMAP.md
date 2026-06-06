@@ -13,6 +13,11 @@ V-followup-tls(1..4) ──> V-followup-mtls ──> V-followup-auth(1..2) ─�
 V-followup-interop(1..7) ──> V-followup-prp-list ──> V-followup-dhchap-4 + 4d ──> V-interop-8 ──> [HERE]
 ```
 
+**项目愿景** (用户 2026-06-06 explicit, [PROJECT_VISION.md](PROJECT_VISION.md))：
+**用户态 NVMe firmware** 为核心 + 三种接入 (OpenHCL VTL2 / OpenVMM dev / QEMU vfio-user) +
+NVMe-oF TCP 第 4 条接入。当前架构 ✅ 已对齐：firmware (controller) runtime-agnostic +
+`trait Transport` 边界已抽出。
+
 **当前状态**：
 - 306 lib + integration tests pass，clippy 0 warning，#![forbid(unsafe_code)] + #![deny(clippy::await_holding_lock)] 维持。
 - Linux nvme-cli plaintext discover + connect + IO 互通已实证。
@@ -22,7 +27,12 @@ V-followup-interop(1..7) ──> V-followup-prp-list ──> V-followup-dhchap-4
 
 ## 1. 短期 (1-3 phase, 不依赖上游)
 
-### V-followup-dhchap-4-real-host-interop (HIGH 优先, 预计 1 day)
+> **firmware-as-core Tier 标签** (按 [PROJECT_VISION §4](PROJECT_VISION.md) 优先级)
+> - **Tier 1**: 3 条接入各 1 个真 host e2e harness (本季)
+> - **Tier 2**: firmware crate 命名重构 (下季)
+> - **Tier 3**: Phase X 仓库拆分 (半年)
+
+### V-followup-dhchap-4-real-host-interop (Tier 1, HIGH 优先, 预计 1 day)
 
 **What**：让 V-interop-8 Python harness 通过即代表 Linux nvme-cli `--dhchap-secret` 也通；
 现在还缺一步：跑真 nvme-cli 而非 Python harness。
@@ -41,7 +51,7 @@ V-followup-interop(1..7) ──> V-followup-prp-list ──> V-followup-dhchap-4
 
 **Links**：commit `714029df`, plans/2026-06-05-phase-v4-detailed.md §9 (entrypoint hint)。
 
-### V-followup-tls-psk-kernel-vector (HIGH 优先, 预计 2 days, 独立于 rustls)
+### V-followup-tls-psk-kernel-vector (Tier 1, HIGH 优先, 预计 2 days, 独立于 rustls)
 
 **What**：写 out-of-tree kernel module dump `nvme_auth_derive_tls_psk` 输出，固化
 5 个 known-good (retained_psk, hostnqn, subsysnqn, hash, expected_tls_psk_hex)
@@ -59,7 +69,26 @@ V-followup-interop(1..7) ──> V-followup-prp-list ──> V-followup-dhchap-4
 - 需要 host root + 写小 kmod (~ 50 LOC)，用户须授权或代提
 - WSL2 kernel 已开 `nvme-tcp` / `nvme-auth` 内置；EXPORT_SYMBOL_GPL OK
 
-### V-followup-discovery-multi-portal-real (MEDIUM, 预计 1 day)
+### V-followup-vfio-user-qemu-harness (Tier 1, HIGH 优先, 预计 1-2 days)
+
+**What**：写 `scripts/qemu_interop/` Python (或 bash) harness 跑真 QEMU 接管模式
+e2e。当前 vfio-user 路径只有 lib unit test，**没有真 QEMU 验过**——firmware-as-core
+愿景的第 3 条接入缺真 host 实测。
+
+**Why**：[PROJECT_VISION §3.3](PROJECT_VISION.md) 标的明显缺口；
+QEMU vfio-user 是行业标准 (8+ / Cloud Hypervisor / SPDK)，缺这一条
+意味着第 3 条接入只是"代码 shipped"而非"真生产可用"。
+
+**Acceptance**：
+- 启 `pcie_remote_nvme_userspace --vfio-user-socket /tmp/nvme.sock`
+- QEMU `-device vfio-user-pci,socket=/tmp/nvme.sock` 启 guest
+- guest 看到 NVMe BDF，nvme list / nvme id-ctrl / IO 通
+- harness 在 CI 跑 (需 QEMU 8+ in test runner)
+
+**Blockers**：QEMU 8+ in test env；现在的 QEMU_VFIO_USER.md 散在
+`pcie_remote_nvme_userspace/`，集中到 `scripts/qemu_interop/README.md`。
+
+### V-followup-discovery-multi-portal-real (Tier 2, MEDIUM, 预计 1 day)
 
 **What**：实测 V7 / V8a `--discovery-target-addr` 重复指定多 portal，nvme-cli
 discover 真能拿到多 entry。
@@ -70,7 +99,7 @@ portal；多 portal 走 [[nvme-of-tcp-real-linux-interop-milestone]] 验过。
 **Acceptance**：起 target with `--discovery-target-addr A:p1 -p A:p2 -p A:p3`，
 `nvme discover -t tcp -a A -s 4420` 输出 3 个 entry，每个 NQN/IP/Port 正确。
 
-### V-followup-py-harness-spec-wire-conformance (MEDIUM, 预计半 day)
+### V-followup-py-harness-spec-wire-conformance (Tier 2, MEDIUM, 预计半 day)
 
 **What**：把 `chap4_spec_wire_e2e.py` 扩到覆盖 reviewer M-4 那 5 个 case
 (REPLY before challenge / REPLY truncation / tid mismatch / SUCCESS2 before
@@ -79,7 +108,25 @@ auth / FAILURE2 from host)，对齐 lib test。
 **Why**：lib test 覆盖了，但 Python harness 缺；跨进程实证 wire 错误路径才能
 保 Linux nvme-cli 拿到正确 FAILURE1 diagnostic。
 
-### Phase X — 把项目搬出 openvmm 仓库 (MEDIUM-LARGE, 预计 1 week, 分 X1-X4 子段)
+### V-followup-firmware-rename + transport-tutorial (Tier 2, MEDIUM, 预计 1-2 days)
+
+**What**：按 firmware-as-core 愿景重命名 + 加教学:
+- `pcie_remote_nvme_userspace` → `nvme_firmware` (强调 "是 firmware")
+- `pcie_remote_userspace_sdk` → `pcie_device_sdk` (去 "remote" 暗示，强调通用)
+- `pcie_remote_protocol` → `pcie_remote_wire` (强调 "是 wire 协议之一")
+- 写 `docs/HOW_TO_ADD_TRANSPORT.md` — 教学加第 5 条 transport (e.g. iSCSI / NBD)
+
+**Why**：现命名带 "pcie_remote" 让人误以为 firmware 跟 PCIe Remote 协议绑定，
+事实上已是 transport-agnostic 的。命名也是文档。
+
+**Acceptance**：
+- 全 grep 改完；306 tests 仍过；clippy 0 warning
+- 改名都用 `git mv` 保 history
+- `HOW_TO_ADD_TRANSPORT.md` 含真 example: 加一条 toy "stdio-pipe" transport
+
+**Blockers**：跟 Phase X (仓库拆分) 一起做更好，避免双轨；建议同期做。
+
+### Phase X — 把项目搬出 openvmm 仓库 (Tier 3, MEDIUM-LARGE, 预计 1 week, 分 X1-X4 子段)
 
 **What**：把 `docs/superpowers/examples/*` 7 crates + 文档 + `vm/devices/pcie_remote_*`
 搬出 openvmm，作为独立仓库。openvmm 仅留 VTL2 device 部分。
@@ -163,10 +210,12 @@ storage 到真 PCIe NVMe device，把 nvme-of target 变成 NVMe-oF JBOD gateway
 
 ## 4. 当前 PRINCIPLES.md / LESSONS.md 入口
 
+- **项目愿景** (firmware-as-core + 3 transport) → [PROJECT_VISION.md](PROJECT_VISION.md)
 - 不可变约束 / coding policy → [PRINCIPLES.md](PRINCIPLES.md)
 - 踩过的坑 + 经验 → [LESSONS.md](LESSONS.md)
 - 重大决策 ADR → [DECISIONS.md](DECISIONS.md)
 - TLS PSK 调研 → [2026-06-06-phase-v-followup-tls-psk-survey.md](2026-06-06-phase-v-followup-tls-psk-survey.md)
+- 外部化调研 → [2026-06-06-phase-x-extract-from-openvmm-survey.md](2026-06-06-phase-x-extract-from-openvmm-survey.md)
 - 各 phase 详 spec → `2026-06-0*-phase-*-detailed.md`
 
 ## 5. 流程提示 (本文件如何用)

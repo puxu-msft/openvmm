@@ -6,12 +6,15 @@ Linux ≥ 5.0 / Windows Server 2025 上的标准 `nvme-cli` 可通过
 `nvme connect -t tcp` 直接挂载并跑 IO。
 
 > **持续开发的顶层文档** (新加 phase 前必读):
-> - [ROADMAP.md](../../plans/ROADMAP.md) — 短/中/长期 phase 列表 (动态)
+> - **[PROJECT_VISION.md](../../plans/PROJECT_VISION.md)** — 项目愿景: 用户态 NVMe firmware 为核心 + 3 transport (OpenHCL/OpenVMM/QEMU vfio-user) + NVMe-oF TCP
+> - [ROADMAP.md](../../plans/ROADMAP.md) — 短/中/长期 phase 列表 (动态)，按 Tier 1/2/3 优先级排
 > - [PRINCIPLES.md](../../plans/PRINCIPLES.md) — 不变约束 + coding policy + subagent reviewer prompt 模板 + 测试命名约定
-> - [LESSONS.md](../../plans/LESSONS.md) — 16 条踩坑教训 (含 decision-then-IO 借用模式 / WebFetch 工作流 / 手算 offset 速查表)
-> - [DECISIONS.md](../../plans/DECISIONS.md) — 重大决策 ADR (7 条)
+> - [LESSONS.md](../../plans/LESSONS.md) — 17 条踩坑教训 (含 decision-then-IO 借用模式 / WebFetch 工作流 / 手算 offset 速查表 / doc audit 必配 git log)
+> - [DECISIONS.md](../../plans/DECISIONS.md) — 重大决策 ADR (9 条)
 > - [tls-psk-survey.md](../../plans/2026-06-06-phase-v-followup-tls-psk-survey.md)
 >   — rustls external-PSK 调研 + 决策
+> - [extract-from-openvmm-survey.md](../../plans/2026-06-06-phase-x-extract-from-openvmm-survey.md)
+>   — 外部化调研 + 决策推迟 (ADR-008/009)
 
 ## Status (2026-06-06)
 

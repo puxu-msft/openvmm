@@ -172,6 +172,30 @@ NVMe-oF TCP。
 
 ---
 
+## ADR-009 — Firmware-as-core 愿景确认 + 命名重构 (2026-06-06)
+
+**Context**：用户 explicit "未来希望以用户态 NVMe firmware 为核心，提供支持 openvmm/openhcl/qemu(vfio-user) 的方式"。
+
+调研 (见 [PROJECT_VISION.md](PROJECT_VISION.md)) 发现当前架构已对齐：
+- NVMe controller core (`controller/*.rs`) runtime-agnostic
+- `trait Transport` (5 原语) 已是 firmware ↔ transport 边界
+- 3 个 transport 实现已落地 (PCIe Remote vsock+TCP / vfio-user / NVMe-oF TCP)
+
+**Decision**：**接受愿景**。优先级重排:
+- Tier 1 (本季): 3 条接入各 1 个真 host e2e harness (CHAP real-host / vfio-user QEMU / kernel-CI vector)
+- Tier 2 (下季): firmware crate 命名重构 (`nvme_firmware` / `pcie_device_sdk` / `pcie_protocol`)
+- Tier 3 (半年): Phase X 仓库拆分 (按 ADR-008 路径 C)
+
+**Consequences**：
+- ROADMAP §1 加 firmware-as-core Tier 标签
+- 新 crate 命名先在 PROJECT_VISION 提议，落地走单独 phase
+- "教学版简化" / "spec-strict-mode" 边界对每个 firmware feature 都明标
+- 长期: 新仓 `userspace-nvme-firmware`，主仓只留 VTL2 device
+
+**Status**：active；命名重构等仓库拆分一起走，避免双轨。
+
+---
+
 ## 加新 ADR 模板
 
 ```markdown
