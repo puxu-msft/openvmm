@@ -292,3 +292,42 @@ fork 时又得重新走一遍 cost-benefit。
 **例**: V-tls-psk reviewer 给 L-1..L-5，L-1/2/5 ≤ 5 LOC 改，L-3 是
 "NQN 校验责任" 需修改函数 signature 才彻底 → 改成 doc 标注 + TODO，留
 下个 phase。
+
+---
+
+## 17. doc audit 必须配 `git log` 复核，光凭印象会夸大或漏记 (HIGH)
+
+**坑** (2026-06-06 audit pass 1+2+3 实测)：
+
+- **审 K-20 hotplug** 时光看 `K20_HOTPLUG_DESIGN.md` 自标 "v2 设计文档，
+  未实施"，直接照搬"仍未实施 (2026-06-06)"。**实际** `git log --grep K-20`
+  3 个 commit (`a99cdc63` 实施 + `64da8fb6` polish + `93c5fa5f` SESSION_LOG
+  状态转 ✅ v9 完成) 早已 shipped。**audit pass 自己造了假信息**。
+- **审 SESSION_LOG** 时只看顶 header 自标 "覆盖 2026-05-29 → 2026-05-31"，
+  没核 git log 发现 Phase J / K / L / M / N / O / P / Q1-Q12 / R / S /
+  T / U1-U5 + U-followup / V 整族都没写进日志。
+- **审 example crates** 时没数有几个 crate；4 个 (`pcie_remote_userspace_sdk` /
+  `pcie_vfio_user_sdk` / `pcie_remote_rng_userspace` / `pcie_remote_noop_host`)
+  完全没 README。
+- **审 ROADMAP §6** "历史 phase plan 索引" 时**只列有 `.md` plan 的**，
+  漏掉所有 "无独立 plan 但 shipped" 的工作 (NVMe userspace Q/R/S 等)。
+
+**修法 (audit 流程)**：
+
+1. `git log --oneline main..HEAD --no-merges | wc -l` 算总 commit 数 — 心
+   里有个量级（本仓 256 commit），不只数自己最近做的。
+2. `git log --oneline | awk -F':' '{print $1}' | sort | uniq -c | sort -rn`
+   按 prefix 分类 — 谁的 commit 量最多 = 哪个模块最可能有漏记。
+3. `git log --oneline | grep -iE "Phase [A-Z]"` 抽所有 Phase 标签 — 比对
+   文档里写了几个。
+4. **每个声称 "未实施" 的 design doc** 都跑 `git log --grep <K-编号>` 复核。
+5. **`find docs/ -name README.md`** 数 README，不存在的 example crate 都
+   是漏记候选。
+6. **声明 "shipped" 时附 commit hash**；空口 "shipped" 等于没说，未来
+   audit 自己都无法验。
+
+**为什么重要**：上一轮 audit 自己引入虚假信息 → 下一轮 audit 又要重审 →
+信任度下降；本条等于 "audit 流程的 anchor test"。
+
+**来源**：2026-06-06 audit pass 3 (commit `5c2ea335` 后 immediate
+follow-up)。
