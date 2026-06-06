@@ -608,7 +608,17 @@ impl IdentifyController {
         // **Phase Q4** — CMIC = Controller Multi-Path I/O and NS Sharing
         // Capabilities (spec § 5.17.2.2 Figure 282)。bit 3 = ANAR (ANA Reporting
         // supported)。bit 0/1/2 是 multi-host / multi-port，教学版不支持留 0。
-        id.cmic = 0x08;
+        //
+        // **V-followup-interop-4** — Discovery Controller 必须**关 ANA bit**。
+        // Linux kernel drivers/nvme/host/multipath.c `nvme_mpath_init_identify`
+        // 见 CMIC.ANA=1 即跑 MNAN 校验：
+        //   if (!ctrl->max_namespaces || ctrl->max_namespaces > id->nn)
+        //       报 "Invalid MNAN value %u" reject
+        // Discovery NN=0 时此校验不可能通过 (MNAN=0 撞条件 1，MNAN>0 撞条件 2)。
+        // 唯一兼容做法 = 关 ANA (CMIC bit 3 = 0)，让整段 multipath_init 跳过。
+        // IO Controller (NN>=1) 时 MNAN=NN 即通过，保留 ANA=1 让 driver 看到
+        // 多路径能力。
+        id.cmic = if cntrltype == 0x02 { 0 } else { 0x08 };
         // ANA group / NSID 配置：教学单 ANA group 含全部 NS
         id.anacap = 0x0F; // optimized + non-opt + inaccessible + persistent loss states 都支持
         id.anagrpmax = 1; // 最多 1 ANA group
@@ -949,6 +959,26 @@ mod tests {
         assert!(ioccsz >= 4, "Discovery IOCCSZ >= 4");
         let msdbd = buf[1803];
         assert!(msdbd > 0, "Discovery MSDBD > 0");
+
+        // **V-followup-interop-4 regression** — Discovery Controller 必须**关
+        // CMIC.ANA** (bit 3)。否则 Linux kernel
+        // drivers/nvme/host/multipath.c::nvme_mpath_init_identify 跑 MNAN
+        // 校验，要求 `1 <= MNAN <= NN`；Discovery NN=0 时不可能满足。实测
+        // dmesg: 'Invalid MNAN value 1'。来源：WSL2 kernel 6.6.114 multipath.c
+        // 检查代码（已 fetch + verify）:
+        //     if (!ctrl->max_namespaces ||
+        //         ctrl->max_namespaces > le32_to_cpu(id->nn))
+        //         dev_err(... "Invalid MNAN value %u" ...);
+        //
+        // CMIC @ offset 76 (NVMe spec § 5.17.2.21 Figure 282)
+        let cmic = buf[76];
+        assert_eq!(
+            cmic & 0x08,
+            0,
+            "Discovery Controller CMIC.ANA (bit 3) 必须 = 0；\
+             否则 Linux mpath_init 触发 MNAN 校验 (NN=0 时不可能通过)。\
+             CMIC = {cmic:#04x}"
+        );
     }
 
     /// **V-followup-interop-3 regression gate** — MDTS advertised 必须与
