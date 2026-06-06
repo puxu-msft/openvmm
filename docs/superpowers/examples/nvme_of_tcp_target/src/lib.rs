@@ -59,6 +59,10 @@
 //!   `parse_host_secret` 参数校验 + 多 conn 共享 `Arc<ChapSecretStore>` +
 //!   主/discovery/TLS 三 accept loop 透传；AUTH_SEND/RECV PDU wire encode +
 //!   admin cmd gate 留 V-followup-dhchap-3-wire 后续 phase
+//! - **V-followup-dhchap-3-wire** ✅ AUTH_SEND/AUTH_RECV wire dispatch
+//!   (`handle_auth_recv_async` / `handle_auth_send_async`) + admin/IO cmd
+//!   gate (`stage.is_authenticated()` 否则 SC=0x83)；完整 host->target HMAC
+//!   challenge-response 闭环 e2e 通过
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

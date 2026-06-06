@@ -527,6 +527,16 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
                         self.handle_disconnect_async(cid, sqe).await?;
                         Ok(DispatchOutcome { disconnected: true })
                     }
+                    fctype::AUTH_RECV => {
+                        // **V-followup-dhchap-3-wire** — host pulls challenge
+                        self.handle_auth_recv_async(cid).await?;
+                        Ok(DispatchOutcome::default())
+                    }
+                    fctype::AUTH_SEND => {
+                        // **V-followup-dhchap-3-wire** — host submits HMAC response
+                        self.handle_auth_send_async(cid, &pdu.data).await?;
+                        Ok(DispatchOutcome::default())
+                    }
                     other => {
                         tracing::warn!(
                             fctype = other,
@@ -538,11 +548,34 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
                 }
             }
             crate::dispatch_plan::CapsuleKind::Admin { cid } => {
+                // **V-followup-dhchap-3-wire** — CHAP gate：启了 CHAP 且尚未通过
+                // 时拒所有 admin cmd（CHAP exchange 本身走 Fabric path 不到这）
+                if let Some(neg) = self.chap.as_ref()
+                    && !neg.stage.is_authenticated()
+                {
+                    tracing::warn!(
+                        stage = ?neg.stage,
+                        "V-followup-dhchap-3-wire admin cmd 拒：CHAP 尚未通过"
+                    );
+                    self.send_capsule_resp_err_async(cid, 0x83).await?;
+                    return Ok(DispatchOutcome::default());
+                }
                 let sqe = &pdu.psh[..64];
                 self.handle_admin_cmd_async(cid, sqe).await?;
                 Ok(DispatchOutcome::default())
             }
             crate::dispatch_plan::CapsuleKind::Io { cid } => {
+                // **V-followup-dhchap-3-wire** — 同 admin gate
+                if let Some(neg) = self.chap.as_ref()
+                    && !neg.stage.is_authenticated()
+                {
+                    tracing::warn!(
+                        stage = ?neg.stage,
+                        "V-followup-dhchap-3-wire IO cmd 拒：CHAP 尚未通过"
+                    );
+                    self.send_capsule_resp_err_async(cid, 0x83).await?;
+                    return Ok(DispatchOutcome::default());
+                }
                 let sqe = &pdu.psh[..64];
                 self.handle_io_cmd_async(cid, sqe).await?;
                 Ok(DispatchOutcome::default())
@@ -856,6 +889,77 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         write_pdu_async(&mut self.stream, &hdr, &psh, &[])
             .await
             .context("V8e-7-2 async write C2HTermReq")
+    }
+
+    /// **V-followup-dhchap-3-wire** — 处理 AUTH_RECV：host 来拉 challenge。
+    ///
+    /// 教学版简化 wire：
+    /// - host 发 capsule cmd fctype=AUTH_RECV，无 data
+    /// - target 抽 challenge（推进 `ChallengeNeeded -> ChallengeSent`）
+    /// - target 发 C2HData(challenge 32B) + CapsuleResp SC=0
+    ///
+    /// 状态非 `ChallengeNeeded` / 未启 CHAP / store 不含 host → SC=0x83
+    /// （AUTHENTICATION_REQUIRED）关 conn-style 错误响应。
+    async fn handle_auth_recv_async(&mut self, cid: u16) -> anyhow::Result<()> {
+        let neg = match self.chap.as_mut() {
+            Some(n) => n,
+            None => {
+                tracing::warn!("AUTH_RECV 拒：session 未 enable_chap");
+                return self.send_capsule_resp_err_async(cid, 0x83).await;
+            }
+        };
+        let challenge = match neg.issue_challenge() {
+            Some(c) => c,
+            None => {
+                tracing::warn!(
+                    stage = ?neg.stage,
+                    "AUTH_RECV 拒：当前 state 不允许 issue_challenge"
+                );
+                return self.send_capsule_resp_err_async(cid, 0x83).await;
+            }
+        };
+        // 教学版：把 challenge 整段（32B）作 C2HData payload 一次发完
+        self.send_c2h_data_async(cid, &challenge).await?;
+        self.send_capsule_resp_ok_async(cid, 0).await
+    }
+
+    /// **V-followup-dhchap-3-wire** — 处理 AUTH_SEND：host 提交 HMAC response。
+    ///
+    /// 教学版简化 wire：
+    /// - host 发 capsule cmd fctype=AUTH_SEND，data 段 = HMAC-SHA256 response (32B)
+    /// - target 调 `verify_host_response`；通过 → CapsuleResp SC=0，state ->
+    ///   `Authenticated`；失败 → SC=0x83，state -> `Failed`
+    ///
+    /// data 段长度 ≠ 32B → SC=0x02 INVALID_FIELD。
+    async fn handle_auth_send_async(&mut self, cid: u16, data: &[u8]) -> anyhow::Result<()> {
+        let neg = match self.chap.as_mut() {
+            Some(n) => n,
+            None => {
+                tracing::warn!("AUTH_SEND 拒：session 未 enable_chap");
+                return self.send_capsule_resp_err_async(cid, 0x83).await;
+            }
+        };
+        if data.len() != crate::dhchap::HMAC_SHA256_LEN {
+            tracing::warn!(
+                got = data.len(),
+                expect = crate::dhchap::HMAC_SHA256_LEN,
+                "AUTH_SEND 拒：response 长度非法"
+            );
+            return self.send_capsule_resp_err_async(cid, 0x02).await;
+        }
+        let mut resp = [0u8; crate::dhchap::HMAC_SHA256_LEN];
+        resp.copy_from_slice(data);
+        let ok = neg.verify_host_response(&resp);
+        if ok {
+            tracing::info!("V-followup-dhchap-3-wire CHAP 通过");
+            self.send_capsule_resp_ok_async(cid, 0).await
+        } else {
+            tracing::warn!(
+                stage = ?neg.stage,
+                "V-followup-dhchap-3-wire CHAP 校验失败"
+            );
+            self.send_capsule_resp_err_async(cid, 0x83).await
+        }
     }
 
     // ============ V8e-7-3 admin / IO async dispatch + AER drain ============

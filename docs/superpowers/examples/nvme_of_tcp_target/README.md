@@ -468,6 +468,7 @@ spec § 8.13.5 的 in-band host authentication。当前 phase 已交付：
 | V-followup-dhchap-1 | HMAC-SHA256 算法构件（challenge / response / verify / secret store） |
 | V-followup-dhchap-2 | `ChapStage` / `ChapNegotiation` state machine + AsyncSession 集成 |
 | V-followup-dhchap-3 | bin CLI `--host-secret <NQN>=<HEX>` + 多 conn 共享 store |
+| V-followup-dhchap-3-wire | AUTH_SEND/RECV PDU dispatch + 完整 e2e + admin/IO cmd gate |
 
 ```bash
 nvme_of_tcp_target \
@@ -487,13 +488,27 @@ session 端行为：
   - 已知 host → `stage = ChallengeNeeded`
   - 未知 host → `stage = Failed`（CHAP 启用就必须可校验）
   - 空 store → `stage = Disabled`（兼容路径）
-- 当前 phase **不 gate admin/IO cmd**（避免不完整 wire 路径回归）；
-  `chap.stage` 仅作 telemetry / 测试观察用
+- **V-followup-dhchap-3-wire**: 已 gate admin / IO 命令：`stage.is_authenticated()`
+  否则返 SC=0x83。`Disabled` 视为已通过（兼容）
 
-后续 V-followup-dhchap-3-wire (TODO):
-- ❌ AUTH_SEND / AUTH_RECV PDU encode/decode
-- ❌ `dispatch_pdu_async` 内 AUTH 分支推进 `ChapNegotiation`
-- ❌ admin/IO cmd 入口 gate by `stage.is_authenticated()`
+### 教学版 wire 协议（简化）
+
+完整 spec § 8.13.5 是 4-message 协议（T_REQ / T_RESP / T_SUCC1 / T_FAIL），
+含 sub-protocol negotiation 字段。本教学版简化为 2-message：
+
+```
+host → target:  AUTH_RECV (fctype=0x06, 无 data)
+target → host:  C2HData(challenge 32B) + CapsuleResp SC=0
+host → target:  AUTH_SEND (fctype=0x05, data = HMAC-SHA256 response 32B)
+target → host:  CapsuleResp SC=0 (通过) / SC=0x83 (失败)
+```
+
+`response = HMAC-SHA256(secret, challenge || hostnqn || subnqn)` 防 cross-protocol replay。
+
+后续可演进 (留 V-followup-dhchap-4+ 后续 phase):
+- ❌ 完整 spec 4-message wire (T_REQ/T_RESP/T_SUCC1/T_FAIL + sub-protocol negotiation)
+- ❌ mutual auth (host 验 target)
+- ❌ ephemeral DH 增量 (forward secrecy)
 
 ### 教学/生产边界
 
