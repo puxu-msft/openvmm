@@ -88,6 +88,10 @@ pub mod session;
 pub mod tcp_transport;
 pub mod tls;
 pub mod tls_identity;
+/// **V-followup-tls-psk (TP-8011)** — NVMe TLS PSK 派生 (digest + HKDF-Expand-Label
+/// + identity 字符串)。deterministic crypto only — 实际注入 rustls 待 upstream
+/// external-PSK API。
+pub mod tls_psk;
 pub mod ttag;
 
 pub use async_session::AsyncSession;

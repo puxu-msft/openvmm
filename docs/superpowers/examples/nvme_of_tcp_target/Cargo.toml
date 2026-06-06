@@ -74,6 +74,9 @@ hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 hex = "0.4"
+# **V-followup-tls-psk (TP-8011)** — PSK digest 字符串需 Base64 (kernel
+# auth.c `nvme_auth_generate_digest` 用 base64_encode)。
+base64 = "0.22"
 
 [[bin]]
 name = "nvme_of_tcp_target"
