@@ -167,9 +167,29 @@ impl NvmeController {
                         } else {
                             self.namespaces.len() as u32
                         };
-                        IdentifyController::build_v2_bytes_with_cntrltype(
+                        let bytes = IdentifyController::build_v2_bytes_with_cntrltype(
                             self.vid, self.ssvid, nn, cntrltype,
-                        )
+                        );
+                        // **V-followup-interop-4 debug** — 真实 wire 关键字段 dump (用 offset_of! anchor)
+                        use core::mem::offset_of;
+                        use crate::cmd::SpecIdentifyController;
+                        let k = offset_of!(SpecIdentifyController, kas);
+                        let m = offset_of!(SpecIdentifyController, mnan);
+                        let n = offset_of!(SpecIdentifyController, nn);
+                        let i = offset_of!(SpecIdentifyController, ioccsz);
+                        tracing::debug!(
+                            cntrltype = format_args!("{:#04x}", bytes[offset_of!(SpecIdentifyController, cntrltype)]),
+                            cmic = format_args!("{:#04x}", bytes[offset_of!(SpecIdentifyController, cmic)]),
+                            mdts = bytes[offset_of!(SpecIdentifyController, mdts)],
+                            nn = u32::from_le_bytes(bytes[n..n+4].try_into().unwrap()),
+                            mnan = u32::from_le_bytes(bytes[m..m+4].try_into().unwrap()),
+                            kas = u16::from_le_bytes([bytes[k], bytes[k+1]]),
+                            ioccsz = u32::from_le_bytes(bytes[i..i+4].try_into().unwrap()),
+                            msdbd = bytes[offset_of!(SpecIdentifyController, msdbd)],
+                            discovery,
+                            "V-interop-4 Identify Ctrl wire bytes (offset_of! anchored)"
+                        );
+                        bytes
                     }
                     0x02 => {
                         // Active NSID list — 列所有已注册 NSID（spec § 5.15.1）。

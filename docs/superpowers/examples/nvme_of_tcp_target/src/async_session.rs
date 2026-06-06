@@ -1026,6 +1026,20 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         let mut sqe = Sqe::read_from_bytes(sqe_bytes)
             .map_err(|_| anyhow::anyhow!("V8e-7-3 admin SQE 不是 64 byte"))?;
 
+        let opc_dbg = (sqe.cdw0 & 0xff) as u8;
+        let cdw10_dbg = sqe.cdw10;
+        let cdw11_dbg = sqe.cdw11;
+        let cdw12_dbg = sqe.cdw12;
+        tracing::debug!(
+            opc = format_args!("{:#04x}", opc_dbg),
+            cid = format_args!("{:#06x}", cid),
+            cdw10 = format_args!("{:#010x}", cdw10_dbg),
+            cdw11 = format_args!("{:#010x}", cdw11_dbg),
+            cdw12 = format_args!("{:#010x}", cdw12_dbg),
+            discovery_mode = self.discovery_mode,
+            "V-interop-4 admin cmd seen"
+        );
+
         let state = self.state_snapshot();
 
         // V7 discovery 白名单
