@@ -146,14 +146,6 @@ where
     let h_type = pdu.header.pdu_type;
     let h_hlen = pdu.header.hlen;
     let h_plen = pdu.header.plen;
-    let h_flags = pdu.header.flags;
-    tracing::debug!(
-        pdu_type = format_args!("{:#x}", h_type),
-        hlen = h_hlen,
-        plen = h_plen,
-        flags = h_flags,
-        "V-followup-interop-1: handshake got first PDU"
-    );
     if h_type != pdu_type::ICREQ {
         anyhow::bail!(
             "V8e-3: expected ICReq (0x00), got pdu_type={:#x} hlen={} plen={}",
@@ -1025,20 +1017,6 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
 
         let mut sqe = Sqe::read_from_bytes(sqe_bytes)
             .map_err(|_| anyhow::anyhow!("V8e-7-3 admin SQE 不是 64 byte"))?;
-
-        let opc_dbg = (sqe.cdw0 & 0xff) as u8;
-        let cdw10_dbg = sqe.cdw10;
-        let cdw11_dbg = sqe.cdw11;
-        let cdw12_dbg = sqe.cdw12;
-        tracing::debug!(
-            opc = format_args!("{:#04x}", opc_dbg),
-            cid = format_args!("{:#06x}", cid),
-            cdw10 = format_args!("{:#010x}", cdw10_dbg),
-            cdw11 = format_args!("{:#010x}", cdw11_dbg),
-            cdw12 = format_args!("{:#010x}", cdw12_dbg),
-            discovery_mode = self.discovery_mode,
-            "V-interop-4 admin cmd seen"
-        );
 
         let state = self.state_snapshot();
 
