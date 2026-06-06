@@ -1,6 +1,6 @@
 # nvme_of_tcp_target
 
-**Phase V5d** — NVMe-over-Fabrics TCP target backed by
+**V-followup-dhchap-4d + V-followup-tls-psk (TP-8011) 全栈** — NVMe-over-Fabrics TCP target backed by
 [`pcie_remote_nvme_userspace`](../pcie_remote_nvme_userspace/) `NvmeController`。
 Linux ≥ 5.0 / Windows Server 2025 上的标准 `nvme-cli` 可通过
 `nvme connect -t tcp` 直接挂载并跑 IO。
@@ -13,37 +13,50 @@ Linux ≥ 5.0 / Windows Server 2025 上的标准 `nvme-cli` 可通过
 > - [tls-psk-survey.md](../../plans/2026-06-06-phase-v-followup-tls-psk-survey.md)
 >   — rustls external-PSK 调研 + 决策
 
-## Status
+## Status (2026-06-06)
 
-**当前进度：V5a/b/c/d 全部完成；admin + IO Read + IO Write 端到端 work。**
+**全栈生产就绪**: 306 lib + integration tests pass，clippy 0 warning。
 
-- ✅ V0 — controller lib+bin 拆分
-- ✅ V1 — PDU 编解码 + CRC32C digest + 同步 TCP framing
-- ✅ V2 — ICReq/ICResp 握手 + Fabric Connect / Property Get/Set
-- ✅ V3 — admin cmd (Identify / Get Log / Set Features) 闭环
-- ✅ V4a — wire layer (R2T / H2CData reassembler / TTAG allocator)
-- ✅ V4b — controller dma_read → R2T → H2CData (单段 ≤ 64 KiB)
-- ✅ V4c — MAXH2CDATA 分片 + 多 R2T 串行（admin path）
-- ✅ V5a — IO queue 安装 + Fabric Connect qid≥1 + dispatch 二分
-- ✅ V5b — IO Read 走 C2HData
-- ✅ V5c — IO Write 走 R2T/H2CData（含数据持久化验证）
-- ✅ **V5d — `main.rs` TcpListener 入口 + README + bin smoke test**
-- ⏳ V6 — AER delivery
-- ⏳ V7 — Discovery subsystem (Log Page 0x70)
-- ⏳ V8 — Multi-queue per session + 完整 Disconnect
+| Phase 组 | 状态 | 关键 commit |
+|---------|------|------------|
+| V0..V5 (PDU / framing / Fabric / Identify / IO Read+Write 闭环) | ✅ shipped | `fc0d43b0` (V5d) |
+| V5e1/2 (IO nlb 1→16) | ✅ shipped | `1ba2cd5e` |
+| V6 (AER delivery) | ✅ shipped | `c6e03aa6`..`d16f6ca0` |
+| V7 (Discovery Log Page 0x70) | ✅ shipped | `3f3b79b1`..`dcfec8ed` |
+| V8a/b/c/d/f (multi-conn / Disconnect / dual-listener) | ✅ shipped | `d801306c`..`5a009d48` |
+| V8e tokio refactor (KATO / AER Notify / 真并发) | ✅ shipped | `06a16176`..`eb04fcf4` |
+| V-followup-tls/mtls (TLS 1.3 + mTLS + NQN<->cert binding) | ✅ shipped | `0534be2a`..`ee820358` |
+| V-followup-auth (host NQN allowlist) | ✅ shipped | `1646ac35` |
+| V-followup-dhchap-1/2/3/3-wire (simplified HMAC-only CHAP) | ✅ shipped | (V-followup 段) |
+| V-followup-dhchap-4 + 4d (spec § 8.13.5 4-msg wire + multi-descriptor) | ✅ shipped | `eff95619` + `714029df` |
+| V-followup-prp-list (session-level chunking 16→256 LBA) | ✅ shipped | `2a4d734b` + `619f8d44` |
+| V-followup-tls-psk (TP-8011 deterministic crypto) | ✅ shipped | `43040427` |
+| V-interop-1..8 (真 Linux nvme-cli + Python harness) | ✅ shipped | 多 commit |
+| Linux nvme-cli plaintext discover + connect + IO 真互通 | ✅ verified | [LESSONS](../../plans/LESSONS.md) §14 |
+
+下一步 HIGH 优先 (见 [ROADMAP §1](../../plans/ROADMAP.md)):
+- real-host CHAP interop (跑真 Linux nvme-cli `--dhchap-secret`)
+- kernel-CI 五元组 anchor for `src/tls_psk.rs`
+- TLS PSK wire 注入 (等 rustls upstream external-PSK API)
 
 ## ⛔ Security warning
 
-**本 bin 无 TLS / 无 in-band auth (DH-HMAC-CHAP) / 无 host NQN 白名单**。
-任何能到达监听端口的 host 都能远程读写所有 `--backing-file` 内容。
+**默认 plaintext / 无 in-band auth / 无 host NQN 白名单**。可通过 CLI flag
+启用：
+- `--tls-listen` + `--tls-cert/--tls-key` → TLS 1.3 server-auth (V-followup-tls)
+- `+ --tls-client-ca` → mTLS 强制 client cert (V-followup-mtls)
+- `+ --tls-bind-nqn-to-cert` → NQN ↔ cert SAN/CN 绑定 (V-followup-auth-2)
+- `--allow-host-nqn <nqn>` → host NQN 白名单 (V-followup-auth)
+- `--host-secret <nqn>=<hex>` → DH-HMAC-CHAP (V-followup-dhchap)
 
+未配置 TLS / auth 时：
 - 默认 `--listen 127.0.0.1:4420` 只接受同机 connection
-- 非 loopback 地址（例 `0.0.0.0` / `192.168.x.x`）需显式 `--i-know-this-is-insecure`
-  才会启动；启动后 stderr 出 prominent WARN
+- 非 loopback 地址需显式 `--i-know-this-is-insecure` 才启动 + WARN
 - 生产 / 共享 LAN 部署务必加 IP 层 ACL / WireGuard / Tailscale 隧道
-- 教学 / 本机演示推荐保留默认 loopback
 
-V-followup 计划加 TLS 1.3 + DH-HMAC-CHAP。
+> **教学/生产边界**：DH-HMAC-CHAP HMAC-only (无 DH ephemeral)；TLS PSK 仅
+> deterministic crypto，rustls 注入待上游 (详 [tls-psk-survey](../../plans/2026-06-06-phase-v-followup-tls-psk-survey.md))。
+> 各 section 都标"教学版简化"或"教学/生产边界"段。
 
 ## Build & Run
 
@@ -143,22 +156,31 @@ sudo nvme list
 cargo test -p nvme_of_tcp_target --test aer_e2e
 ```
 
-V8 计划：timer-driven SMART threshold + 通过 ctrlc::set_handler 类机制让
-SIGUSR1 触发 inject_aen 用于 manual interop。
+> **2026-06-06 update**: V8e-4 已加 `aen_notify: Arc<Notify>` 让 inject_aen
+> 触发 < 10 ms 内 wake AsyncSession select；V8c 加 per-conn AER routing。
+> 真 SMART threshold timer 未实施 (低优先级)。手动测：见上面 `inject_aen`
+> 编程接口段。
 
-## V5 已知限制（V6+ 解除）
+## 当前已知限制 (剩余) — 2026-06-06 audit
 
-| 限制 | 原因 | 解除阶段 |
+> 原"V5 已知限制 V6+ 解除"表绝大多数已 ✅ 解除；以下是 *现状* 残留。
+
+| 限制 | 原因 | 解除路径 |
 |---|---|---|
-| 单 IO ≤ 8 KiB（nlb ≤ 16 @ LBADS=9，无 PI） | session sentinel scheme 教学版只支持 prp1+prp2 直接指针（≤ 8 KiB）；controller `bytes <= 2*NVME_PAGE_SIZE` 走 dual-PRP path。**session block FORMAT_NVM / NS_MANAGEMENT 防止 host 切换 NS 形状破坏此假设**（V5e-1-fix review H-1） | V5e-3（PRP list path → MDTS 上限）/ V8 PI support |
-| 单 backing file 同时仅 1 active connection | 教学版 controller 无 `Arc<Mutex<>>` 共享 | V8.5 |
-| **R-8 锁基于 path 字符串**：symlink/hardlink 别名指向同 inode 仍能绕过锁 | clippy 禁 `Path::canonicalize`；inode-based key 需 unix-specific fd metadata | V8（fd-based key 配合 controller 共享） |
-| 无 Discovery subsystem | 必须 `nvme connect -n nqn...`，不能 `connect-all` | V7 |
-| 无 TLS 1.3 / DH-HMAC-CHAP | spec § 8 独立模块 | V-followup |
-| 单 IO queue per session | per-qid 一 TCP conn（与 Linux nvme-tcp 真实行为一致） | V8 |
-| nlb > 1 单 IO → driver 自动拆 | 返 SC=0x18 SGL_DATA_LENGTH_INVALID 让 host 重发分片 | V5e |
-| 大块 IO 性能差 | 串行多 cmd，无 pipelining | V8 + tokio refactor |
-| Ctrl-C / SIGTERM graceful shutdown | 已通过 `ctrlc` crate 实现：flip running flag → accept loop 退 → 等 ≤ 2s in-flight worker drain → exit | V5d-fix-2 ✅ |
+| 单 IO ≤ 128 KiB (256 LBA) | session-level chunking (V-followup-prp-list) 透明 16→256 LBA；> 256 LBA SC=0x18 | future controller PRP-list path (见 [DECISIONS](../../plans/DECISIONS.md) ADR-006) |
+| TLS PSK 不能注入握手 | rustls 0.23 无 external-PSK API | 等 rustls upstream，见 [tls-psk-survey](../../plans/2026-06-06-phase-v-followup-tls-psk-survey.md) |
+| DH-HMAC-CHAP HMAC-only | 教学版无 DH ephemeral key exchange | V-spec-strict-mode (见 [ROADMAP §3](../../plans/ROADMAP.md)) |
+| `tls_psk.rs` self-consistent 测试 only | 缺 Linux kernel 真五元组 anchor | kernel probe module dump (ROADMAP §1 HIGH) |
+| `parse_negotiate` 多 protocol descriptor 已支持 (V-dhchap-4d) | — | — ✅ |
+| 单 backing file 真 multi-conn 已支持 (V8b `Arc<SharedControllerInner>`) | — | — ✅ |
+| Discovery subsystem 已支持 (V7) | — | — ✅ |
+| TLS + DH-HMAC-CHAP 已支持 (V-followup-tls / V-followup-dhchap-3+4) | — | — ✅ |
+| 单 IO queue per session 已扩到多 IO queue (V8 + V8e) | — | — ✅ |
+| 已 Ctrl-C / SIGTERM graceful shutdown | tokio::sync::watch shutdown | — ✅ |
+| ~~大块 IO 性能差~~ | V8e tokio + 透明 chunking 大幅改善；fio 实测见 V-interop-7 load_test.py | — ✅ |
+
+> 下方按 phase 分组的"## V6 AER" / "## V8e tokio" / "## TLS 教学开关" 等
+> 章节是 **enable / 使用文档**，不是 status；详细 status 见上表。
 
 ## 架构概览
 
@@ -528,16 +550,38 @@ target → host:  CapsuleResp SC=0 (通过) / SC=0x83 (失败)
 - ❌ wire 集成未完成（V-followup-dhchap-3-wire）
 - 生产建议同时启 TLS (V-followup-tls-3+) 防 plaintext challenge 泄漏
 
+> **2026-06-06 update**: DH-HMAC-CHAP wire 已落地两条：simplified (V-dhchap-3-wire)
+> + spec § 8.13.5 4-message (V-dhchap-4 + 4d 多 descriptor)，自动识别。
+> 详 [DECISIONS](../../plans/DECISIONS.md) ADR-005。
+
 ## 内部参考
 
-- 计划文档：[`../../plans/2026-06-04-phase-v-nvme-of-tcp.md`](../../plans/2026-06-04-phase-v-nvme-of-tcp.md)
-  + [V4 详细计划](../../plans/2026-06-05-phase-v4-detailed.md)
-  + [V5 详细计划](../../plans/2026-06-05-phase-v5-detailed.md)
-  + [V8 详细计划](../../plans/2026-06-06-phase-v8-detailed.md)
-  + [V8e tokio refactor 详细计划](../../plans/2026-06-06-phase-v8e-tokio-detailed.md)
-  + [V8e-7 dispatch 详细计划](../../plans/2026-06-06-phase-v8e-7-dispatch-detailed.md)
+**首选** (持续维护、动态更新):
+- [ROADMAP](../../plans/ROADMAP.md) — 短/中/长期 phase 列表 + 历史 phase 索引
+- [PRINCIPLES](../../plans/PRINCIPLES.md) — coding policy + reviewer prompt 模板
+- [LESSONS](../../plans/LESSONS.md) — 16 条踩坑教训
+- [DECISIONS](../../plans/DECISIONS.md) — 重大决策 ADR (7 条)
+
+**wire / 算法 reference** (新字段同步更新):
 - wire spec：[`../../specs/2026-06-04-nvme-tcp-wire-reference.md`](../../specs/2026-06-04-nvme-tcp-wire-reference.md)
+- TLS PSK 调研：[`../../plans/2026-06-06-phase-v-followup-tls-psk-survey.md`](../../plans/2026-06-06-phase-v-followup-tls-psk-survey.md)
+
+**历史 phase 计划** (已 SHIPPED，保留作设计记录；status banner 见各文件顶):
+- [V (NVMe-oF TCP 总)](../../plans/2026-06-04-phase-v-nvme-of-tcp.md)
+- [V4 detailed](../../plans/2026-06-05-phase-v4-detailed.md) /
+  [V5 detailed](../../plans/2026-06-05-phase-v5-detailed.md) /
+  [V6 detailed](../../plans/2026-06-06-phase-v6-detailed.md) /
+  [V7 short](../../plans/2026-06-06-phase-v7-short.md) /
+  [V8 detailed](../../plans/2026-06-06-phase-v8-detailed.md)
+- [V8e tokio detailed](../../plans/2026-06-06-phase-v8e-tokio-detailed.md) /
+  [V8e-7 dispatch detailed](../../plans/2026-06-06-phase-v8e-7-dispatch-detailed.md)
+- [V-followup-tls detailed](../../plans/2026-06-06-phase-v-followup-tls-detailed.md) /
+  [V-followup-prp-list detailed (SUPERSEDED)](../../plans/2026-06-06-phase-v-followup-prp-list-detailed.md)
+
+**Backend / Python harness**:
 - backend controller：[`../pcie_remote_nvme_userspace/README.md`](../pcie_remote_nvme_userspace/README.md)
+- Python interop harness：[`scripts/interop_py/`](scripts/interop_py/) (9 个 script，详 `scripts/interop_py/README.md`)
+- Integration tests 命名约定：见 [PRINCIPLES §10](../../plans/PRINCIPLES.md)
 
 ## 许可
 

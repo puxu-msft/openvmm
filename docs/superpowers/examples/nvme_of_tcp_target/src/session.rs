@@ -100,7 +100,8 @@ pub fn cq_sentinel(qid: u16) -> u64 {
 ///
 /// **review M-4 / H-1**：当前 hard-coded LBADS=9 + no PI 假设；session 已经
 /// block FORMAT_NVM / NS_MANAGEMENT (handle_admin_cmd 入口) 防止 host 切换
-/// NS 形状破坏此假设。V5e-3 加 PRP list 后再扩到更大 MDTS。
+/// NS 形状破坏此假设。V-followup-prp-list (session-level chunking) 已让 host
+/// 看到 256 LBA 上限；future controller PRP-list path 见 DECISIONS ADR-006。
 pub const V5_NLB_MAX: u32 = 16;
 
 /// **V-followup-prp-list** — host 端 IO 单 cmd 上限 (= MDTS 真实生效值)。
