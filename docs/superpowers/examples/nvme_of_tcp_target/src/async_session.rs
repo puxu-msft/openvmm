@@ -722,23 +722,40 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
                 self.set_kato(kato);
             }
         } else {
-            if !self.admin_connected {
-                return self
-                    .send_capsule_resp_err_async(cid, fabric_sc::CONNECT_INVALID_PARAM)
-                    .await;
+            // **V-followup-interop-2** — NVMe-oF fabric IO queue Connect。
+            // 与 PCIe 路径区别：fabric host **不** 发 `Create IO CQ`+`Create
+            // IO SQ` 双 admin cmd（那是 PCIe-only）；spec § 3.6 fabric IO
+            // queue 由 Connect (qid≥1) 直接创建。每条 IO queue = 独立 TCP
+            // 连接 + 独立 AsyncSession，所以 self.admin_connected 在 IO 端永
+            // 远 false（admin queue 是另一条 TCP）。
+            //
+            // 行为：
+            // 1. 不校验 self.admin_connected（per-session 字段对 fabric IO 无意义）
+            // 2. 强制 install controller-side IO CQ + SQ (force_install 容忍
+            //    重 Connect / overwrite)
+            // 3. session 端 io_queues 镜像加 Sq{connected=true}，让 IO cmd
+            //    dispatch_plan::CapsuleKind::Io 路径生效
+            let cq_sentinel = crate::session::cq_sentinel(qid);
+            let qsize = fields.sqsize as u32 + 1; // sqsize 是 0-based
+            {
+                let mut c = self.controller.controller.lock();
+                c.nvme_force_install_io_queue(qid, cq_sentinel, qsize);
             }
-            match self.io_queues.get_mut(&qid) {
-                Some(state @ crate::io_queue::IoQueueState::Sq { .. }) => {
-                    state.mark_connected();
-                    self.current_qid = qid;
-                }
-                _ => {
-                    tracing::warn!(qid, "V8e-7-2 Connect qid≥1 before Create IO SQ — reject");
-                    return self
-                        .send_capsule_resp_err_async(cid, fabric_sc::CONNECT_INVALID_PARAM)
-                        .await;
-                }
+            self.io_queues
+                .insert(qid, crate::io_queue::IoQueueState::new_cq(cq_sentinel));
+            // 立即 transit 到 Sq{connected=true}：fabric 把 CQ+SQ install 合一
+            self.io_queues
+                .insert(qid, crate::io_queue::IoQueueState::new_sq(qid));
+            if let Some(state) = self.io_queues.get_mut(&qid) {
+                state.mark_connected();
             }
+            self.current_qid = qid;
+            tracing::info!(
+                qid,
+                qsize,
+                cq_sentinel = format_args!("{:#x}", cq_sentinel),
+                "V-followup-interop-2 fabric IO queue auto-installed via Connect"
+            );
         }
         let cntlid = self.cntlid as u32;
         self.send_capsule_resp_ok_async(cid, cntlid).await

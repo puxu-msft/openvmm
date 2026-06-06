@@ -1211,6 +1211,41 @@ impl NvmeController {
         self.cqs.insert(0, cq);
     }
 
+    /// **V-followup-interop-2** — NVMe-oF fabric IO queue 自动 install。
+    ///
+    /// NVMe-oF spec § 3.6 IO queue 由 Fabric Connect (qid≥1) 创建，**不**
+    /// 走 PCIe-only 的 admin `Create IO CQ` + `Create IO SQ` 双 cmd 流程。
+    /// session 端 `handle_connect_async` 见 qid≥1 调本 API 一次性 install
+    /// 该 qid 对应的 CQ + SQ；wire 端 IO cmd 接下来按 PCIe 同路径 dispatch。
+    ///
+    /// - `qid`: 队列 ID (≥ 1；admin 用 [`Self::nvme_force_install_admin_cq`])
+    /// - `cq_base_gpa`: CQ sentinel GPA (session 端 `cq_sentinel(qid)`)
+    /// - `qsize`: 队列槽数 (与 host 的 sqsize+1 等价；NVMe-oF Connect.sqsize
+    ///   是 0-based)
+    pub fn nvme_force_install_io_queue(&mut self, qid: u16, cq_base_gpa: u64, qsize: u32) {
+        assert!(qid >= 1, "qid 0 是 admin，应用 nvme_force_install_admin_cq");
+        let cq = crate::regs::CompletionQueue {
+            base_gpa: cq_base_gpa,
+            size: qsize,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        };
+        self.cqs.insert(qid, cq);
+        let sq = crate::regs::SubmissionQueue {
+            base_gpa: 0, // fabric 路径 SQ base 无意义 (cmd 直接走 PDU dispatch)
+            size: qsize,
+            head: 0,
+            tail: 0,
+            cq_id: qid, // fabric IO queue：SQ 与 CQ 同 qid (1:1 pairing)
+        };
+        self.sqs.insert(qid, sq);
+    }
+
     /// **V8b** — 检查 admin CQ (cq_id=0) 是否已 install。
     /// session 端 multi-conn 共享时 cheap-check 避免重复 install。
     pub fn nvme_has_admin_cq(&self) -> bool {
