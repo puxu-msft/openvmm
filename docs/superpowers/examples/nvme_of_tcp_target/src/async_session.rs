@@ -124,6 +124,14 @@ pub struct AsyncSession<S: AsyncSessionStream = TokioStream> {
     /// 由 bin 端 mTLS handshake 完成后调 [`AsyncSession::bind_host_identities`]
     /// 注入；与 `host_nqn_allowlist` 是**且**关系（同时 enabled 时两关都过才能 Connect）。
     pub bound_host_identities: Option<std::collections::HashSet<String>>,
+    /// **V-followup-dhchap-2** — CHAP secret store（共享 across all conn）。
+    /// `None` = bin 未传 `--host-secret`（CHAP 完全 disabled）；`Some` = Connect
+    /// 后会构造 `ChapNegotiation` 并把 stage 放入 [`Self::chap`]。
+    pub chap_secret_store: Option<std::sync::Arc<crate::dhchap::ChapSecretStore>>,
+    /// **V-followup-dhchap-2** — per-session CHAP 协商状态。Connect 入口由
+    /// `chap_secret_store` 是否 Some 决定是否 init；非 None 时 admin/IO cmd 入口
+    /// 必须 `stage.is_authenticated()` 才放行。
+    pub chap: Option<crate::dhchap::ChapNegotiation>,
 }
 
 /// **V8e-3** — async 版 ICReq/ICResp handshake。语义与 sync
@@ -221,6 +229,8 @@ where
         pending_aers: Vec::new(),
         host_nqn_allowlist: None,
         bound_host_identities: None,
+        chap_secret_store: None,
+        chap: None,
     })
 }
 
@@ -256,6 +266,13 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
     /// `fabric_sc::CONNECT_INVALID_HOST` (0x84)。
     pub fn bind_host_identities(&mut self, identities: std::collections::HashSet<String>) {
         self.bound_host_identities = Some(identities);
+    }
+
+    /// **V-followup-dhchap-2** — 在 handshake 后注入 CHAP secret store。
+    /// 之后 Connect 内会按 store 是否含本 host NQN 决定走 `Authenticated` /
+    /// `Disabled` / `ChallengeNeeded` 路径。
+    pub fn enable_chap(&mut self, store: std::sync::Arc<crate::dhchap::ChapSecretStore>) {
+        self.chap_secret_store = Some(store);
     }
 
     /// **V8e-3 / V8e-4 / V8e-5** — async 主循环单次 tick。
@@ -636,6 +653,23 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             }
             self.admin_connected = true;
             self.current_qid = 0;
+            // **V-followup-dhchap-2** — Connect 成功后启动 CHAP 协商（若 store 已注入）。
+            // 注意：本 phase 不挂 AUTH wire dispatch；store 不为 None 时
+            // `chap.stage` 进入 `ChallengeNeeded` 但 V-dhchap-3 才有真 wire 路径
+            // 把它推进到 Authenticated。教学说明：用户启了 --host-secret 但没
+            // 跑到 V-dhchap-3 时会卡在 ChallengeNeeded，本 phase 暂不 gate
+            // admin/IO 命令（兼容性优先），只把 state 暴露出来供测试观察。
+            if let Some(store) = self.chap_secret_store.as_ref() {
+                self.chap = Some(crate::dhchap::ChapNegotiation::on_connect(
+                    std::sync::Arc::clone(store),
+                    cd.hostnqn_str(),
+                    cd.subnqn_str(),
+                ));
+                tracing::info!(
+                    stage = ?self.chap.as_ref().map(|c| &c.stage),
+                    "V-followup-dhchap-2 CHAP 协商初始化"
+                );
+            }
             // **V8e-5 / V8e-7-2** — KATO timer 在 admin Connect 成功后真 arm
             // （spec § 7.13；kato=0 disable）
             if kato > 0 {

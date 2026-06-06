@@ -51,6 +51,10 @@
 //! - **V-followup-dhchap-1** ✅ DH-HMAC-CHAP 算法 building block (HMAC-only)：
 //!   challenge / response 计算 / constant-time verify / secret store；wire
 //!   集成 (AUTH_SEND/RECV state machine) 留 V-followup-dhchap-2
+//! - **V-followup-dhchap-2** ✅ `ChapStage` / `ChapNegotiation` state machine
+//!   + AsyncSession 集成（`chap_secret_store` / `chap` 字段 + `enable_chap`
+//!   setter + Connect post-action 自动 init）；wire AUTH_SEND/RECV PDU
+//!   dispatch 留 V-followup-dhchap-3
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
