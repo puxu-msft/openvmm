@@ -79,6 +79,28 @@ auth / FAILURE2 from host)，对齐 lib test。
 **Why**：lib test 覆盖了，但 Python harness 缺；跨进程实证 wire 错误路径才能
 保 Linux nvme-cli 拿到正确 FAILURE1 diagnostic。
 
+### Phase X — 把项目搬出 openvmm 仓库 (MEDIUM-LARGE, 预计 1 week, 分 X1-X4 子段)
+
+**What**：把 `docs/superpowers/examples/*` 7 crates + 文档 + `vm/devices/pcie_remote_*`
+搬出 openvmm，作为独立仓库。openvmm 仅留 VTL2 device 部分。
+
+**Why**：教学项目独立有利于贡献者门槛 + CI 速度 + 文档/代码一体。
+
+**调研已完成**：见 [2026-06-06-phase-x-extract-from-openvmm-survey.md](2026-06-06-phase-x-extract-from-openvmm-survey.md)。
+结论：可行；耦合度比想象低 (7 example crate 早已 workspace `exclude`；
+真用到的 openvmm 内部 crate 只 4 个；推荐路径 C 换 tokio + vendor)。
+
+**Blockers**：
+- `pal_async` 是 OpenHCL VTL2 必须；用户态可换 tokio (`nvme_of_tcp_target` 已证)
+- workspace inheritance 让 git dep 单 crate 拉不下来；要么 git 整个 openvmm，
+  要么 vendor
+
+**Acceptance**：
+- X1: `nvme_of_tcp_target` 单 crate 试水 git dep
+- X2: pal_async → tokio (sdk + nvme userspace)
+- X3: 新 repo 立 + git filter-repo 抽 + vendor 完成
+- X4: openvmm 主仓只留 `vm/devices/pcie_remote_*` (or 也搬走)
+
 ## 2. 中期 (3-6 phase, 部分依赖上游)
 
 ### V-followup-tls-psk-rustls-wire (HIGH, depends rustls upstream)
@@ -176,6 +198,7 @@ storage 到真 PCIe NVMe device，把 nvme-of target 变成 NVMe-oF JBOD gateway
 | 2026-06-06-phase-v-followup-tls-detailed.md | ✅ SHIPPED — 已大幅超越 | TLS server-auth → mTLS + NQN binding + 完整 CHAP 全栈 |
 | 2026-06-06-phase-v-followup-prp-list-detailed.md | ⚠️ SUPERSEDED | 改走 session chunking；本文档原方案留给"future production PRP-list" |
 | 2026-06-06-phase-v-followup-tls-psk-survey.md | 📋 CURRENT | rustls external-PSK 调研 + 决策路径 A+C |
+| 2026-06-06-phase-x-extract-from-openvmm-survey.md | 📋 CURRENT | 外部化调研 + 决策推迟 (ADR-008) |
 
 **未来 phase plan 命名约定**：`YYYY-MM-DD-phase-<name>-<detailed|short|survey>.md`。
 - `detailed` = 落地实施细节 + 每段 sub-phase 拆解 + reviewer-pass 计划

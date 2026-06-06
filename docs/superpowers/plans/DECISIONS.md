@@ -146,6 +146,32 @@ NVMe-oF TCP。
 
 ---
 
+## ADR-008 — Phase X 外部化路径 C (换 tokio + vendor)，预设但不立即执行 (2026-06-06)
+
+**Context**：用户问"未来希望把 nvme 这些挪出本仓库"是否可行/方便。完成调研
+[2026-06-06-phase-x-extract-from-openvmm-survey.md](2026-06-06-phase-x-extract-from-openvmm-survey.md)：
+7 个 example crate 早是 workspace `exclude`，真正"借自 openvmm"只 4 个 crate
+(pal_async / vmsocket / nvme_spec / storage_string)。
+
+**Options**：
+- A: 全 git dep — workspace inheritance 让单 crate git dep fail，得 git 整 openvmm 64 K 行
+- B: vendor 小依赖 + fork pal_async minimal subset — 中等代价 + 持续追上游
+- C: 换 tokio + vendor 小依赖 — 大代价 (4-6 day) 但完全独立 + 长期低维护
+
+**Decision**：**预设路径 C，但不立即执行**。下个月跑 X1 试水 (`nvme_of_tcp_target` 单 crate)
+看 git dep 真实痛点，再定 B vs C。
+
+**Consequences**：
+- **现在不动**: 让用户专注 ROADMAP §1 HIGH 待办 (real-host CHAP interop / kernel-CI vector)
+- **新工作按"将来要搬"预设写**: 新 dep 优先 crates.io；避免新增 `mesh::*` use；
+  `pal_async` use 集中到少数文件 (易将来 swap)
+- **VTL2 path 必须保留 pal_async** (VTL2 paravisor 不能跑 tokio)；用户态路径可换
+- **新 repo 命名候选**: `pcie-userspace-toolkit` / `nvme-of-tcp-toolkit` 之类
+
+**Status**：调研完成，落地推迟。X1 试水时 revisit。
+
+---
+
 ## 加新 ADR 模板
 
 ```markdown
