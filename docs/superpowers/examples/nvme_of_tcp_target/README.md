@@ -5,6 +5,13 @@
 Linux ≥ 5.0 / Windows Server 2025 上的标准 `nvme-cli` 可通过
 `nvme connect -t tcp` 直接挂载并跑 IO。
 
+> **持续开发的三份顶层文档** (新加 phase 前必读):
+> - [ROADMAP.md](../../plans/ROADMAP.md) — 短/中/长期 phase 列表 (动态)
+> - [PRINCIPLES.md](../../plans/PRINCIPLES.md) — 不变约束 + coding policy
+> - [LESSONS.md](../../plans/LESSONS.md) — 踩过的坑 + 教训
+> - [tls-psk-survey.md](../../plans/2026-06-06-phase-v-followup-tls-psk-survey.md)
+>   — rustls external-PSK 调研 + 决策
+
 ## Status
 
 **当前进度：V5a/b/c/d 全部完成；admin + IO Read + IO Write 端到端 work。**
