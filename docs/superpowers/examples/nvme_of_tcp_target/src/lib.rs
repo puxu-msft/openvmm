@@ -116,6 +116,7 @@ pub use session::DISCOVERY_NQN;
 pub use session::MAXH2CDATA_BYTES;
 pub use session::NegotiatedIc;
 pub use session::PRP1_SENTINEL;
+pub use session::V_HOST_IO_NLB_MAX;
 pub use session::V2Session;
 pub use session::V5_NLB_MAX;
 pub use session::ic_handshake;

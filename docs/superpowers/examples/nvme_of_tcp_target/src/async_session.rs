@@ -1144,6 +1144,19 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
     }
 
     /// **V8e-7-3** — async 版 IO cmd dispatch（与 sync `handle_io_cmd` 1:1）。
+    ///
+    /// **V-followup-prp-list (session chunking)** — host nlb > V5_NLB_MAX 时
+    /// 不再 SC=0x18 reject；session 透明地把 IO 拆成 `ceil(N/V5_NLB_MAX)`
+    /// 个 sub-cmd 各走 V5e-2 dual-PRP 路径，串行发 R2T (Write) /
+    /// C2HData (Read)，最后给 host 单个 CapsuleResp。
+    ///
+    /// 优点：避开 controller PRP-list path 复杂性 (mixed read/write capture
+    /// 重构)；缺点：host 看到一条 IO，target 在 backing 上发了 N 个串行
+    /// dispatch — 单 host IO IOPS 受 N 倍延迟。教学版可接受；生产应做
+    /// 真 PRP-list 让 controller 一次 dispatch 多 page。
+    ///
+    /// 单 cmd 上限受 spec MDTS 限制；当前 advertised MDTS=5 → 256 LBA = 128 KiB
+    /// (与 V_HOST_IO_NLB_MAX 一致)。
     async fn handle_io_cmd_async(&mut self, cid: u16, sqe_bytes: &[u8]) -> anyhow::Result<()> {
         use crate::dispatch_plan::{IoNlbDecision, decide_io_nlb_check, prp2_sentinel_for_nlb};
         use pcie_remote_nvme_userspace::cmd::Sqe;
@@ -1163,12 +1176,30 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             ),
         };
 
-        // NLB + dual-PRP sentinel 决策
-        match decide_io_nlb_check(&sqe) {
-            IoNlbDecision::OverMax { nlb_real } => {
-                tracing::warn!(opc = (sqe.cdw0 & 0xff) as u8, nlb_real, "V5e-2 nlb>MAX");
+        let opc = (sqe.cdw0 & 0xff) as u8;
+        let nlb_real = (sqe.cdw12 & 0xffff) + 1;
+        let is_rw = matches!(opc, 0x01 | 0x02);
+
+        // **V-followup-prp-list session chunking** — host nlb > V5_NLB_MAX 时
+        // 拆 sub-cmd 并对 V_HOST_IO_NLB_MAX (= MDTS) 真值上限校验
+        if is_rw && nlb_real > crate::V5_NLB_MAX {
+            if nlb_real > crate::V_HOST_IO_NLB_MAX {
+                tracing::warn!(
+                    opc,
+                    nlb_real,
+                    cap = crate::V_HOST_IO_NLB_MAX,
+                    "V-followup-prp-list: nlb > MDTS cap, reject SC=0x18"
+                );
                 return self.send_capsule_resp_err_async(cid, 0x18).await;
             }
+            return self
+                .handle_io_cmd_chunked_async(cid, sqe, sq_id, cq_id, opc, nlb_real)
+                .await;
+        }
+
+        // NLB + dual-PRP sentinel 决策 (≤ V5_NLB_MAX 单 dispatch)
+        match decide_io_nlb_check(&sqe) {
+            IoNlbDecision::OverMax { .. } => unreachable!("已上面分流"),
             IoNlbDecision::Ok { nlb_real } => {
                 sqe.prp2 = prp2_sentinel_for_nlb(nlb_real);
             }
@@ -1186,6 +1217,208 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         };
         self.run_post_dispatch_async(cid, immediate_cqe, tcp_t)
             .await
+    }
+
+    /// **V-followup-prp-list session chunking** — 大 IO 拆 sub-cmd。
+    ///
+    /// 把 nlb_real 拆成 ⌈nlb/V5_NLB_MAX⌉ 个 sub-cmd:
+    /// - 每个 sub-cmd 用 unique sub-cid 让 controller 不撞 (host 的 cid 复用 OK)
+    /// - 每个 sub-cmd 走 controller V5e-2 dual-PRP 单 dispatch
+    /// - Read: 每 sub-cmd 收 controller 写 captured data → 我们发 1 个 C2HData
+    /// - Write: 每 sub-cmd controller 要 dma_read → 走 R2T 三段式
+    /// - 最后一个 sub-cmd 完成后用其 CQE 反给 host (cid 改回 host 的)
+    ///
+    /// 这避开了控制器 PRP-list path (mixed read/write capture 复杂度)，但
+    /// 单 host IO 拆 N 次 dispatch — IOPS 降 N 倍。教学版可接受。
+    async fn handle_io_cmd_chunked_async(
+        &mut self,
+        cid: u16,
+        original_sqe: pcie_remote_nvme_userspace::cmd::Sqe,
+        sq_id: u16,
+        cq_id: u16,
+        opc: u8,
+        nlb_real: u32,
+    ) -> anyhow::Result<()> {
+        use crate::dispatch_plan::prp2_sentinel_for_nlb;
+        let chunk_max = crate::V5_NLB_MAX;
+        let num_chunks = nlb_real.div_ceil(chunk_max);
+        let slba = original_sqe.cdw10 as u64 | ((original_sqe.cdw11 as u64) << 32);
+
+        tracing::info!(
+            cid,
+            opc,
+            nlb_real,
+            num_chunks,
+            slba,
+            "V-followup-prp-list: chunked IO dispatch start"
+        );
+
+        let mut _last_sc: u8 = 0;
+        for chunk_idx in 0..num_chunks {
+            let chunk_lba_off = chunk_idx * chunk_max;
+            let chunk_nlb = chunk_max.min(nlb_real - chunk_lba_off);
+            let chunk_slba = slba + chunk_lba_off as u64;
+
+            // 构造 sub-SQE
+            let mut sub_sqe = original_sqe;
+            sub_sqe.cdw10 = (chunk_slba & 0xffff_ffff) as u32;
+            sub_sqe.cdw11 = ((chunk_slba >> 32) & 0xffff_ffff) as u32;
+            sub_sqe.cdw12 = (sub_sqe.cdw12 & !0xffff) | (chunk_nlb - 1); // 0-based
+            sub_sqe.prp2 = prp2_sentinel_for_nlb(chunk_nlb);
+
+            let mut tcp_t =
+                crate::tcp_transport::TcpAdminTransport::new_with_token_base(self.next_token);
+            let immediate_cqe = {
+                let mut c = self.controller.controller.lock();
+                let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                c.nvme_io_dispatch(&mut ctx, sq_id, sub_sqe, cid, cq_id)
+            };
+
+            // 复用 V8e-7-3 R2T 三段式 + data emit。**关键**: 不让最终 CQE 反给
+            // host (拦截掉 capsule_resp emit 由 chunked driver 控制)。
+            // run_post_dispatch_async 内部会发 capsule resp；为了 chunked 模式
+            // 我们手动跑 phase 2 (R2T) + phase 3 (post_cqe) + phase 4 (data emit)
+            // 但跳过 capsule resp emit。
+            let chunk_sc = self
+                .run_post_dispatch_chunked_async(
+                    cid,
+                    immediate_cqe,
+                    tcp_t,
+                    /*emit_capsule_resp*/ chunk_idx == num_chunks - 1,
+                )
+                .await?;
+            if chunk_sc != 0 {
+                _last_sc = chunk_sc;
+                // 早 fail：剩余 sub-cmd 不发；emit 最终 err resp
+                self.send_capsule_resp_err_async(cid, chunk_sc).await?;
+                tracing::warn!(
+                    cid,
+                    chunk_idx,
+                    chunk_sc = format_args!("{:#x}", chunk_sc),
+                    "V-prp-list chunked sub-cmd fail; abort"
+                );
+                return Ok(());
+            }
+        }
+        tracing::debug!(cid, num_chunks, "V-prp-list chunked done");
+        Ok(())
+    }
+
+    /// **V-followup-prp-list** — chunked 版本的 run_post_dispatch_async。
+    ///
+    /// 与 [`Self::run_post_dispatch_async`] 区别：
+    /// - 不 emit CapsuleResp (chunked 完成后 caller 决定)
+    /// - 仍 emit C2HData / R2T (每 chunk 自身的 wire effect 必须发)
+    /// - 返 chunk 的 SC byte (0 = OK，非 0 = err，caller 短路)
+    async fn run_post_dispatch_chunked_async(
+        &mut self,
+        cid: u16,
+        immediate_cqe: Option<pcie_remote_nvme_userspace::cmd::Cqe>,
+        mut tcp_t: crate::tcp_transport::TcpAdminTransport,
+        emit_capsule_resp: bool,
+    ) -> anyhow::Result<u8> {
+        // 走 run_post_dispatch_async 大部分逻辑，但 phase 5 emit 时按 flag 决定
+        let dispatch_data_writes = tcp_t
+            .writes
+            .iter()
+            .filter(|w| w.gpa < crate::CQ_BASE_GPA)
+            .count();
+        let dispatch_pending_reads = tcp_t.pending_reads.len();
+        if dispatch_data_writes > 0 && dispatch_pending_reads > 0 {
+            anyhow::bail!(
+                "V-prp-list chunked: chunk produced both data_write ({}) and dma_read ({})",
+                dispatch_data_writes,
+                dispatch_pending_reads
+            );
+        }
+        let had_pending_reads = dispatch_pending_reads > 0;
+
+        // Phase 2: dma_read 闭环走 R2T 三段式
+        let mut cmd_cumulative_offset: u32 = 0;
+        while let Some(read_req) = tcp_t.pop_read() {
+            let bytes = self
+                .dma_read_via_r2t_async(cid, cmd_cumulative_offset, read_req.len)
+                .await
+                .with_context(|| {
+                    format!(
+                        "V-prp-list chunked dma_read failed (cid={cid}, token={tok}, len={l}, offset={off})",
+                        tok = read_req.token,
+                        l = read_req.len,
+                        off = cmd_cumulative_offset,
+                    )
+                })?;
+            cmd_cumulative_offset = cmd_cumulative_offset.saturating_add(read_req.len);
+            {
+                let mut c = self.controller.controller.lock();
+                let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                c.nvme_admin_complete_dma(&mut ctx, read_req.token, true, bytes);
+            }
+        }
+
+        // Phase 3: sync / async write-out
+        if let Some(cqe) = immediate_cqe {
+            let mut c = self.controller.controller.lock();
+            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            c.nvme_post_cqe(&mut ctx, cqe);
+        } else if !had_pending_reads {
+            let mut data_tokens = Vec::with_capacity(tcp_t.writes.len());
+            for w in tcp_t.writes.iter() {
+                if w.gpa >= crate::CQ_BASE_GPA {
+                    anyhow::bail!(
+                        "V-prp-list chunked: dispatch produced CQE write before on_dma_complete (gpa={:#x})",
+                        { w.gpa }
+                    );
+                }
+                data_tokens.push(w.token);
+            }
+            for tok in data_tokens {
+                let mut c = self.controller.controller.lock();
+                let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                c.nvme_admin_complete_dma(&mut ctx, tok, true, Vec::new());
+            }
+        }
+
+        self.next_token = tcp_t.token_high_water();
+
+        // Phase 4: drain captured.writes → data + cqe
+        let mut data_payload = Vec::new();
+        let mut cqe_bytes: Option<Vec<u8>> = None;
+        while let Some(w) = tcp_t.pop_write() {
+            if w.gpa >= crate::CQ_BASE_GPA {
+                if cqe_bytes.is_some() {
+                    anyhow::bail!("V-prp-list chunked: multiple CQE writes for single sub-cmd");
+                }
+                if w.data.len() != 16 {
+                    anyhow::bail!("captured CQE write len={} != 16", w.data.len());
+                }
+                cqe_bytes = Some(w.data);
+            } else {
+                if cqe_bytes.is_some() {
+                    anyhow::bail!(
+                        "V-prp-list chunked: data write after CQE write (gpa={:#x}, {}B)",
+                        { w.gpa },
+                        w.data.len()
+                    );
+                }
+                data_payload.extend_from_slice(&w.data);
+            }
+        }
+        let cqe_bytes = cqe_bytes
+            .ok_or_else(|| anyhow::anyhow!("V-prp-list chunked: controller did not produce CQE"))?;
+
+        // 解 CQE SC byte
+        let status = u16::from_le_bytes([cqe_bytes[14], cqe_bytes[15]]);
+        let sc = ((status >> 1) & 0xFF) as u8;
+
+        // Phase 5: emit C2HData (本 chunk 的 data 必须发) +
+        // (按 flag 决定是否 emit CapsuleResp)
+        if !data_payload.is_empty() {
+            self.send_c2h_data_async(cid, &data_payload).await?;
+        }
+        if emit_capsule_resp {
+            self.write_capsule_resp_bytes_async(&cqe_bytes).await?;
+        }
+        Ok(sc)
     }
 
     /// **V8e-7-3** — async run_post_dispatch（与 sync `run_post_dispatch`

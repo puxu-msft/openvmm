@@ -103,6 +103,12 @@ pub fn cq_sentinel(qid: u16) -> u64 {
 /// NS 形状破坏此假设。V5e-3 加 PRP list 后再扩到更大 MDTS。
 pub const V5_NLB_MAX: u32 = 16;
 
+/// **V-followup-prp-list** — host 端 IO 单 cmd 上限 (= MDTS 真实生效值)。
+/// 受 V5_NLB_MAX 限制每 chunk 8 KiB；这里 256 LBA = 128 KiB = 16 chunk。
+/// session 在 handle_io_cmd_async 内拆 sub-cmd，每 sub-cmd 走 V5e-2 dual-PRP。
+/// 256 LBA 与 spec MDTS=5 (2^5 page=128 KiB) 对齐。
+pub const V_HOST_IO_NLB_MAX: u32 = 256;
+
 /// **Phase V5e-2** — PRP1 sentinel 不变 (V3)；新加 PRP2 sentinel 让 controller
 /// 走 dual-PRP path 时 session 能识别第二段 dma_read/dma_write。
 /// 必须 < CQ_BASE_GPA 才能与 CQE write 区分。

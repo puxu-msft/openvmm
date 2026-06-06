@@ -352,17 +352,49 @@ async fn v8e7_3_io_read_nlb1_async_round_trip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn v8e7_3_io_nlb_over_max_async_rejected_sc18() {
+    // **V-followup-prp-list 后行为变更**: nlb 上限从 V5_NLB_MAX=16 提到
+    // V_HOST_IO_NLB_MAX=256 via session chunking。
+    // - 17..256 LBA: session 拆 sub-cmd, 应成功 (SC=0)
+    // - >256 LBA: 仍 SC=0x18 reject
     let backing = make_backing(1024 * 1024, 0);
     let shared = make_shared(backing.path());
     let (mut client, mut sess) = handshake_async(shared).await;
     set_up_qid1(&mut client, &mut sess).await;
-    // nlb=17 > V5_NLB_MAX=16
+    // nlb=17 现在应通过 (= V5_NLB_MAX+1, chunked into 16+1)
     let _ = sess
         .dispatch_pdu_async(build_io_read_pdu(0x0030, 1, 0, 17))
         .await
         .unwrap();
+    // chunked Read 发 2 个 C2HData (chunk 0: 16 LBA, chunk 1: 1 LBA) 然后 1 个 RSP
+    // 收掉前 2 个 C2HData
+    let p1 = read_pdu_async(&mut client).await.unwrap();
+    assert_eq!(
+        p1.header.pdu_type,
+        nvme_of_tcp_target::pdu::pdu_type::C2H_DATA
+    );
+    let p2 = read_pdu_async(&mut client).await.unwrap();
+    assert_eq!(
+        p2.header.pdu_type,
+        nvme_of_tcp_target::pdu::pdu_type::C2H_DATA
+    );
     let resp = read_pdu_async(&mut client).await.unwrap();
-    assert_eq!(sc_of(&resp.psh), 0x18, "nlb>MAX 应 SC=0x18");
+    assert_eq!(
+        sc_of(&resp.psh),
+        0,
+        "V-followup-prp-list: nlb=17 chunked 应通过 (SC=0)"
+    );
+
+    // > V_HOST_IO_NLB_MAX=256 应仍 reject
+    let _ = sess
+        .dispatch_pdu_async(build_io_read_pdu(0x0031, 1, 0, 257))
+        .await
+        .unwrap();
+    let resp = read_pdu_async(&mut client).await.unwrap();
+    assert_eq!(
+        sc_of(&resp.psh),
+        0x18,
+        "V-followup-prp-list: nlb=257 > V_HOST_IO_NLB_MAX 应 SC=0x18"
+    );
     drop(client);
 }
 

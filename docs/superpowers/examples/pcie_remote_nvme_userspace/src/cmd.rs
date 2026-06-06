@@ -525,15 +525,13 @@ impl IdentifyController {
         id.mn = ascii_padded::<40>(b"OpenHCL Userspace NVMe v2.0");
         id.fr = ascii_padded::<8>(b"v2.0    ");
         // MDTS = Maximum Data Transfer Size，2^MDTS * MPSMIN page (= 4 KiB)。
-        // **V-followup-interop-3 修复** — 之前 MDTS=5 (=128 KiB=256 LBA)
-        // 与 NVMe-oF 路径 `V5_NLB_MAX=16 LBA (=8 KiB)` 大幅不一致；Linux
-        // nvme-tcp 看 MDTS=5 按 128 KiB 发 IO，被 session 端反复 INVALID
-        // reject (`nlb>MAX` warn 一片)。dd 4K 通过但 block layer 大 prefetch
-        // / fio 多 jobs 都会撞墙。
-        // 8 KiB = 2 page → MDTS=1 (2^1 * 4 KiB)。这是教学版当前 NVMe-oF
-        // 路径真实上限；放大 MDTS 等价于 lying to host，触发 5xx KiB IO 后
-        // SC=0x18 INVALID_FIELD 灾难。生产版应支持多 PRP list 后再升 MDTS。
-        id.mdts = 1;
+        // **V-followup-prp-list** — 升回 MDTS=5 (= 128 KiB = 256 LBA @ LBADS=9)，
+        // 因为 session 端 (async_session.rs::handle_io_cmd_async) 已实现
+        // chunking：host 看到 > V5_NLB_MAX=16 LBA IO 时 session 拆 sub-cmd
+        // 各走 V5e-2 dual-PRP 路径。host 端无感，但 IOPS 受 N 倍 overhead；
+        // V-followup-prp-list-real-controller-path 阶段升级 controller PRP-list
+        // 后即可恢复单 dispatch。
+        id.mdts = 5;
         id.cntlid = 1;
         id.ver = NVME_VERSION_2_0;
         id.cntrltype = nvme_spec::ControllerType(cntrltype);
@@ -1006,12 +1004,14 @@ mod tests {
         );
     }
 
-    /// **V-followup-interop-3** — MDTS <= 1 (与 V5_NLB_MAX=16 LBA = 8 KiB 对齐)。
+    /// **V-followup-interop-3 / V-followup-prp-list** — MDTS 与 session 真实 cap 一致。
+    /// V-prp-list 后 session chunking 把 V_HOST_IO_NLB_MAX 提到 256 LBA = 128 KiB
+    /// = 32 page → MDTS=5。
     #[test]
     fn v_interop_3_mdts_matches_nvme_of_v5_nlb_max() {
         use core::mem::offset_of;
         let buf = IdentifyController::build_v2_bytes(0x1414, 0xc0de, 1);
         let mdts = buf[offset_of!(SpecIdentifyController, mdts)];
-        assert!(mdts <= 1, "MDTS={mdts} 必须 <= 1");
+        assert_eq!(mdts, 5, "MDTS=5 (= 128 KiB = V_HOST_IO_NLB_MAX 256 LBA)");
     }
 }
