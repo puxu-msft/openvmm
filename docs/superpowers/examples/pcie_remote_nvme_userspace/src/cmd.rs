@@ -626,6 +626,34 @@ impl IdentifyController {
         id.awun = 255;
         id.awupf = 255;
         id.acwu = 0;
+        // **V-followup-interop-1** — Keep-Alive Support (spec § 5.17.2.21 byte
+        // 320-321)。Linux nvme-tcp host 在 `dmesg` 看到 KAS=0 时报
+        // "keep-alive support is mandatory for fabrics" 并 reject Connect。
+        // 单位 = 100ms 增量；10 = 1s 粒度（足够覆盖 driver 用 KATO=10s 等
+        // 主流配置）。
+        id.kas = 10;
+        // **V-followup-interop-1** — NVMe-oF mandatory fields (spec NVMe Base 2.0
+        // § 5.17.2.21, Fabrics-specific Identify Controller):
+        //   IOCCSZ = IO Queue Command Capsule Size (in 16B units). NVMe-oF
+        //   command capsule = 64B SQE + optional in-capsule data. host expects
+        //   ≥ 4 (= 64B SQE alone)。我们写 4 (= 64B SQE only) 让 driver 走标准
+        //   SGL/PRP transfer 路径（不用 in-capsule data）。
+        //   IORCSZ = IO Queue Response Capsule Size (16B units). 1 = 16B CQE only。
+        //   ICDOFF = In-Capsule Data Offset (16B units)。 0 = data 紧跟 SQE。
+        //   MSDBD = Maximum SGL Data Block Descriptors. Linux nvme-tcp 要求 > 0；
+        //   1 = 单 SGL data block (足够 PRP1 等价路径)。
+        //   FCATT = Fabrics Controller Attributes (bit 0=Dynamic ctlr, 留 0=Static)。
+        //   OFCS = Optional Fabric Commands Supported (bit 0=Disconnect)。
+        // SUBNQN 必填，且应与 Connect.SUBNQN 字符串相等 (spec § 5.17.2.21)。
+        id.ioccsz = 4; // 4 * 16B = 64B SQE only (no in-capsule data)
+        id.iorcsz = 1; // 1 * 16B = 16B CQE
+        id.icdoff = 0;
+        id.fcatt = 0;
+        id.msdbd = 1;
+        id.ofcs = 0x0001; // Disconnect supported
+        let subnqn_str = b"nqn.2014-08.org.nvmexpress:teaching:disk";
+        let n = subnqn_str.len().min(id.subnqn.len() - 1); // 保留 1 byte NUL
+        id.subnqn[..n].copy_from_slice(&subnqn_str[..n]);
         id.as_bytes().to_vec()
     }
 }
@@ -815,5 +843,94 @@ mod tests {
         assert_eq!(buf[111], 0x02, "explicit CNTRLTYPE = 0x02 (Discovery Controller)");
         // Discovery 也保留 spec layout: VID/SSVID/VER 等
         assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 0x1414);
+    }
+
+    /// **V-followup-interop-1 regression gate** — NVMe-oF mandatory + fabrics
+    /// fields completeness。Linux nvme-tcp `nvme_init_identify` 在
+    /// `drivers/nvme/host/core.c` 检查:
+    ///
+    /// - SUBNQN 非空 (否则 `missing or invalid SUBNQN field`)
+    /// - KAS > 0 for fabrics (否则 `keep-alive support is mandatory for fabrics`)
+    /// - IOCCSZ, IORCSZ, MSDBD 非 0
+    ///
+    /// 本测试锁定全部 fabrics-mandatory 字段的 spec offset + 非零，防止未来
+    /// 静默回归（spec 字段是 packed struct，offset 漂变 / 默认 zero-init 都
+    /// 在 wire 上看不见但 host 立即 reject）。
+    ///
+    /// Spec 参考：NVMe Base 2.0c § 5.17.2.21 (Identify Controller Data Structure)
+    /// Figure 312 / 313。
+    #[test]
+    fn v_interop_1_identify_controller_fabrics_fields_completeness() {
+        let buf = IdentifyController::build_v2_bytes(0x1414, 0xc0de, 1);
+        assert_eq!(buf.len(), 4096, "Identify Controller data 必须 4 KiB");
+
+        // KAS @ offset 320..322 (NVMe spec Figure 312)
+        let kas = u16::from_le_bytes([buf[320], buf[321]]);
+        assert!(
+            kas > 0,
+            "KAS 必须 > 0 否则 Linux nvme-tcp 报 'keep-alive support is mandatory for fabrics'，实际 = {kas}"
+        );
+
+        // SUBNQN @ offset 768..1024 (256B ASCII)
+        let subnqn_end = buf[768..1024].iter().position(|&b| b == 0).unwrap_or(256);
+        let subnqn = std::str::from_utf8(&buf[768..768 + subnqn_end])
+            .expect("SUBNQN 必须为合法 UTF-8");
+        assert!(
+            subnqn.starts_with("nqn."),
+            "SUBNQN 必须以 'nqn.' 开头，实际 = {subnqn:?}"
+        );
+        assert!(
+            !subnqn.is_empty(),
+            "SUBNQN 必须非空，否则 Linux nvme-tcp 报 'missing or invalid SUBNQN field'"
+        );
+
+        // Fabrics-specific fields @ offset 1792..1804
+        // ioccsz @ 1792..1796 (u32)
+        let ioccsz = u32::from_le_bytes(buf[1792..1796].try_into().unwrap());
+        assert!(ioccsz >= 4, "IOCCSZ 必须 >= 4 (≥ 64B SQE only)，实际 = {ioccsz}");
+
+        // iorcsz @ 1796..1800 (u32)
+        let iorcsz = u32::from_le_bytes(buf[1796..1800].try_into().unwrap());
+        assert!(iorcsz >= 1, "IORCSZ 必须 >= 1 (16B CQE)，实际 = {iorcsz}");
+
+        // icdoff @ 1800..1802 (u16)
+        let icdoff = u16::from_le_bytes([buf[1800], buf[1801]]);
+        assert_eq!(icdoff, 0, "ICDOFF 必须 = 0 (in-capsule data 紧跟 SQE)，实际 = {icdoff}");
+
+        // fcatt @ 1802 (u8)
+        let _fcatt = buf[1802]; // 允许 0 = Static controller
+
+        // msdbd @ 1803 (u8)
+        let msdbd = buf[1803];
+        assert!(msdbd > 0, "MSDBD 必须 > 0 否则 nvme-tcp reject SGL，实际 = {msdbd}");
+
+        // ofcs @ 1804..1806 (u16)
+        let ofcs = u16::from_le_bytes([buf[1804], buf[1805]]);
+        assert!(
+            ofcs & 0x0001 != 0,
+            "OFCS bit 0 (Disconnect) 必须 set，实际 = {ofcs:#06x}"
+        );
+
+        // CNTRLTYPE @ offset 111
+        assert_eq!(buf[111], 0x01, "默认 CNTRLTYPE = 0x01 (NVM IO Controller)");
+
+        // VID/SSVID/CNTLID/VER sanity
+        assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 0x1414);
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0xc0de);
+    }
+
+    /// 同上 regression gate，Discovery Controller 路径。Discovery 也走 fabrics
+    /// 路径，但 NN/IOCCSZ 等 IO 相关字段含义不同（spec § 5.1.4）；KAS / SUBNQN
+    /// / fabrics fields 仍 mandatory。
+    #[test]
+    fn v_interop_1_identify_discovery_controller_fabrics_fields_completeness() {
+        let buf = IdentifyController::build_v2_bytes_with_cntrltype(0x1414, 0, 0, 0x02);
+        assert_eq!(buf[111], 0x02, "Discovery Controller CNTRLTYPE = 0x02");
+        let kas = u16::from_le_bytes([buf[320], buf[321]]);
+        assert!(kas > 0, "Discovery 也必须 KAS > 0");
+        let ioccsz = u32::from_le_bytes(buf[1792..1796].try_into().unwrap());
+        assert!(ioccsz >= 4, "Discovery IOCCSZ >= 4");
+        let msdbd = buf[1803];
+        assert!(msdbd > 0, "Discovery MSDBD > 0");
     }
 }

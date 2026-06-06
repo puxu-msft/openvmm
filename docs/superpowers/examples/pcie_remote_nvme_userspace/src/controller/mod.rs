@@ -1189,6 +1189,28 @@ impl NvmeController {
         Ok(())
     }
 
+    /// **V-followup-interop-1** — 强制 (重新) install admin CQ；为 NVMe-oF
+    /// fabric session 在 CC.EN 0→1 后 controller `enable()` 会把 cqs[0]
+    /// 重置为 `self.acq = 0` (host fabric 路径不写 ACQ register)。session 端
+    /// 通过本 API 把 cqs[0] base_gpa 拍回 CQ_BASE_GPA sentinel。
+    ///
+    /// 与 [`Self::nvme_install_admin_cq`] 区别：本函数永远成功并覆盖，不返
+    /// `MismatchedParams`。
+    pub fn nvme_force_install_admin_cq(&mut self, base_gpa: u64, qsize: u32) {
+        let cq = crate::regs::CompletionQueue {
+            base_gpa,
+            size: qsize,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        };
+        self.cqs.insert(0, cq);
+    }
+
     /// **V8b** — 检查 admin CQ (cq_id=0) 是否已 install。
     /// session 端 multi-conn 共享时 cheap-check 避免重复 install。
     pub fn nvme_has_admin_cq(&self) -> bool {

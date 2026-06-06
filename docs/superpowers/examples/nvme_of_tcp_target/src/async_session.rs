@@ -143,10 +143,23 @@ where
 {
     // 1. recv ICReq
     let pdu = read_pdu_async(stream).await.context("V8e-3: read ICReq")?;
-    if pdu.header.pdu_type != pdu_type::ICREQ {
+    let h_type = pdu.header.pdu_type;
+    let h_hlen = pdu.header.hlen;
+    let h_plen = pdu.header.plen;
+    let h_flags = pdu.header.flags;
+    tracing::debug!(
+        pdu_type = format_args!("{:#x}", h_type),
+        hlen = h_hlen,
+        plen = h_plen,
+        flags = h_flags,
+        "V-followup-interop-1: handshake got first PDU"
+    );
+    if h_type != pdu_type::ICREQ {
         anyhow::bail!(
-            "V8e-3: expected ICReq, got pdu_type={:#x}",
-            pdu.header.pdu_type
+            "V8e-3: expected ICReq (0x00), got pdu_type={:#x} hlen={} plen={}",
+            h_type,
+            h_hlen,
+            h_plen
         );
     }
     let icreq: IcPsh = crate::pdu::decode_psh(&pdu.psh).context("V8e-3: decode ICReq PSH")?;
@@ -779,6 +792,26 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         };
         if !ok {
             return self.send_capsule_resp_err_async(cid, 0x02).await;
+        }
+        // **V-followup-interop-1 修复** — Linux nvme-tcp host 走 fabric path
+        // 不会写 ASQ/ACQ register (NVMe-oF spec § 3.6 admin queue 由 Fabric
+        // Connect 建立)，所以 CC.EN 0→1 触发的 `controller.enable()` 会把
+        // `cqs[0].base_gpa` 重置为 `self.acq = 0` (默认值)，导致 admin CQE
+        // 被 post 到 gpa=0 而非我们的 sentinel CQ_BASE_GPA → dispatch 拿不到
+        // CQE → "controller did not produce CQE for cmd" Err。
+        //
+        // 修复: 见 CC 写 + EN bit 时重 install admin CQ 到 CQ_BASE_GPA。
+        // CC 寄存器在 fabric 上仍可正常 read/write 给 host 做 polling，但
+        // admin CQ 实际 sentinel 永远是我们这个。
+        if ofst == fabric::property_offset::CC && (value as u32) & 0x1 != 0 {
+            let mut c = self.controller.controller.lock();
+            // **V-followup-interop-1** — `enable()` 用 `self.acq=0` 重置了
+            // cqs[0]，普通 `nvme_install_admin_cq` 见已存在 cq[0] (base=0)
+            // 会返 MismatchedParams 不替换。这里必须用 force_install 覆盖。
+            c.nvme_force_install_admin_cq(crate::CQ_BASE_GPA, crate::ADMIN_CQ_SIZE);
+            tracing::debug!(
+                "V-followup-interop-1 CC.EN=1 后 force-reinstall admin CQ at CQ_BASE_GPA"
+            );
         }
         self.send_capsule_resp_ok_async(cid, 0).await
     }
