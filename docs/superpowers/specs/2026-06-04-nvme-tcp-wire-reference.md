@@ -1,5 +1,7 @@
 # NVMe TCP Transport + Fabric Commands — Byte-Level Reference
 
+> **📖 EVERGREEN (2026-06-06 audit)** — wire 字节级权威；Phase V / V-followup 所有 wire 实现以本文为准。新 spec 字段或 layout 修正 (V-interop-5/6 / 9 个 wire blocker 教训) **应同步更新本文**，并配 [LESSONS.md](../plans/LESSONS.md) §1 `offset_of!` anchor test。
+
 > 由 subagent fetch Linux `nvme-tcp.h` + SPDK `nvmf_spec.h` 整合，作为
 > Phase V (NVMe-oF TCP target) 实现的唯一参考。
 

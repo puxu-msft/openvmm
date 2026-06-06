@@ -1,5 +1,9 @@
 # Phase T — Transport Abstraction
 
+> **✅ SHIPPED (2026-06-06 audit)** — `trait Transport` 已抽出并由 vsock/vfio-user/in-process 三 backend 实现；Phase U（vfio-user）+ Phase V (NVMe-oF TCP) 都基于本 abstraction 落地。本文档保留为历史 design 记录。
+>
+> 后续开发请参考：[ROADMAP.md](ROADMAP.md) / [PRINCIPLES.md](PRINCIPLES.md) / [LESSONS.md](LESSONS.md)。
+
 > **Status:** planning（已 review，准备执行）
 > **Date:** 2026-06-04
 > **Prereq:** Phases A–S 已完成（67 NVMe tests / 8 SDK tests baseline）

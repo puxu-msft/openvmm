@@ -1,5 +1,7 @@
 # Phase U — vfio-user Backend
 
+> **✅ SHIPPED (2026-06-06 audit)** — `pcie_vfio_user_sdk` crate 落地 (U1-U5)，NVMe controller behind vfio-user 接 QEMU 模式跑通 (commit `2d284030` Phase U-followup)。同时 `docs/superpowers/specs/2026-06-05-vfio-user-client-design.md` 走了 round-2 reviewer 收敛 14 条 caveat (`9b2e1dca`)。本文档保留为历史 design 记录。
+
 > **Status:** design draft（执行前再细化）
 > **Date:** 2026-06-04
 > **Prereq:** Phase T（`trait Transport` 抽出）

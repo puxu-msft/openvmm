@@ -1,5 +1,7 @@
 # PCIe Remote 实施进度日志
 
+> **🔼 2026-06-06 audit**: 本日志覆盖 PCIe Remote v1/v2 实施 (2026-05-29 → 2026-05-31)，最终里程碑是 Phase 10 完成 + 真 Hyper-V e2e 验证。之后项目延伸到 Phase T → U → V (NVMe-oF TCP target) + V-followup-tls/auth/dhchap 系列；这些**不在本日志**，最新坐标见 [plans/ROADMAP.md](plans/ROADMAP.md) §0。本日志保留为 PCIe Remote 阶段实施实录。
+
 > 这是 Claude 无人值守实施会话的实时进度日志。
 
 ## 会话信息

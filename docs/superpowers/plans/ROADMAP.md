@@ -154,3 +154,31 @@ storage 到真 PCIe NVMe device，把 nvme-of target 变成 NVMe-oF JBOD gateway
   写 one-liner pointer；删 todo
 - **新发现 phase**：写在合适优先段（短期/中期/长期），不堆"杂项"
 - **废弃 phase**：strikethrough 不删，留 rationale 句
+
+## 6. 历史 phase plan 索引 (2026-06-06 audit)
+
+所有 `2026-XX-YY-phase-*.md` 文档顶都加了状态 banner。一览：
+
+| Plan 文件 | 状态 | 备注 |
+|----------|------|------|
+| 2026-05-29-pcie-remote-impl.md | ✅ SHIPPED | PCIe Remote v2 (2026-05-30 已自标); 真 Linux KVM + Hyper-V e2e 通 |
+| 2026-06-04-phase-t-transport-abstraction.md | ✅ SHIPPED | `trait Transport` 抽出，3 backend |
+| 2026-06-04-phase-u-vfio-user.md | ✅ SHIPPED | U1-U5 + U-followup QEMU 接管模式 |
+| 2026-06-04-phase-v-nvme-of-tcp.md | ✅ SHIPPED — 已大幅超越 | non-goals (TLS/CHAP) 全实现 |
+| 2026-06-05-phase-v4-detailed.md | ✅ SHIPPED | V4a/b/c (R2T / H2CData / SGL) |
+| 2026-06-05-phase-v5-detailed.md | ✅ SHIPPED | V5a-d + V5e1/2 + V-followup-prp-list 进一步提到 256 LBA |
+| 2026-06-06-phase-v6-detailed.md | ✅ SHIPPED | V6a/b/c AER |
+| 2026-06-06-phase-v7-short.md | ✅ SHIPPED | V7a/b/c-fix Discovery + V-interop 后续修 |
+| 2026-06-06-phase-v8-detailed.md | ✅ SHIPPED | V8a/b/c/d/f (V8e 分到 tokio plan) |
+| 2026-06-06-phase-v8e-tokio-detailed.md | ✅ SHIPPED | V8e-1..6 tokio runtime + Notify |
+| 2026-06-06-phase-v8e-7-dispatch-detailed.md | ✅ SHIPPED | V8e-7-1..4 dispatch + bin 纯 async |
+| 2026-06-06-phase-v-followup-tls-detailed.md | ✅ SHIPPED — 已大幅超越 | TLS server-auth → mTLS + NQN binding + 完整 CHAP 全栈 |
+| 2026-06-06-phase-v-followup-prp-list-detailed.md | ⚠️ SUPERSEDED | 改走 session chunking；本文档原方案留给"future production PRP-list" |
+| 2026-06-06-phase-v-followup-tls-psk-survey.md | 📋 CURRENT | rustls external-PSK 调研 + 决策路径 A+C |
+
+**未来 phase plan 命名约定**：`YYYY-MM-DD-phase-<name>-<detailed|short|survey>.md`。
+- `detailed` = 落地实施细节 + 每段 sub-phase 拆解 + reviewer-pass 计划
+- `short` = ≤ 100 行轻量 plan（如 V7-short）
+- `survey` = 调研 / 决策类（如 tls-psk-survey）
+
+落地后回本表加一行 + status icon (✅/⚠️/📋/❌)。

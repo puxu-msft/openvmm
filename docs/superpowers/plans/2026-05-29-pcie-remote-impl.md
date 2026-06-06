@@ -1,5 +1,7 @@
 # PCIe Remote 实施计划 v2
 
+> **✅ SHIPPED (2026-06-06 audit)** — 原 status (2026-05-30 v2) 仍准；本工程后续延伸到 vfio-user (Phase U) + NVMe-oF TCP (Phase V→V-followup-...)，详 [ROADMAP.md](ROADMAP.md) §0。本文档保留为 PCIe Remote 阶段权威设计记录。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 > **2026-05-30 STATUS：实施计划已全部完成。** Phase 1 ~ 10 落地完毕，

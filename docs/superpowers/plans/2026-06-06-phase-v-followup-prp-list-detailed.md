@@ -1,5 +1,7 @@
 # Phase V-followup-prp-list — Lift V5_NLB_MAX 上限 via PRP-list path
 
+> **⚠️ SUPERSEDED — 不按本文档做 (2026-06-06 audit)** — 本文档原计划走 session 端 multi-sentinel decode (改 controller PRP-list path)，最终改走 **session-level chunking** (16→256 LBA 透明分片) 路径，0 controller 改动；交付为 commits `2a4d734b` + `619f8d44`，5 anchor tests + Python io_size_sweep 12 场景 byte-equal。原 multi-sentinel 路径作为"future production PRP-list"留 TODO，需要时回看本文档的 §3.1+。当前路径成本 ≈ 200 LOC，本文档原方案 ≈ 500 LOC，**未来若做真 controller PRP-list path，本文档仍可作为起点**。
+
 > 日期：2026-06-06
 > 前置 HEAD：8b68c4cd (V-interop-7 全段完成)
 > 目标：让 NVMe-oF target 单 IO 突破 V5_NLB_MAX=16 LBA (8 KiB)，支持 ≥ 128 KiB

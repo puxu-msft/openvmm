@@ -1,6 +1,6 @@
 # K-20: pcie_remote hotplug 设计草案 (v2)
 
-> **状态**：v2 设计文档，未实施。spec §10 K-20 标 P2·部署，"v1 体验最大遗憾"。
+> **状态**：v2 设计文档，**未实施 (2026-06-06 仍未做)**。spec §10 K-20 标 P2·部署，"v1 体验最大遗憾"。后续主线已转 NVMe-oF TCP target / vfio-user，K-20 hotplug 优先级降低；若 PCIe Remote path 还需用，本文档作为起点。最新坐标 [plans/ROADMAP.md](plans/ROADMAP.md)。
 > v1 行为：listener 一次性 accept，handshake 完进 prepared_map，listener 退出；
 > 设备 Lost 后 terminal，host 重启无法恢复。
 

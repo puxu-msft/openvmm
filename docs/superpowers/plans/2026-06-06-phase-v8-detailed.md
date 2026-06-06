@@ -1,5 +1,7 @@
 # Phase V8 详细实施计划 — 多 conn 共享 controller / Disconnect 真清 / Builder + multi-portal / 单 bin 双 listener
 
+> **✅ SHIPPED (2026-06-06 audit)** — V8a/b/c/d/f 五段全段落地 (commits `d801306c` → `5a009d48`)；124 tests + clippy 0；8 轮 reviewer C-1/C-2/H-1..H-4/M-1..M-3 全修。原文档预期的 V8e 部分被新文档 [2026-06-06-phase-v8e-tokio-detailed.md](2026-06-06-phase-v8e-tokio-detailed.md) 接走（tokio runtime 重构）。本文档保留为 V8 主体设计记录。
+
 > **Status:** design draft
 > **Date:** 2026-06-06
 > **Branch:** `feat/pcie-remote-experimental`

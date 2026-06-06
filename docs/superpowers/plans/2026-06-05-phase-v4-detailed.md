@@ -1,5 +1,7 @@
 # Phase V4 详细实施计划 — R2T / H2CData 循环 + SGL 完整化
 
+> **✅ SHIPPED (2026-06-06 audit)** — V4a/V4b/V4c 全段落地 (commits `f8ef8e48` / `ad594893` / `665ba1ec`)；64 tests + reviewer H-1/H-2 修。本文档保留为 design 记录。§9 V5 entrypoint hint 已被 V5a-d 系列吸收。
+
 > **Status:** design draft
 > **Date:** 2026-06-05
 > **Branch:** `feat/pcie-remote-experimental`

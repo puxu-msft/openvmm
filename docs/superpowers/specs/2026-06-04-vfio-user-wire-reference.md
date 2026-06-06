@@ -1,5 +1,7 @@
 # vfio-user 协议字节级参考（自调研 + libvfio-user header 验证）
 
+> **📖 EVERGREEN (2026-06-06 audit)** — wire 字节级权威；Phase U 全段 + U-followup QEMU 接管模式以本文为准。后续若加 Live Migration / 新 region type，**应同步更新本文**。
+
 > 由 general-purpose subagent 跨 fetch 三份权威源（libvfio-user `vfio-user.h` /
 > spec `.rst` / Linux `vfio.h`）后整合，作为 Phase U 实现的唯一参考。
 

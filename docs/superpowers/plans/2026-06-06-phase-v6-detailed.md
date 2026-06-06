@@ -1,5 +1,7 @@
 # Phase V6 详细实施计划 — AER (Async Event Request) 投递
 
+> **✅ SHIPPED (2026-06-06 audit)** — V6a/b/c 全段落地 (commits `c6e03aa6` → `d16f6ca0`)；97 tests + reviewer H-1/M-1/M-3/M-4 修；inject_aen API + select-style pump_one_with_events。V8c per-conn AER routing 进一步升级。本文档保留为 AER 初版设计记录。
+
 > **Status:** design draft
 > **Date:** 2026-06-06
 > **Branch:** `feat/pcie-remote-experimental`

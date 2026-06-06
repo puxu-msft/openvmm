@@ -1,5 +1,7 @@
 # vfio-user Client Backend — 设计 Spec
 
+> **✅ SHIPPED (2026-06-06 audit)** — 本 design 经 2 轮 reviewer (`9b2e1dca` round-2 合并 14 条 caveat)；OpenVMM client 侧已落地，本仓 NVMe demo 可作 server 让 QEMU 接管。Phase B (OpenHCL paravisor 侧) 未实施 — 留待 Hyper-V 真机 vfio-user 需要时再开。
+
 > 在 OpenVMM 内新增 *client*-side vfio-user backend，让任意外部 vfio-user
 > server（本仓 NVMe demo / SPDK / 未来其他）暴露的 PCIe 设备成为 guest 可见
 > 的普通 BDF。Linux/Windows guest 用 *inbox* driver 即可消费，不写一行新

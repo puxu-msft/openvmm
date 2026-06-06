@@ -1,5 +1,7 @@
 # Phase V5 详细实施计划 — IO Read/Write + bin 入口 + nvme-cli interop
 
+> **✅ SHIPPED (2026-06-06 audit)** — V5a/b/c/d 全段落地 (commits `81dbed8e` / `0d0f6559` / `fc0d43b0`)；79 tests + bin smoke 全过；V5e-1/V5e-2 把 IO nlb cap 提到 16 LBA (`2d1c1282` / `1ba2cd5e`)；后续被 V-followup-prp-list 进一步提到 256 LBA (透明 chunking)。本文档保留为初版 IO 路径设计记录。
+
 > **Status:** design draft
 > **Date:** 2026-06-05
 > **Branch:** `feat/pcie-remote-experimental`

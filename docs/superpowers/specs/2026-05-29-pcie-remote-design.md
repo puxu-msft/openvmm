@@ -1,5 +1,7 @@
 # OpenHCL / OpenVMM 远程 PCIe 实验设备：设计文档 (v3.1)
 
+> **✅ SHIPPED (2026-06-06 audit)** — v3.1 全部 P0 落地，真 Linux KVM + 真 Hyper-V e2e 验证通过 (2026-05-30/31)。后续工程演化 (Phase T 抽 Transport / Phase U vfio-user / Phase V NVMe-oF TCP)  见 [../plans/ROADMAP.md](../plans/ROADMAP.md)。本文档保留为 PCIe Remote 阶段权威设计 + §10 K-IDs 跟进表 (K-20 hotplug 仍未实施)。
+
 - **日期**：2026-05-29
 - **作者**：xp（与 Claude Code 共同设计）
 - **状态**：草案 v3.1（**3 轮独立 reviewer 评审完成；P0 全部收口；P1/P2 列入 §10 跟进**，可进入实施计划）

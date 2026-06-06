@@ -1,5 +1,7 @@
 # Phase V8e-7 详细实施计划 — AsyncSession 完整 admin/IO dispatch + bin 切纯 async
 
+> **✅ SHIPPED (2026-06-06 audit)** — V8e-7-1..V8e-7-4 全段落地 (commits `c84c3b54` → `eb04fcf4`)；192 active test + clippy 0；dispatch_plan 决策表 + AsyncSession fabric/admin/IO 完整 dispatch + R2T 三段式 + bin spawn_blocking 退役。本文档保留为 dispatch decision-table 设计记录。
+
 > **Status:** design draft
 > **Date:** 2026-06-06
 > **Branch:** `feat/pcie-remote-experimental`

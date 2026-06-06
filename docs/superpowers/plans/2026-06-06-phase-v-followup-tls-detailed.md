@@ -1,5 +1,7 @@
 # Phase V-followup TLS — NVMe-oF TCP target 加 TLS 1.3 wrap
 
+> **✅ SHIPPED — 含本文档外的扩展 (2026-06-06 audit)** — V-followup-tls-1..4 全段落地 (commits `0534be2a` → `995c8647`)；V-followup-mtls (`793240e8`) / V-followup-auth-1+2 (`ee820358`) / V-followup-dhchap-1..3-wire / V-followup-dhchap-4 + 4d (`eff95619`/`714029df`) 全栈完成；258+ tests reviewer-clean。原本文档只覆盖 TLS server-auth；之后延伸到 mTLS + NQN<->cert binding + DH-HMAC-CHAP 完整 4 子 phase + spec § 8.13.5 4-message wire。TP-8011 PSK 派生层 (tls_psk.rs) 已实现 deterministic crypto；rustls 注入待上游 (见 [tls-psk-survey](2026-06-06-phase-v-followup-tls-psk-survey.md))。本文档保留为 TLS 起步设计记录。
+
 > 日期：2026-06-06
 > Plan 作者：planner subagent
 > 前置 HEAD：`afb90654`（V8e-7 完成；197 active test，clippy 0 warning）
