@@ -1,0 +1,9 @@
+[project]
+name = "nvme_of_interop_py"
+version = "0.1.0"
+description = "Python interop harness for nvme_of_tcp_target — TLS / wire-level testing without sudo"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.uv]
+managed = true
