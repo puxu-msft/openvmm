@@ -53,8 +53,12 @@
 //!   集成 (AUTH_SEND/RECV state machine) 留 V-followup-dhchap-2
 //! - **V-followup-dhchap-2** ✅ `ChapStage` / `ChapNegotiation` state machine
 //!   + AsyncSession 集成（`chap_secret_store` / `chap` 字段 + `enable_chap`
-//!   setter + Connect post-action 自动 init）；wire AUTH_SEND/RECV PDU
-//!   dispatch 留 V-followup-dhchap-3
+//!     setter + Connect post-action 自动 init）；wire AUTH_SEND/RECV PDU
+//!     dispatch 留 V-followup-dhchap-3
+//! - **V-followup-dhchap-3** ✅ bin CLI `--host-secret <NQN>=<HEX>` 可重复 +
+//!   `parse_host_secret` 参数校验 + 多 conn 共享 `Arc<ChapSecretStore>` +
+//!   主/discovery/TLS 三 accept loop 透传；AUTH_SEND/RECV PDU wire encode +
+//!   admin cmd gate 留 V-followup-dhchap-3-wire 后续 phase
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

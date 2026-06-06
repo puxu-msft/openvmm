@@ -169,6 +169,32 @@ struct Cli {
     /// NQN；本白名单只挡 "拿错 NQN 配置" 类误用，**不是** 身份认证。
     #[arg(long = "allow-host-nqn")]
     allow_host_nqns: Vec<String>,
+    /// **V-followup-dhchap-3** 注册一对 `<HOST_NQN>=<HEX_SECRET>` 用于
+    /// DH-HMAC-CHAP (spec § 8.13.5) host->target 单向认证。HEX 解码后
+    /// 必须 ≥ 32 字节 (256-bit entropy)。可重复指定多 host。
+    ///
+    /// **本 phase 行为**: 一旦至少注册一个 secret，每条 conn handshake 完成
+    /// 后自动 `AsyncSession::enable_chap(store)`；Connect 完成自动初始化
+    /// `ChapNegotiation` (`stage = ChallengeNeeded` 已知 host / `Failed` 未知 /
+    /// `Disabled` 空 store)。AUTH_SEND/RECV PDU wire dispatch + admin cmd
+    /// gate 留 V-followup-dhchap-3-wire 后续 phase。
+    ///
+    /// **教学/生产边界**: HMAC-only 模式 (无 ephemeral DH)；建议同时启 TLS
+    /// (V-followup-tls-3+) 防 challenge 明文泄漏。
+    #[arg(long = "host-secret", value_parser = parse_host_secret)]
+    host_secrets: Vec<(String, Vec<u8>)>,
+}
+
+fn parse_host_secret(s: &str) -> Result<(String, Vec<u8>), String> {
+    let (nqn, hex_str) = s
+        .split_once('=')
+        .ok_or_else(|| format!("--host-secret 格式应为 <HOST_NQN>=<HEX_SECRET>，got {s:?}"))?;
+    if nqn.is_empty() {
+        return Err(format!("--host-secret HOST_NQN 不能为空: {s:?}"));
+    }
+    let bytes = nvme_of_tcp_target::dhchap::decode_secret(hex_str)
+        .map_err(|e| format!("--host-secret 解码失败 ({nqn}): {e:#}"))?;
+    Ok((nqn.to_string(), bytes))
 }
 
 fn parse_hex_u16(s: &str) -> Result<u16, String> {
@@ -530,6 +556,23 @@ async fn main() -> Result<()> {
             Some(std::sync::Arc::new(set))
         };
 
+    // **V-followup-dhchap-3** — CHAP secret store；多 conn 共享 Arc<...> clone。
+    // 空 = 完全 disabled (V-dhchap-2 兼容路径)。
+    let chap_store: Option<std::sync::Arc<nvme_of_tcp_target::dhchap::ChapSecretStore>> =
+        if cli.host_secrets.is_empty() {
+            None
+        } else {
+            let mut store = nvme_of_tcp_target::dhchap::ChapSecretStore::new();
+            for (nqn, secret) in &cli.host_secrets {
+                store.insert(nqn.clone(), secret.clone());
+            }
+            tracing::warn!(
+                count = store.len(),
+                "🔒 V-followup-dhchap-3 CHAP secret store 注入；已知 host 进入 CHAP 协商"
+            );
+            Some(std::sync::Arc::new(store))
+        };
+
     // **V8f / V8e-2** — 若 dual-listener 模式，先 spawn discovery accept loop
     // （独立 tokio task），主 task 跑主 IO listener。两个 loop 共享 watch
     // shutdown channel，SIGINT 同时停。
@@ -550,6 +593,7 @@ async fn main() -> Result<()> {
                 max_conn,
                 "discovery",
                 host_nqn_allowlist.clone(),
+                chap_store.clone(),
             )))
         } else {
             drop(shutdown_rx_disc);
@@ -579,6 +623,7 @@ async fn main() -> Result<()> {
                 max_conn,
                 host_nqn_allowlist.clone(),
                 bind_nqn_to_cert,
+                chap_store.clone(),
             )))
         } else {
             drop(shutdown_rx_tls);
@@ -595,6 +640,7 @@ async fn main() -> Result<()> {
         max_conn,
         "main",
         host_nqn_allowlist.clone(),
+        chap_store.clone(),
     )
     .await;
     let _ = shutdown_tx.send(true);
@@ -636,6 +682,7 @@ async fn main() -> Result<()> {
 /// 共用）。改 `tokio::net::TcpListener::accept().await` + `tokio::select!`
 /// 与 shutdown watch 多路复用；每条 conn `spawn_blocking` 把当前 sync
 /// `handle_conn` 跑在 blocking pool（V8e-3 后改 async `tokio::spawn`）。
+#[allow(clippy::too_many_arguments)]
 async fn run_accept_loop(
     listener: tokio::net::TcpListener,
     shared: nvme_of_tcp_target::SharedController,
@@ -644,6 +691,7 @@ async fn run_accept_loop(
     max_conn: usize,
     label: &'static str,
     host_nqn_allowlist: Option<std::sync::Arc<std::collections::HashSet<String>>>,
+    chap_store: Option<std::sync::Arc<nvme_of_tcp_target::dhchap::ChapSecretStore>>,
 ) -> Result<()> {
     let mut accept_backoff_ms: u64 = 0;
     loop {
@@ -692,6 +740,7 @@ async fn run_accept_loop(
         let shared_ctrl = Arc::clone(&shared);
         let shutdown_rx = shutdown_rx.clone();
         let allowlist = host_nqn_allowlist.clone();
+        let chap = chap_store.clone();
         // **V8e-7-4 reviewer M-1 + security LOW-3** — detach `tokio::spawn`
         // JoinHandle 但闭包内：
         //   1. `InflightGuard` RAII：drop 时无条件 fetch_sub（即使 future panic）
@@ -714,6 +763,7 @@ async fn run_accept_loop(
                 shared_ctrl,
                 shutdown_rx,
                 allowlist,
+                chap,
             ));
             let r = futures::FutureExt::catch_unwind(fut).await;
             match r {
@@ -756,6 +806,7 @@ async fn handle_conn_async(
     shared_ctrl: nvme_of_tcp_target::SharedController,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     host_nqn_allowlist: Option<std::sync::Arc<std::collections::HashSet<String>>>,
+    chap_store: Option<std::sync::Arc<nvme_of_tcp_target::dhchap::ChapSecretStore>>,
 ) -> Result<()> {
     let mut sess = if let Some(allow) = host_nqn_allowlist {
         nvme_of_tcp_target::accept_and_handshake_async_with_auth(stream, shared_ctrl, allow)
@@ -766,6 +817,9 @@ async fn handle_conn_async(
             .await
             .context("V8e-7-4 AsyncSession handshake")?
     };
+    if let Some(store) = chap_store {
+        sess.enable_chap(store);
+    }
     loop {
         let event = sess.pump_one_async(&mut shutdown_rx).await?;
         match event {
@@ -818,6 +872,7 @@ async fn run_accept_loop_tls(
     max_conn: usize,
     host_nqn_allowlist: Option<std::sync::Arc<std::collections::HashSet<String>>>,
     bind_nqn_to_cert: bool,
+    chap_store: Option<std::sync::Arc<nvme_of_tcp_target::dhchap::ChapSecretStore>>,
 ) -> Result<()> {
     let label = "tls";
     let mut accept_backoff_ms: u64 = 0;
@@ -862,6 +917,7 @@ async fn run_accept_loop_tls(
         let shutdown_rx = shutdown_rx.clone();
         let acceptor = acceptor.clone();
         let allowlist = host_nqn_allowlist.clone();
+        let chap = chap_store.clone();
         let _handle = tokio::spawn(async move {
             struct InflightGuard(Arc<AtomicUsize>);
             impl Drop for InflightGuard {
@@ -900,6 +956,7 @@ async fn run_accept_loop_tls(
                 shutdown_rx,
                 allowlist,
                 bind_nqn_to_cert,
+                chap,
             ));
             let r = futures::FutureExt::catch_unwind(fut).await;
             match r {
@@ -931,12 +988,14 @@ async fn run_accept_loop_tls(
 
 /// **V-followup-tls-3** — TLS conn handler；与 `handle_conn_async` 结构 1:1
 /// 等价，stream 类型由泛型 monomorphize 给 `TlsStream<TcpStream>`。
+#[allow(clippy::too_many_arguments)]
 async fn handle_conn_async_tls(
     stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     shared_ctrl: nvme_of_tcp_target::SharedController,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     host_nqn_allowlist: Option<std::sync::Arc<std::collections::HashSet<String>>>,
     bind_nqn_to_cert: bool,
+    chap_store: Option<std::sync::Arc<nvme_of_tcp_target::dhchap::ChapSecretStore>>,
 ) -> Result<()> {
     // **V-followup-auth-2** — 在交给 AsyncSession 前抽 leaf cert SAN/CN
     // identities（仅当 bind_nqn_to_cert + mTLS 拿到 peer certs 时）
@@ -985,6 +1044,9 @@ async fn handle_conn_async_tls(
     };
     if let Some(ids) = bound_ids {
         sess.bind_host_identities(ids);
+    }
+    if let Some(store) = chap_store {
+        sess.enable_chap(store);
     }
     loop {
         let event = sess.pump_one_async(&mut shutdown_rx).await?;

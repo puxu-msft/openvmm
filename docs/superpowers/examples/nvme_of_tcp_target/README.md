@@ -459,6 +459,52 @@ openssl x509 -req -in client.csr -CA client-ca.pem -CAkey client-ca.key \
 - ❌ 与 `--allow-host-nqn` 是**且**关系（同设两关都过才放行）；既要白名单也要
   cert binding 时建议把白名单装满"允许的 NQN"，cert binding 再挡假冒
 
+## DH-HMAC-CHAP 教学开关（V-followup-dhchap）
+
+spec § 8.13.5 的 in-band host authentication。当前 phase 已交付：
+
+| 子 phase | 范围 |
+|----------|------|
+| V-followup-dhchap-1 | HMAC-SHA256 算法构件（challenge / response / verify / secret store） |
+| V-followup-dhchap-2 | `ChapStage` / `ChapNegotiation` state machine + AsyncSession 集成 |
+| V-followup-dhchap-3 | bin CLI `--host-secret <NQN>=<HEX>` + 多 conn 共享 store |
+
+```bash
+nvme_of_tcp_target \
+    --listen 127.0.0.1:4420 \
+    --backing-file disk.img \
+    --host-secret nqn.host-a=ab12cd34ef56...    # >= 32B (256-bit) HEX
+```
+
+CLI 行为：
+- HEX 解码后必须 ≥ 32 字节（256-bit entropy），否则 hard-fail
+- 可重复指定多 host
+- 任一参数不合法 → 中文 stderr + exit != 0
+
+session 端行为：
+- 注册了 secret → 每条 conn handshake 后自动 `enable_chap(store)`
+- Connect 完成后初始化 `ChapNegotiation`：
+  - 已知 host → `stage = ChallengeNeeded`
+  - 未知 host → `stage = Failed`（CHAP 启用就必须可校验）
+  - 空 store → `stage = Disabled`（兼容路径）
+- 当前 phase **不 gate admin/IO cmd**（避免不完整 wire 路径回归）；
+  `chap.stage` 仅作 telemetry / 测试观察用
+
+后续 V-followup-dhchap-3-wire (TODO):
+- ❌ AUTH_SEND / AUTH_RECV PDU encode/decode
+- ❌ `dispatch_pdu_async` 内 AUTH 分支推进 `ChapNegotiation`
+- ❌ admin/IO cmd 入口 gate by `stage.is_authenticated()`
+
+### 教学/生产边界
+
+- ✅ HMAC-SHA256 transcript 含 (challenge || hostnqn || subnqn) 防 cross-replay
+- ✅ constant-time verify 防 timing leak
+- ✅ OsRng challenge nonce
+- ❌ HMAC-only 模式（无 ephemeral DH = 无 forward-secrecy）
+- ❌ host->target 单向（无 mutual auth；留 V-followup-dhchap-4）
+- ❌ wire 集成未完成（V-followup-dhchap-3-wire）
+- 生产建议同时启 TLS (V-followup-tls-3+) 防 plaintext challenge 泄漏
+
 ## 内部参考
 
 - 计划文档：[`../../plans/2026-06-04-phase-v-nvme-of-tcp.md`](../../plans/2026-06-04-phase-v-nvme-of-tcp.md)
