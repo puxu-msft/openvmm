@@ -741,12 +741,19 @@ impl NvmeController {
                 // NVMe spec § 5.16 Get Log Page。CDW10 bits 7:0 = LID
                 // (log page identifier)，bits 31:16 = NUMDL (number of
                 // dwords lower, zero-based)。CDW11 高 16 = NUMDU。
+                // **V-followup-interop-6** — CDW12 (LPO low 32b) + CDW13 (LPO
+                // hi 32b) 是 Log Page Offset。libnvme Discovery 流程：
+                //   1. probe 20 byte (LPO=0) 拿 header NUMREC
+                //   2. 第 2 次 LPO=sizeof(header)=1024, len=numrec*1024，**只拿 entries**
+                // 我们之前忽略 LPO 直接调 build_discovery_log(bytes)，第 2 次
+                // 拿到的还是 [0..bytes] header 截断，entries 全没发出去。
                 let lid = (sqe.cdw10 & 0xff) as u8;
                 let numd_lo = ((sqe.cdw10 >> 16) & 0xffff) as u32;
                 let numd_hi = (sqe.cdw11 & 0xffff) as u32;
                 let numd = ((numd_hi << 16) | numd_lo) as u64 + 1; // zero-based dwords
                 let bytes_req = numd * 4; // bytes
-                tracing::debug!(lid, bytes = bytes_req, "Get Log Page");
+                let lpo: u64 = (sqe.cdw12 as u64) | ((sqe.cdw13 as u64) << 32);
+                tracing::debug!(lid, bytes = bytes_req, lpo, "Get Log Page");
                 // **H1 修复**：我们目前没实现 PRP list（Phase E TODO），
                 // 单次最多用 PRP1+PRP2 = 8 KiB；超过返 INVALID_FIELD 让
                 // driver 明确知道（不再 silent truncate）。
@@ -798,11 +805,32 @@ impl NvmeController {
                     // session 启动 `--discovery-mode` 时通过 nvme_set_discovery_target
                     // 注入 portals；非 discovery mode 时 portals 空 → 返 header-only
                     // empty log (NUMREC=0)。host 也可正常解析。
-                    0x70 => super::discovery_log::build_discovery_log(
-                        self.discovery_gen_ctr,
-                        &self.discovery_portals,
-                        bytes,
-                    ),
+                    0x70 => {
+                        // **V-followup-interop-6** — 真正应用 LPO：build 完整
+                        // log (header + N entries)，然后按 [lpo .. lpo+bytes]
+                        // 切片返。libnvme `nvme_discovery_log()` 用 LPO=1024
+                        // (sizeof header) 拉 entries 部分。
+                        let full = super::discovery_log::build_discovery_log(
+                            self.discovery_gen_ctr,
+                            &self.discovery_portals,
+                            // 强制让 build 产足够大 buffer (header + entries 实际 size)
+                            1024 + self.discovery_portals.len() * 1024,
+                        );
+                        let start = (lpo as usize).min(full.len());
+                        let end = (start + bytes).min(full.len());
+                        let mut out = full[start..end].to_vec();
+                        // host 期待恰好 bytes 个字节；zero-pad 若 source 不够长
+                        if out.len() < bytes {
+                            out.resize(bytes, 0);
+                        }
+                        let _ = std::fs::write("/tmp/wire_actual_discovery_log.bin", &out);
+                        tracing::warn!(
+                            len = out.len(),
+                            lpo,
+                            "V-interop-6 dumped real discovery log to /tmp/wire_actual_discovery_log.bin"
+                        );
+                        out
+                    }
                     _ => {
                         tracing::debug!(
                             lid = format_args!("{:#x}", lid),

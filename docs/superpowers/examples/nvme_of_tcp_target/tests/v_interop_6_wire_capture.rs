@@ -141,18 +141,23 @@ fn build_identify_ctrl(cid: u16) -> Pdu {
 ///
 /// cdw10: lid (bits 7:0) + lsp(bits 15:8) + rae(bit 15) + numdl(bits 31:16)
 /// cdw11: numdu(bits 15:0) + lsi(bits 31:16)
+/// cdw12: LPO low 32b
+/// cdw13: LPO hi 32b
 ///
 /// Spec § 5.16.1 — numdl = (bytes/4) - 1 (dword count 0-based)
-/// 拉 8 KiB = 2048 dwords → numdl = 2047 (0x7ff)
-fn build_get_log_page_discovery(cid: u16, bytes: u32) -> Pdu {
+fn build_get_log_page_discovery_with_lpo(cid: u16, bytes: u32, lpo: u64) -> Pdu {
     let dwords = bytes / 4;
     let numdl = (dwords - 1) & 0xffff;
-    let lid: u32 = 0x70; // Discovery Log Page
+    let lid: u32 = 0x70;
     let cdw10 = lid | (numdl << 16);
+    let cdw12 = (lpo & 0xffff_ffff) as u32;
+    let cdw13 = ((lpo >> 32) & 0xffff_ffff) as u32;
     let mut sqe = vec![0u8; 64];
-    sqe[0] = 0x02; // GET_LOG_PAGE
+    sqe[0] = 0x02;
     sqe[2..4].copy_from_slice(&cid.to_le_bytes());
     sqe[40..44].copy_from_slice(&cdw10.to_le_bytes());
+    sqe[48..52].copy_from_slice(&cdw12.to_le_bytes());
+    sqe[52..56].copy_from_slice(&cdw13.to_le_bytes());
     Pdu {
         header: CommonHdr {
             pdu_type: pdu_type::CMD,
@@ -164,6 +169,107 @@ fn build_get_log_page_discovery(cid: u16, bytes: u32) -> Pdu {
         psh: sqe,
         data: vec![],
     }
+}
+
+fn build_get_log_page_discovery(cid: u16, bytes: u32) -> Pdu {
+    build_get_log_page_discovery_with_lpo(cid, bytes, 0)
+}
+
+/// **V-followup-interop-6** — 模拟 libnvme `nvme_discovery_log()` 真 2-phase
+/// 流程 (而非我们之前的 8KB 单 request 假设)。
+///
+/// Phase 1: GLP len=20 LPO=0 → 拿 header NUMREC
+/// Phase 2: GLP len=numrec*1024 **LPO=sizeof(header)=1024** → 拿 entries 部分
+///
+/// 上一轮 bug：admin.rs 忽略 LPO 直接调 build_discovery_log(bytes)，第 2 次
+/// 拿到的还是 [0..bytes] header 截断，entries 没发，nvme-cli 看 NUMREC=1 但
+/// entry 字段全空 (subnqn 空, trtype rdma=数字 1 误读)。
+#[tokio::test(flavor = "multi_thread")]
+async fn v_interop_6_libnvme_two_phase_discover_with_lpo() {
+    use core::mem::offset_of;
+    use pcie_remote_nvme_userspace::controller::discovery_log::DiscoveryEntry;
+
+    let (shared, _backing) = make_discovery_shared();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let s = Arc::clone(&shared);
+    let server = tokio::spawn(async move {
+        let (server, _) = listener.accept().await.unwrap();
+        let mut sess: AsyncSession<TcpStream> =
+            accept_and_handshake_async(server, s).await.unwrap();
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        for _ in 0..32 {
+            match sess.pump_one_async(&mut rx).await {
+                Ok(nvme_of_tcp_target::PumpEvent::Pdu(p)) => {
+                    if sess.dispatch_pdu_async(p).await.is_err() {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+    });
+    let mut c = TcpStream::connect(addr).await.unwrap();
+    let (h, psh) = build_icreq();
+    write_pdu_async(&mut c, &h, &psh, &[]).await.unwrap();
+    let _ = read_pdu_async(&mut c).await.unwrap();
+    let connect = build_connect(
+        0x0001,
+        "nqn.2014-08.org.nvmexpress:uuid:host-01",
+        "nqn.2014-08.org.nvmexpress.discovery",
+    );
+    write_pdu_async(&mut c, &connect.header, &connect.psh, &connect.data)
+        .await
+        .unwrap();
+    let _ = read_pdu_async(&mut c).await.unwrap();
+    let ps = build_property_set(0x0002, property_offset::CC, 0x0046_0001);
+    write_pdu_async(&mut c, &ps.header, &ps.psh, &ps.data)
+        .await
+        .unwrap();
+    let _ = read_pdu_async(&mut c).await.unwrap();
+
+    // ===== Phase 1: probe header =====
+    let glp1 = build_get_log_page_discovery_with_lpo(0x0010, 20, 0);
+    write_pdu_async(&mut c, &glp1.header, &glp1.psh, &glp1.data)
+        .await
+        .unwrap();
+    let data1 = read_pdu_async(&mut c).await.unwrap();
+    let _ = read_pdu_async(&mut c).await.unwrap();
+    assert_eq!(data1.header.pdu_type, pdu_type::C2H_DATA);
+    assert_eq!(data1.data.len(), 20);
+    let numrec = u64::from_le_bytes(data1.data[8..16].try_into().unwrap());
+    assert_eq!(numrec, 1, "phase 1: NUMREC=1");
+
+    // ===== Phase 2: pull entries (LPO=1024) =====
+    let entries_size = (numrec as u32) * 1024;
+    let glp2 = build_get_log_page_discovery_with_lpo(0x0011, entries_size, 1024);
+    write_pdu_async(&mut c, &glp2.header, &glp2.psh, &glp2.data)
+        .await
+        .unwrap();
+    let data2 = read_pdu_async(&mut c).await.unwrap();
+    let _ = read_pdu_async(&mut c).await.unwrap();
+    assert_eq!(data2.header.pdu_type, pdu_type::C2H_DATA);
+    assert_eq!(data2.data.len() as u32, entries_size);
+
+    // entries 应直接是 entry[0] (因为 LPO 跳过 header)
+    let entry = &data2.data[..1024];
+    let trtype = entry[offset_of!(DiscoveryEntry, trtype)];
+    let subtype = entry[offset_of!(DiscoveryEntry, subtype)];
+    assert_eq!(
+        trtype, 3,
+        "phase 2: entry[0] TRTYPE=3 (TCP) — 之前 bug 时此字节是 0 (假 RDMA)"
+    );
+    assert_eq!(subtype, 2, "phase 2: entry[0] SUBTYPE=2 (NVM Subsystem)");
+    let o = offset_of!(DiscoveryEntry, subnqn);
+    let end = entry[o..o + 256]
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(256);
+    let subnqn = std::str::from_utf8(&entry[o..o + end]).unwrap();
+    assert_eq!(subnqn, "nqn.2014-08.org.nvmexpress:teaching:disk");
+
+    c.shutdown().await.unwrap();
+    let _ = server.await;
 }
 
 fn cqe_sc(pdu: &Pdu) -> u8 {
