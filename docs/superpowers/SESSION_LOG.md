@@ -1,6 +1,20 @@
 # PCIe Remote 实施进度日志
 
-> **🔼 2026-06-06 audit**: 本日志覆盖 PCIe Remote v1/v2 实施 (2026-05-29 → 2026-05-31)，最终里程碑是 Phase 10 完成 + 真 Hyper-V e2e 验证。之后项目延伸到 Phase T → U → V (NVMe-oF TCP target) + V-followup-tls/auth/dhchap 系列；这些**不在本日志**，最新坐标见 [plans/ROADMAP.md](plans/ROADMAP.md) §0。本日志保留为 PCIe Remote 阶段实施实录。
+> **🔼 2026-06-06 audit**: 本日志覆盖 PCIe Remote v1/v2 实施 (2026-05-29 → 2026-05-31)，最终里程碑是 Phase 10 完成 + 真 Hyper-V e2e 验证 + Phase I3 第二个 PcieDevice (RNG) example。
+>
+> **本日志没记的后续工作 (2026-05-31 → 2026-06-06)**：
+> - **NVMe userspace 教学 controller 完善**: Phase J / K / L / M / N / O / P / **Q1-Q12** / **R1+R3+R4** / **S1-S7** (NVMe 2.0 spec 全覆盖 + 多轮 reviewer)。详 [`examples/pcie_remote_nvme_userspace/README.md`](examples/pcie_remote_nvme_userspace/README.md)。
+> - **Phase T**: `trait Transport` 抽出 + 3 backend。
+> - **Phase U1-U5 + U-followup**: vfio-user SDK + NVMe behind QEMU。详 [`specs/2026-06-05-vfio-user-client-design.md`](specs/2026-06-05-vfio-user-client-design.md)。
+> - **Phase V → V8 → V8e → V-followup-tls/mtls/auth/dhchap-3/4/4d/prp-list/tls-psk**: NVMe-oF TCP target 全栈。详 [`examples/nvme_of_tcp_target/README.md`](examples/nvme_of_tcp_target/README.md) + [`plans/ROADMAP.md`](plans/ROADMAP.md)。
+> - **K-20 hotplug** 已 ✅ shipped (commits `a99cdc63` + `64da8fb6`)，已自标在 [`K20_HOTPLUG_DESIGN.md`](K20_HOTPLUG_DESIGN.md)。
+>
+> **新工作不再写本日志**；统一去：
+> - [`plans/ROADMAP.md`](plans/ROADMAP.md) — 当前坐标 + 下一步 HIGH
+> - [`plans/DECISIONS.md`](plans/DECISIONS.md) — 重大决策 ADR
+> - [`plans/LESSONS.md`](plans/LESSONS.md) — 踩坑教训
+>
+> 本日志保留为 PCIe Remote 阶段 (2026-05-29 → 2026-05-31) 实施实录。
 
 > 这是 Claude 无人值守实施会话的实时进度日志。
 

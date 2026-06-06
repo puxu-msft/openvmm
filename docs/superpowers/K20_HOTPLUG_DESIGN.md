@@ -1,8 +1,11 @@
 # K-20: pcie_remote hotplug 设计草案 (v2)
 
-> **状态**：v2 设计文档，**未实施 (2026-06-06 仍未做)**。spec §10 K-20 标 P2·部署，"v1 体验最大遗憾"。后续主线已转 NVMe-oF TCP target / vfio-user，K-20 hotplug 优先级降低；若 PCIe Remote path 还需用，本文档作为起点。最新坐标 [plans/ROADMAP.md](plans/ROADMAP.md)。
+> **✅ SHIPPED (2026-06-06 audit 修正)** — commit `a99cdc63` (`feat(pcie_remote): K-20 hotplug 实施 — listener 永不退 + worker transport refresh`) + `64da8fb6` (持久 PolledSocket 替代每轮 rebind) + `93c5fa5f` (SESSION_LOG + spec K-20 v2 backlog → ✅ v9 完成) 已实施。**前一轮 audit (2026-06-06 上午) 误标 "未实施"，本次修正。** spec §10 K-20 已从 P2·backlog 转 ✅ v9 完成。
 > v1 行为：listener 一次性 accept，handshake 完进 prepared_map，listener 退出；
 > 设备 Lost 后 terminal，host 重启无法恢复。
+>
+> v2 (本文档) → v9 实施：listener 永不退 + worker transport refresh，本文档作为
+> 实施前的设计记录保留。
 
 ## 目标
 

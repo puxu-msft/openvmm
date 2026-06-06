@@ -378,3 +378,45 @@ Production-ready as teaching example。
 - **Q11** mod.rs 拆 enable.rs + mmio.rs（2102 → 1885 行，单一职责）
 - **Q12** WSL → Windows MSVC 交叉编译脚本支持 standalone example
   (exclude 列表) — 一行命令 build PE32+ exe
+
+## Phase R 系列 (SGL 完整化 + 公开 PCI BAR 上报)
+
+- **R1** SGL Data Block descriptor 真处理 (CDW0 bit24=1 = SGL data mode)
+- **R3** Identify Controller `sgls` 字段 advertise SGL 支持 (NVMe 2.0 §
+  5.17.2.1 Figure 277)
+- **R4** RBAR (Read BAR) ADR field 上报真实 PCI register layout
+
+commit `f19c193f`。
+
+## Phase S 系列 (NS Attach / Controller List / NS Write Protect / ANA state machine)
+
+- **S1** Namespace Write Protection (Feature 0x84) + SC 0x20 ATTEMPTED_WRITE_TO_RO_RANGE
+- **S2** COPY conflict detect (Simple Copy spans 跟 reservation 冲突 → SC 0x83)
+- **S3** Identify NS 加 NAWUN/NAWUPF/NACWU/NOIOB/NPWG/NPWA/NPDG/NPDA 真填
+  (driver 用来决定 IO alignment / prefer write granularity)
+- **S4** Namespace Attachment (admin cmd 0x15) 真 Attach/Detach state +
+  multi-controller share 假设
+- **S5** Controller List CNS 0x12/0x13 (NVMe 2.0 § 5.17.2.16-17)
+- **S6** Reservation Notification Log records resv events (Log Page 0x80
+  按 spec 序列化)
+- **S7** ANA (Asymmetric Namespace Access) state machine + Change AEN
+  (spec § 5.20 ANAGRP state transitions)
+
+commits `d0b36b19`..`f8d847ea` + reviewer round 1 batch `10f987f5`。
+
+## 状态总览 (2026-06-06)
+
+本 crate 已实现 NVMe 2.0 spec 的 admin + IO 大部分公开 feature；剩余主要
+deferred 的是 **真 ZNS 完整** (ZNS_DESIGN.md 标 deferred ROI 不对) + **多
+queue parallel dispatch** (M3_PARALLEL_DESIGN.md ADR)。具体 spec coverage
++ test count + reviewer round 详 `README.md` 顶 + Phase 列表。
+
+下游消费者：
+- [`pcie_remote_userspace_sdk`](../pcie_remote_userspace_sdk/) — SDK 把
+  本 controller 跑在 vsock/TCP 之上
+- [`pcie_remote_rng_userspace`](../pcie_remote_rng_userspace/) — 第二个
+  PcieDevice 教学 example
+- **`nvme_of_tcp_target`** — 把本 controller 包成 NVMe-oF TCP target；
+  详 [`../nvme_of_tcp_target/README.md`](../nvme_of_tcp_target/README.md)
+- **vfio-user via `pcie_vfio_user_sdk`** — 把本 controller 通过 vfio-user
+  UNIX socket 挂给 QEMU

@@ -15,7 +15,9 @@ Linux ≥ 5.0 / Windows Server 2025 上的标准 `nvme-cli` 可通过
 
 ## Status (2026-06-06)
 
-**全栈生产就绪**: 306 lib + integration tests pass，clippy 0 warning。
+**所有 phase 代码 + 测试 shipped**: 306 lib + integration tests pass，clippy 0 warning。
+
+**已 verified 在真 Linux nvme-cli**: plaintext `discover` + `connect` + IO (kernel 6.6.114 nvme-tcp.ko, WSL2)。**TLS / mTLS / DH-HMAC-CHAP 等安全栈未走真 Linux nvme-cli 实测**，只走 lib test + Python harness (跨进程但同一份 Rust 算法对自家 Python 算法)。真 third-party host interop 是下一步 HIGH (见 [ROADMAP §1](../../plans/ROADMAP.md))。
 
 | Phase 组 | 状态 | 关键 commit |
 |---------|------|------------|

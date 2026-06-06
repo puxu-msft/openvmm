@@ -183,3 +183,30 @@ storage 到真 PCIe NVMe device，把 nvme-of target 变成 NVMe-oF JBOD gateway
 - `survey` = 调研 / 决策类（如 tls-psk-survey）
 
 落地后回本表加一行 + status icon (✅/⚠️/📋/❌)。
+
+## 7. 无独立 plan 但已 shipped 的工作 (2026-06-06 audit 补)
+
+下表是 `git log` 出现但 `plans/` 下没有独立 `.md` 的工作。它们落在
+**别的目录的 README** 或 SESSION_LOG。**新加阶段不必每个都写 plan**，
+小段可直接进对应 crate README + commit message + 本表登记。
+
+| Phase 段 | 范围 | 文档归属 | commit 范围 |
+|---------|------|---------|------------|
+| Phase A..J (NVMe userspace 初版) | 单 PRP / SQ-CQ / dual-PRP / CRC PI | [`examples/pcie_remote_nvme_userspace/README.md`](../examples/pcie_remote_nvme_userspace/README.md) | 早期 (SESSION_LOG 涵盖) |
+| Phase K1..K9 (NVMe PI + Sanitize + Compare + Reservation) | T10 DIF + Compare PRP-list + NS Management + Sanitize + Doorbell Buffer + Reservation HOSTID | nvme userspace README | (SESSION_LOG 早期截止；后续段散见) |
+| Phase L1..L5 (NVMe ZNS 基础 + Log Page + Directive + Security) | ZNS basics + Identify CNS 0x05/0x06 + Reservation Notification Log + Directive Send/Recv + Security Send/Recv | nvme userspace README | 2026-05-31..06-01 |
+| Phase M1..M3 (NVMe IRQ coalesce + mmap + parallel) | Set Features 0x08 + mmap zero-copy + per-queue parallel ADR | nvme userspace README + `M2_MMAP_DESIGN.md` + `M3_PARALLEL_DESIGN.md` | `003bdb33`..`3658d21f` |
+| Phase N1+N2 (SDK 测试 + 教学文档) | DeviceCtx outbound/inbound 单测 + NVMe 12-step lifecycle | nvme userspace README + `docs/NVME_LIFECYCLE.md` | 2026-06-01..02 |
+| Phase O1..O3 (NVMe Copy + Fused C+W) | Simple Copy 0x19 + Fused dispatcher + atomic chain | nvme userspace README | `3bc36b26`..`c5af27fb` |
+| Phase P1 (NVMe Endurance Group + NVM Set) | CNS 0x19 + CNS 0x04 + PTPL reservation | nvme userspace README | `0064e755` |
+| Phase Q1..Q12 (NVMe 2.0 spec coverage 完整化) | PRACT + ZONE_APPEND PI + Telemetry + ANA + BP + Lockdown + crypto erase + RNM + DeviceCtx::for_testing + mod 拆分 + WSL→Windows MSVC 跨编 | nvme userspace README "## Phase Q 系列" | `e84578c9`..`cfd95e54` |
+| Phase R1+R3+R4 (NVMe SGL + Identify advertise + RBAR) | SGL Data Block + sgls 字段 + RBAR ADR | nvme userspace README "## Phase R 系列" (本次 audit 补) | `f19c193f` |
+| Phase S1..S7 (NVMe NS WP / NS Attach / Controller List / ANA state machine) | Write Protect + COPY conflict + Identify NS NAWUN 等 + NS Attachment 0x15 + Controller List CNS 0x12/13 + Reservation Notification Log + ANA state machine + Change AEN | nvme userspace README "## Phase S 系列" (本次 audit 补) | `d0b36b19`..`f8d847ea` + `10f987f5` |
+| K-20 hotplug (pcie_remote) | listener 永不退 + worker transport refresh | [`../K20_HOTPLUG_DESIGN.md`](../K20_HOTPLUG_DESIGN.md) (本次 audit 修正) + SESSION_LOG | `a99cdc63` + `64da8fb6` + `93c5fa5f` |
+| Phase I3 (RNG example) | 第二个 PcieDevice 教学 example | [`../examples/pcie_remote_rng_userspace/README.md`](../examples/pcie_remote_rng_userspace/README.md) (本次 audit 补) | `7402dd62` |
+
+**判据 — 何时写独立 plan，何时跳过**：
+- 写 plan: > 1 day 工作 + 跨多 module + reviewer round 可能 ≥ 2 轮 + 决策点不止 1 个
+- 跳过 plan: ≤ 1 day 单点 feature + 单 module + 决策已明 + commit message 能覆盖
+
+跳过 plan 不代表跳过文档；**对应 crate README + commit message 必须详细到能让人复现**。
