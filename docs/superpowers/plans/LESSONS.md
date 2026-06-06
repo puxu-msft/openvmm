@@ -146,3 +146,149 @@ workspace (含 openssl-sys dep 缺) → fail。
 
 **修法**：cd 到 `docs/superpowers/examples/nvme_of_tcp_target/` 再跑 cargo。
 本仓库 nvme_of_tcp_target 是独立 crate，不属于 openvmm workspace member。
+
+---
+
+## 11. decision-then-IO 借用模式 (HIGH, 反复出现的 async 借用陷阱)
+
+**坑**：async fn 拿了 `&mut self.field` 后跨 `.await` 又要调 `self.send_*().await`
+→ E0499 "cannot borrow `*self` as mutable more than once at a time"。
+最初 V-dhchap-4 把所有错误处理 inline 在 match arm 里，编译器 4 处错。
+
+**修法**：把 *所有* state mutation 收进一个 scope，scope 内算出一个枚举
+`Decision` 描述要做什么（不含 self ref），scope 出后再做 async I/O。模式：
+
+```rust
+async fn handle(&mut self) -> Result<()> {
+    enum Decision {
+        Ok,
+        ErrCapsule(u8),
+        WireFailThenCapsule(Vec<u8>, u8),
+    }
+    let decision = {
+        let field = self.field.as_mut().unwrap();
+        if cond_a {
+            field.state = State::Failed;
+            Decision::ErrCapsule(0x83)
+        } else if cond_b {
+            let wire = build_failure(field.tid, ...);
+            field.state = State::Failed;
+            Decision::WireFailThenCapsule(wire, 0x83)
+        } else {
+            Decision::Ok
+        }
+    }; // ← borrow ends here
+    match decision {
+        Decision::Ok => self.send_ok().await,
+        Decision::ErrCapsule(sc) => self.send_err(sc).await,
+        Decision::WireFailThenCapsule(w, sc) => {
+            self.send_wire(&w).await?;
+            self.send_err(sc).await
+        }
+    }
+}
+```
+
+**为什么比"先 drop guard"通用**：当 self 既要 mutate 字段又要调多个 async
+method，drop guard 模式得反复 re-acquire；decision-then-IO 一次性算出所有
+副作用让 borrow checker 静默。
+
+**来源**：commit `eff95619` (V-dhchap-4) borrow-fix refactor。
+
+---
+
+## 12. WebFetch → 源验证 → anchor test (HIGH, 工作流模板)
+
+**坑**：早期实现 wire / crypto 全靠 spec PDF + 想象，第一次实测必错。
+
+**修法 (三步法)**：
+1. **WebFetch** raw Linux kernel mirror (`raw.githubusercontent.com/torvalds/linux/master/...`)
+   或 nvme-cli `libnvme` 源；spec PDF 经常 403/可视化噪音多
+2. **抽 layout / 算法**：找 `struct nvmf_*` / `nvme_auth_*` / format strings
+   (kernel 用 `"NVMe%u%c%02u %s %s"` 这种)；记字段顺序 + size + 算法步骤
+3. **同 commit 写 anchor test**：用 `offset_of!` 锁字段位置 / 用 known
+   input → known output 锁 crypto；测试名带 `_anchor_` / `_kernel_ci_`
+   前缀便于 grep
+
+**何时跳过 WebFetch**：spec § 8.13.5 那种纯 wire layout 我们已经 fetch 过
+的 — 直接 grep `2026-06-04-nvme-tcp-wire-reference.md` 查；不重复 fetch。
+
+**何时必须 WebFetch**：写新 crypto / 新 wire 字段 / packed struct 偏移 *任何
+不确定* 的瞬间 — 比手算更省时间，因为 false-positive 测试通过的 cost 远
+高于一次网络请求。
+
+**来源**：V-dhchap-4 NEGOTIATE/CHALLENGE 字段 + V-tls-psk HKDF-Expand-Label
+labels 都靠这条工作流确认。
+
+---
+
+## 13. anchor test 是"spec drift 的金丝雀"，非单元测试 (MEDIUM)
+
+**坑**：reviewer L-2 让我加 SHA-384 端到端 self-consistent test。当时
+理解是"覆盖率 +1"。
+
+**真正价值**：dispatch table 第二臂 (Sha384) 万一某天被人误删 / 改错 →
+SHA-256 路径全绿，*只有这条 anchor 红*。覆盖率工具看不出"算法支持几种
+hash"的语义，anchor test 看得出。
+
+**判据**：当代码有 dispatch / lookup table / 多 hash / 多 algorithm 分支，
+*每条分支* 至少配一个 anchor test，命名带 `_dispatch_arm_<N>` / `_branch_*`
+便于 grep。
+
+---
+
+## 14. 手算 offset 失败 case 速查表 (CRITICAL, 教训具体化)
+
+[[lesson §1]] 提了"不手算 packed struct"，下表是实际踩过的 9 个坑，下次
+怀疑某个字段算错时先查表：
+
+| spec struct | 我手算 offset | 真实 offset (offset_of! 验) | 修法 commit |
+|------------|--------------|--------------------------|------------|
+| IdentifyController.KAS | 320 (对了但凑出来的) | 320 | offset_of! 锁定 |
+| IdentifyController.MNAN | 524 | 540 | `665ba1ec` 系列 |
+| IdentifyController.CMIC ANA bit | 设 1 | 必须设 0 (Disc Ctlr NN=0) | 同 |
+| DiscoveryEntry.eflags | 漏字段 | offset 10 (2 B) | V-interop-5 |
+| DiscoveryEntry.rsvd0 | 22 B | 20 B (eflags 占了 2) | 同 |
+| Get Log Page LPO | 忽略 | u64 cdw12/13 拼，做 offset slice | V-interop-6 |
+| Discovery SUBNQN | 用 IO target NQN | 必须 `"nqn.2014-08.org.nvmexpress.discovery"` | 同 |
+| Fabric Connect IO qid Connect Data | 用默认 | 必须 nlb cap 检查 | V5a |
+| MDTS | 5 (= 128 KiB) | 5，但只对 V5_NLB_MAX=16 时是"对"的 | V-prp-list 修对应关系 |
+
+**通用模式**：spec PDF 字段表看着对 ≠ packed struct 字节布局对。任何怀疑
+先 `offset_of!` anchor 一遍。
+
+---
+
+## 15. "不做"也是一种工程决策 (HIGH)
+
+**坑**：F 段 (rustls external-PSK survey) 一度纠结"要不要 fork rustls"。
+半天后我意识到决策本身就是 "不接 fork，等上游"，并且要 **同等严肃** 写
+进 plan（[2026-06-06-phase-v-followup-tls-psk-survey.md](2026-06-06-phase-v-followup-tls-psk-survey.md)
+§4 "推荐：路径 A + C 并行"）。
+
+**为什么重要**：不写下来的"不做"决策一周后没人记得为什么；下次有人冲动
+fork 时又得重新走一遍 cost-benefit。
+
+**模板** (写 survey 时用)：
+- 候选路径 A / B / C / ...
+- 每条 cost + risk + side-effect
+- 推荐 + rationale
+- 副产物：明列"不接 路径 X，因为 ..."
+
+---
+
+## 16. reviewer L-fix 即修 vs deferred 判定 (MEDIUM)
+
+**坑**：L 级 finding 默认"可下个 phase 修"，但 V-tls-psk L-1/L-2/L-5
+我都在同 commit 修了。判据没写过。
+
+**判据**：
+- ≤ 5 LOC 改 + 不引入新依赖 + 不动 public API → **即修，节省 reviewer
+  下次再来一轮**
+- 需要外部数据 (如 kernel CI vector) / 跨 module 修 / 改 public API
+  → **deferred 加 TODO 标 reviewer 编号** (例: `TODO(reviewer L-3)`)
+- 命名 / 文档 LOW → 看心情，但若多个 L 集中在同一文件 → 一次性扫
+
+**例**: V-tls-psk reviewer 给 L-1..L-5，L-1/2/5 ≤ 5 LOC 改，L-3 是
+"NQN 校验责任" 需修改函数 signature 才彻底 → 改成 doc 标注 + TODO，留
+下个 phase。

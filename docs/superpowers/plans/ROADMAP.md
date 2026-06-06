@@ -143,6 +143,7 @@ storage 到真 PCIe NVMe device，把 nvme-of target 变成 NVMe-oF JBOD gateway
 
 - 不可变约束 / coding policy → [PRINCIPLES.md](PRINCIPLES.md)
 - 踩过的坑 + 经验 → [LESSONS.md](LESSONS.md)
+- 重大决策 ADR → [DECISIONS.md](DECISIONS.md)
 - TLS PSK 调研 → [2026-06-06-phase-v-followup-tls-psk-survey.md](2026-06-06-phase-v-followup-tls-psk-survey.md)
 - 各 phase 详 spec → `2026-06-0*-phase-*-detailed.md`
 

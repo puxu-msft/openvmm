@@ -89,7 +89,68 @@
 - 本文 (PRINCIPLES) — 不变约束
 - `ROADMAP.md` — 动态短中长期 phase 列表
 - `LESSONS.md` — 教训 + 经验 (踩过坑后)
+- `DECISIONS.md` — 重大决策日志 (ADR 风格)
 - `2026-XX-YY-phase-*-detailed.md` — 各 phase 实施细节
 - `2026-XX-YY-phase-*-survey.md` — 调研类（如 tls-psk-survey）
 
 进新文档前先看本目录有没有合适 host；不为单次工作开新顶层文件夹。
+
+## 9. Subagent reviewer prompt 工程
+
+reviewer 抓 H 级 bug 的概率，正比于 prompt 给的 context 量。**最低 prompt
+模板**：
+
+```
+Review the <Phase-NAME> change for <module>.
+
+Working directory: <abs path>
+
+Files changed:
+- <path1> (+N/-M)
+- <path2> (...)
+- <path3> (new, ~N LOC)
+
+Context:
+- <一句话说本 phase 做什么>
+- 后向兼容策略 (如自动检测 / sentinel / 后向 wire mode)
+- 跨语言/进程 anchor (如 Linux kernel struct nvmf_*)
+- 测试 / clippy 状态 (\"N tests pass + clippy 0 warning\")
+- Crate policies (forbid_unsafe / await_holding_lock / 中文注释)
+
+Run `git diff HEAD -- <paths>` to see the full diff.
+
+Review specifically for:
+1. <wire/算法 correctness specific question>
+2. <state machine / borrow / lifetime specific question>
+3. <error path coverage>
+4. <edge case worth thinking about, e.g. 1/65536 collision>
+5. <test gaps>
+6. <doc accuracy>
+
+Output findings by severity (CRITICAL/HIGH/MEDIUM/LOW). Be terse.
+Skip nitpicks; teaching module status is acceptable for <X>.
+```
+
+**关键 gotcha**：
+- 不要只说 "review the diff"；明列 5-6 个 specific question
+- 把 *你已经知道的边缘 case* (如 wire mode 自动识别 collision 概率) 给
+  reviewer，否则他要重新算
+- 教学 vs prod 边界 explicitly 标，否则 reviewer 把 "教学版简化" 当
+  CRITICAL
+
+**来源**：V-dhchap-4 + V-tls-psk reviewer 两次都抓到 H 级 issue，对照
+prompt 内的 specific question；之前同模板 reviewer 只抓 L。
+
+## 10. 测试命名约定
+
+| 前缀 | 含义 | 例 |
+|------|------|------|
+| `vt_<phase>_<topic>` | unit test in lib (#[cfg(test)] mod) | `vt_dhchap4_negotiate_parse_happy` |
+| `v_<topic>_anchor_<what>` | spec layout / 不变量 anchor test | `v_prp_list_anchor_constants` |
+| `<phase>_<topic>_dispatch_arm_<N>` | dispatch table 第 N 臂覆盖 | `vt_tlspsk_e2e_self_consistent_sha384` |
+| `<phase>_kernel_ci_vector_<N>` | 真 kernel 输出 anchor (待补) | `vt_tlspsk_kernel_ci_vector_1_sha256` |
+| `<phase>_regression_<bug>` | 修过的 bug regression | (TODO 用) |
+
+集成 test 文件 `tests/vt_<phase>_<topic>.rs`：每个 phase / 子 phase 一个
+文件便于 grep + 报告。Python harness `scripts/interop_py/<topic>.py`，
+名字描述 *验什么 wire*，不描述实现。
