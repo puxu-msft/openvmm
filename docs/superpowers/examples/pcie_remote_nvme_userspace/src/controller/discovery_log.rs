@@ -48,35 +48,45 @@
 
 use zerocopy::{Immutable, IntoBytes, KnownLayout};
 
-/// 单个 Discovery Log entry（spec § 5.16.1.20 Figure 351）。1024 byte。
+/// 单个 Discovery Log entry（spec § 5.16.1.20 Figure 351；wire 布局与
+/// Linux kernel `struct nvmf_disc_rsp_page_entry` 1:1 等价）。1024 byte。
+///
+/// **V-followup-interop-5 layout 修复**：之前缺 `eflags` 字段且 `rsvd0` size
+/// 错 (22B 应为 20B)，导致 trsvcid 之后的字段全部错位 1 byte，nvme-cli 解
+/// 出 `subtype: unrecognized / subnqn: 空 / traddr: 空` (false-positive：
+/// builder unit test 编 + 解都用同 struct 看不出，必须靠 Linux 真 host 比对)。
+/// 字段 offset 由 `offset_of!` anchor test 锁定 (cmd.rs#tests 同套模式)。
 #[derive(Debug, Clone, Copy, IntoBytes, KnownLayout, Immutable)]
 #[repr(C, packed)]
 pub struct DiscoveryEntry {
-    /// transport type (3 = TCP)
+    /// transport type (3 = TCP) @ offset 0
     pub trtype: u8,
-    /// address family (1 = IPv4, 2 = IPv6)
+    /// address family (1 = IPv4, 2 = IPv6) @ offset 1
     pub adrfam: u8,
-    /// subsystem type (1 = Discovery, 2 = NVM)
+    /// subsystem type (1 = Discovery, 2 = NVM) @ offset 2
     pub subtype: u8,
-    /// transport requirements bitmap (bit 0 = secure channel required)
+    /// transport requirements bitmap @ offset 3
     pub treq: u8,
-    /// portid
+    /// portid @ offset 4
     pub portid: u16,
-    /// cntlid
+    /// cntlid @ offset 6
     pub cntlid: u16,
-    /// admin SQ size 推荐值
+    /// admin SQ size 推荐值 @ offset 8
     pub asqsz: u16,
-    /// **review L-2** — reserved fields 改 `pub(crate)` 防 external mutate
-    /// 破 spec wire 兼容性。builder (本模块) 内部仍可读写。
-    pub(crate) rsvd0: [u8; 22],
-    /// ASCII service id（端口号字符串，trailing zero-pad）
+    /// **V-followup-interop-5** — eflags @ offset 10 (entry flags, spec
+    /// NVMe-oF 1.1a + Base 2.0c)
+    pub eflags: u16,
+    /// reserved 20B @ offset 12..32 (spec)
+    pub(crate) rsvd0: [u8; 20],
+    /// ASCII service id @ offset 32..64 (NVMF_TRSVCID_SIZE=32)
     pub trsvcid: [u8; 32],
+    /// reserved 192B @ offset 64..256
     pub(crate) rsvd1: [u8; 192],
-    /// ASCII subsystem NQN
+    /// ASCII subsystem NQN @ offset 256..512 (NVMF_NQN_FIELD_LEN=256)
     pub subnqn: [u8; 256],
-    /// ASCII transport address (IP 字符串)
+    /// ASCII transport address (IP 字符串) @ offset 512..768 (NVMF_TRADDR_SIZE=256)
     pub traddr: [u8; 256],
-    /// transport-specific address subtype
+    /// transport-specific address subtype @ offset 768..1024 (NVMF_TSAS_SIZE=256)
     pub tsas: [u8; 256],
 }
 
@@ -92,7 +102,8 @@ impl Default for DiscoveryEntry {
             portid: 0,
             cntlid: 0,
             asqsz: 0,
-            rsvd0: [0u8; 22],
+            eflags: 0,
+            rsvd0: [0u8; 20],
             trsvcid: [0u8; 32],
             rsvd1: [0u8; 192],
             subnqn: [0u8; 256],
@@ -186,6 +197,62 @@ fn copy_ascii(dst: &mut [u8], src: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **V-followup-interop-5 anchor** — 锁定 DiscoveryEntry 字段 offset 与
+    /// Linux kernel `nvmf_disc_rsp_page_entry` (include/linux/nvme.h) 1:1
+    /// 等价。spec § 5.16.1.20 Figure 351。
+    ///
+    /// 教训：前几轮 `nvme discover` 真互通时 nvme-cli 输出 `subtype: unrecognized
+    /// / subnqn: 空 / traddr: 空` — 我们 struct 内 `rsvd0 [u8; 22]` (应 20) +
+    /// 缺 `eflags` 字段，导致 trsvcid 偏移 30 而非 32，所有 ASCII 字段全偏移
+    /// 1 byte，nvme-cli 解出垃圾。builder 单元测自己用同 struct write/read 看
+    /// 不出 (false-positive)，必须靠 `offset_of!` anchor + 真 host 比对。
+    #[test]
+    fn v_interop_5_anchor_discovery_entry_field_offsets() {
+        use core::mem::offset_of;
+        assert_eq!(offset_of!(DiscoveryEntry, trtype), 0, "TRTYPE");
+        assert_eq!(offset_of!(DiscoveryEntry, adrfam), 1, "ADRFAM");
+        assert_eq!(offset_of!(DiscoveryEntry, subtype), 2, "SUBTYPE");
+        assert_eq!(offset_of!(DiscoveryEntry, treq), 3, "TREQ");
+        assert_eq!(offset_of!(DiscoveryEntry, portid), 4, "PORTID");
+        assert_eq!(offset_of!(DiscoveryEntry, cntlid), 6, "CNTLID");
+        assert_eq!(offset_of!(DiscoveryEntry, asqsz), 8, "ASQSZ");
+        assert_eq!(offset_of!(DiscoveryEntry, eflags), 10, "EFLAGS");
+        assert_eq!(offset_of!(DiscoveryEntry, trsvcid), 32, "TRSVCID");
+        assert_eq!(offset_of!(DiscoveryEntry, subnqn), 256, "SUBNQN");
+        assert_eq!(offset_of!(DiscoveryEntry, traddr), 512, "TRADDR");
+        assert_eq!(offset_of!(DiscoveryEntry, tsas), 768, "TSAS");
+        assert_eq!(core::mem::size_of::<DiscoveryEntry>(), 1024);
+    }
+
+    /// **V-followup-interop-5** — 真 wire 端字段值校验：builder 产的字节流
+    /// 对照 spec offset 表逐字节读，断言 nvme-cli 解出的值与我们填的一致。
+    #[test]
+    fn v_interop_5_built_entry_wire_bytes_at_spec_offsets() {
+        use core::mem::offset_of;
+        let portal = DiscoveryPortal::from_ipv4_addr(
+            "nqn.2014-08.org.nvmexpress:teaching:disk",
+            "127.0.0.1:4420",
+        )
+        .unwrap();
+        let buf = build_discovery_log(1, std::slice::from_ref(&portal), 2048);
+        let entry = &buf[1024..2048]; // header 占 0..1024
+        assert_eq!(entry[offset_of!(DiscoveryEntry, trtype)], 3, "TRTYPE=3 (TCP)");
+        assert_eq!(entry[offset_of!(DiscoveryEntry, adrfam)], 1, "ADRFAM=1 (IPv4)");
+        assert_eq!(entry[offset_of!(DiscoveryEntry, subtype)], 2, "SUBTYPE=2 (NVM)");
+        let o = offset_of!(DiscoveryEntry, trsvcid);
+        let trsvcid_end = entry[o..o + 32].iter().position(|&b| b == 0).unwrap_or(32);
+        let trsvcid = std::str::from_utf8(&entry[o..o + trsvcid_end]).unwrap();
+        assert_eq!(trsvcid, "4420", "TRSVCID ASCII");
+        let o = offset_of!(DiscoveryEntry, subnqn);
+        let end = entry[o..o + 256].iter().position(|&b| b == 0).unwrap_or(256);
+        let subnqn = std::str::from_utf8(&entry[o..o + end]).unwrap();
+        assert_eq!(subnqn, "nqn.2014-08.org.nvmexpress:teaching:disk", "SUBNQN");
+        let o = offset_of!(DiscoveryEntry, traddr);
+        let end = entry[o..o + 256].iter().position(|&b| b == 0).unwrap_or(256);
+        let traddr = std::str::from_utf8(&entry[o..o + end]).unwrap();
+        assert_eq!(traddr, "127.0.0.1", "TRADDR");
+    }
 
     /// **V7-1** — empty portals header byte-exact：GENCTR=0 / NUMREC=0 / RECFMT=0
     #[test]
