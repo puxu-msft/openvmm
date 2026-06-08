@@ -32,7 +32,7 @@
 //! client**，故单条消息的数据量受 **client 广告的** `max_data_xfer_size` 约束
 //! （per-receiver 语义，见 [`crate::handshake::SERVER_MAX_DATA_XFER_SIZE`] 的反方向）。
 //! 教学 NVMe 当前单次 DMA 远小于 1 MiB（PRP 粒度），未触限；但**将来若要发
-//! > client max_data_xfer_size 的 DMA，必须先 parse `Negotiated.client_caps_json`
+//! 超过 client `max_data_xfer_size` 的 DMA，必须先 parse `Negotiated.client_caps_json`
 //! 里的 `max_data_xfer_size` 并据此分片**（类似 NVMe-oF 的 MAXH2CDATA 切片），
 //! 否则超 client 接收上限。`VfioUserSession.negotiated` 字段正是这个未来钩子。
 

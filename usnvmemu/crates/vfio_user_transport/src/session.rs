@@ -31,6 +31,7 @@ use crate::proto::pci_irq;
 use crate::proto::pci_region;
 use crate::proto::region_flags;
 use anyhow::Context as _;
+use pcie_device_core::DeviceDescribe;
 use pcie_device_core::PcieDevice;
 use std::os::unix::net::UnixStream;
 use zerocopy::IntoBytes;
@@ -81,6 +82,11 @@ pub struct VfioUserSession {
     /// `device.describe()` 懒构造。服务 CONFIG region 读写（identity /
     /// BAR probe），取代此前误把 CONFIG 当 BAR MMIO 转给 `mmio_read` 的 bug。
     config: Option<crate::ConfigSpace>,
+    /// **perf (reviewer)** — `device.describe()` 是静态的但每调一次 alloc 一个
+    /// `Vec<BarLayout>`。region 访问 / GET_REGION_INFO / GET_IRQ_INFO 都需要它，
+    /// 故首访懒缓存一次后复用，热路径不再每请求 alloc describe Vec。FLR reset
+    /// 时随 config 一起丢弃重建（describe 静态，理论不变，但保持与 config 同源）。
+    describe: Option<DeviceDescribe>,
     /// **Phase W (vfio-spec head-of-line 修复)** — 在等 server-initiated DMA
     /// reply 期间收到的、非本次 reply 的入站帧 defer 到此队列；`pump_one`
     /// 顶部在 device 回调栈 unwind 后再 dispatch（避免 device 重入）。
@@ -109,18 +115,28 @@ impl VfioUserSession {
             next_server_msg_id: 0x8000,
             pending_completions: std::collections::VecDeque::new(),
             config: None,
+            describe: None,
             inbound_queue: std::collections::VecDeque::new(),
         }
     }
 
-    /// **Phase W1** — 懒构造并借出 host-side config space。首访由
-    /// `device.describe()` 合成（identity / BAR / capability）；describe() 是
-    /// 静态的，构造一次后复用。
+    /// **perf** — 懒缓存并借出 `device.describe()`（静态描述）。首访 alloc 一次，
+    /// 之后热路径（region 访问 / GET_REGION_INFO / GET_IRQ_INFO）复用，不再每请求
+    /// alloc describe Vec。
+    fn describe_for<D: PcieDevice>(&mut self, device: &D) -> &DeviceDescribe {
+        self.describe.get_or_insert_with(|| device.describe())
+    }
+
+    /// **Phase W1** — 懒构造并借出 host-side config space。首访由缓存的
+    /// `describe()` 合成（identity / BAR / capability）；describe() 是静态的，
+    /// 构造一次后复用。`describe` / `config` 是 self 的不相交字段，借用安全；
+    /// 关键依据是 [`crate::ConfigSpace::new`] **消费** `&DeviceDescribe`（不持有
+    /// 引用），故 `desc` 借用在 `new` 返回后即结束 —— 若将来 `new` 改为存引用，
+    /// 此处 disjoint borrow 会失效，需重新评估。
     fn config_for<D: PcieDevice>(&mut self, device: &D) -> &mut crate::ConfigSpace {
-        if self.config.is_none() {
-            self.config = Some(crate::ConfigSpace::new(&device.describe()));
-        }
-        self.config.as_mut().expect("config just initialized above")
+        let desc = self.describe.get_or_insert_with(|| device.describe());
+        self.config
+            .get_or_insert_with(|| crate::ConfigSpace::new(desc))
     }
 
     /// 阻塞处理一条入站消息：read → dispatch → 自动 reply。
@@ -274,18 +290,20 @@ impl VfioUserSession {
         };
         let idx = req.index;
         // **Phase W1** — BAR/config 描述统一从中立 describe() 派生（不再 Regions）。
-        let desc = device.describe();
+        // 先把 BAR0 size 抽到 owned local，结束 describe 借用，再 match（match 臂里
+        // 的 send_err 需 &mut self，不能与 describe 借用并存）。
+        let bar0_size = self
+            .describe_for(device)
+            .bars
+            .iter()
+            .find(|b| b.index == 0)
+            .map_or(0, |b| b.size);
         let (flags, size) = match idx {
             x if x == pci_region::BAR0 => {
-                let s = desc
-                    .bars
-                    .iter()
-                    .find(|b| b.index == 0)
-                    .map_or(0, |b| b.size);
-                if s == 0 {
+                if bar0_size == 0 {
                     (0u32, 0u64)
                 } else {
-                    (region_flags::READ | region_flags::WRITE, s)
+                    (region_flags::READ | region_flags::WRITE, bar0_size)
                 }
             }
             x if x == pci_region::CONFIG => (
@@ -331,8 +349,10 @@ impl VfioUserSession {
             }
         };
         let idx = req.index;
+        // 先抽 msix_count 到 owned local，结束 describe 借用，再 match。
+        let msix_count = self.describe_for(device).msix_count;
         let (flags, count) = match idx {
-            x if x == pci_irq::MSIX => (irq_info::EVENTFD, device.describe().msix_count),
+            x if x == pci_irq::MSIX => (irq_info::EVENTFD, msix_count),
             x if x < pci_irq::NUM_IRQS => (0u32, 0u32),
             _ => {
                 self.send_err(id, Command::DeviceGetIrqInfo, libc::EINVAL as u32);
@@ -354,13 +374,12 @@ impl VfioUserSession {
     /// `[offset, offset+count)` 须落在该 region 的 size 内。region size 与
     /// `GET_REGION_INFO` 同源（CONFIG = 4 KiB / BAR0 = describe 派生 / 其余 = 0）。
     /// bogus region index（如 0xdeadbeef）或越界 → false，caller 回 EINVAL。
-    fn region_access_ok<D: PcieDevice>(device: &D, region: u32, offset: u64, count: usize) -> bool {
+    /// `desc` 由 caller 传缓存的 [`DeviceDescribe`]（见 [`Self::describe_for`]）。
+    fn region_access_ok(desc: &DeviceDescribe, region: u32, offset: u64, count: usize) -> bool {
         let size = if region == pci_region::CONFIG {
             crate::ConfigSpace::SIZE as u64
         } else if region == pci_region::BAR0 {
-            device
-                .describe()
-                .bars
+            desc.bars
                 .iter()
                 .find(|b| b.index == 0)
                 .map_or(0, |b| b.size)
@@ -442,7 +461,8 @@ impl VfioUserSession {
             self.send_err(id, Command::RegionRead, libc::EINVAL as u32);
             return Ok(());
         }
-        if !Self::region_access_ok(device, bar, offset, count) {
+        let access_ok = Self::region_access_ok(self.describe_for(device), bar, offset, count);
+        if !access_ok {
             self.send_err(id, Command::RegionRead, libc::EINVAL as u32);
             return Ok(());
         }
@@ -500,7 +520,8 @@ impl VfioUserSession {
             return Ok(());
         }
         // **vfio-spec** — region index / 越界校验（bogus region → EINVAL）。
-        if !Self::region_access_ok(device, bar, offset, count) {
+        let access_ok = Self::region_access_ok(self.describe_for(device), bar, offset, count);
+        if !access_ok {
             self.send_err(id, Command::RegionWrite, libc::EINVAL as u32);
             return Ok(());
         }
@@ -538,8 +559,10 @@ impl VfioUserSession {
         device.reset(0); // kind=0 == FLR
         // **Phase W1 / review M-1** — FLR 复位 config space：丢弃缓存，下次访问
         // 按 `device.describe()` 重建（BAR base 归 0 / Command 清零），符合 PCI
-        // FLR 语义，也避免"describe() 运行期变化但缓存 stale"的隐患。
+        // FLR 语义，也避免"describe() 运行期变化但缓存 stale"的隐患。describe
+        // 缓存一并丢弃，确保 config 从新鲜 describe 重建（同源、不读 stale）。
         self.config = None;
+        self.describe = None;
         let hdr = Header::reply_ok(id, Command::DeviceReset, 0);
         write_message(&mut self.stream, &hdr, &[], &[]).context("write DEVICE_RESET reply")
     }
@@ -676,17 +699,22 @@ mod tests {
     struct MockDev {
         bar0: Vec<u64>,
         last_reset: u32,
+        /// describe() 调用计数（跨 spawn 线程可读，验证缓存命中/失效）。
+        describe_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
     impl MockDev {
         fn new() -> Self {
             Self {
                 bar0: vec![0u64; 1024],
                 last_reset: 0xFFFF_FFFF,
+                describe_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
     }
     impl Pde for MockDev {
         fn describe(&self) -> DeviceDescribe {
+            self.describe_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // **Phase W1** — 取代被删的 `Regions`：BAR0 8 KiB + 8 MSI-X 由
             // describe() 提供；identity 供 config-space 路由测试断言。
             DeviceDescribe {
@@ -841,6 +869,54 @@ mod tests {
             assert_eq!(f, expect_flags);
             assert_eq!(c, expect_count);
         }
+    }
+
+    /// **perf (reviewer MEDIUM+LOW)** — describe() 懒缓存的独立 oracle：
+    /// 多次访问只 alloc 一次 describe（缓存命中），FLR reset 后失效重建。
+    /// 3 次 GET_IRQ_INFO 中间夹 1 次 DEVICE_RESET → describe() 恰好调 **2** 次：
+    /// - 不缓存会调 3 次（每次访问各一次）；
+    /// - reset 不失效会只调 1 次（第 3 次命中 stale 缓存）。
+    ///
+    /// 故 ==2 同时钉死「缓存命中」与「reset 失效」两条语义（不靠 config 也清碰巧绿）。
+    #[test]
+    fn describe_cache_hits_and_reset_invalidates() {
+        let (server, mut client) = pair();
+        let mut sess = VfioUserSession::new(server, neg());
+        let mut dev = MockDev::new();
+        let calls = dev.describe_calls.clone();
+        let _h = thread::spawn(move || {
+            for _ in 0..4 {
+                if !sess.pump_one(&mut dev).unwrap() {
+                    break;
+                }
+            }
+        });
+        let irq_req = || IrqInfoPayload {
+            argsz: core::mem::size_of::<IrqInfoPayload>() as u32,
+            flags: 0,
+            index: pci_irq::MSIX,
+            count: 0,
+        };
+        let send_irq = |client: &mut UnixStream, id: u16| {
+            let req = irq_req();
+            let hdr = Header::command(id, Command::DeviceGetIrqInfo, req.as_bytes().len() as u32);
+            fw_write(client, &hdr, req.as_bytes(), &[]).unwrap();
+            let _ = read_message(client).unwrap();
+        };
+        // 访问 1 + 2：缓存 miss 一次后命中。
+        send_irq(&mut client, 1);
+        send_irq(&mut client, 2);
+        // DEVICE_RESET：丢弃 describe 缓存。
+        let hdr = Header::command(3, Command::DeviceReset, 0);
+        fw_write(&mut client, &hdr, &[], &[]).unwrap();
+        let _ = read_message(&mut client).unwrap();
+        // 访问 3：reset 后重建（第 2 次 describe()）。
+        send_irq(&mut client, 4);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "describe() 应恰好调 2 次：缓存命中(否则 3) + reset 失效重建(否则 1)"
+        );
     }
 
     /// REGION_WRITE 8 byte + REGION_READ 8 byte：写 cafebabedeadbeef 然后读回。
