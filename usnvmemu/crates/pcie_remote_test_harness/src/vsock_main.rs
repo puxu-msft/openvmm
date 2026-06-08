@@ -5,7 +5,7 @@
 //! is Windows-specific.
 //!
 //! Usage (Windows host):
-//!   pcie_remote_noop_host_vsock --vm-id <guid> --port <number>
+//!   pcie_remote_test_harness_vsock --vm-id <guid> --port <number>
 
 use anyhow::Result;
 use anyhow::anyhow;
