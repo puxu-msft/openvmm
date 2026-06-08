@@ -16,7 +16,7 @@ use crate::cmd::*;
 use crate::controller::NvmeController;
 use crate::controller::ZnsState;
 use crate::regs::*;
-use pcie_device_sdk::*;
+use pcie_device_core::*;
 use zerocopy::IntoBytes;
 
 /// **Phase L1c** — 构造 4 KiB ZNS NS Identify (spec ZNS § 3.1.6 / Figure

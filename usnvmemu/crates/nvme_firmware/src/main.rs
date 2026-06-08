@@ -48,7 +48,9 @@ use anyhow::Result;
 use anyhow::anyhow;
 use clap::Parser;
 use controller::NvmeController;
+#[cfg(feature = "openhcl")]
 use pcie_device_sdk::*;
+#[cfg(feature = "openhcl")]
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -108,10 +110,7 @@ fn main() -> Result<()> {
             "non-Windows build requires --tcp-addr or --vfio-user-sock (vsock AF_HYPERV unavailable)"
         ));
     }
-    if args.vfio_user_sock.is_some() {
-        return run_vfio_user(args);
-    }
-    run_main(args)
+    dispatch(args)
 }
 
 #[cfg(windows)]
@@ -122,14 +121,38 @@ fn main() -> Result<()> {
             "provide --vm-id (vsock) or --tcp-addr or --vfio-user-sock"
         ));
     }
+    dispatch(args)
+}
+
+/// 按 CLI 参数选 transport；按 feature 编译时裁剪未启用的路径。
+fn dispatch(args: Args) -> Result<()> {
     if args.vfio_user_sock.is_some() {
-        return run_vfio_user(args);
+        #[cfg(feature = "vfio-user")]
+        {
+            return run_vfio_user(args);
+        }
+        #[cfg(not(feature = "vfio-user"))]
+        {
+            return Err(anyhow!(
+                "--vfio-user-sock 需在编译时启用 'vfio-user' feature"
+            ));
+        }
     }
-    run_main(args)
+    #[cfg(feature = "openhcl")]
+    {
+        run_main(args)
+    }
+    #[cfg(not(feature = "openhcl"))]
+    {
+        Err(anyhow!(
+            "vsock/tcp transport 需在编译时启用 'openhcl' feature"
+        ))
+    }
 }
 
 /// **Phase U-followup** — vfio-user 模式：绑定 UNIX socket，accept QEMU
 /// 接管，跑同一份 NvmeController（与 pcie_remote 路径共享 controller code）。
+#[cfg(feature = "vfio-user")]
 fn run_vfio_user(args: Args) -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "nvme_firmware=debug,vfio_user_transport=debug,info".into());
@@ -153,6 +176,7 @@ fn run_vfio_user(args: Args) -> Result<()> {
     })
 }
 
+#[cfg(feature = "openhcl")]
 fn run_main(args: Args) -> Result<()> {
     // 默认开 device + SDK debug log；用户可用 RUST_LOG 覆盖。
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -205,6 +229,7 @@ fn run_main(args: Args) -> Result<()> {
     })
 }
 
+#[cfg(feature = "openhcl")]
 async fn connect_with_retry(driver: &pal_async::DefaultDriver, args: &Args) -> Result<WireStream> {
     let mut attempt = 0;
     loop {
@@ -225,6 +250,7 @@ async fn connect_with_retry(driver: &pal_async::DefaultDriver, args: &Args) -> R
     }
 }
 
+#[cfg(feature = "openhcl")]
 async fn try_one(driver: &pal_async::DefaultDriver, args: &Args) -> Result<WireStream> {
     if let Some(addr) = &args.tcp_addr {
         return connect_tcp(driver, addr).await;

@@ -9,13 +9,16 @@ name = "nvme_firmware"
 path = "src/main.rs"
 
 [dependencies]
-pcie_device_sdk = { path = "../pcie_device_sdk" }
-# **Phase U-followup** — vfio-user backend，让 NVMe controller 也能被
-# QEMU `-device vfio-user-pci,socket=...` 直接接管。
-vfio_user_transport = { path = "../vfio_user_transport" }
-pcie_remote_protocol = { path = "../../../vm/devices/pcie_remote_protocol" }
-pal_async = { path = "../../../support/pal/pal_async" }
-guid = { path = "../../../support/guid", features = ["mesh"] }
+# **Phase W3 (ADR-010)** — controller（lib）只依赖中立 domain core；transport
+# 是 bin 的事，按 feature 选。`cargo build --no-default-features --lib` 可只靠
+# core 编出 controller，证明 device 层与具体 transport 解耦。
+pcie_device_core = { path = "../pcie_device_core" }
+# OpenHCL / OpenVMM pcie_remote transport（vsock + TCP）—— 仅 bin 用，openhcl feature 拉入。
+pcie_device_sdk = { path = "../pcie_device_sdk", optional = true }
+pal_async = { path = "../../../support/pal/pal_async", optional = true }
+guid = { path = "../../../support/guid", features = ["mesh"], optional = true }
+# vfio-user transport（QEMU `-device vfio-user-pci,socket=...` 接管）—— vfio-user feature 拉入。
+vfio_user_transport = { path = "../vfio_user_transport", optional = true }
 # 复用仓库内的 NVMe 2.0c spec 定义（完整 Cap/Cc/Csts bitfield、Command/
 # Completion、IdentifyController 全部字段、AdminOpcode/NvmOpcode 枚举）。
 # 这让我们不用手写 1000+ 行 spec 类型，专注 controller 行为实现。
@@ -31,3 +34,10 @@ zerocopy = { version = "0.8", features = ["derive"] }
 # 不安全 mmap 边界。教学：演示 file IO → mmap 零拷贝路径减 2 次 kernel
 # memcpy（Read/Write 各一次）。
 memmap2 = "0.9"
+
+[features]
+default = ["openhcl", "vfio-user"]
+# OpenHCL/OpenVMM pcie_remote transport（vsock 生产 + TCP 开发）。
+openhcl = ["dep:pcie_device_sdk", "dep:pal_async", "dep:guid"]
+# vfio-user transport（QEMU 接管）。
+vfio-user = ["dep:vfio_user_transport"]

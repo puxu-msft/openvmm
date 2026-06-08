@@ -18,7 +18,7 @@ use crate::controller::WriteAccum;
 use crate::controller::ZnsState;
 use crate::controller::ZoneState;
 use crate::regs::*;
-use pcie_device_sdk::*;
+use pcie_device_core::*;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;

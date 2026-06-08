@@ -1260,9 +1260,9 @@ fn o3_fused_cw_dispatch_chain_smoke() {
         .write_at(&[0xAB; 512], 0)
         .unwrap();
     // 构造 mock DeviceCtx
-    let mut cap = pcie_device_sdk::CaptureTransport::new();
+    let mut cap = pcie_device_core::CaptureTransport::new();
     {
-        let _ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
+        let _ctx = pcie_device_core::DeviceCtx::new(&mut cap);
         // 仅验证 helper 可用 — 完整 SQE → dispatch_io → on_dma_complete 链
         // 涉及 enable controller / create IO SQ 等大量 setup，这里只 smoke
         // test mock ctx 能构造而不 panic；块结束借用释放后再断言。
@@ -1273,10 +1273,10 @@ fn o3_fused_cw_dispatch_chain_smoke() {
 /// **Phase Q10** — DeviceCtx mock can capture outbound DMA / interrupt 包。
 #[test]
 fn devicectx_mock_captures_dma_read() {
-    use pcie_device_sdk::TransportEvent;
-    let mut cap = pcie_device_sdk::CaptureTransport::with_start_token(200);
+    use pcie_device_core::TransportEvent;
+    let mut cap = pcie_device_core::CaptureTransport::with_start_token(200);
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
         let t_read = ctx.dma_read(0x1000_0000, 4096);
         assert_eq!(t_read, 200, "token = initial next_dma_token");
         let t_write = ctx.dma_write(0x2000_0000, vec![0xCD; 8]);
@@ -1417,7 +1417,7 @@ fn ns_write_protection_get_set_round_trip() {
     )
     .unwrap();
     // 准备 mock DeviceCtx + CQ entry（admin dispatch 需要 phase）
-    let mut cap = pcie_device_sdk::CaptureTransport::new();
+    let mut cap = pcie_device_core::CaptureTransport::new();
     // 准备 admin CQ 才能拿 phase
     c.cqs.insert(
         0,
@@ -1455,7 +1455,7 @@ fn ns_write_protection_get_set_round_trip() {
     let sc_of = |cqe: &Cqe| (cqe.dw3 >> 17) as u8;
 
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
         // Set NS 1 WPS=1
         let cqe = c
             .dispatch_admin(&mut ctx, make_set(1, 1), 0x11, 0, 0)
@@ -1596,7 +1596,7 @@ fn ns_attachment_via_admin_round_trip() {
             last_fire: None,
         },
     );
-    let mut cap = pcie_device_sdk::CaptureTransport::with_start_token(0x1000);
+    let mut cap = pcie_device_core::CaptureTransport::with_start_token(0x1000);
 
     let make_sqe = |sel: u8| {
         let zero = [0u8; 64];
@@ -1615,7 +1615,7 @@ fn ns_attachment_via_admin_round_trip() {
     ctrl_list[3] = 0; // cntlid[0] hi
 
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
         // SEL=1 Detach
         let r = c.dispatch_admin(&mut ctx, make_sqe(1), 0x33, 0, 0);
         assert!(r.is_none(), "Detach 走 DMA-read，dispatch 不立即返 cqe");
@@ -1626,7 +1626,7 @@ fn ns_attachment_via_admin_round_trip() {
     }
     // 再做 Attach（重新建 ctx 避免借用冲突）
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
         let r = c.dispatch_admin(&mut ctx, make_sqe(0), 0x33, 0, 0);
         assert!(r.is_none());
         let tok = *c.pending_ios.keys().next().expect("pending IO 应有一条");
@@ -1636,7 +1636,7 @@ fn ns_attachment_via_admin_round_trip() {
     // 再 Attach 应 NAMESPACE_ALREADY_ATTACHED (SC 0x18, SCT Cmd-Specific)
     let outbound_pre = cap.events().len();
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
         let r = c.dispatch_admin(&mut ctx, make_sqe(0), 0x33, 0, 0);
         assert!(r.is_none());
         let tok = *c.pending_ios.keys().next().expect("pending IO 应有一条");
@@ -1646,7 +1646,7 @@ fn ns_attachment_via_admin_round_trip() {
     assert!(c.namespaces[&1].attached);
     // 抓 outbound_pre 之后最后一条 WriteGpa 解析为 Cqe（post_cqe via
     // dma_write_fire_and_forget 把 16-byte CQE 发到 admin CQ GPA）。
-    use pcie_device_sdk::TransportEvent;
+    use pcie_device_core::TransportEvent;
     let cqe_bytes = cap
         .events()
         .iter()
@@ -1690,7 +1690,7 @@ fn identify_controller_list_cns_0x12_0x13() {
     );
     // 模拟 build_v2 buf 直接（不走 admin dispatch；admin dispatch 走 DMA-write 较繁）
     // 改成构造 sqe 跑 dispatch_admin → 完成时通过 outbound 抓 buf。
-    let mut cap = pcie_device_sdk::CaptureTransport::with_start_token(0x2000);
+    let mut cap = pcie_device_core::CaptureTransport::with_start_token(0x2000);
     let make_sqe = |cns: u8, nsid: u32, start_cntlid: u16| {
         let zero = [0u8; 64];
         let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
@@ -1701,8 +1701,8 @@ fn identify_controller_list_cns_0x12_0x13() {
         sqe
     };
     // Helper：从 outbound 取最后一条 WriteGpa 的 data
-    use pcie_device_sdk::TransportEvent;
-    let extract_last_write = |events: &[pcie_device_sdk::TransportEvent]| -> Vec<u8> {
+    use pcie_device_core::TransportEvent;
+    let extract_last_write = |events: &[pcie_device_core::TransportEvent]| -> Vec<u8> {
         for e in events.iter().rev() {
             if let TransportEvent::DmaWrite { data, .. } = e {
                 return data.clone();
@@ -1712,7 +1712,7 @@ fn identify_controller_list_cns_0x12_0x13() {
     };
 
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
         // CNS 0x13 start=0 → 含本 ctrl
         let _ = c.dispatch_admin(&mut ctx, make_sqe(0x13, 0, 0), 0x44, 0, 0);
     }
@@ -1723,7 +1723,7 @@ fn identify_controller_list_cns_0x12_0x13() {
     cap.clear();
 
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
         // CNS 0x13 start=2 → 空列表
         let _ = c.dispatch_admin(&mut ctx, make_sqe(0x13, 0, 2), 0x44, 0, 0);
     }
@@ -1736,7 +1736,7 @@ fn identify_controller_list_cns_0x12_0x13() {
     cap.clear();
 
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
         // CNS 0x12 nsid=1 attached → NumIDs=1
         let _ = c.dispatch_admin(&mut ctx, make_sqe(0x12, 1, 0), 0x44, 0, 0);
     }
@@ -1747,7 +1747,7 @@ fn identify_controller_list_cns_0x12_0x13() {
     // Detach NS 1 → 0x12 NumIDs=0
     c.namespaces.get_mut(&1).unwrap().attached = false;
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
         let _ = c.dispatch_admin(&mut ctx, make_sqe(0x12, 1, 0), 0x44, 0, 0);
     }
     let buf = extract_last_write(cap.events());
@@ -1810,9 +1810,9 @@ fn ana_state_change_triggers_aen() {
     c.aen_pending.push_back((0x42, 0, 0, 0));
     assert_eq!(c.ana_state, 0x01);
     let initial_change = c.ana_change_count;
-    let mut cap = pcie_device_sdk::CaptureTransport::new();
+    let mut cap = pcie_device_core::CaptureTransport::new();
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
         // 切到 Non-Optimized 0x02
         assert!(c.set_ana_state(&mut ctx, 0x02));
         // 重复设同值 → false

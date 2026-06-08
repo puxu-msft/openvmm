@@ -33,7 +33,7 @@ use super::Namespace;
 use super::NvmeController;
 use super::ReservationKind;
 use crate::cmd::*;
-use pcie_device_sdk::*;
+use pcie_device_core::*;
 
 impl Namespace {
     /// 单调递增 reservation_gen（spec § 6.14 driver 用此感知 state 变化）。

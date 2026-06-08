@@ -48,7 +48,7 @@ mod reservation;
 
 use crate::cmd::*;
 use crate::regs::*;
-use pcie_device_sdk::*;
+use pcie_device_core::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Seek;
@@ -1051,7 +1051,7 @@ impl NvmeController {
     /// **Phase V2** — Fabric Property Set 同窄 wrapper。
     pub fn nvme_property_set(
         &mut self,
-        ctx: &mut pcie_device_sdk::DeviceCtx<'_>,
+        ctx: &mut pcie_device_core::DeviceCtx<'_>,
         ofst: u32,
         size: u32,
         value: u64,
@@ -1074,7 +1074,7 @@ impl NvmeController {
     /// 走 post_cqe 路径。
     pub fn nvme_admin_dispatch(
         &mut self,
-        ctx: &mut pcie_device_sdk::DeviceCtx<'_>,
+        ctx: &mut pcie_device_core::DeviceCtx<'_>,
         sqe: crate::cmd::Sqe,
         cid: u16,
         cq_id: u16,
@@ -1092,7 +1092,7 @@ impl NvmeController {
     /// 也防 BC wrapper 静默覆盖 caller 已设值。
     pub fn nvme_admin_dispatch_with_conn(
         &mut self,
-        ctx: &mut pcie_device_sdk::DeviceCtx<'_>,
+        ctx: &mut pcie_device_core::DeviceCtx<'_>,
         sqe: crate::cmd::Sqe,
         cid: u16,
         cq_id: u16,
@@ -1112,7 +1112,7 @@ impl NvmeController {
     /// `nvme_admin_complete_dma`）。
     pub fn nvme_io_dispatch(
         &mut self,
-        ctx: &mut pcie_device_sdk::DeviceCtx<'_>,
+        ctx: &mut pcie_device_core::DeviceCtx<'_>,
         sq_id: u16,
         sqe: crate::cmd::Sqe,
         cid: u16,
@@ -1126,12 +1126,12 @@ impl NvmeController {
     /// 一次 ok=true 触发 controller post_cqe）。
     pub fn nvme_admin_complete_dma(
         &mut self,
-        ctx: &mut pcie_device_sdk::DeviceCtx<'_>,
+        ctx: &mut pcie_device_core::DeviceCtx<'_>,
         token: u64,
         ok: bool,
         data: Vec<u8>,
     ) {
-        use pcie_device_sdk::PcieDevice as _;
+        use pcie_device_core::PcieDevice as _;
         self.on_dma_complete(ctx, token, ok, data);
     }
 
@@ -1275,7 +1275,7 @@ impl NvmeController {
     /// 错位归因为 controller bug。tripwire 让 panic 直接命中 root cause。
     pub fn nvme_post_cqe(
         &mut self,
-        ctx: &mut pcie_device_sdk::DeviceCtx<'_>,
+        ctx: &mut pcie_device_core::DeviceCtx<'_>,
         cqe: crate::cmd::Cqe,
     ) {
         debug_assert!(
@@ -1354,14 +1354,14 @@ impl NvmeController {
 
     /// **Phase V6b** — 外部强制 fire 一条 AEN；返 true 表示 AER 已 fire
     /// （驱动 `aen_pending.pop_front` + post_cqe 已发 16B CQE 到 ctx.dma_write
-    /// 哨值地址，caller 必须用 [`pcie_device_sdk::DeviceCtx`] 接
+    /// 哨值地址，caller 必须用 [`pcie_device_core::DeviceCtx`] 接
     /// 着上 `TcpAdminTransport` capture 那条 CQE write）。
     /// false 表示无 pending AER 可弹（事件按 spec drop）。
     ///
     /// `aen_type` < 8 (spec § 5.2 Figure 174 bits 2:0)。
     pub fn nvme_fire_aen(
         &mut self,
-        ctx: &mut pcie_device_sdk::DeviceCtx<'_>,
+        ctx: &mut pcie_device_core::DeviceCtx<'_>,
         aen_type: u8,
         aen_info: u8,
         log_id: u8,
@@ -1373,7 +1373,7 @@ impl NvmeController {
     /// AER 留在队列里不动。session V2 调本 wrapper 防 cross-conn AER 窃取。
     pub fn nvme_fire_aen_for_conn(
         &mut self,
-        ctx: &mut pcie_device_sdk::DeviceCtx<'_>,
+        ctx: &mut pcie_device_core::DeviceCtx<'_>,
         aen_type: u8,
         aen_info: u8,
         log_id: u8,

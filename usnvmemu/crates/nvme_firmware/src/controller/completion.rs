@@ -21,7 +21,7 @@ use crate::controller::ZoneState;
 use crate::controller::parse_prp_list;
 use crate::controller::try_mmap_file;
 use crate::regs::*;
-use pcie_device_sdk::*;
+use pcie_device_core::*;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
