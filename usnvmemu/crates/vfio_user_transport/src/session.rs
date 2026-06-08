@@ -31,12 +31,12 @@ use crate::proto::pci_irq;
 use crate::proto::pci_region;
 use crate::proto::region_flags;
 use anyhow::Context as _;
-use pcie_device_sdk::PcieDevice;
+use pcie_device_core::PcieDevice;
 use std::os::unix::net::UnixStream;
 use zerocopy::IntoBytes;
 
 // **Phase W1** — `Regions` trait 已删除（ADR-010）。设备的 BAR/MSI-X/config
-// 描述统一从 `PcieDevice::describe` 的中立 `pcie_device_sdk::DeviceDescribe`
+// 描述统一从 `PcieDevice::describe` 的中立 `pcie_device_core::DeviceDescribe`
 // 派生，不再要求实现者额外实现一个 vfio-user 专属 trait（消除"描述模型分叉"）。
 
 /// Server-side session：握手已完成，循环派发入站命令到 [`PcieDevice`]。
@@ -160,7 +160,7 @@ impl VfioUserSession {
             // 给 device 的 ctx 借 *self*：device.on_dma_complete 可能继续
             // 调 ctx.dma_*，又往 pending_completions 推新事件 — while 循环
             // 自动 drain 干净。
-            let mut ctx = pcie_device_sdk::DeviceCtx::new(self);
+            let mut ctx = pcie_device_core::DeviceCtx::new(self);
             device.on_dma_complete(&mut ctx, c.token, c.ok, c.data);
         }
     }
@@ -411,7 +411,7 @@ impl VfioUserSession {
             // 给 vfio-user backend 实现 Transport，先用 NoopTransport 屏蔽
             // dma/irq（U4/U5 接通后真正生效）。
             let mut t = crate::transport::NoopTransport;
-            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut t);
+            let mut ctx = pcie_device_core::DeviceCtx::new(&mut t);
             device.mmio_write(&mut ctx, bar, offset, count as u32, value);
         }
         // Reply: echo struct only (no data).
@@ -471,7 +471,7 @@ impl VfioUserSession {
 ///
 /// 失败时（DMA 表查不到 region / wire IO err）：返非零 token + 把
 /// `ok=false data=[]` 推队列，让 device 走 NVMe 标准 DMA-fail 清理路径。
-impl pcie_device_sdk::Transport for VfioUserSession {
+impl pcie_device_core::Transport for VfioUserSession {
     fn fire_interrupt(&mut self, msix_index: u32) {
         let _ = self.irq_vectors.fire(msix_index);
     }
@@ -559,11 +559,11 @@ mod tests {
     use crate::HEADER_LEN;
     use crate::HeaderFlags;
     use crate::framing::write_message as fw_write;
-    use pcie_device_sdk::BarKind;
-    use pcie_device_sdk::BarLayout;
-    use pcie_device_sdk::DeviceCtx;
-    use pcie_device_sdk::DeviceDescribe;
-    use pcie_device_sdk::PcieDevice as Pde;
+    use pcie_device_core::BarKind;
+    use pcie_device_core::BarLayout;
+    use pcie_device_core::DeviceCtx;
+    use pcie_device_core::DeviceDescribe;
+    use pcie_device_core::PcieDevice as Pde;
     use std::os::unix::net::UnixStream;
     use std::thread;
 

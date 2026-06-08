@@ -321,7 +321,7 @@ async fn v8e7_2_disconnect_async_sweeps_io_queue_via_drop() {
     {
         let mut c = sess.controller().controller.lock();
         let mut t = vfio_user_transport::NoopTransport;
-        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut t);
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut t);
         // Create IO CQ qid=1
         let mut sqe = Sqe::new_zeroed();
         sqe.cdw0 = 0x05;

@@ -11,7 +11,7 @@
 use crate::handshake::server_handshake;
 use crate::session::VfioUserSession;
 use anyhow::Context as _;
-use pcie_device_sdk::PcieDevice;
+use pcie_device_core::PcieDevice;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 

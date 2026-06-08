@@ -7,7 +7,7 @@
 //! Phase U4 加 `VfioUserTransport` 真实现：dma_read/write 经 DMA_READ/WRITE
 //! S→C 命令拿数据；fire_interrupt 写 eventfd。
 
-use pcie_device_sdk::Transport;
+use pcie_device_core::Transport;
 
 /// 不做任何事的 [`Transport`]。任何 dma_read/dma_write 返 token=0；
 /// fire_interrupt 静默丢弃。
@@ -47,7 +47,7 @@ mod tests {
 
     #[test]
     fn noop_returns_zero_token_and_does_not_panic() {
-        let mut t: Box<dyn pcie_device_sdk::Transport> = Box::new(NoopTransport);
+        let mut t: Box<dyn pcie_device_core::Transport> = Box::new(NoopTransport);
         t.fire_interrupt(7);
         assert_eq!(t.dma_read(0xCAFE, 4096), 0);
         assert_eq!(t.dma_write(0xBEEF, vec![1, 2, 3]), 0);
@@ -56,6 +56,6 @@ mod tests {
     #[test]
     fn noop_is_object_safe() {
         let mut t = NoopTransport;
-        let _dyn_ref: &mut dyn pcie_device_sdk::Transport = &mut t;
+        let _dyn_ref: &mut dyn pcie_device_core::Transport = &mut t;
     }
 }

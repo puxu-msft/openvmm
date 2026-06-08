@@ -9,7 +9,7 @@ nvme_firmware = { path = "../nvme_firmware" }
 # **V2** — 复用 NoopTransport stub 给 controller.mmio_write_impl(ctx)；
 # CC.EN=1 等 Property Set 路径不会触发 dma/interrupt，stub 安全。
 vfio_user_transport = { path = "../vfio_user_transport" }
-pcie_device_sdk = { path = "../pcie_device_sdk" }
+pcie_device_core = { path = "../pcie_device_core" }
 anyhow = "1.0.102"
 thiserror = "1.0"
 tracing = "0.1.44"

@@ -793,7 +793,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         let value = pf.value;
         let ok = {
             let mut t = vfio_user_transport::NoopTransport;
-            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut t);
+            let mut ctx = pcie_device_core::DeviceCtx::new(&mut t);
             self.controller
                 .controller
                 .lock()
@@ -1319,7 +1319,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         let conn_id = self.conn_id;
         let immediate_cqe = {
             let mut c = self.controller.controller.lock();
-            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
+            let mut ctx = pcie_device_core::DeviceCtx::new(&mut tcp_t);
             c.nvme_admin_dispatch_with_conn(&mut ctx, sqe, cid, 0, conn_id)
         };
 
@@ -1359,7 +1359,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         let conn_id = self.conn_id;
         let immediate = {
             let mut c = self.controller.controller.lock();
-            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
+            let mut ctx = pcie_device_core::DeviceCtx::new(&mut tcp_t);
             c.nvme_admin_dispatch_with_conn(&mut ctx, sqe, cid, 0, conn_id)
         };
         self.next_token = tcp_t.token_high_water();
@@ -1453,7 +1453,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             crate::tcp_transport::TcpAdminTransport::new_with_token_base(self.next_token);
         let immediate_cqe = {
             let mut c = self.controller.controller.lock();
-            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
+            let mut ctx = pcie_device_core::DeviceCtx::new(&mut tcp_t);
             c.nvme_io_dispatch(&mut ctx, sq_id, sqe, cid, cq_id)
         };
         self.run_post_dispatch_async(cid, immediate_cqe, tcp_t)
@@ -1511,7 +1511,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
                 crate::tcp_transport::TcpAdminTransport::new_with_token_base(self.next_token);
             let immediate_cqe = {
                 let mut c = self.controller.controller.lock();
-                let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
+                let mut ctx = pcie_device_core::DeviceCtx::new(&mut tcp_t);
                 c.nvme_io_dispatch(&mut ctx, sq_id, sub_sqe, cid, cq_id)
             };
 
@@ -1591,7 +1591,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             cmd_cumulative_offset = cmd_cumulative_offset.saturating_add(read_req.len);
             {
                 let mut c = self.controller.controller.lock();
-                let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
+                let mut ctx = pcie_device_core::DeviceCtx::new(&mut tcp_t);
                 c.nvme_admin_complete_dma(&mut ctx, read_req.token, true, bytes);
             }
         }
@@ -1599,7 +1599,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         // Phase 3: sync / async write-out
         if let Some(cqe) = immediate_cqe {
             let mut c = self.controller.controller.lock();
-            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
+            let mut ctx = pcie_device_core::DeviceCtx::new(&mut tcp_t);
             c.nvme_post_cqe(&mut ctx, cqe);
         } else if !had_pending_reads {
             let mut data_tokens = Vec::with_capacity(tcp_t.writes.len());
@@ -1614,7 +1614,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             }
             for tok in data_tokens {
                 let mut c = self.controller.controller.lock();
-                let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
+                let mut ctx = pcie_device_core::DeviceCtx::new(&mut tcp_t);
                 c.nvme_admin_complete_dma(&mut ctx, tok, true, Vec::new());
             }
         }
@@ -1713,7 +1713,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             // 第 3 段：lock-complete
             {
                 let mut c = self.controller.controller.lock();
-                let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
+                let mut ctx = pcie_device_core::DeviceCtx::new(&mut tcp_t);
                 c.nvme_admin_complete_dma(&mut ctx, read_req.token, true, bytes);
             }
         }
@@ -1721,7 +1721,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         // Phase 3: 同步 / 异步 write-out
         if let Some(cqe) = immediate_cqe {
             let mut c = self.controller.controller.lock();
-            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
+            let mut ctx = pcie_device_core::DeviceCtx::new(&mut tcp_t);
             c.nvme_post_cqe(&mut ctx, cqe);
         } else if !had_pending_reads {
             let mut data_tokens = Vec::with_capacity(tcp_t.writes.len());
@@ -1737,7 +1737,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             }
             for tok in data_tokens {
                 let mut c = self.controller.controller.lock();
-                let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
+                let mut ctx = pcie_device_core::DeviceCtx::new(&mut tcp_t);
                 c.nvme_admin_complete_dma(&mut ctx, tok, true, Vec::new());
             }
         }
@@ -1882,7 +1882,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
                 if c.nvme_pending_aer_count_for_conn(conn_id) == 0 {
                     false
                 } else {
-                    let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
+                    let mut ctx = pcie_device_core::DeviceCtx::new(&mut tcp_t);
                     c.nvme_fire_aen_for_conn(
                         &mut ctx, /*type*/ 0, /*info*/ 0, /*log_id*/ 0, conn_id,
                     )
@@ -1957,7 +1957,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         let conn_id = self.conn_id;
         let fired = {
             let mut c = self.controller.controller.lock();
-            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
+            let mut ctx = pcie_device_core::DeviceCtx::new(&mut tcp_t);
             c.nvme_fire_aen_for_conn(&mut ctx, aen_type, aen_info, log_id, conn_id)
         };
         self.next_token = tcp_t.token_high_water();

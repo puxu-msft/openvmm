@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! **Phase U** — vfio-user protocol backend for [`pcie_device_sdk`].
+//! **Phase U** — vfio-user protocol backend for [`pcie_device_core`].
 //!
-//! 让任意实现了 [`pcie_device_sdk::PcieDevice`] 的设备（如本仓库
+//! 让任意实现了 [`pcie_device_core::PcieDevice`] 的设备（如本仓库
 //! 的 NVMe controller）通过 [vfio-user 协议][spec] 暴露成 UNIX-socket
 //! server，被 QEMU `-device vfio-user-pci,socket=...` 直接接管。
 //!

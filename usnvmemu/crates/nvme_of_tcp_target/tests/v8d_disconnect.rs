@@ -344,7 +344,7 @@ fn v8d_aer_hard_cap_enforced() {
         );
     }
     struct NullTransport;
-    impl pcie_device_sdk::Transport for NullTransport {
+    impl pcie_device_core::Transport for NullTransport {
         fn fire_interrupt(&mut self, _msix_index: u32) {}
         fn dma_write(&mut self, _gpa: u64, _data: Vec<u8>) -> u64 {
             0
@@ -364,7 +364,7 @@ fn v8d_aer_hard_cap_enforced() {
     {
         let mut c = shared.controller.lock();
         let mut t = NullTransport;
-        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut t);
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut t);
         // conn_a 灌 8 条 AER（命中 per-conn cap=8）
         for i in 0..8 {
             let r = c.nvme_admin_dispatch_with_conn(

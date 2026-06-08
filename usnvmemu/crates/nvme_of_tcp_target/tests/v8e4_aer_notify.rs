@@ -69,7 +69,7 @@ async fn send_icreq(s: &mut TcpStream) {
 fn push_aer_and_notify(shared: &Arc<SharedControllerInner>, cid: u16, conn_id: u32) {
     use nvme_firmware::cmd::Sqe;
     struct NullTransport;
-    impl pcie_device_sdk::Transport for NullTransport {
+    impl pcie_device_core::Transport for NullTransport {
         fn fire_interrupt(&mut self, _: u32) {}
         fn dma_write(&mut self, _: u64, _: Vec<u8>) -> u64 {
             0
@@ -85,7 +85,7 @@ fn push_aer_and_notify(shared: &Arc<SharedControllerInner>, cid: u16, conn_id: u
             nvme_of_tcp_target::ADMIN_CQ_SIZE,
         );
         let mut t = NullTransport;
-        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut t);
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut t);
         let mut sqe = Sqe::new_zeroed();
         sqe.cdw0 = ((cid as u32) << 16) | 0xC;
         let _ = c.nvme_admin_dispatch_with_conn(&mut ctx, sqe, cid, 0, conn_id);

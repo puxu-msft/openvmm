@@ -16,9 +16,9 @@
 //! 此前 CONFIG region 读写被误当 BAR MMIO 转给 `mmio_read`，guest 拿不到正确
 //! vendor/device ID。
 
-use pcie_device_sdk::BarKind;
-use pcie_device_sdk::DeviceDescribe;
-use pcie_device_sdk::describe::cfg_offset as o;
+use pcie_device_core::BarKind;
+use pcie_device_core::DeviceDescribe;
+use pcie_device_core::describe::cfg_offset as o;
 
 /// 单个 BAR dword slot 的写语义。
 #[derive(Clone, Copy)]
@@ -119,7 +119,7 @@ impl ConfigSpace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pcie_device_sdk::BarLayout;
+    use pcie_device_core::BarLayout;
 
     fn desc() -> DeviceDescribe {
         DeviceDescribe {
