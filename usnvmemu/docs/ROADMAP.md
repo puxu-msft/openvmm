@@ -34,6 +34,21 @@ NVMe-oF TCP 第 4 条接入。当前架构 ✅ 已对齐：firmware (controller)
 > - **Tier 2**: firmware crate 命名重构 (下季)
 > - **Tier 3**: Phase X 仓库拆分 (半年)
 
+> **2026-06-09 自主会话状态分类**（哪些能无人值守做、哪些卡外部）：
+> - **✅ 本会话已完成**：vfio spec-complete track 全部（握手 minor 协商 / max_msg_fds /
+>   bulk REGION_WRITE / REGION 上限 max_data_xfer_size / describe 缓存 / mmap 零拷贝 DMA）
+>   + 真 QEMU 11 e2e harness + HOW_TO_ADD_TRANSPORT.md。
+> - **⏳ 可无人值守做（纯代码/文档，未做）**：V-followup-fused-cmd（Fused C&W 真原子）/
+>   V-followup-py-harness-spec-wire-conformance（CHAP wire 错误路径 Python）。
+> - **🔒 卡 host-root / sudo / kmod（须用户授权，无法无人值守）**：
+>   dhchap-4-real-host-interop（`sudo nvme connect --dhchap-secret`）/
+>   tls-psk-kernel-vector（写+装 ~50 LOC kmod dump kernel TLS PSK）/
+>   discovery-multi-portal-real（`nvme discover`）/ fabric-disconnect-real-interop。
+> - **🔒 卡上游**：tls-psk-rustls-wire（等 rustls external-PSK stable API）。
+> - **🔒 多月架构级（不宜单会话）**：V9 RDMA（6+ 月）/ V10 DMA backend / V-spec-strict /
+>   V-zoned-namespace。
+> - **🔒 卡 Phase X 时机**：pcie_remote_protocol 改名 / 仓库外部化（ADR-008 推迟）。
+
 ### Phase W — pcie_device_sdk 补全 hexagonal 结构 (Tier 2-结构, HIGH 优先, 分 W1-W4)
 
 **What**：Phase T 只抽了出站半边，入站/描述/crate 边界仍泄漏 OpenHCL。把
@@ -175,8 +190,8 @@ auth / FAILURE2 from host)，对齐 lib test。
 **What (仍未做, 留后续)**：
 - `pcie_remote_protocol` → `pcie_remote_wire` — 该 crate 在主仓 `vm/devices/`，
   VTL2 path 还在用；等 Phase X3 仓库拆分一起动
-- `docs/HOW_TO_ADD_TRANSPORT.md` — 教学加第 5 条 transport (e.g. iSCSI / NBD /
-  toy stdio-pipe)。**Tier 2 剩余 HIGH 项**
+- ~~`docs/HOW_TO_ADD_TRANSPORT.md`~~ **✅ 2026-06-09 done**（commit 4d8033d1）：
+  以 Transport trait 为中心的加接入教学指南；architect review 抓 H-1/C-1 事实错误已修。
 
 ### Phase X — 把项目搬出 openvmm 仓库 (Tier 3, MEDIUM-LARGE, 预计 1 week, 分 X1-X4 子段)
 
