@@ -8,15 +8,20 @@ description = "Userspace SDK for implementing PCIe devices over the pcie_remote 
 pcie_device_core = { path = "../pcie_device_core" }
 pcie_remote_protocol = { path = "../../../vm/devices/pcie_remote_protocol" }
 pal_async = { path = "../../../support/pal/pal_async" }
-mesh = { path = "../../../support/mesh" }
-guid = { path = "../../../support/guid", features = ["mesh"] }
-vmsocket = { path = "../../../support/vmsocket" }
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 futures = "0.3.32"
 tracing = "0.1.44"
 parking_lot = "0.12.5"
 socket2 = "0.6"
+
+# **Phase W2** — vsock (AF_HYPERV) 是 Windows-only：vmsocket / guid / mesh 仅
+# `connect_vsock`（#[cfg(windows)]）用，移到 target-gated deps 让 Linux 构建
+# （CI / TCP 路径）不链接它们。
+[target.'cfg(windows)'.dependencies]
+mesh = { path = "../../../support/mesh" }
+guid = { path = "../../../support/guid", features = ["mesh"] }
+vmsocket = { path = "../../../support/vmsocket" }
 
 [dev-dependencies]
 tracing-subscriber = "0.3.23"
