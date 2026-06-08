@@ -120,12 +120,21 @@ realize 成功。教训记 [LESSONS.md](LESSONS.md) §21（"版本不带≠协�
 - ~~**bulk REGION_WRITE**~~ **✅ 2026-06-09 done**（commit 4a539d9c）：WRITE 对称
   支持 bulk + 抽出共享对齐感知 register-granular chunker（`src/access.rs`，
   READ/WRITE/config 三路 DRY 复用）；config max=4 / MMIO max=8 区分寄存器宽度。
-- **用协商 `max_data_xfer_size` 替代硬编码 4096**：需先在 `Negotiated` parse 出
-  数值字段（当前只存 caps JSON 原始串）。← **下一个 vfio spec-complete HIGH**
-- **`region_access_ok` 缓存 BAR layout**：当前每次 region 访问 alloc describe() Vec。
-- **mmap 零拷贝 DMA**：见 Phase W plan §8 设计（DmaTable 并行 mmaps + memfd 单测）。
+- ~~**用协商 `max_data_xfer_size` 替代硬编码 4096**~~ **✅ 2026-06-09 done**
+  （commit 4e904999）：spec 校正 —— REGION 是 client→server，上限取 **server 广告值**
+  `SERVER_MAX_DATA_XFER_SIZE=1MiB`（per-receiver，非 min）；真边界仍由 region_access_ok
+  把关。client 值只对反方向 DMA 有意义，dma.rs 留 TODO 锚点（YAGNI 未 parse）。
+- ~~**`region_access_ok` 缓存 BAR layout**~~ **✅ 2026-06-09 done**（commit fe1e9b4a）：
+  session 懒缓存 `device.describe()`，4 处热路径复用；FLR reset 失效重建；describe-call
+  计数测试钉死缓存命中 + reset 失效。
+- ~~**mmap 零拷贝 DMA**~~ **✅ 2026-06-09 done**（commit dfa9fefb）：DMA_MAP 带 memfd
+  时按权限 mmap，dma_read/write 本地 memcpy 免 wire；不带 fd / mmap 失败退回 message
+  路径。2 轮 rust-reviewer（首轮 BLOCK 抓 CRITICAL C-1：client 声明 size > fd 真实
+  大小 → SIGBUS DoS，修=fstat 独立 oracle 校验）；9 memfd 单测。**vfio spec-complete
+  track 全部完成**（只剩真 guest boot 的全-DMA e2e）。
 - **真 guest OS 引导**：当前 QEMU e2e 用 `-S` 暂停 CPU，只验到 realize/PCI 枚举；
   引导 kernel+rootfs 看 `/dev/nvme0` 真读写需 IO queue DMA 全路径 + initramfs，留 future。
+  这也是 mmap DMA 路径全-e2e 验证的前置。
 
 **Why**：[PROJECT_VISION §3.3](PROJECT_VISION.md) firmware-as-core 第 3 条接入。
 真 QEMU 11 e2e 把 vfio-user 从"自家 client 验自家 server"推到"第三方独立实现

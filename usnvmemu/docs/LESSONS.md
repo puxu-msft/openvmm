@@ -438,3 +438,41 @@ fork"。这是把**单个版本的快照**当成**项目能力的全集**。正�
 
 **来源**: ROADMAP V-followup-vfio-user-cross-process-harness 段曾写的错误
 "现实修正"，2026-06-09 用 QEMU 11.0.1 实测推翻并更正。
+
+---
+
+## 22. unsafe 的 SAFETY 判据必须用独立 oracle，不可用不可信输入自证（mmap SIGBUS）(CRITICAL)
+
+**坑**: 实现 vfio-user mmap 零拷贝 DMA 时，`map_dma_fd` 把 client 在 DMA_MAP 里
+声明的 `size` 直接当 mmap 长度，SAFETY 注释写"所有 gpa→偏移索引都在 mmap_read/
+write 里按 size 边界校验"——**看似严密，实则致命**。
+
+**为什么是 CRITICAL**: `mmap(2)` 只要求 offset 页对齐，**不校验** `offset+size ≤
+文件真实大小`；映射超出真实页的区间会**成功**返回一个长度合法的 VMA，但 memcpy
+触碰无 backing 的页 → 内核投 **SIGBUS 杀整个进程**。client 发"大 size + 小 memfd"
+即可 DoS。而我的所有 Rust slice 边界检查（`off+len ≤ bytes.len()`）**完全无效**——
+越界发生在内核页层，不是 slice 层；`bytes.len()` 本身就等于那个撒谎的 size。
+
+**根本错误（与 [[lesson §20]] 同源，第 3 次复现）**: SAFETY 判据用的是
+**client 声明的 size**（不可信输入），而它和"映射区间长度"是同一个值——**自己
+印证自己**。真正的 oracle 是 `fstat(fd).st_size`（内核真相），代码从未查过。
+"按 size 校验 size" 是 self-consistent 假设当判据的教科书案例，只是这次戴上了
+unsafe 的帽子，代价从"连接挂"升级到"进程崩"。
+
+**修法**: mmap 前 `fstat` fd 取真实大小，校验 `offset+size ≤ st_size`，否则退回
+message 路径（绝不 mmap）。SAFETY 注释重写为**诚实列外部不变量**：fstat 保证
+backing / TOCTOU shrink 残留依赖（生产须 `F_SEAL_SHRINK`）/ u8 并发无 UB——而非
+假装"全在我方校验内"。
+
+**两条根本教训**:
+1. **unsafe 的 SAFETY 论证，每个不变量都要问"判据来自独立 oracle 还是不可信
+   输入的自我印证？"**。映射一个外部 fd，长度 oracle 是 `fstat` 不是对方的声明；
+   解析 wire，判据是协议 flag 不是自家编号约定（[[lesson §20]]）。同一把尺子。
+2. **review 第 3 次抓到我会 ship 的严重 bug**（§20 DMA head-of-line HIGH → 本条
+   SIGBUS CRITICAL）。模式稳定：我自信写完 unsafe + 测试全绿（5 个测试全用
+   size==fd 真实大小，self-consistent 数据，碰不到 SIGBUS 路径），reviewer 用
+   adversarial 视角（"size>fd 会怎样"）一问即破。**unsafe 必过 review，且测试
+   必须含 adversarial 用例**（不可信输入的极端值），不能只测 happy path。
+
+**来源**: vfio-user mmap DMA 的 rust-reviewer 2 轮（首轮 BLOCK CRITICAL C-1），
+commit dfa9fefb；回归测试 `dma_map_fd_smaller_than_declared_size_falls_back_no_sigbus`。
