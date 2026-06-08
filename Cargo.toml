@@ -66,6 +66,7 @@ exclude = [
   "xsync",
   "Guide/mdbook-openvmm-shim",
   "usnvmemu/crates/pcie_remote_test_harness",
+  "usnvmemu/crates/pcie_device_core",
   "usnvmemu/crates/pcie_device_sdk",
   "usnvmemu/crates/nvme_firmware",
   "usnvmemu/crates/rng_device_example",

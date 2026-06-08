@@ -1260,43 +1260,51 @@ fn o3_fused_cw_dispatch_chain_smoke() {
         .write_at(&[0xAB; 512], 0)
         .unwrap();
     // 构造 mock DeviceCtx
-    let mut outbound: Vec<pcie_device_sdk::ToOpenhcl> = Vec::new();
-    let mut seq = 1u64 << 32;
-    let mut tok = 1u64 << 40;
-    let ctx = pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
-    // 仅验证 helper 可用 — 完整 SQE → dispatch_io → on_dma_complete 链
-    // 涉及 enable controller / create IO SQ 等大量 setup，这里只 smoke
-    // test mock ctx 能 fire_interrupt / dma_read 而不 panic。
-    drop(ctx); // Phase T 后 ctx 借 outbound &mut，断言前要 drop
-    assert!(outbound.is_empty(), "no outbound yet");
+    let mut cap = pcie_device_sdk::CaptureTransport::new();
+    {
+        let _ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
+        // 仅验证 helper 可用 — 完整 SQE → dispatch_io → on_dma_complete 链
+        // 涉及 enable controller / create IO SQ 等大量 setup，这里只 smoke
+        // test mock ctx 能构造而不 panic；块结束借用释放后再断言。
+    }
+    assert!(cap.events().is_empty(), "no outbound yet");
 }
 
 /// **Phase Q10** — DeviceCtx mock can capture outbound DMA / interrupt 包。
 #[test]
 fn devicectx_mock_captures_dma_read() {
-    let mut outbound: Vec<pcie_device_sdk::ToOpenhcl> = Vec::new();
-    let mut seq = 100u64;
-    let mut tok = 200u64;
+    use pcie_device_sdk::TransportEvent;
+    let mut cap = pcie_device_sdk::CaptureTransport::with_start_token(200);
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
-        let token = ctx.dma_read(0x1000_0000, 4096);
-        assert_eq!(token, 200, "token = initial next_dma_token");
+        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
+        let t_read = ctx.dma_read(0x1000_0000, 4096);
+        assert_eq!(t_read, 200, "token = initial next_dma_token");
+        let t_write = ctx.dma_write(0x2000_0000, vec![0xCD; 8]);
+        assert_eq!(t_write, 201, "token 单调 +1");
         ctx.fire_interrupt(7);
     }
-    assert_eq!(outbound.len(), 2);
-    // verify outbound[0] is ReadGpa, outbound[1] is InterruptFire
-    use pcie_device_sdk::pcie_remote_protocol::to_openhcl::Body;
-    match outbound[0].body.as_ref().unwrap() {
-        Body::ReadGpa(r) => {
-            assert_eq!(r.gpa, 0x1000_0000);
-            assert_eq!(r.len, 4096);
+    // 中立事件按序：DmaRead → DmaWrite → FireInterrupt（取代旧 protobuf Body 断言）。
+    assert_eq!(cap.events().len(), 3);
+    assert_eq!(
+        cap.events()[0],
+        TransportEvent::DmaRead {
+            token: 200,
+            gpa: 0x1000_0000,
+            len: 4096,
         }
-        _ => panic!("expected ReadGpa"),
-    }
-    match outbound[1].body.as_ref().unwrap() {
-        Body::InterruptFire(i) => assert_eq!(i.msix_index, 7),
-        _ => panic!("expected InterruptFire"),
-    }
+    );
+    assert_eq!(
+        cap.events()[1],
+        TransportEvent::DmaWrite {
+            token: 201,
+            gpa: 0x2000_0000,
+            data: vec![0xCD; 8],
+        }
+    );
+    assert_eq!(
+        cap.events()[2],
+        TransportEvent::FireInterrupt { msix_index: 7 }
+    );
 }
 
 /// **Phase R1** — SGL inline single Data Block 解 prp1=address。
@@ -1409,9 +1417,7 @@ fn ns_write_protection_get_set_round_trip() {
     )
     .unwrap();
     // 准备 mock DeviceCtx + CQ entry（admin dispatch 需要 phase）
-    let mut outbound: Vec<pcie_device_sdk::ToOpenhcl> = Vec::new();
-    let mut seq = 1u64;
-    let mut tok = 1u64;
+    let mut cap = pcie_device_sdk::CaptureTransport::new();
     // 准备 admin CQ 才能拿 phase
     c.cqs.insert(
         0,
@@ -1449,7 +1455,7 @@ fn ns_write_protection_get_set_round_trip() {
     let sc_of = |cqe: &Cqe| (cqe.dw3 >> 17) as u8;
 
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
+        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
         // Set NS 1 WPS=1
         let cqe = c
             .dispatch_admin(&mut ctx, make_set(1, 1), 0x11, 0, 0)
@@ -1590,9 +1596,7 @@ fn ns_attachment_via_admin_round_trip() {
             last_fire: None,
         },
     );
-    let mut outbound: Vec<pcie_device_sdk::ToOpenhcl> = Vec::new();
-    let mut seq = 1u64;
-    let mut tok_counter = 0x1000u64;
+    let mut cap = pcie_device_sdk::CaptureTransport::with_start_token(0x1000);
 
     let make_sqe = |sel: u8| {
         let zero = [0u8; 64];
@@ -1611,8 +1615,7 @@ fn ns_attachment_via_admin_round_trip() {
     ctrl_list[3] = 0; // cntlid[0] hi
 
     {
-        let mut ctx =
-            pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok_counter);
+        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
         // SEL=1 Detach
         let r = c.dispatch_admin(&mut ctx, make_sqe(1), 0x33, 0, 0);
         assert!(r.is_none(), "Detach 走 DMA-read，dispatch 不立即返 cqe");
@@ -1623,8 +1626,7 @@ fn ns_attachment_via_admin_round_trip() {
     }
     // 再做 Attach（重新建 ctx 避免借用冲突）
     {
-        let mut ctx =
-            pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok_counter);
+        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
         let r = c.dispatch_admin(&mut ctx, make_sqe(0), 0x33, 0, 0);
         assert!(r.is_none());
         let tok = *c.pending_ios.keys().next().expect("pending IO 应有一条");
@@ -1632,10 +1634,9 @@ fn ns_attachment_via_admin_round_trip() {
         assert!(c.namespaces[&1].attached, "Attach 后 attached=true");
     }
     // 再 Attach 应 NAMESPACE_ALREADY_ATTACHED (SC 0x18, SCT Cmd-Specific)
-    let outbound_pre = outbound.len();
+    let outbound_pre = cap.events().len();
     {
-        let mut ctx =
-            pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok_counter);
+        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
         let r = c.dispatch_admin(&mut ctx, make_sqe(0), 0x33, 0, 0);
         assert!(r.is_none());
         let tok = *c.pending_ios.keys().next().expect("pending IO 应有一条");
@@ -1645,12 +1646,13 @@ fn ns_attachment_via_admin_round_trip() {
     assert!(c.namespaces[&1].attached);
     // 抓 outbound_pre 之后最后一条 WriteGpa 解析为 Cqe（post_cqe via
     // dma_write_fire_and_forget 把 16-byte CQE 发到 admin CQ GPA）。
-    use pcie_device_sdk::pcie_remote_protocol::to_openhcl::Body;
-    let cqe_bytes = outbound
+    use pcie_device_sdk::TransportEvent;
+    let cqe_bytes = cap
+        .events()
         .iter()
         .skip(outbound_pre)
-        .filter_map(|m| match m.body.as_ref()? {
-            Body::WriteGpa(w) if w.data.len() >= 16 => Some(w.data.clone()),
+        .filter_map(|e| match e {
+            TransportEvent::DmaWrite { data, .. } if data.len() >= 16 => Some(data.clone()),
             _ => None,
         })
         .next_back()
@@ -1688,9 +1690,7 @@ fn identify_controller_list_cns_0x12_0x13() {
     );
     // 模拟 build_v2 buf 直接（不走 admin dispatch；admin dispatch 走 DMA-write 较繁）
     // 改成构造 sqe 跑 dispatch_admin → 完成时通过 outbound 抓 buf。
-    let mut outbound: Vec<pcie_device_sdk::ToOpenhcl> = Vec::new();
-    let mut seq = 1u64;
-    let mut tok_counter = 0x2000u64;
+    let mut cap = pcie_device_sdk::CaptureTransport::with_start_token(0x2000);
     let make_sqe = |cns: u8, nsid: u32, start_cntlid: u16| {
         let zero = [0u8; 64];
         let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
@@ -1701,60 +1701,56 @@ fn identify_controller_list_cns_0x12_0x13() {
         sqe
     };
     // Helper：从 outbound 取最后一条 WriteGpa 的 data
-    use pcie_device_sdk::pcie_remote_protocol::to_openhcl::Body;
-    let extract_last_write = |outbound: &[pcie_device_sdk::ToOpenhcl]| -> Vec<u8> {
-        for msg in outbound.iter().rev() {
-            if let Some(Body::WriteGpa(w)) = msg.body.as_ref() {
-                return w.data.clone();
+    use pcie_device_sdk::TransportEvent;
+    let extract_last_write = |events: &[pcie_device_sdk::TransportEvent]| -> Vec<u8> {
+        for e in events.iter().rev() {
+            if let TransportEvent::DmaWrite { data, .. } = e {
+                return data.clone();
             }
         }
         Vec::new()
     };
 
     {
-        let mut ctx =
-            pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok_counter);
+        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
         // CNS 0x13 start=0 → 含本 ctrl
         let _ = c.dispatch_admin(&mut ctx, make_sqe(0x13, 0, 0), 0x44, 0, 0);
     }
-    let buf = extract_last_write(&outbound);
+    let buf = extract_last_write(cap.events());
     assert!(buf.len() >= 4, "WriteGpa buf 至少 4 byte");
     assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 1, "NumIDs=1");
     assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 1, "cntlid=1");
-    outbound.clear();
+    cap.clear();
 
     {
-        let mut ctx =
-            pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok_counter);
+        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
         // CNS 0x13 start=2 → 空列表
         let _ = c.dispatch_admin(&mut ctx, make_sqe(0x13, 0, 2), 0x44, 0, 0);
     }
-    let buf = extract_last_write(&outbound);
+    let buf = extract_last_write(cap.events());
     assert_eq!(
         u16::from_le_bytes([buf[0], buf[1]]),
         0,
         "start>1 → NumIDs=0"
     );
-    outbound.clear();
+    cap.clear();
 
     {
-        let mut ctx =
-            pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok_counter);
+        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
         // CNS 0x12 nsid=1 attached → NumIDs=1
         let _ = c.dispatch_admin(&mut ctx, make_sqe(0x12, 1, 0), 0x44, 0, 0);
     }
-    let buf = extract_last_write(&outbound);
+    let buf = extract_last_write(cap.events());
     assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 1, "NS 1 attached → 1");
-    outbound.clear();
+    cap.clear();
 
     // Detach NS 1 → 0x12 NumIDs=0
     c.namespaces.get_mut(&1).unwrap().attached = false;
     {
-        let mut ctx =
-            pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok_counter);
+        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
         let _ = c.dispatch_admin(&mut ctx, make_sqe(0x12, 1, 0), 0x44, 0, 0);
     }
-    let buf = extract_last_write(&outbound);
+    let buf = extract_last_write(cap.events());
     assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 0, "detached → 0");
 }
 
@@ -1814,11 +1810,9 @@ fn ana_state_change_triggers_aen() {
     c.aen_pending.push_back((0x42, 0, 0, 0));
     assert_eq!(c.ana_state, 0x01);
     let initial_change = c.ana_change_count;
-    let mut outbound: Vec<pcie_device_sdk::ToOpenhcl> = Vec::new();
-    let mut seq = 1u64;
-    let mut tok = 1u64;
+    let mut cap = pcie_device_sdk::CaptureTransport::new();
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
+        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut cap);
         // 切到 Non-Optimized 0x02
         assert!(c.set_ana_state(&mut ctx, 0x02));
         // 重复设同值 → false

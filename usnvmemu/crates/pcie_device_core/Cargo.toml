@@ -1,0 +1,12 @@
+[package]
+name = "pcie_device_core"
+version = "0.1.0"
+edition = "2024"
+description = "Transport-neutral PCIe device domain model (PcieDevice trait + DeviceCtx + neutral DeviceDescribe). Zero wire / zero runtime dependencies."
+
+# **Phase W2 (ADR-010)** — 纯 domain crate：零 wire（无 pcie_remote_protocol）、
+# 零 runtime（无 pal_async / tokio / vmsocket）依赖。每个 transport adapter 在自己
+# 的 crate 里实现 `Transport` 并把 device 跑起来。
+[dependencies]
+
+[dev-dependencies]

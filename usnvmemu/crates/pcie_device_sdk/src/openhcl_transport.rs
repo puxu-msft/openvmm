@@ -22,8 +22,9 @@ use pcie_remote_protocol::to_openhcl::Body;
 /// 1. [`OpenhclVsockTransport::new`]：自带 owned buffer，SDK [`crate::run`]
 ///    主循环每 iter 调 [`Self::drain`] 把 buffer flush 到 wire。
 /// 2. [`OpenhclVsockTransport::with_buffers`]：借用外部 buffer + seq/token
-///    分配器，用于 `DeviceCtx::for_testing` —— 测试调用方在 ctx drop 后
-///    直接读 outbound vec 做断言（保持 Phase Q10 测试 API 兼容）。
+///    分配器，配 [`crate::DeviceCtx::new`] 用于 adapter 的 wire 单测 —— 调用方
+///    在 ctx 借用结束后直接读 outbound vec 断言 protobuf 帧（见 run.rs 的
+///    `device_ctx_*_body` 测试）。
 pub struct OpenhclVsockTransport<'a> {
     outbound: BufferRef<'a>,
     next_seq: U64Ref<'a>,

@@ -255,7 +255,9 @@ mod tests {
         let mut seq = 0u64;
         let mut tok = 0u64;
         {
-            let mut ctx = crate::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
+            let mut t =
+                crate::OpenhclVsockTransport::with_buffers(&mut outbound, &mut seq, &mut tok);
+            let mut ctx = crate::DeviceCtx::new(&mut t);
             ctx.fire_interrupt(0);
             let t1 = ctx.dma_read(0x1000, 4096);
             let t2 = ctx.dma_write(0x2000, vec![0xab; 256]);
@@ -276,7 +278,9 @@ mod tests {
         let mut seq = 0u64;
         let mut tok = 0u64;
         {
-            let mut ctx = crate::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
+            let mut t =
+                crate::OpenhclVsockTransport::with_buffers(&mut outbound, &mut seq, &mut tok);
+            let mut ctx = crate::DeviceCtx::new(&mut t);
             ctx.fire_interrupt(3);
         }
         let msg = &outbound[0];
@@ -294,7 +298,9 @@ mod tests {
         let mut tok = 0u64;
         let returned_token;
         {
-            let mut ctx = crate::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
+            let mut t =
+                crate::OpenhclVsockTransport::with_buffers(&mut outbound, &mut seq, &mut tok);
+            let mut ctx = crate::DeviceCtx::new(&mut t);
             returned_token = ctx.dma_read(0xdead_beef, 8192);
         }
         match outbound[0].body.as_ref().unwrap() {
@@ -316,7 +322,9 @@ mod tests {
         let payload = vec![1, 2, 3, 4, 5];
         let returned_token;
         {
-            let mut ctx = crate::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
+            let mut t =
+                crate::OpenhclVsockTransport::with_buffers(&mut outbound, &mut seq, &mut tok);
+            let mut ctx = crate::DeviceCtx::new(&mut t);
             returned_token = ctx.dma_write(0xcafe_babe, payload.clone());
         }
         match outbound[0].body.as_ref().unwrap() {

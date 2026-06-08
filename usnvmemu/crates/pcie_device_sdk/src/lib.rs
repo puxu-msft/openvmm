@@ -57,26 +57,26 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-pub mod describe;
-mod device;
 mod openhcl_transport;
 mod run;
 mod transport;
 
-pub use describe::BarKind;
-pub use describe::BarLayout;
-pub use describe::Capability;
-pub use describe::DeviceDescribe;
-pub use device::DeviceCtx;
-pub use device::PcieDevice;
-pub use device::Transport;
+// **Phase W2 (ADR-010)** — device 模型移到 `pcie_device_core`（零 wire / 零 runtime
+// 依赖）。本 crate 现在是 **openhcl (pcie_remote vsock) transport adapter**：实现
+// `OpenhclVsockTransport` + 主循环 + connect。re-export core 类型让 openhcl bin
+// 单路径 import；wire 类型（pcie_remote_protocol）**不再** pub —— 撤掉了泄漏，
+// adapter 内部仍用它做 wire 编码。
 pub use openhcl_transport::OpenhclVsockTransport;
-// **Phase Q10** — re-export protocol types so example crates can use them
-// in test fixtures (DeviceCtx::for_testing 输出 outbound 包).
-// **Phase W1** — `DeviceDescribe` / `BarKind` 等已改指向中立 [`describe`] 模块；
-// wire 类型仍可经 `pcie_remote_protocol::` 路径访问（W2 撤此 pub use）。
-pub use pcie_remote_protocol;
-pub use pcie_remote_protocol::ToOpenhcl;
+pub use pcie_device_core::BarKind;
+pub use pcie_device_core::BarLayout;
+pub use pcie_device_core::Capability;
+pub use pcie_device_core::CaptureTransport;
+pub use pcie_device_core::DeviceCtx;
+pub use pcie_device_core::DeviceDescribe;
+pub use pcie_device_core::PcieDevice;
+pub use pcie_device_core::Transport;
+pub use pcie_device_core::TransportEvent;
+pub use pcie_device_core::describe;
 pub use run::RunOptions;
 pub use run::run;
 pub use transport::WireStream;

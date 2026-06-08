@@ -112,37 +112,21 @@ pub trait PcieDevice: 'static {
 ///
 /// 这样 device 实现保持纯同步，不需要 async/await。
 ///
-/// **Phase T**：内部既可以 `Borrowed(&mut dyn Transport)`（生产路径，由
-/// `DeviceCtx::new` 构造）也可以 `Owned(Box<dyn Transport + 'a>)`（仅
-/// `for_testing` 路径，让 test 写法保持单行）。两者均通过 `transport()`
-/// helper 借出 trait 对象。
+/// **Phase W2**：内部直接持 `&mut dyn Transport`（borrowed）。`+ 'a` 让 transport
+/// 可承载非 'static 内部借用（如 vfio-user backend 持有 borrowed fd table）。
 pub struct DeviceCtx<'a> {
-    inner: CtxInner<'a>,
-}
-
-enum CtxInner<'a> {
-    // **review M1** — 显式 `+ 'a` 让 borrowed transport 也可承载非 'static
-    // 内部借用（如 vfio-user/V backend 可能持有 borrowed fd table）。默认
-    // 对象绑定是 'static，会让 Phase U/V 阶段需要时碰壁；现在加上不影响
-    // 现有路径（OpenhclVsockTransport::new() 内部全 owned，满足任意 lifetime）。
-    Borrowed(&'a mut (dyn Transport + 'a)),
-    Owned(Box<dyn Transport + 'a>),
+    transport: &'a mut (dyn Transport + 'a),
 }
 
 impl<'a> DeviceCtx<'a> {
-    /// 包一个 [`Transport`] 实例成 `DeviceCtx`。SDK 主循环用；用户实现
+    /// 包一个 [`Transport`] 实例成 `DeviceCtx`。adapter 主循环用；device 实现
     /// 一般通过 callback 拿到现成的 `&mut DeviceCtx<'_>`，不直接构造。
     pub fn new(transport: &'a mut (dyn Transport + 'a)) -> Self {
-        Self {
-            inner: CtxInner::Borrowed(transport),
-        }
+        Self { transport }
     }
 
     fn transport(&mut self) -> &mut dyn Transport {
-        match &mut self.inner {
-            CtxInner::Borrowed(t) => *t,
-            CtxInner::Owned(t) => t.as_mut(),
-        }
+        self.transport
     }
 
     /// 给 guest 触发 MSI-X 中断（vector index）。fire-and-forget。
@@ -173,32 +157,5 @@ impl<'a> DeviceCtx<'a> {
     /// fire-and-forget 写。
     pub fn dma_write_fire_and_forget(&mut self, gpa: u64, data: Vec<u8>) {
         let _ = self.dma_write(gpa, data);
-    }
-
-    /// **Phase Q10 + 12 轮 M-Q10**（Phase T 重构后）— Test-only 构造器。
-    ///
-    /// 让外部 crate 的单元测试能直接捕获 device 产生的 DMA/CQE/interrupt 包
-    /// （无需 mock SDK transport / live vsock）。
-    ///
-    /// 三个 `&mut` 参数（outbound / next_seq / next_dma_token）原为
-    /// `DeviceCtx` 内部字段；Phase T 后这些字段移到
-    /// [`OpenhclVsockTransport`](crate::OpenhclVsockTransport)，但调用方式
-    /// 与重构前一致 — 内部把 transport 装在 `CtxInner::Owned(Box<…>)`，
-    /// 由 `DeviceCtx` drop 时一并销毁，不需要 caller 再多写一行 `let mut t =`。
-    ///
-    /// `#[doc(hidden)]` 让此 API 不出现在 cargo doc 公开页（production
-    /// SDK 用户不应直接用）；保 `pub` 以便其他 crate 的 `#[cfg(test)]`
-    /// 模块能访问。
-    #[doc(hidden)]
-    pub fn for_testing(
-        outbound: &'a mut Vec<pcie_remote_protocol::ToOpenhcl>,
-        next_seq: &'a mut u64,
-        next_dma_token: &'a mut u64,
-    ) -> Self {
-        let transport =
-            crate::OpenhclVsockTransport::with_buffers(outbound, next_seq, next_dma_token);
-        Self {
-            inner: CtxInner::Owned(Box::new(transport)),
-        }
     }
 }

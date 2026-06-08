@@ -5,6 +5,7 @@ edition = "2024"
 description = "Userspace SDK for implementing PCIe devices over the pcie_remote vsock protocol."
 
 [dependencies]
+pcie_device_core = { path = "../pcie_device_core" }
 pcie_remote_protocol = { path = "../../../vm/devices/pcie_remote_protocol" }
 pal_async = { path = "../../../support/pal/pal_async" }
 mesh = { path = "../../../support/mesh" }
