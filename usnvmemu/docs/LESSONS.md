@@ -1,4 +1,4 @@
-# NVMe-oF TCP Target — 教训 (LESSONS.md)
+# usnvmemu — 工程教训 (LESSONS.md, 项目级)
 
 > 每条都是真踩过 + 修过的坑；带 commit / phase 引用。新踩坑 + 修后第一时间
 > 加这里，下次别重蹈。

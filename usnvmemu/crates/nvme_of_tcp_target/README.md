@@ -9,8 +9,8 @@ Linux ≥ 5.0 / Windows Server 2025 上的标准 `nvme-cli` 可通过
 > - **[PROJECT_VISION.md](/usnvmemu/docs/PROJECT_VISION.md)** — 项目愿景: 用户态 NVMe firmware 为核心 + 3 transport (OpenHCL/OpenVMM/QEMU vfio-user) + NVMe-oF TCP
 > - [ROADMAP.md](/usnvmemu/docs/ROADMAP.md) — 短/中/长期 phase 列表 (动态)，按 Tier 1/2/3 优先级排
 > - [PRINCIPLES.md](/usnvmemu/docs/PRINCIPLES.md) — 不变约束 + coding policy + subagent reviewer prompt 模板 + 测试命名约定
-> - [LESSONS.md](/usnvmemu/docs/LESSONS.md) — 17 条踩坑教训 (含 decision-then-IO 借用模式 / WebFetch 工作流 / 手算 offset 速查表 / doc audit 必配 git log)
-> - [DECISIONS.md](/usnvmemu/docs/DECISIONS.md) — 重大决策 ADR (9 条)
+> - [LESSONS.md](/usnvmemu/docs/LESSONS.md) — 18 条踩坑教训 (含 decision-then-IO 借用模式 / WebFetch 工作流 / 手算 offset 速查表 / doc audit 必配 git log)
+> - [DECISIONS.md](/usnvmemu/crates/nvme_of_tcp_target/docs/DECISIONS.md) — 本 crate ADR (003-007)；跨切面见 [项目 DECISIONS](/usnvmemu/docs/DECISIONS.md)
 > - [tls-psk-survey.md](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v-followup-tls-psk-survey.md)
 >   — rustls external-PSK 调研 + 决策
 > - [extract-from-openvmm-survey.md](/usnvmemu/docs/2026-06-06-phase-x-extract-from-openvmm-survey.md)
@@ -172,7 +172,7 @@ cargo test -p nvme_of_tcp_target --test aer_e2e
 
 | 限制 | 原因 | 解除路径 |
 |---|---|---|
-| 单 IO ≤ 128 KiB (256 LBA) | session-level chunking (V-followup-prp-list) 透明 16→256 LBA；> 256 LBA SC=0x18 | future controller PRP-list path (见 [DECISIONS](/usnvmemu/docs/DECISIONS.md) ADR-006) |
+| 单 IO ≤ 128 KiB (256 LBA) | session-level chunking (V-followup-prp-list) 透明 16→256 LBA；> 256 LBA SC=0x18 | future controller PRP-list path (见 [DECISIONS](/usnvmemu/crates/nvme_of_tcp_target/docs/DECISIONS.md) ADR-006) |
 | TLS PSK 不能注入握手 | rustls 0.23 无 external-PSK API | 等 rustls upstream，见 [tls-psk-survey](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v-followup-tls-psk-survey.md) |
 | DH-HMAC-CHAP HMAC-only | 教学版无 DH ephemeral key exchange | V-spec-strict-mode (见 [ROADMAP §3](/usnvmemu/docs/ROADMAP.md)) |
 | `tls_psk.rs` self-consistent 测试 only | 缺 Linux kernel 真五元组 anchor | kernel probe module dump (ROADMAP §1 HIGH) |
@@ -557,15 +557,15 @@ target → host:  CapsuleResp SC=0 (通过) / SC=0x83 (失败)
 
 > **2026-06-06 update**: DH-HMAC-CHAP wire 已落地两条：simplified (V-dhchap-3-wire)
 > + spec § 8.13.5 4-message (V-dhchap-4 + 4d 多 descriptor)，自动识别。
-> 详 [DECISIONS](/usnvmemu/docs/DECISIONS.md) ADR-005。
+> 详 [DECISIONS](/usnvmemu/crates/nvme_of_tcp_target/docs/DECISIONS.md) ADR-005。
 
 ## 内部参考
 
 **首选** (持续维护、动态更新):
 - [ROADMAP](/usnvmemu/docs/ROADMAP.md) — 短/中/长期 phase 列表 + 历史 phase 索引
 - [PRINCIPLES](/usnvmemu/docs/PRINCIPLES.md) — coding policy + reviewer prompt 模板
-- [LESSONS](/usnvmemu/docs/LESSONS.md) — 16 条踩坑教训
-- [DECISIONS](/usnvmemu/docs/DECISIONS.md) — 重大决策 ADR (7 条)
+- [LESSONS](/usnvmemu/docs/LESSONS.md) — 18 条踩坑教训
+- [DECISIONS](/usnvmemu/crates/nvme_of_tcp_target/docs/DECISIONS.md) — 本 crate ADR (003-007)；跨切面见 [项目 DECISIONS](/usnvmemu/docs/DECISIONS.md)
 
 **wire / 算法 reference** (新字段同步更新):
 - wire spec：[`../../specs/2026-06-04-nvme-tcp-wire-reference.md`](/usnvmemu/crates/nvme_of_tcp_target/docs/specs/2026-06-04-nvme-tcp-wire-reference.md)

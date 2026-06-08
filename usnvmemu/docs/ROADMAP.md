@@ -34,6 +34,29 @@ NVMe-oF TCP 第 4 条接入。当前架构 ✅ 已对齐：firmware (controller)
 > - **Tier 2**: firmware crate 命名重构 (下季)
 > - **Tier 3**: Phase X 仓库拆分 (半年)
 
+### Phase W — pcie_device_sdk 补全 hexagonal 结构 (Tier 2-结构, HIGH 优先, 分 W1-W4)
+
+**What**：Phase T 只抽了出站半边，入站/描述/crate 边界仍泄漏 OpenHCL。把
+`pcie_device_sdk` 拆成中立 `pcie_device_core` + 平级 transport adapter。详
+[2026-06-08-phase-w-hexagonal-restructure.md](/usnvmemu/crates/pcie_device_sdk/docs/plans/2026-06-08-phase-w-hexagonal-restructure.md)
++ 决策 [ADR-010](/usnvmemu/crates/pcie_device_sdk/docs/DECISIONS.md)。
+
+**Why**：教学 = 严谨全面（PRINCIPLES）。architect 复核确认 5 条结构债，最根本是
+`DeviceDescribe` vs `Regions` **描述模型分叉**（同信息两套真相源）。修后"用不用
+`vfio_user` crate"降级为局部可逆 adapter 私事。
+
+**子阶段**：W1 中立描述模型（最高优先，顺带修 vfio-user cfg-space identity gap）→
+W2 crate 拆分（撤 `pub use pcie_remote_protocol`）→ W3 device 层解耦（兑现 Phase T
+deferred）→ W4 dma-completion 语义文档。
+
+**显式不做**（ADR-010 否决）：对称入站 trait（PCI 读写本不对称）/ 单一 `generic run<T>()`（三 transport async 模型不同）。
+
+**Acceptance**：见 plan §6。每子阶段过 rust-reviewer。
+
+**关联 track（独立）**：vfio-user spec-complete（DMA head-of-line 阻塞 `dma.rs:260` /
+mmap DMA / GET_REGION_IO_FDS）—— 不属 Phase W 结构范围，见 plan §8 + 下方
+V-followup-vfio-user-qemu-harness。
+
 ### V-followup-dhchap-4-real-host-interop (Tier 1, HIGH 优先, 预计 1 day)
 
 **What**：让 V-interop-8 Python harness 通过即代表 Linux nvme-cli `--dhchap-secret` 也通；

@@ -1,4 +1,4 @@
-# NVMe-oF TCP Target — 工程原则 (PRINCIPLES.md)
+# usnvmemu — 工程原则 (PRINCIPLES.md, 项目级)
 
 > 不可变约束。代码 review、commit、subagent 调用都按这些办；偏离需 explicit
 > rationale。本文件为底层契约，**不随单 phase 变**；如需变更先在 PR 描述里

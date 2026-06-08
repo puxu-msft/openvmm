@@ -1,148 +1,91 @@
-# NVMe-oF TCP Target — 重大决策日志 (ADR)
+# usnvmemu — 重大决策日志 (ADR, 项目级)
 
 > Architecture Decision Records, 时间倒序。每条捕获 "我们曾在两条路径间纠
 > 结，最终选 X 而不选 Y，因为 ..." 类决策，未来回看不必重新算 cost-benefit。
 >
+> **两层制 (ADR-011)**：本文件只留**跨切面 / 架构级**决策；有明确归属 crate 的
+> ADR 下放到 `crates/<X>/docs/DECISIONS.md`。下表是全 ADR 索引，保证跨切面可发现性。
+>
 > 模板：每条决策 → 日期 / Context / Options / Decision / Consequences /
 > Status (active / superseded / revisited)。
 
----
+## ADR 索引 (全项目)
 
-## ADR-007 — TP-8011 PSK 不 fork rustls，等上游 (2026-06-06)
-
-**Context**：实现 NVMe TP-8011 需 TLS 1.3 external PSK；rustls 0.23 没公开
-API；SpiderOak fork (PR #2424) closed without merge。
-
-**Options**：
-- A: 等 rustls upstream — 时间不可控
-- B: 自 fork rustls — 高维护成本，安全债
-- C: SpiderOak fork 当 git dep — 教学 OK，prod 不可
-- D: 换 TLS 栈 (s2n-tls / openssl) — 800-1500 LOC 重写
-
-**Decision**：路径 A + C 并行（短期不动主线，等上游；C 作为可选实验脚本）。
-
-**Consequences**：
-- `src/tls_psk.rs` 留 deterministic crypto only，标 "rustls 注入待上游"
-- 出 detailed survey 文档 [2026-06-06-phase-v-followup-tls-psk-survey.md]
-- 优先级降为"等 + monitor"；HIGH 优先 swap 给 *kernel CI vector* (独立)
-
-**Status**：active；rustls 出 external PSK API 后 revisit。
+| ADR | 决策 | 归属 / 位置 |
+|-----|------|------------|
+| 001 | PCIe Remote Path C (OpenHCL VTL2 + vsock) | [pcie-remote-phase](/usnvmemu/docs/pcie-remote-phase/DECISIONS.md) |
+| 002 | Phase T 抽 `trait Transport` | [pcie_device_sdk](/usnvmemu/crates/pcie_device_sdk/docs/DECISIONS.md) |
+| 003 | V8e tokio runtime + AsyncSession | [nvme_of_tcp_target](/usnvmemu/crates/nvme_of_tcp_target/docs/DECISIONS.md) |
+| 004 | Python interop 不走 sudo nvme-cli | [nvme_of_tcp_target](/usnvmemu/crates/nvme_of_tcp_target/docs/DECISIONS.md) |
+| 005 | DHCHAP wire 双模式共存 | [nvme_of_tcp_target](/usnvmemu/crates/nvme_of_tcp_target/docs/DECISIONS.md) |
+| 006 | prp-list 走 session-level chunking | [nvme_of_tcp_target](/usnvmemu/crates/nvme_of_tcp_target/docs/DECISIONS.md) |
+| 007 | TP-8011 PSK 不 fork rustls，等上游 | [nvme_of_tcp_target](/usnvmemu/crates/nvme_of_tcp_target/docs/DECISIONS.md) |
+| 008 | Phase X 外部化路径 C，预设但不立即执行 | **本文件** ↓ |
+| 009 | Firmware-as-core 愿景确认 + 命名重构 | **本文件** ↓ |
+| 010 | Phase W：pcie_device_sdk 补全 hexagonal | [pcie_device_sdk](/usnvmemu/crates/pcie_device_sdk/docs/DECISIONS.md) |
+| 011 | 文档架构改两层制 | **本文件** ↓ |
 
 ---
 
-## ADR-006 — V-followup-prp-list 走 session-level chunking 不动 controller (2026-06-06)
+## ADR-011 — 文档架构改两层制 (项目级 + crate 级) (2026-06-08)
 
-**Context**：V5_NLB_MAX=16 LBA (8 KiB) 卡死 IO 大小；MDTS=5 (128 KiB) 名义
-support 但实际 reject。
+**Context**：`DECISIONS.md` / `PRINCIPLES.md` / `LESSONS.md` 三份顶层 dev-doc 出身为
+NVMe-oF TCP target 的开发文档（标题仍挂 "NVMe-oF TCP Target —"），随项目长成
+"用户态 NVMe firmware + 3 transport" 后吸收了全项目内容，造成杂糅：
+- `DECISIONS.md` 混着 5 条 NVMe-oF **本地** ADR (003-007) + 5 条**跨切面** ADR
+  (001/002/008/009/010)。
+- `PRINCIPLES.md` / `LESSONS.md` 标题挂 "NVMe-oF" 却装着**通用工程**内容
+  (不手算 offset / reviewer 必跑 / async 借用 …)，适用所有 crate。
 
-**Options**：
-- A: 改 controller PRP-list path (扩 sentinel decode + multi-page)
-  ~ 500 LOC + 跨 lib 改动 + 新 reviewer round
-- B: session 端透明 chunking (16 → 256 LBA, 内部分 16 个 sub-cmd)
-  ~ 200 LOC，0 controller 改动
-
-**Decision**：B。
-
-**Consequences**：
-- 单 IO 上限提到 256 LBA / 128 KiB，符合 MDTS
-- host 不感知 chunking；wire 仍走每 sub-cmd 一组 C2HData
-- *Future production* 路径仍是 A，本文档保留作为起点
-- plan 文档标 SUPERSEDED + 留 rationale
-
-**Status**：active；real-Linux interop 实测过后可考虑回 A。
-
----
-
-## ADR-005 — DHCHAP wire 同时支持 simplified + spec 4-msg (2026-06-06)
-
-**Context**：V-followup-dhchap-3 已落地教学版 simplified wire (2-msg)，
-Linux nvme-cli 实发 spec § 8.13.5 4-msg (NEGOTIATE/CHALLENGE/REPLY/SUCCESS1)。
-新加 4-msg 是否破坏老 simplified？
+各 crate 的 `plans/` `specs/` 早已分好（2026-06-08 重组），问题只在顶层 4 份。
 
 **Options**：
-- A: 删 simplified，只留 spec — 删 V-dhchap-3 测试 + 改 Python harness
-- B: 双 wire 共存，host 首发包自动识别
+- A: 全部按 crate 拆 — 否。会把通用工程教训散落各 crate，普适知识反而找不到、会重复。
+- B: 维持单层项目级 — 否。crate 本地决策 (tokio / CHAP / chunking) 混在项目日志里是噪音。
+- C: **两层制**，按 scope 分：项目级只留不可再归属的跨切面；有明确归属 crate 的下放。
 
-**Decision**：B（`ChapWireMode::Unknown → Spec4Msg/Simplified` 三态锁定）。
+**Decision**：选 **C**。
+- **项目级** `docs/`：PROJECT_VISION / ROADMAP / PRINCIPLES / LESSONS /
+  DECISIONS(跨切面 ADR + 索引表)。
+- **crate 级** `crates/<X>/docs/DECISIONS.md`：该 crate 自有 ADR。
+- **ADR 归属规则**：决策主表面归哪个 crate 就放哪；只有架构级 (愿景 / 外部化 /
+  文档架构本身) 留项目级。
+- **PRINCIPLES / LESSONS 不拆**（通用工程知识），仅退标题为项目级。
 
-**Consequences**：
-- 兼容 V-dhchap-3 全部测试 (105 个) + V-dhchap-4 新增 10 e2e
-- 自动检测的 collision 概率 ≈ 2^-32 (4 条 condition 同时满足，见 reviewer L-3)
-- 文档承载额外复杂度 (两条路径)
-- *设计模式*：wire 自动识别 + 锁定，是后向兼容的可复用模板 (见 LESSONS §11
-  decision-then-IO 模式同段落)
-
-**Status**：active；若未来 simplified 路径再没人用可推 ADR-008 deprecate it。
-
----
-
-## ADR-004 — Python interop 不走 sudo nvme-cli (2026-05-31..2026-06-06)
-
-**Context**：Python harness 想真验 wire，最自然是 `subprocess` 调 nvme-cli。
-但 nvme-cli `connect` 需要 root + `nvme-tcp.ko` 模块 + WSL2 kernel 兼容。
-
-**Options**：
-- A: sudo nvme-cli 包装（高真实度，前置门槛高）
-- B: 纯 Python raw socket 发 NVMe-oF wire（自构造 PDU 全部字段）
-- C: libnvme C library Python binding（依赖编译）
-
-**Decision**：B（uv + stdlib only，0 sudo）。
+迁移结果：001 → pcie-remote-phase；002/010 → pcie_device_sdk；003-007 →
+nvme_of_tcp_target；008/009/011 留项目级。
 
 **Consequences**：
-- 7+1 Python scenarios 跑通，每个 < 200 LOC，纯 stdlib
-- 不能验 Linux kernel nvme-tcp.ko 的 *实际* wire (只验自家算法)
-- 真 kernel interop 留另一类 task (ROADMAP §1 real-host CHAP interop)
-- *硬限*: Python harness 是 "我们自家算法对自家算法的高效 e2e"，不是 spec
-  conformance test
-
-**Status**：active；real-host interop task 是补足，不是替代。
-
----
-
-## ADR-003 — V8e tokio runtime + AsyncSession (2026-06-06)
-
-**Context**：V8 之前 session 是 sync thread-per-conn；扩到多 conn + AER +
-KATO timer 需要 select。
-
-**Options**：
-- A: 继续 sync + 加 mpsc 桥 — KATO / AER 跨 thread 难
-- B: tokio runtime + AsyncSession + select! — 重构成本高
-
-**Decision**：B（V8e-1..V8e-7 7 sub-phase）。
-
-**Consequences**：
-- 引入 `#![deny(clippy::await_holding_lock)]` 防 lock-await-stall
-- 落实 decision-then-IO 借用模式 (见 LESSONS §11)
-- 性能：AER Notify < 10ms，KATO timer 精度 < 100ms
-- bin 全 async，spawn_blocking 退役
+- 新 ADR 起草先判 scope：跨 ≥2 crate 或架构级 → 项目级；否则 crate 级。
+- 跨文档 link 一律用 `/usnvmemu/` repo-root-absolute（见
+  [LESSONS §18](/usnvmemu/docs/LESSONS.md)：大规模 move 用脚本 + 死链扫描，别手算深度）。
+- PRINCIPLES / LESSONS 退标题，内容不动。
 
 **Status**：active。
 
 ---
 
-## ADR-002 — Phase T 抽 `trait Transport` (2026-06-04)
+## ADR-009 — Firmware-as-core 愿景确认 + 命名重构 (2026-06-06)
 
-**Context**：vsock/protobuf 强耦合让 NvmeController 不能复用到 vfio-user /
-NVMe-oF TCP。
+**Context**：用户 explicit "未来希望以用户态 NVMe firmware 为核心，提供支持 openvmm/openhcl/qemu(vfio-user) 的方式"。
 
-**Decision**：抽 5 个原语 `dma_read/write/fire_*/fire_interrupt` 成
-`pcie_device_sdk` crate，3 backend 实现。
+调研 (见 [PROJECT_VISION.md](PROJECT_VISION.md)) 发现当前架构已对齐：
+- NVMe controller core (`controller/*.rs`) runtime-agnostic
+- `trait Transport` (5 原语) 已是 firmware ↔ transport 边界
+- 3 个 transport 实现已落地 (PCIe Remote vsock+TCP / vfio-user / NVMe-oF TCP)
 
-**Consequences**：Phase U / V 都基于本抽象，不动 controller 主体。
+**Decision**：**接受愿景**。优先级重排:
+- Tier 1 (本季): 3 条接入各 1 个真 host e2e harness (CHAP real-host / vfio-user QEMU / kernel-CI vector)
+- Tier 2 (下季): firmware crate 命名重构 (`nvme_firmware` / `pcie_device_sdk` / `pcie_protocol`)
+- Tier 3 (半年): Phase X 仓库拆分 (按 ADR-008 路径 C)
 
-**Status**：active。
+**Consequences**：
+- ROADMAP §1 加 firmware-as-core Tier 标签
+- 新 crate 命名先在 PROJECT_VISION 提议，落地走单独 phase
+- "教学版简化" / "spec-strict-mode" 边界对每个 firmware feature 都明标
+- 长期: 新仓 `userspace-nvme-firmware`，主仓只留 VTL2 device
 
----
-
-## ADR-001 — PCIe Remote Path C (OpenHCL VTL2 + vsock) (2026-05-29..30)
-
-**Context**：早期纠结 Path A (OpenVMM Linux) / Path B (mshv) / Path C
-(OpenHCL VTL2)。
-
-**Decision**：Path C，理由见 [../PCIE_REMOTE_SESSION_LOG.md](/usnvmemu/docs/pcie-remote-phase/SESSION_LOG.md) 早期段。
-
-**Status**：active；Path A 仍可跑，Path B (mshv) [MSHV_DIAGNOSIS.md](/usnvmemu/docs/pcie-remote-phase/MSHV_DIAGNOSIS.md)
-搁置。
+**Status**：active；命名重构等仓库拆分一起走，避免双轨。
 
 ---
 
@@ -172,31 +115,10 @@ NVMe-oF TCP。
 
 ---
 
-## ADR-009 — Firmware-as-core 愿景确认 + 命名重构 (2026-06-06)
-
-**Context**：用户 explicit "未来希望以用户态 NVMe firmware 为核心，提供支持 openvmm/openhcl/qemu(vfio-user) 的方式"。
-
-调研 (见 [PROJECT_VISION.md](PROJECT_VISION.md)) 发现当前架构已对齐：
-- NVMe controller core (`controller/*.rs`) runtime-agnostic
-- `trait Transport` (5 原语) 已是 firmware ↔ transport 边界
-- 3 个 transport 实现已落地 (PCIe Remote vsock+TCP / vfio-user / NVMe-oF TCP)
-
-**Decision**：**接受愿景**。优先级重排:
-- Tier 1 (本季): 3 条接入各 1 个真 host e2e harness (CHAP real-host / vfio-user QEMU / kernel-CI vector)
-- Tier 2 (下季): firmware crate 命名重构 (`nvme_firmware` / `pcie_device_sdk` / `pcie_protocol`)
-- Tier 3 (半年): Phase X 仓库拆分 (按 ADR-008 路径 C)
-
-**Consequences**：
-- ROADMAP §1 加 firmware-as-core Tier 标签
-- 新 crate 命名先在 PROJECT_VISION 提议，落地走单独 phase
-- "教学版简化" / "spec-strict-mode" 边界对每个 firmware feature 都明标
-- 长期: 新仓 `userspace-nvme-firmware`，主仓只留 VTL2 device
-
-**Status**：active；命名重构等仓库拆分一起走，避免双轨。
-
----
-
 ## 加新 ADR 模板
+
+> 先判 scope：跨 ≥2 crate 或架构级 → 写本文件 (项目级)；单 crate 内部 →
+> 写 `crates/<X>/docs/DECISIONS.md`，并在上方索引表加一行。
 
 ```markdown
 ## ADR-NNN — <一行决策>  (YYYY-MM-DD)

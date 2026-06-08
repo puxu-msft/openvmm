@@ -49,8 +49,8 @@ usnvmemu/
 │   ├── PROJECT_VISION.md                  — 项目愿景 + 架构图
 │   ├── ROADMAP.md                         — 短/中/长期 phase (Tier 1/2/3 优先级)
 │   ├── PRINCIPLES.md                      — 不变约束 + coding policy
-│   ├── LESSONS.md                         — 17 条踩坑教训
-│   ├── DECISIONS.md                       — 9 条 ADR
+│   ├── LESSONS.md                         — 18 条踩坑教训
+│   ├── DECISIONS.md                       — 跨切面 ADR (008/009/011) + 全 ADR 索引表 (crate 本地 ADR 见各 crates/<X>/docs/DECISIONS.md)
 │   ├── 2026-06-06-phase-x-extract-from-openvmm-survey.md  — 外部化调研 (跨项目)
 │   └── pcie-remote-phase/                 — PCIe Remote 阶段历史 (跨 SDK+harness+主仓 device)
 │       ├── SESSION_LOG.md / HYPERV_RUNBOOK.md / HOTPLUG_DESIGN.md

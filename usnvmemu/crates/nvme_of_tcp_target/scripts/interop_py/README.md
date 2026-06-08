@@ -1,6 +1,6 @@
 # scripts/interop_py — Python 跨进程 wire 实证 harness
 
-> **uv-managed venv，stdlib only，0 sudo / 0 nvme-cli 依赖**。详 [DECISIONS](/usnvmemu/docs/DECISIONS.md) ADR-004。
+> **uv-managed venv，stdlib only，0 sudo / 0 nvme-cli 依赖**。详 [DECISIONS](/usnvmemu/crates/nvme_of_tcp_target/docs/DECISIONS.md) ADR-004。
 
 每个 script 是 1 个独立 Python harness，验某个 wire / 行为。**模式**：起 Rust target → uv run python <script>.py → 退出码 0 = 全 scenario 通过。
 

@@ -10,9 +10,9 @@
 > - **K-20 hotplug** 已 ✅ shipped (commits `a99cdc63` + `64da8fb6`)，已自标在 [`K20_HOTPLUG_DESIGN.md`](HOTPLUG_DESIGN.md)。
 >
 > **新工作不再写本日志**；统一去：
-> - [`plans/ROADMAP.md`](/usnvmemu/docs/ROADMAP.md) — 当前坐标 + 下一步 HIGH
-> - [`plans/DECISIONS.md`](/usnvmemu/docs/DECISIONS.md) — 重大决策 ADR
-> - [`plans/LESSONS.md`](/usnvmemu/docs/LESSONS.md) — 踩坑教训
+> - [`ROADMAP.md`](/usnvmemu/docs/ROADMAP.md) — 当前坐标 + 下一步 HIGH
+> - [`DECISIONS.md`](/usnvmemu/docs/pcie-remote-phase/DECISIONS.md) — 本阶段 ADR (ADR-001 路径选择)；跨切面见 [项目 DECISIONS](/usnvmemu/docs/DECISIONS.md)
+> - [`LESSONS.md`](/usnvmemu/docs/LESSONS.md) — 踩坑教训
 >
 > 本日志保留为 PCIe Remote 阶段 (2026-05-29 → 2026-05-31) 实施实录。
 
