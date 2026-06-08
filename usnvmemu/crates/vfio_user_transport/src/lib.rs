@@ -21,11 +21,12 @@
 //!
 //! # unsafe 范围
 //!
-//! 本 crate 整体走 `#![deny(unsafe_code)]`（不是 forbid），仅
-//! [`framing::into_owned_fd`] 一处 `#[allow(unsafe_code)]` 调
-//! `OwnedFd::from_raw_fd` 将 `SCM_RIGHTS` 收到的 RawFd 转 owned 句柄。
-//! 该 unsafe 由严密 SAFETY 注释保护并被 [`framing::tests::roundtrip_with_one_fd`]
-//! 覆盖。
+//! 本 crate 整体走 `#![deny(unsafe_code)]`（不是 forbid），仅两处
+//! `#[allow(unsafe_code)]`，均由严密 SAFETY 注释保护 + 测试覆盖：
+//! 1. [`framing::into_owned_fd`] 调 `OwnedFd::from_raw_fd` 将 `SCM_RIGHTS`
+//!    收到的 RawFd 转 owned 句柄（[`framing::tests::roundtrip_with_one_fd`]）。
+//! 2. `dma::map_dma_fd` 调 `memmap2::MmapOptions::map{,_mut}` 把 DMA_MAP 带来的
+//!    client memfd 映射成零拷贝 DMA 内存（`dma::tests` mmap roundtrip 覆盖）。
 //!
 //! [spec]: https://github.com/nutanix/libvfio-user/blob/master/docs/vfio-user.rst
 

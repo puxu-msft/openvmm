@@ -219,7 +219,8 @@ pub fn write_message(
 
 /// 把 `nix::recvmsg` `ScmRights` 解到的 RawFd 包成 [`OwnedFd`]。
 ///
-/// 这是本 crate 唯一一处 `unsafe` 例外（lib 顶层 `#![deny(unsafe_code)]`）。
+/// 这是本 crate 两处 `unsafe` 例外之一（另一处见 `dma::map_dma_fd` 的 mmap；
+/// lib 顶层 `#![deny(unsafe_code)]`）。
 fn into_owned_fd(raw: RawFd) -> OwnedFd {
     #[allow(unsafe_code)]
     {

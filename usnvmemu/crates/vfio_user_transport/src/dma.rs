@@ -5,10 +5,11 @@
 //!
 //! ## 设计要点
 //!
-//! - **Message-mediated DMA**（教学路径）：QEMU 发来的 DMA_MAP 我们 *不*
-//!   mmap 共享 memfd，而是把元数据存表；后续 controller 调 `dma_read`/
-//!   `dma_write` 时通过 DMA_READ/DMA_WRITE S→C 消息 *阻塞* 走 round-trip。
-//!   spec 明确允许 server 忽略 DMA_MAP 附带的 fd 强制走消息路径。
+//! - **两条 DMA 路径**：① **zero-copy（Phase W）** —— DMA_MAP 带 memfd 时
+//!   `mmap` 共享内存，`dma_read/write` 本地 memcpy，无 wire round-trip；
+//!   ② **message-mediated（教学/回退路径）** —— 不带 fd 或 mmap 失败时，把
+//!   region 元数据存表，`dma_read/write` 走 DMA_READ/DMA_WRITE S→C 消息 *阻塞*
+//!   round-trip。spec 允许 server 忽略 fd 走消息路径，故二者都合规。
 //!
 //! - **Token = msg_id**：vfio-user 的 server-initiated msg_id 由 server 自选
 //!   且与 client 方向独立。我们把 `Transport::dma_read/write` 返的 token 直接
@@ -22,8 +23,10 @@
 //! - **bound 校验**：DMA_MAP 表查 (addr, len) 是否落在某个映射区间；不在则返
 //!   `EFAULT`（vfio-user 标准行为）。
 //!
-//! - **fd 处理**：DMA_MAP 若带 fd，我们 *接收并立即 drop*（关闭），等价不 mmap。
-//!   spec 允许；fd 内核会自动 close。
+//! - **fd 处理（Phase W mmap 零拷贝）**：DMA_MAP 带 memfd 时，按 region 权限
+//!   `mmap` 进 `DmaTable.mmaps`，`dma_read/write` 走零拷贝 memcpy 不走 wire；
+//!   mmap 失败或不带 fd 时退回 message-mediated（功能不变）。映射用 MAP_SHARED
+//!   后独立于 fd 存续，fd 用完即 close，munmap 随映射 Drop。
 //!
 //! ## TODO（spec follow-up，未来扩展前必读）
 //!
@@ -48,8 +51,40 @@ use crate::proto::HeaderFlags;
 use crate::proto::decode_payload;
 use anyhow::Context as _;
 use std::collections::BTreeMap;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use zerocopy::IntoBytes;
+
+/// fd-backed 零拷贝 DMA 映射：`DMA_MAP` 带 memfd 时，按 region 权限 mmap，
+/// `dma_read`/`dma_write` 直接 memcpy 不走 wire round-trip。
+///
+/// readable-only region → `Ro`（PROT_READ）；writeable region → `Rw`
+/// （PROT_READ|WRITE，兼容读）。client 不带 fd 的 region 不进此表，退回
+/// message-mediated 路径。
+#[derive(Debug)]
+pub(crate) enum DmaMmap {
+    /// 只读映射（region 仅 readable）。
+    Ro(memmap2::Mmap),
+    /// 读写映射（region writeable；读也走它）。
+    Rw(memmap2::MmapMut),
+}
+
+impl DmaMmap {
+    /// 映射字节（读路径；RO/RW 都可读）。
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            DmaMmap::Ro(m) => m,
+            DmaMmap::Rw(m) => m,
+        }
+    }
+    /// 可写字节切片；RO 映射返 `None`（写须走 message 路径 / 报错）。
+    fn as_bytes_mut(&mut self) -> Option<&mut [u8]> {
+        match self {
+            DmaMmap::Rw(m) => Some(&mut m[..]),
+            DmaMmap::Ro(_) => None,
+        }
+    }
+}
 
 /// QEMU 通告的一段 guest RAM region。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,10 +115,15 @@ impl DmaRegion {
 }
 
 /// DMA 映射表：addr → DmaRegion。BTreeMap 让按 addr 排序，便于 unmap_all 时
-/// 遍历有序输出。
-#[derive(Debug, Default, Clone)]
+/// 遍历有序输出。`mmaps` 是**并行**表（addr → 零拷贝映射），只存 DMA_MAP 带
+/// fd 且 mmap 成功的 region；`regions` 始终是真相源（权限/边界校验），`mmaps`
+/// 只是其上的零拷贝加速。`DmaRegion` 保持 Copy（纯元数据），mmap 不放进它。
+///
+/// **不 derive Clone**：`memmap2::MmapMut` 非 Clone，且映射独占 fd 资源不应被复制。
+#[derive(Debug, Default)]
 pub struct DmaTable {
     regions: BTreeMap<u64, DmaRegion>,
+    mmaps: BTreeMap<u64, DmaMmap>,
 }
 
 impl DmaTable {
@@ -110,18 +150,65 @@ impl DmaTable {
         Ok(())
     }
     /// 移除 (addr, size) 必须精确匹配一条已存在 region；否则 EINVAL。
+    /// 同步丢弃该 addr 的零拷贝映射（munmap 随 `DmaMmap` Drop）。
     pub fn remove_exact(&mut self, addr: u64, size: u64) -> Result<(), DmaError> {
         match self.regions.get(&addr) {
             Some(r) if r.size == size => {
                 self.regions.remove(&addr);
+                self.mmaps.remove(&addr);
                 Ok(())
             }
             _ => Err(DmaError::NotFound),
         }
     }
-    /// 撤销所有 region（DMA_UNMAP flags=UNMAP_ALL）。
+    /// 撤销所有 region（DMA_UNMAP flags=UNMAP_ALL）+ 所有零拷贝映射。
     pub fn clear(&mut self) {
         self.regions.clear();
+        self.mmaps.clear();
+    }
+    /// **Phase W (mmap 零拷贝)** — 给已入表的 region 附加零拷贝映射。caller
+    /// （`handle_dma_map`）在 region `insert` 成功后、mmap fd 成功时调。
+    pub(crate) fn attach_mmap(&mut self, addr: u64, mmap: DmaMmap) {
+        self.mmaps.insert(addr, mmap);
+    }
+    /// **Phase W (mmap 零拷贝)** — 零拷贝读：若 `[gpa, gpa+len)` 落在某带 mmap
+    /// 的 readable region 内，返回其字节副本（无 wire round-trip）；否则 `None`
+    /// （caller 退回 message-mediated 路径）。
+    pub(crate) fn mmap_read(&self, gpa: u64, len: u32) -> Option<Vec<u8>> {
+        let region = self.find(gpa, len as u64)?;
+        if !region.readable {
+            return None;
+        }
+        let addr = region.addr;
+        let m = self.mmaps.get(&addr)?;
+        let off = (gpa - addr) as usize;
+        let end = off.checked_add(len as usize)?;
+        let bytes = m.as_bytes();
+        // **review H-2** — 防御校验以**真实映射长度** `bytes.len()` 为准，不依赖
+        // "region.size == mmap 长度" 这个等式（虽当前 map_dma_fd 用同一 size，但
+        // 不把它当判据）；保证 Rust slice 层永不越界。
+        if end > bytes.len() {
+            return None;
+        }
+        Some(bytes[off..end].to_vec())
+    }
+    /// **Phase W (mmap 零拷贝)** — 零拷贝写：若 `[gpa, gpa+len)` 落在某带 RW
+    /// mmap 的 writeable region 内，原地写入并返 `Some(())`（无 wire round-trip）；
+    /// 否则 `None`（无 mmap / RO 映射 / 越界 → caller 退回 message 路径）。
+    pub(crate) fn mmap_write(&mut self, gpa: u64, data: &[u8]) -> Option<()> {
+        let region = *self.find(gpa, data.len() as u64)?;
+        if !region.writeable {
+            return None;
+        }
+        let m = self.mmaps.get_mut(&region.addr)?;
+        let dst = m.as_bytes_mut()?;
+        let off = (gpa - region.addr) as usize;
+        let end = off.checked_add(data.len())?;
+        if end > dst.len() {
+            return None;
+        }
+        dst[off..end].copy_from_slice(data);
+        Some(())
     }
     /// 查找包含 `[gpa, gpa+len)` 的 region；返 readable/writeable 用于权限校验。
     pub fn find(&self, gpa: u64, len: u64) -> Option<&DmaRegion> {
@@ -165,15 +252,15 @@ impl DmaError {
 
 /// 处理 DMA_MAP cmd：解 payload + 入表 + 回 reply（OK / 错）。
 ///
-/// **review M4** — 本路径 *有意* 忽略 `msg.fds`：spec 允许 server 不 mmap
-/// 共享 memfd，强制走 message-mediated DMA_READ/WRITE 往返。`msg.fds` 是
-/// `Vec<OwnedFd>`，调用方 (session) 在 Message drop 时自动 close，无 leak。
-/// 见模块 doc。
+/// **Phase W (mmap 零拷贝)** — 若 `msg.fds` 带 memfd，按 region 权限 mmap 进
+/// `table.mmaps`，后续 `dma_read`/`dma_write` 走零拷贝 memcpy；mmap 失败或不带
+/// fd 时退回 message-mediated 路径（功能不受影响）。取走的 fd 用完即 drop（close）；
+/// 多余 fd 随 `msg.fds` Drop 自动 close，无 leak。
 pub fn handle_dma_map(
     stream: &mut UnixStream,
     table: &mut DmaTable,
     msg_id: u16,
-    msg: &Message,
+    msg: &mut Message,
 ) -> anyhow::Result<()> {
     let want = core::mem::size_of::<DmaMapPayload>();
     if msg.payload.len() != want {
@@ -212,16 +299,99 @@ pub fn handle_dma_map(
     let r_size = region.size;
     let r_rd = region.readable;
     let r_wr = region.writeable;
+    // **Phase W (mmap 零拷贝)** — region 入表成功后，若带 fd 则 mmap。取第一个
+    // fd（vfio-user DMA_MAP 单 region 单 fd）；mmap 失败只记 warn + 退回 message
+    // 路径，不让 MAP 整体失败（功能正确性不依赖 mmap）。
+    let mut zero_copy = false;
+    if !msg.fds.is_empty() {
+        let fd = msg.fds.remove(0);
+        match map_dma_fd(&fd, pl.offset, pl.size, region.writeable) {
+            Ok(mmap) => {
+                table.attach_mmap(region.addr, mmap);
+                zero_copy = true;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    addr = format_args!("{r_addr:#x}"),
+                    error = %e,
+                    "DMA_MAP mmap 失败，退回 message-mediated"
+                );
+            }
+        }
+        // fd 在此 drop（close）；mmap(MAP_SHARED) 后映射独立于 fd 存续。
+    }
     tracing::debug!(
         addr = format_args!("{r_addr:#x}"),
         size = r_size,
         readable = r_rd,
         writeable = r_wr,
+        zero_copy,
         "DMA_MAP added"
     );
     // OK reply：spec 说回 header only。
     let hdr = Header::reply_ok(msg_id, Command::DmaMap, 0);
     write_message(stream, &hdr, &[], &[]).context("write DMA_MAP reply")
+}
+
+/// **Phase W (mmap 零拷贝)** — 按 `[offset, offset+size)` mmap 客户端 memfd。
+/// writeable region → RW 映射（兼容读写）；只读 region → RO 映射。
+///
+/// **review C-1（CRITICAL 修复）**：mmap 前必须 `fstat` fd 校验
+/// `offset + size ≤ 文件真实大小`。`mmap(2)` 只要求 offset 页对齐，**不**校验
+/// 区间是否在文件内；映射超出真实页的区间会成功返回，但 memcpy 触碰即 **SIGBUS**
+/// 杀进程。client 声明的 `size` 不可信（恶意 client 发大 size + 小 memfd 即可
+/// DoS），故真正的 oracle 是 `fstat().st_size`，不是 client 的声明。校验失败 →
+/// `Err` 退回 message-mediated 路径，绝不 mmap 超出真实文件的区间。
+fn map_dma_fd(
+    fd: &std::os::fd::OwnedFd,
+    offset: u64,
+    size: u64,
+    writeable: bool,
+) -> std::io::Result<DmaMmap> {
+    use std::os::fd::AsFd as _;
+    // **review C-1** — 用 fd 真实大小（独立 oracle）校验，而非 client 声明的 size。
+    let st = nix::sys::stat::fstat(fd.as_fd())
+        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+    let file_len = u64::try_from(st.st_size).unwrap_or(0);
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "offset+size 溢出"))?;
+    if end > file_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("DMA_MAP offset+size {end} 超出 fd 真实大小 {file_len}（防 SIGBUS）"),
+        ));
+    }
+    let mut opts = memmap2::MmapOptions::new();
+    opts.offset(offset).len(size as usize);
+    let raw = fd.as_raw_fd();
+    if writeable {
+        #[allow(unsafe_code)]
+        // SAFETY: `fd` 是 client 经 SCM_RIGHTS 传来的 memfd（共享 guest RAM）。
+        // 不变量与外部依赖（已诚实列出，非自家 self-consistent 断言）：
+        // 1. **有真实页 backing**：上面 `fstat` 已校验 `offset+size ≤ st_size`，
+        //    故映射区间全程有文件页 backing，普通访问不会 SIGBUS（修 review C-1）。
+        // 2. **fd 生命周期**：mmap 用 MAP_SHARED，映射独立于 fd 存续；caller 在
+        //    map 后 drop fd 是安全的。munmap 随 `MmapMut` Drop。
+        // 3. **slice 边界**：`mmap_read/write` 以真实映射长度 `bytes.len()`（非
+        //    client 声明 size）做 `off+len` 校验，故 Rust slice 层不会越界。
+        // 4. **外部依赖（教学版接受、生产须加固）**：若 client 在映射存续期间
+        //    `ftruncate` 缩小 memfd，超出新大小的页会失去 backing → SIGBUS（fstat
+        //    是单次 TOCTOU，挡不住事后 shrink）。生产应要求 client 对 memfd 加
+        //    `F_SEAL_SHRINK` 后再信任；本教学版信任 QEMU 不 shrink 已映射的 DMA 区。
+        // 5. **并发**：guest 可并发改这段共享内存——这是 DMA 的固有语义。纯 `u8`
+        //    memcpy 无 typed 解释，撕裂的字节值合法 → 无 Rust 内存模型 UB；逻辑
+        //    一致性（不在 DMA in-flight 时改 buffer）由 guest/DMA 协议保证，非本层职责。
+        let m = unsafe { opts.map_mut(raw) }?;
+        Ok(DmaMmap::Rw(m))
+    } else {
+        #[allow(unsafe_code)]
+        // SAFETY: 同 RW 分支的不变量 1-5（只读映射，只读不写）。关键同样是：上面
+        // `fstat` 校验保证有真实页 backing（修 C-1）；`mmap_read` 以 `bytes.len()`
+        // 校验 slice 边界；F_SEAL_SHRINK 外部依赖同上；u8 读无 UB。
+        let m = unsafe { opts.map(raw) }?;
+        Ok(DmaMmap::Ro(m))
+    }
 }
 
 /// 处理 DMA_UNMAP cmd。
@@ -326,11 +496,18 @@ pub fn dma_read_sync(
     gpa: u64,
     len: u32,
 ) -> anyhow::Result<(u16, Vec<u8>)> {
-    let region = table
+    let region = *table
         .find(gpa, len as u64)
         .ok_or_else(|| anyhow::anyhow!("DMA_READ {gpa:#x}+{len} not in any DMA region"))?;
     if !region.readable {
         anyhow::bail!("DMA_READ region @{gpa:#x} not readable");
+    }
+    // **Phase W (mmap 零拷贝)** — 命中带 mmap 的 region → 本地 memcpy，无 wire
+    // round-trip。仍分配 token（server msg_id）保持返回契约一致（caller 用它
+    // 当 DMA 完成 token close pending_ios）。
+    if let Some(data) = table.mmap_read(gpa, len) {
+        let msg_id = alloc_server_msg_id(next_server_msg_id);
+        return Ok((msg_id, data));
     }
     let msg_id = alloc_server_msg_id(next_server_msg_id);
     let hdr = Header::command(
@@ -360,21 +537,26 @@ pub fn dma_read_sync(
     ))
 }
 
-/// 服务端发起的同步 DMA_WRITE：发 request + data → 等 echo reply。返 msg_id。
+/// 服务端发起的同步 DMA_WRITE：命中 mmap → 零拷贝写；否则发 request + data →
+/// 等 echo reply。返 msg_id。`table` 取 `&mut`（mmap 写需可变）。
 pub fn dma_write_sync(
     stream: &mut UnixStream,
-    table: &DmaTable,
+    table: &mut DmaTable,
     next_server_msg_id: &mut u16,
     inbound_queue: &mut std::collections::VecDeque<crate::framing::Message>,
     gpa: u64,
     data: &[u8],
 ) -> anyhow::Result<u16> {
     let len = data.len() as u64;
-    let region = table
+    let region = *table
         .find(gpa, len)
         .ok_or_else(|| anyhow::anyhow!("DMA_WRITE {gpa:#x}+{len} not in any DMA region"))?;
     if !region.writeable {
         anyhow::bail!("DMA_WRITE region @{gpa:#x} not writeable");
+    }
+    // **Phase W (mmap 零拷贝)** — 命中带 RW mmap 的 region → 本地 memcpy，无 wire。
+    if table.mmap_write(gpa, data).is_some() {
+        return Ok(alloc_server_msg_id(next_server_msg_id));
     }
     let msg_id = alloc_server_msg_id(next_server_msg_id);
     let payload_len = core::mem::size_of::<DmaRwHdrPayload>() + data.len();
@@ -420,7 +602,7 @@ pub(crate) fn validate_dma_reply(
 
 /// server-initiated msg_id 分配器：顶位 `0x8000` 起始，便于日志区分；
 /// `next_server_msg_id` 由 caller (VfioUserSession) 持有。
-fn alloc_server_msg_id(next: &mut u16) -> u16 {
+pub(crate) fn alloc_server_msg_id(next: &mut u16) -> u16 {
     let v = *next;
     // wraparound 后跳回 0x8000；保顶位 1。
     *next = if v == u16::MAX { 0x8000 } else { v + 1 };
@@ -509,8 +691,8 @@ mod tests {
         let mut table = DmaTable::default();
         let h = thread::spawn(move || -> anyhow::Result<DmaTable> {
             // 两轮：MAP + UNMAP
-            let msg1 = read_message(&mut server)?;
-            handle_dma_map(&mut server, &mut table, msg1.header.msg_id, &msg1)?;
+            let mut msg1 = read_message(&mut server)?;
+            handle_dma_map(&mut server, &mut table, msg1.header.msg_id, &mut msg1)?;
             let msg2 = read_message(&mut server)?;
             handle_dma_unmap(&mut server, &mut table, msg2.header.msg_id, &msg2)?;
             Ok(table)
@@ -728,7 +910,7 @@ mod tests {
             let mut queue = std::collections::VecDeque::new();
             dma_write_sync(
                 &mut server,
-                &table,
+                &mut table,
                 &mut next,
                 &mut queue,
                 0x2200,
@@ -776,7 +958,7 @@ mod tests {
         let mut queue = std::collections::VecDeque::new();
         let r = dma_write_sync(
             &mut server,
-            &table,
+            &mut table,
             &mut next,
             &mut queue,
             0x1100,
@@ -872,8 +1054,8 @@ mod tests {
             let (mut server, mut client) = pair();
             let mut table = DmaTable::default();
             let h = thread::spawn(move || -> anyhow::Result<()> {
-                let msg = read_message(&mut server)?;
-                handle_dma_map(&mut server, &mut table, msg.header.msg_id, &msg)?;
+                let mut msg = read_message(&mut server)?;
+                handle_dma_map(&mut server, &mut table, msg.header.msg_id, &mut msg)?;
                 Ok(())
             });
             let hdr = Header::command(1, Command::DmaMap, pl.as_bytes().len() as u32);
@@ -892,10 +1074,10 @@ mod tests {
         let (mut server, mut client) = pair();
         let mut table = DmaTable::default();
         let h = thread::spawn(move || -> anyhow::Result<()> {
-            let m1 = read_message(&mut server)?;
-            handle_dma_map(&mut server, &mut table, m1.header.msg_id, &m1)?;
-            let m2 = read_message(&mut server)?;
-            handle_dma_map(&mut server, &mut table, m2.header.msg_id, &m2)?;
+            let mut m1 = read_message(&mut server)?;
+            handle_dma_map(&mut server, &mut table, m1.header.msg_id, &mut m1)?;
+            let mut m2 = read_message(&mut server)?;
+            handle_dma_map(&mut server, &mut table, m2.header.msg_id, &mut m2)?;
             Ok(())
         });
         let pl = DmaMapPayload {
@@ -916,5 +1098,212 @@ mod tests {
         let err = r2.header.error_no;
         assert_eq!(err, libc::EEXIST as u32);
         h.join().unwrap().unwrap();
+    }
+
+    // ── Phase W: mmap 零拷贝 DMA ──────────────────────────────────────────
+
+    /// 建一个含 `bytes` 的 memfd（DMA_MAP fd 的测试替身，模拟 client 共享 RAM）。
+    fn memfd_with(bytes: &[u8]) -> std::os::fd::OwnedFd {
+        use std::io::Write as _;
+        let fd = nix::sys::memfd::memfd_create(c"dma-zc-test", nix::sys::memfd::MFdFlags::empty())
+            .expect("memfd_create");
+        let mut f = std::fs::File::from(fd);
+        f.write_all(bytes).expect("write memfd");
+        f.flush().ok();
+        std::os::fd::OwnedFd::from(f)
+    }
+
+    /// 构造一条带 fd 的 DMA_MAP Message（绕过 socket，直接喂 handle_dma_map）。
+    fn dma_map_msg(addr: u64, size: u64, flags: u32, fd: std::os::fd::OwnedFd) -> Message {
+        let pl = DmaMapPayload {
+            argsz: core::mem::size_of::<DmaMapPayload>() as u32,
+            flags,
+            offset: 0,
+            addr,
+            size,
+        };
+        Message {
+            header: Header::command(1, Command::DmaMap, pl.as_bytes().len() as u32),
+            payload: pl.as_bytes().to_vec(),
+            fds: vec![fd],
+        }
+    }
+
+    /// 带 fd 的 DMA_MAP → mmap 附加；`dma_read` 走零拷贝读出 memfd 内容（无 wire）。
+    #[test]
+    fn dma_map_with_fd_enables_zero_copy_read() {
+        let (mut server, _client) = pair();
+        let mut table = DmaTable::default();
+        let bytes = b"zero-copy-dma-payload-0123456789";
+        let mut msg = dma_map_msg(
+            0x4000,
+            bytes.len() as u64,
+            dma_map_flags::READABLE | dma_map_flags::WRITEABLE,
+            memfd_with(bytes),
+        );
+        handle_dma_map(&mut server, &mut table, 1, &mut msg).unwrap();
+        assert!(msg.fds.is_empty(), "fd 应被取走");
+        // mmap_read 命中 → 返 memfd 内容。
+        assert_eq!(
+            table.mmap_read(0x4000, bytes.len() as u32).as_deref(),
+            Some(&bytes[..])
+        );
+        // 子区间偏移读也正确。
+        assert_eq!(table.mmap_read(0x4005, 4).as_deref(), Some(&bytes[5..9]));
+        // dma_read_sync 命中 mmap：无需 server 端 reply 即返（_client 没发任何东西）。
+        let mut next = 0x8000u16;
+        let mut q = std::collections::VecDeque::new();
+        let (tok, data) = dma_read_sync(&mut server, &table, &mut next, &mut q, 0x4000, 8).unwrap();
+        assert_eq!(tok, 0x8000);
+        assert_eq!(data, &bytes[..8]);
+    }
+
+    /// 带 RW fd 的 DMA_MAP → `dma_write` 零拷贝写进 memfd，回读可见。
+    #[test]
+    fn dma_map_with_fd_enables_zero_copy_write() {
+        let (mut server, _client) = pair();
+        let mut table = DmaTable::default();
+        let fd = memfd_with(&[0u8; 64]);
+        let mut msg = dma_map_msg(
+            0x5000,
+            64,
+            dma_map_flags::READABLE | dma_map_flags::WRITEABLE,
+            fd,
+        );
+        handle_dma_map(&mut server, &mut table, 1, &mut msg).unwrap();
+        let mut next = 0x8000u16;
+        let mut q = std::collections::VecDeque::new();
+        let payload = b"written-via-mmap";
+        let tok =
+            dma_write_sync(&mut server, &mut table, &mut next, &mut q, 0x5010, payload).unwrap();
+        assert_eq!(tok, 0x8000);
+        // 回读 mmap 见写入值。
+        assert_eq!(
+            table.mmap_read(0x5010, payload.len() as u32).as_deref(),
+            Some(&payload[..])
+        );
+    }
+
+    /// 不带 fd 的 DMA_MAP → 不附加 mmap；mmap_read 返 None（退回 message 路径）。
+    #[test]
+    fn dma_map_without_fd_no_mmap_falls_back() {
+        let (mut server, mut client) = pair();
+        let mut table = DmaTable::default();
+        let h = thread::spawn(move || -> anyhow::Result<DmaTable> {
+            let mut m = read_message(&mut server)?;
+            handle_dma_map(&mut server, &mut table, m.header.msg_id, &mut m)?;
+            Ok(table)
+        });
+        let pl = DmaMapPayload {
+            argsz: 32,
+            flags: dma_map_flags::READABLE | dma_map_flags::WRITEABLE,
+            offset: 0,
+            addr: 0x6000,
+            size: 0x1000,
+        };
+        let hdr = Header::command(1, Command::DmaMap, pl.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, pl.as_bytes(), &[]).unwrap();
+        let reply = read_message(&mut client).unwrap();
+        assert!(!reply.header.flags().is_error(), "无 fd 的 MAP 仍应成功");
+        let table = h.join().unwrap().unwrap();
+        assert!(
+            table.mmap_read(0x6000, 8).is_none(),
+            "无 fd → 无 mmap，应退回 message 路径"
+        );
+    }
+
+    /// 只读 region 的 mmap：`mmap_write` 返 None（写须走 message / 报错），读 OK。
+    #[test]
+    fn dma_map_readonly_fd_blocks_zero_copy_write() {
+        let (mut server, _client) = pair();
+        let mut table = DmaTable::default();
+        let bytes = b"read-only-region";
+        let mut msg = dma_map_msg(
+            0x7000,
+            bytes.len() as u64,
+            dma_map_flags::READABLE,
+            memfd_with(bytes),
+        );
+        handle_dma_map(&mut server, &mut table, 1, &mut msg).unwrap();
+        // 读零拷贝 OK。
+        assert_eq!(
+            table.mmap_read(0x7000, bytes.len() as u32).as_deref(),
+            Some(&bytes[..])
+        );
+        // 写零拷贝被拒（RO 映射）→ None。
+        assert!(table.mmap_write(0x7000, b"xxxx").is_none());
+    }
+
+    /// DMA_UNMAP 精确移除后，mmap 一并丢弃（zero-copy 读返 None）。
+    #[test]
+    fn dma_unmap_drops_mmap() {
+        let (mut server, _client) = pair();
+        let mut table = DmaTable::default();
+        let bytes = b"unmap-drops-mmap";
+        let mut msg = dma_map_msg(
+            0x8800,
+            bytes.len() as u64,
+            dma_map_flags::READABLE | dma_map_flags::WRITEABLE,
+            memfd_with(bytes),
+        );
+        handle_dma_map(&mut server, &mut table, 1, &mut msg).unwrap();
+        assert!(table.mmap_read(0x8800, 4).is_some());
+        table.remove_exact(0x8800, bytes.len() as u64).unwrap();
+        assert!(table.mmap_read(0x8800, 4).is_none(), "unmap 后 mmap 应丢弃");
+    }
+
+    /// **review C-1（CRITICAL 回归）** — client 声明 size 大于 memfd 真实大小：
+    /// mmap **不得**附加（否则 memcpy 触发 SIGBUS 杀进程）；DMA_MAP 本身仍成功，
+    /// 退回 message 路径（`mmap_read` 返 None）。本测试若回退失效会让进程崩溃，
+    /// 故它同时是"绝不 SIGBUS"的活体守卫。
+    #[test]
+    fn dma_map_fd_smaller_than_declared_size_falls_back_no_sigbus() {
+        let (mut server, _client) = pair();
+        let mut table = DmaTable::default();
+        // memfd 只有 4096 字节，但 DMA_MAP 声明 8192。
+        let fd = memfd_with(&[0xABu8; 4096]);
+        let mut msg = dma_map_msg(
+            0x9000,
+            8192,
+            dma_map_flags::READABLE | dma_map_flags::WRITEABLE,
+            fd,
+        );
+        handle_dma_map(&mut server, &mut table, 1, &mut msg).unwrap();
+        // fstat 校验拒绝 mmap（offset+size > 真实大小）→ 无 mmap 附加。
+        assert!(
+            table.mmap_read(0x9000, 8).is_none(),
+            "fd 小于声明 size 时必须退回 message 路径，绝不 mmap（防 SIGBUS）"
+        );
+    }
+
+    /// **review L-2** — `pl.offset` 透传：DMA_MAP 带页对齐 offset，mmap 映射 fd 内
+    /// `[offset, offset+size)`，zero-copy 读出该段内容。
+    #[test]
+    fn dma_map_honors_fd_offset() {
+        let (mut server, _client) = pair();
+        let mut table = DmaTable::default();
+        // memfd 总长 4096+64；marker 写在 offset 4096 处。
+        let mut content = vec![0u8; 4096 + 64];
+        let marker: &[u8] = b"at-page-1-offset-marker-012345678";
+        content[4096..4096 + marker.len()].copy_from_slice(marker);
+        let fd = memfd_with(&content);
+        let pl = DmaMapPayload {
+            argsz: core::mem::size_of::<DmaMapPayload>() as u32,
+            flags: dma_map_flags::READABLE,
+            offset: 4096, // 页对齐
+            addr: 0xA000,
+            size: 64,
+        };
+        let mut msg = Message {
+            header: Header::command(1, Command::DmaMap, pl.as_bytes().len() as u32),
+            payload: pl.as_bytes().to_vec(),
+            fds: vec![fd],
+        };
+        handle_dma_map(&mut server, &mut table, 1, &mut msg).unwrap();
+        // gpa 0xA000 → fd offset 4096，读出 marker。
+        assert_eq!(
+            table.mmap_read(0xA000, marker.len() as u32).as_deref(),
+            Some(marker)
+        );
     }
 }

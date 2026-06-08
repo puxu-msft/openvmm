@@ -226,9 +226,10 @@ impl VfioUserSession {
             Command::RegionRead => self.handle_region_read(id, &msg, device),
             Command::RegionWrite => self.handle_region_write(id, &msg, device),
             Command::DeviceReset => self.handle_reset(id, &msg, device),
-            // **Phase U4** — DMA 表已接：
+            // **Phase U4 / W mmap** — DMA 表已接（DMA_MAP 取 fd 做零拷贝 mmap）：
             Command::DmaMap => {
-                crate::dma::handle_dma_map(&mut self.stream, &mut self.dma_table, id, &msg)
+                let mut msg = msg;
+                crate::dma::handle_dma_map(&mut self.stream, &mut self.dma_table, id, &mut msg)
             }
             Command::DmaUnmap => {
                 crate::dma::handle_dma_unmap(&mut self.stream, &mut self.dma_table, id, &msg)
@@ -631,8 +632,9 @@ impl pcie_device_core::Transport for VfioUserSession {
             Err(e) => {
                 tracing::warn!(error = %e, gpa = format_args!("{gpa:#x}"), len,
                     "VfioUserTransport.dma_read failed");
-                // 取下一个 msg_id 作为合成 token（让 pending_ios 仍能 close）。
-                let token = self.next_server_msg_id as u64;
+                // **review M-2** — 用 alloc 取**唯一** token（advance），避免与成功
+                // 路径 token 撞导致 pending_ios 错配。
+                let token = crate::dma::alloc_server_msg_id(&mut self.next_server_msg_id) as u64;
                 self.pending_completions.push_back(DmaCompletion {
                     token,
                     ok: false,
@@ -646,7 +648,7 @@ impl pcie_device_core::Transport for VfioUserSession {
     fn dma_write(&mut self, gpa: u64, data: Vec<u8>) -> u64 {
         match crate::dma::dma_write_sync(
             &mut self.stream,
-            &self.dma_table,
+            &mut self.dma_table,
             &mut self.next_server_msg_id,
             &mut self.inbound_queue,
             gpa,
@@ -670,7 +672,8 @@ impl pcie_device_core::Transport for VfioUserSession {
             Err(e) => {
                 tracing::warn!(error = %e, gpa = format_args!("{gpa:#x}"),
                     "VfioUserTransport.dma_write failed");
-                let token = self.next_server_msg_id as u64;
+                // **review M-2** — 唯一 token（advance），防与成功路径撞。
+                let token = crate::dma::alloc_server_msg_id(&mut self.next_server_msg_id) as u64;
                 self.pending_completions.push_back(DmaCompletion {
                     token,
                     ok: false,
