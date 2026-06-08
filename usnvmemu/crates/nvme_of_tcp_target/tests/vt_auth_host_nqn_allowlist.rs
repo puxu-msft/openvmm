@@ -13,6 +13,7 @@
 
 #![allow(missing_docs)]
 
+use nvme_firmware::NvmeController;
 use nvme_of_tcp_target::fabric::{self, ConnectData, ConnectFabricFields, fctype};
 use nvme_of_tcp_target::framing::{read_pdu_async, write_pdu_async};
 use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
@@ -20,7 +21,6 @@ use nvme_of_tcp_target::{
     AsyncSession, SharedControllerInner, accept_and_handshake_async,
     accept_and_handshake_async_with_auth,
 };
-use nvme_firmware::NvmeController;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;

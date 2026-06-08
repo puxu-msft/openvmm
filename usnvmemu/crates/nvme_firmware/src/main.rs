@@ -131,9 +131,8 @@ fn main() -> Result<()> {
 /// **Phase U-followup** — vfio-user 模式：绑定 UNIX socket，accept QEMU
 /// 接管，跑同一份 NvmeController（与 pcie_remote 路径共享 controller code）。
 fn run_vfio_user(args: Args) -> Result<()> {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        "nvme_firmware=debug,vfio_user_transport=debug,info".into()
-    });
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "nvme_firmware=debug,vfio_user_transport=debug,info".into());
     tracing_subscriber::fmt().with_env_filter(filter).init();
     let Some(sock) = args.vfio_user_sock.clone() else {
         // **review M4** — caller 应已经校验，但 unwrap 误判会 panic；
@@ -156,9 +155,8 @@ fn run_vfio_user(args: Args) -> Result<()> {
 
 fn run_main(args: Args) -> Result<()> {
     // 默认开 device + SDK debug log；用户可用 RUST_LOG 覆盖。
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        "nvme_firmware=debug,pcie_device_sdk=debug,info".into()
-    });
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "nvme_firmware=debug,pcie_device_sdk=debug,info".into());
     tracing_subscriber::fmt().with_env_filter(filter).init();
     pal_async::DefaultPool::run_with(|driver| async move {
         tracing::info!(

@@ -977,10 +977,7 @@ impl V2Session {
     /// + drain captured CQE write，本函数不再被 handle_admin_cmd 调用，但
     ///   保留作为外部 caller（V6 AER 等）将 Cqe 直接 emit 的 helper。
     #[allow(dead_code)]
-    fn write_capsule_resp_from_cqe(
-        &mut self,
-        cqe: &nvme_firmware::cmd::Cqe,
-    ) -> anyhow::Result<()> {
+    fn write_capsule_resp_from_cqe(&mut self, cqe: &nvme_firmware::cmd::Cqe) -> anyhow::Result<()> {
         self.write_capsule_resp_bytes(cqe.as_bytes())
     }
 

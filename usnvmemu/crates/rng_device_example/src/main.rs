@@ -361,9 +361,8 @@ fn main() -> Result<()> {
 }
 
 fn run_main(args: Args) -> Result<()> {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        "rng_device_example=debug,pcie_device_sdk=info,info".into()
-    });
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "rng_device_example=debug,pcie_device_sdk=info,info".into());
     tracing_subscriber::fmt().with_env_filter(filter).init();
     let seed = args.seed.unwrap_or_else(|| {
         std::time::SystemTime::now()

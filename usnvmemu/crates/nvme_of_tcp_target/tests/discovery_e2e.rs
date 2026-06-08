@@ -10,12 +10,12 @@
 //! - admin Get Log Page LID=0x70 返 Discovery Log Page byte-exact
 //! - admin opc 白名单（非 Discovery cmd → INVALID_OPCODE）
 
+use nvme_firmware::NvmeController;
+use nvme_firmware::controller::discovery_log::DiscoveryPortal;
 use nvme_of_tcp_target::fabric::{self, ConnectData, ConnectFabricFields, fctype};
 use nvme_of_tcp_target::framing::{read_pdu, write_pdu};
 use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
 use nvme_of_tcp_target::{DISCOVERY_NQN, V2Session};
-use nvme_firmware::NvmeController;
-use nvme_firmware::controller::discovery_log::DiscoveryPortal;
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 use zerocopy::IntoBytes;

@@ -29,10 +29,10 @@
 // V8e-7 security-reviewer MEDIUM-1：inject_aen_async 被标 deprecated 作 test-only 屏障
 #![allow(deprecated)]
 
+use nvme_firmware::NvmeController;
 use nvme_of_tcp_target::framing::{read_pdu_async, write_pdu_async};
 use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
 use nvme_of_tcp_target::{AsyncSession, SharedControllerInner, accept_and_handshake_async};
-use nvme_firmware::NvmeController;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use zerocopy::IntoBytes;

@@ -19,8 +19,8 @@
 
 #![allow(missing_docs)]
 
-use nvme_of_tcp_target::{SharedControllerInner, V2Session};
 use nvme_firmware::NvmeController;
+use nvme_of_tcp_target::{SharedControllerInner, V2Session};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;

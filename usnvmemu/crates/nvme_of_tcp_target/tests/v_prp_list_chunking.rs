@@ -13,13 +13,13 @@
 
 #![allow(missing_docs)]
 
+use nvme_firmware::NvmeController;
 use nvme_of_tcp_target::fabric::{
     self, ConnectData, ConnectFabricFields, PropertyFabricFields, fctype, property_offset,
 };
 use nvme_of_tcp_target::framing::{read_pdu_async, write_pdu_async};
 use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
 use nvme_of_tcp_target::{AsyncSession, SharedControllerInner, accept_and_handshake_async};
-use nvme_firmware::NvmeController;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::{TcpListener, TcpStream};
@@ -222,7 +222,11 @@ async fn v_prp_list_anchor_constants() {
     let host_max = nvme_of_tcp_target::V_HOST_IO_NLB_MAX;
     let chunk_max = nvme_of_tcp_target::V5_NLB_MAX;
     assert!(host_max >= chunk_max);
-    assert_eq!(host_max % chunk_max, 0, "V_HOST_IO_NLB_MAX 应为 V5_NLB_MAX 整数倍");
+    assert_eq!(
+        host_max % chunk_max,
+        0,
+        "V_HOST_IO_NLB_MAX 应为 V5_NLB_MAX 整数倍"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

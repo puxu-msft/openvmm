@@ -10,17 +10,6 @@
 use anyhow::Result;
 use anyhow::anyhow;
 use clap::Parser;
-use pcie_remote_protocol::BarInfo;
-use pcie_remote_protocol::DeviceDescribe;
-use pcie_remote_protocol::HelloAck;
-use pcie_remote_protocol::MmioReadResult;
-use pcie_remote_protocol::ToHost;
-use pcie_remote_protocol::ToOpenhcl;
-use pcie_remote_protocol::bar_info::Kind;
-use pcie_remote_protocol::codec;
-use pcie_remote_protocol::to_host::Body as HostBody;
-use pcie_remote_protocol::to_openhcl::Body as OpenhclBody;
-use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(about = "Noop pcie_remote host stub (vsock client variant).")]
@@ -65,7 +54,11 @@ fn main() -> Result<()> {
             .vm_id
             .parse()
             .map_err(|e| anyhow!("invalid vm_id {}: {e}", args.vm_id))?;
-        tracing::info!(?vm_id, port = args.port, "vsock client starting (persistent reconnect loop)");
+        tracing::info!(
+            ?vm_id,
+            port = args.port,
+            "vsock client starting (persistent reconnect loop)"
+        );
 
         // 外层 reconnect loop：guest OOBE 期间 VM 会 reboot 多次，每次
         // OpenHCL 重起新的 vsock listener，host 端需要重连维持设备 live。
@@ -259,7 +252,10 @@ async fn serve(
             };
             codec::write_frame(&mut polled, &req).await?;
         }
-        tracing::info!(stress_dma_count, "STRESS: burst done, switching to normal serve");
+        tracing::info!(
+            stress_dma_count,
+            "STRESS: burst done, switching to normal serve"
+        );
     }
 
     // 主循环：在读 inbound 时设短超时；超时则发 InterruptFire（不占 polled
@@ -288,7 +284,10 @@ async fn serve(
                     Some(HostBody::MmioRead(m)) => {
                         let value = ((m.offset & 0xffff) << 16) | 0xDEAD;
                         tracing::info!(
-                            seq, bar = m.bar, offset = m.offset, size = m.size,
+                            seq,
+                            bar = m.bar,
+                            offset = m.offset,
+                            size = m.size,
                             value = format_args!("{:#x}", value),
                             "MMIO read → pattern reply"
                         );
@@ -300,19 +299,33 @@ async fn serve(
                     }
                     Some(HostBody::MmioWrite(m)) => {
                         tracing::info!(
-                            seq, bar = m.bar, offset = m.offset, size = m.size,
+                            seq,
+                            bar = m.bar,
+                            offset = m.offset,
+                            size = m.size,
                             value = format_args!("{:#x}", m.value),
                             "MMIO write (observed)"
                         );
                     }
                     Some(HostBody::CfgWriteSideEffect(c)) => {
-                        tracing::info!(seq, offset = c.offset, value = format_args!("{:#x}", c.value), "cfg side-effect (observed)");
+                        tracing::info!(
+                            seq,
+                            offset = c.offset,
+                            value = format_args!("{:#x}", c.value),
+                            "cfg side-effect (observed)"
+                        );
                     }
                     Some(HostBody::Reset(r)) => {
                         tracing::info!(seq, kind = r.kind, "reset (ignored)");
                     }
                     Some(HostBody::DmaCompletion(d)) => {
-                        tracing::debug!(seq, token = d.token, ok = d.ok, data_len = d.data.len(), "DmaCompletion (unexpected on noop client)");
+                        tracing::debug!(
+                            seq,
+                            token = d.token,
+                            ok = d.ok,
+                            data_len = d.data.len(),
+                            "DmaCompletion (unexpected on noop client)"
+                        );
                     }
                     None => {
                         tracing::warn!(seq, "ToHost missing body");
@@ -331,7 +344,8 @@ async fn serve(
                     body: Some(OpenhclBody2::InterruptFire(InterruptFire { msix_index: 0 })),
                 };
                 tracing::info!(
-                    fire_count, int_seq,
+                    fire_count,
+                    int_seq,
                     "periodic InterruptFire msix_index=0 → guest MSI-X"
                 );
                 codec::write_frame(&mut polled, &fire).await?;
@@ -352,7 +366,8 @@ async fn serve(
                         })),
                     };
                     tracing::info!(
-                        token, dma_seq,
+                        token,
+                        dma_seq,
                         "periodic ReadGpa gpa=0 len=4 → guest memory DMA"
                     );
                     codec::write_frame(&mut polled, &read_gpa).await?;
@@ -375,7 +390,8 @@ async fn serve(
                         })),
                     };
                     tracing::info!(
-                        token, dma_seq,
+                        token,
+                        dma_seq,
                         "periodic WriteGpa gpa=0x1000 len=4 → guest memory DMA write"
                     );
                     codec::write_frame(&mut polled, &write_gpa).await?;

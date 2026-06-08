@@ -48,8 +48,8 @@
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use nvme_of_tcp_target::V2Session;
 use nvme_firmware::NvmeController;
+use nvme_of_tcp_target::V2Session;
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -274,9 +274,9 @@ async fn main() -> Result<()> {
 
     // **V7 / V8a** — discovery mode 必填 target NQN + addr 多 portal；
     // zip 配对（必须等长且非空）；spawn 时 clone 给每条 conn handler
-    let discovery_portals: Vec<
-        nvme_firmware::controller::discovery_log::DiscoveryPortal,
-    > = if cli.discovery_mode {
+    let discovery_portals: Vec<nvme_firmware::controller::discovery_log::DiscoveryPortal> = if cli
+        .discovery_mode
+    {
         if cli.discovery_target_nqn.is_empty() || cli.discovery_target_addr.is_empty() {
             anyhow::bail!(
                 "--discovery-mode 必须配至少一对 --discovery-target-nqn + --discovery-target-addr"
@@ -365,41 +365,40 @@ async fn main() -> Result<()> {
     // 让 NvmeController::open 通过最小校验，discovery 路径走 session.discovery_mode
     // 拒 IO，文件实际不会被读写。
     let _disc_backing_keepalive: Option<tempfile::NamedTempFile>;
-    let discovery_shared: Option<nvme_of_tcp_target::SharedController> = if let Some(disc_addr) =
-        parsed_discovery_listen
-    {
-        // 512B tempfile（1 LBA @ LBADS=9）：drop 后被自动清；持有到 main 退出
-        let f = tempfile::NamedTempFile::new()
-            .context("V8f: 创建 discovery controller 最小 tempfile")?;
-        f.as_file()
-            .set_len(512)
-            .context("V8f: discovery tempfile set_len(512)")?;
-        let path = f.path().to_string_lossy().into_owned();
-        let mut disc_ctrl =
-            NvmeController::open(std::slice::from_ref(&path), cli.vid, cli.ssvid, &[])
-                .context("NvmeController::open (V8f discovery, isolated backing)")?;
-        let mut ps = Vec::with_capacity(cli.discovery_target_nqn.len());
-        for (nqn, addr) in cli
-            .discovery_target_nqn
-            .iter()
-            .zip(cli.discovery_target_addr.iter())
-        {
-            let p = nvme_firmware::controller::discovery_log::DiscoveryPortal::from_ipv4_addr(
+    let discovery_shared: Option<nvme_of_tcp_target::SharedController> =
+        if let Some(disc_addr) = parsed_discovery_listen {
+            // 512B tempfile（1 LBA @ LBADS=9）：drop 后被自动清；持有到 main 退出
+            let f = tempfile::NamedTempFile::new()
+                .context("V8f: 创建 discovery controller 最小 tempfile")?;
+            f.as_file()
+                .set_len(512)
+                .context("V8f: discovery tempfile set_len(512)")?;
+            let path = f.path().to_string_lossy().into_owned();
+            let mut disc_ctrl =
+                NvmeController::open(std::slice::from_ref(&path), cli.vid, cli.ssvid, &[])
+                    .context("NvmeController::open (V8f discovery, isolated backing)")?;
+            let mut ps = Vec::with_capacity(cli.discovery_target_nqn.len());
+            for (nqn, addr) in cli
+                .discovery_target_nqn
+                .iter()
+                .zip(cli.discovery_target_addr.iter())
+            {
+                let p = nvme_firmware::controller::discovery_log::DiscoveryPortal::from_ipv4_addr(
                     nqn, addr,
                 )
                 .with_context(|| format!("parse V8f discovery_target_addr {addr:?}"))?;
-            ps.push(p);
-        }
-        disc_ctrl.nvme_set_discovery_target(ps);
-        tracing::info!(addr = %disc_addr, "V8f 启用 dual-listener 模式 (discovery)");
-        _disc_backing_keepalive = Some(f);
-        Some(Arc::new(nvme_of_tcp_target::SharedControllerInner::new(
-            disc_ctrl,
-        )))
-    } else {
-        _disc_backing_keepalive = None;
-        None
-    };
+                ps.push(p);
+            }
+            disc_ctrl.nvme_set_discovery_target(ps);
+            tracing::info!(addr = %disc_addr, "V8f 启用 dual-listener 模式 (discovery)");
+            _disc_backing_keepalive = Some(f);
+            Some(Arc::new(nvme_of_tcp_target::SharedControllerInner::new(
+                disc_ctrl,
+            )))
+        } else {
+            _disc_backing_keepalive = None;
+            None
+        };
 
     // **V5d-fix C-1** — 并发上限信号量
     let inflight = Arc::new(AtomicUsize::new(0));

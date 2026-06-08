@@ -1278,8 +1278,7 @@ fn devicectx_mock_captures_dma_read() {
     let mut seq = 100u64;
     let mut tok = 200u64;
     {
-        let mut ctx =
-            pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
+        let mut ctx = pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
         let token = ctx.dma_read(0x1000_0000, 4096);
         assert_eq!(token, 200, "token = initial next_dma_token");
         ctx.fire_interrupt(7);
@@ -1450,8 +1449,7 @@ fn ns_write_protection_get_set_round_trip() {
     let sc_of = |cqe: &Cqe| (cqe.dw3 >> 17) as u8;
 
     {
-        let mut ctx =
-            pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
+        let mut ctx = pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
         // Set NS 1 WPS=1
         let cqe = c
             .dispatch_admin(&mut ctx, make_set(1, 1), 0x11, 0, 0)
@@ -1613,11 +1611,8 @@ fn ns_attachment_via_admin_round_trip() {
     ctrl_list[3] = 0; // cntlid[0] hi
 
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::for_testing(
-            &mut outbound,
-            &mut seq,
-            &mut tok_counter,
-        );
+        let mut ctx =
+            pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok_counter);
         // SEL=1 Detach
         let r = c.dispatch_admin(&mut ctx, make_sqe(1), 0x33, 0, 0);
         assert!(r.is_none(), "Detach 走 DMA-read，dispatch 不立即返 cqe");
@@ -1628,11 +1623,8 @@ fn ns_attachment_via_admin_round_trip() {
     }
     // 再做 Attach（重新建 ctx 避免借用冲突）
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::for_testing(
-            &mut outbound,
-            &mut seq,
-            &mut tok_counter,
-        );
+        let mut ctx =
+            pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok_counter);
         let r = c.dispatch_admin(&mut ctx, make_sqe(0), 0x33, 0, 0);
         assert!(r.is_none());
         let tok = *c.pending_ios.keys().next().expect("pending IO 应有一条");
@@ -1642,11 +1634,8 @@ fn ns_attachment_via_admin_round_trip() {
     // 再 Attach 应 NAMESPACE_ALREADY_ATTACHED (SC 0x18, SCT Cmd-Specific)
     let outbound_pre = outbound.len();
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::for_testing(
-            &mut outbound,
-            &mut seq,
-            &mut tok_counter,
-        );
+        let mut ctx =
+            pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok_counter);
         let r = c.dispatch_admin(&mut ctx, make_sqe(0), 0x33, 0, 0);
         assert!(r.is_none());
         let tok = *c.pending_ios.keys().next().expect("pending IO 应有一条");
@@ -1723,11 +1712,8 @@ fn identify_controller_list_cns_0x12_0x13() {
     };
 
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::for_testing(
-            &mut outbound,
-            &mut seq,
-            &mut tok_counter,
-        );
+        let mut ctx =
+            pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok_counter);
         // CNS 0x13 start=0 → 含本 ctrl
         let _ = c.dispatch_admin(&mut ctx, make_sqe(0x13, 0, 0), 0x44, 0, 0);
     }
@@ -1738,11 +1724,8 @@ fn identify_controller_list_cns_0x12_0x13() {
     outbound.clear();
 
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::for_testing(
-            &mut outbound,
-            &mut seq,
-            &mut tok_counter,
-        );
+        let mut ctx =
+            pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok_counter);
         // CNS 0x13 start=2 → 空列表
         let _ = c.dispatch_admin(&mut ctx, make_sqe(0x13, 0, 2), 0x44, 0, 0);
     }
@@ -1755,11 +1738,8 @@ fn identify_controller_list_cns_0x12_0x13() {
     outbound.clear();
 
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::for_testing(
-            &mut outbound,
-            &mut seq,
-            &mut tok_counter,
-        );
+        let mut ctx =
+            pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok_counter);
         // CNS 0x12 nsid=1 attached → NumIDs=1
         let _ = c.dispatch_admin(&mut ctx, make_sqe(0x12, 1, 0), 0x44, 0, 0);
     }
@@ -1770,11 +1750,8 @@ fn identify_controller_list_cns_0x12_0x13() {
     // Detach NS 1 → 0x12 NumIDs=0
     c.namespaces.get_mut(&1).unwrap().attached = false;
     {
-        let mut ctx = pcie_device_sdk::DeviceCtx::for_testing(
-            &mut outbound,
-            &mut seq,
-            &mut tok_counter,
-        );
+        let mut ctx =
+            pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok_counter);
         let _ = c.dispatch_admin(&mut ctx, make_sqe(0x12, 1, 0), 0x44, 0, 0);
     }
     let buf = extract_last_write(&outbound);
@@ -1841,8 +1818,7 @@ fn ana_state_change_triggers_aen() {
     let mut seq = 1u64;
     let mut tok = 1u64;
     {
-        let mut ctx =
-            pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
+        let mut ctx = pcie_device_sdk::DeviceCtx::for_testing(&mut outbound, &mut seq, &mut tok);
         // 切到 Non-Optimized 0x02
         assert!(c.set_ana_state(&mut ctx, 0x02));
         // 重复设同值 → false

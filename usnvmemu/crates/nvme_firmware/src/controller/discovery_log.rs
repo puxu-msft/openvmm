@@ -237,19 +237,37 @@ mod tests {
         .unwrap();
         let buf = build_discovery_log(1, std::slice::from_ref(&portal), 2048);
         let entry = &buf[1024..2048]; // header 占 0..1024
-        assert_eq!(entry[offset_of!(DiscoveryEntry, trtype)], 3, "TRTYPE=3 (TCP)");
-        assert_eq!(entry[offset_of!(DiscoveryEntry, adrfam)], 1, "ADRFAM=1 (IPv4)");
-        assert_eq!(entry[offset_of!(DiscoveryEntry, subtype)], 2, "SUBTYPE=2 (NVM)");
+        assert_eq!(
+            entry[offset_of!(DiscoveryEntry, trtype)],
+            3,
+            "TRTYPE=3 (TCP)"
+        );
+        assert_eq!(
+            entry[offset_of!(DiscoveryEntry, adrfam)],
+            1,
+            "ADRFAM=1 (IPv4)"
+        );
+        assert_eq!(
+            entry[offset_of!(DiscoveryEntry, subtype)],
+            2,
+            "SUBTYPE=2 (NVM)"
+        );
         let o = offset_of!(DiscoveryEntry, trsvcid);
         let trsvcid_end = entry[o..o + 32].iter().position(|&b| b == 0).unwrap_or(32);
         let trsvcid = std::str::from_utf8(&entry[o..o + trsvcid_end]).unwrap();
         assert_eq!(trsvcid, "4420", "TRSVCID ASCII");
         let o = offset_of!(DiscoveryEntry, subnqn);
-        let end = entry[o..o + 256].iter().position(|&b| b == 0).unwrap_or(256);
+        let end = entry[o..o + 256]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(256);
         let subnqn = std::str::from_utf8(&entry[o..o + end]).unwrap();
         assert_eq!(subnqn, "nqn.2014-08.org.nvmexpress:teaching:disk", "SUBNQN");
         let o = offset_of!(DiscoveryEntry, traddr);
-        let end = entry[o..o + 256].iter().position(|&b| b == 0).unwrap_or(256);
+        let end = entry[o..o + 256]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(256);
         let traddr = std::str::from_utf8(&entry[o..o + end]).unwrap();
         assert_eq!(traddr, "127.0.0.1", "TRADDR");
     }

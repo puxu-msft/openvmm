@@ -1046,9 +1046,9 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         // scope；scope 退出后再做 async wire I/O，避免对 self 的 reborrow 冲突。
         // 返回 (Option<wire_failure_bytes>, capsule_sc, log_done)。
         enum AuthSendDecision {
-            CapsuleErr(u8),                         // 简单 capsule err，无 wire
-            WireFailThenCapsule(Vec<u8>, u8),       // 先发 wire，再 capsule_sc
-            CapsuleOk,                              // 简单 OK
+            CapsuleErr(u8),                   // 简单 capsule err，无 wire
+            WireFailThenCapsule(Vec<u8>, u8), // 先发 wire，再 capsule_sc
+            CapsuleOk,                        // 简单 OK
         }
 
         let decision = {
@@ -1066,7 +1066,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
                     && data[0] == crate::dhchap::wire::AUTH_TYPE_DHCHAP
                     && data[1] == crate::dhchap::wire::MSG_NEGOTIATE
                     && data[6] == 0           // sc_c == 0
-                    && data[7] >= 1;          // napd >= 1
+                    && data[7] >= 1; // napd >= 1
                 if looks_spec {
                     neg.wire_mode = ChapWireMode::Spec4Msg;
                     tracing::info!("V-dhchap-4: 锁定 Spec4Msg wire (host 发 NEGOTIATE)");
@@ -1154,8 +1154,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
                                             neg.stage = ChapStage::Failed;
                                             AuthSendDecision::WireFailThenCapsule(fw, 0x83)
                                         } else {
-                                            let mut resp =
-                                                [0u8; crate::dhchap::HMAC_SHA256_LEN];
+                                            let mut resp = [0u8; crate::dhchap::HMAC_SHA256_LEN];
                                             resp.copy_from_slice(&rval);
                                             let ok = neg.verify_host_response(&resp);
                                             if ok {
@@ -1189,9 +1188,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
                                 neg.stage = ChapStage::Failed;
                                 AuthSendDecision::WireFailThenCapsule(fw, 0x83)
                             } else {
-                                tracing::info!(
-                                    "V-dhchap-4 SUCCESS2 received (unidirectional ack)"
-                                );
+                                tracing::info!("V-dhchap-4 SUCCESS2 received (unidirectional ack)");
                                 AuthSendDecision::CapsuleOk
                             }
                         }

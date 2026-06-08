@@ -22,12 +22,12 @@
 
 #![allow(missing_docs)]
 
+use nvme_firmware::NvmeController;
 use nvme_of_tcp_target::framing::{read_pdu_async, write_pdu_async};
 use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
 use nvme_of_tcp_target::{
     AsyncSession, PumpEvent, SharedControllerInner, V2Session, accept_and_handshake_async,
 };
-use nvme_firmware::NvmeController;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use zerocopy::IntoBytes;

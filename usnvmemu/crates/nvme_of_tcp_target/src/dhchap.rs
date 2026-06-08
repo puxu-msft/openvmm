@@ -632,9 +632,7 @@ pub fn parse_negotiate(data: &[u8]) -> anyhow::Result<(u16, bool, bool)> {
         let dhlen = data[off + 3] as usize;
         let idlist_end = off + 4 + halen + dhlen;
         if data.len() < idlist_end {
-            bail!(
-                "auth_protocol[{i}] idlist truncated (halen={halen} dhlen={dhlen})"
-            );
+            bail!("auth_protocol[{i}] idlist truncated (halen={halen} dhlen={dhlen})");
         }
         // 非 DHCHAP descriptor 跳过 (spec 允许 host 列其他 family)
         if authid == wire::AUTH_DHCHAP_AUTH_ID {
@@ -797,7 +795,7 @@ mod wire_tests {
         // protocol descriptor
         out.extend_from_slice(&[
             wire::AUTH_DHCHAP_AUTH_ID,
-            0,                  // rsvd
+            0, // rsvd
             hash_ids.len() as u8,
             dh_ids.len() as u8,
         ]);
@@ -953,11 +951,7 @@ mod wire_tests {
         // napd=2 但只够 1 个 descriptor + 2 byte (< 4 byte header)
         let mut data = build_negotiate_multi(
             0x6666,
-            &[(
-                wire::AUTH_DHCHAP_AUTH_ID,
-                &[wire::HASH_SHA384],
-                &[0x01],
-            )],
+            &[(wire::AUTH_DHCHAP_AUTH_ID, &[wire::HASH_SHA384], &[0x01])],
         );
         data[7] = 2; // 谎称 napd=2
         data.extend_from_slice(&[0u8; 2]); // 只够 2 B 而非 4 B descriptor header

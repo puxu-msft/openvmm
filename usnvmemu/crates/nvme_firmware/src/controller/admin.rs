@@ -167,10 +167,9 @@ impl NvmeController {
                         } else {
                             self.namespaces.len() as u32
                         };
-                        let bytes = IdentifyController::build_v2_bytes_with_cntrltype(
+                        IdentifyController::build_v2_bytes_with_cntrltype(
                             self.vid, self.ssvid, nn, cntrltype,
-                        );
-                        bytes
+                        )
                     }
                     0x02 => {
                         // Active NSID list — 列所有已注册 NSID（spec § 5.15.1）。
@@ -691,11 +690,7 @@ impl NvmeController {
                 }
                 let conn_id = self.current_dispatch_conn_id;
                 if conn_id != 0 {
-                    let per_conn_count = self
-                        .aen_pending
-                        .iter()
-                        .filter(|t| t.3 == conn_id)
-                        .count();
+                    let per_conn_count = self.aen_pending.iter().filter(|t| t.3 == conn_id).count();
                     if per_conn_count >= PER_CONN_AER_CAP {
                         tracing::warn!(
                             cid,

@@ -512,12 +512,7 @@ impl IdentifyController {
     ///
     /// 替代 V7c-fix 在 `controller/admin.rs` 用 byte 111 post-hoc patch 的
     /// 临时方案；wire data 全由 type 构造，更清洁。
-    pub fn build_v2_bytes_with_cntrltype(
-        vid: u16,
-        ssvid: u16,
-        nn: u32,
-        cntrltype: u8,
-    ) -> Vec<u8> {
+    pub fn build_v2_bytes_with_cntrltype(vid: u16, ssvid: u16, nn: u32, cntrltype: u8) -> Vec<u8> {
         let mut id = SpecIdentifyController::new_zeroed();
         id.vid = vid;
         id.ssvid = ssvid;
@@ -866,7 +861,10 @@ mod tests {
     #[test]
     fn v8a_builder_cntrltype_discovery_explicit() {
         let buf = IdentifyController::build_v2_bytes_with_cntrltype(0x1414, 0, 0, 0x02);
-        assert_eq!(buf[111], 0x02, "explicit CNTRLTYPE = 0x02 (Discovery Controller)");
+        assert_eq!(
+            buf[111], 0x02,
+            "explicit CNTRLTYPE = 0x02 (Discovery Controller)"
+        );
         // Discovery 也保留 spec layout: VID/SSVID/VER 等
         assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 0x1414);
     }
@@ -900,7 +898,11 @@ mod tests {
         // 测试值 = compiler 当下 layout，**用户运行通过即 wire 与 Linux 兼容**)
         assert_eq!(offset_of!(SpecIdentifyController, cmic), 76, "CMIC");
         assert_eq!(offset_of!(SpecIdentifyController, mdts), 77, "MDTS");
-        assert_eq!(offset_of!(SpecIdentifyController, cntrltype), 111, "CNTRLTYPE");
+        assert_eq!(
+            offset_of!(SpecIdentifyController, cntrltype),
+            111,
+            "CNTRLTYPE"
+        );
         assert_eq!(offset_of!(SpecIdentifyController, kas), 320, "KAS");
         assert_eq!(offset_of!(SpecIdentifyController, nn), 516, "NN");
         assert_eq!(offset_of!(SpecIdentifyController, sgls), 536, "SGLS");
@@ -998,8 +1000,7 @@ mod tests {
         let end = buf[o..o + 256].iter().position(|&b| b == 0).unwrap_or(256);
         let subnqn = std::str::from_utf8(&buf[o..o + end]).unwrap();
         assert_eq!(
-            subnqn,
-            "nqn.2014-08.org.nvmexpress.discovery",
+            subnqn, "nqn.2014-08.org.nvmexpress.discovery",
             "Discovery SUBNQN 必须 = spec well-known NQN"
         );
     }

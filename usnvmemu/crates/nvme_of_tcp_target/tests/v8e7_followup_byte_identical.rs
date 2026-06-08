@@ -30,11 +30,11 @@
 
 #![allow(missing_docs)]
 
+use nvme_firmware::NvmeController;
 use nvme_of_tcp_target::fabric::{self, ConnectData, ConnectFabricFields, fctype};
 use nvme_of_tcp_target::framing::Pdu;
 use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, decode_common_hdr, pdu_type};
 use nvme_of_tcp_target::{SharedControllerInner, V2Session, accept_and_handshake_async};
-use nvme_firmware::NvmeController;
 use std::io::{Read as _, Write as _};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

@@ -78,9 +78,9 @@ async fn serve(stream: TcpStream) -> Result<()> {
         ok: true,
         reason: String::new(),
         device: Some(DeviceDescribe {
-            vendor_id: 0x1414,           // Microsoft
-            device_id: 0xc0de,           // 实验设备
-            class_code: 0x010802,        // NVMe storage
+            vendor_id: 0x1414,    // Microsoft
+            device_id: 0xc0de,    // 实验设备
+            class_code: 0x010802, // NVMe storage
             revision: 1,
             subsystem_vendor: 0,
             subsystem_device: 0,
@@ -104,7 +104,13 @@ async fn serve(stream: TcpStream) -> Result<()> {
         let seq = req.seq;
         match req.body {
             Some(HostBody::MmioRead(m)) => {
-                tracing::debug!(seq, bar = m.bar, offset = m.offset, size = m.size, "MMIO read");
+                tracing::debug!(
+                    seq,
+                    bar = m.bar,
+                    offset = m.offset,
+                    size = m.size,
+                    "MMIO read"
+                );
                 let resp = ToOpenhcl {
                     seq,
                     body: Some(OpenhclBody::MmioReadResult(MmioReadResult { value: 0 })),

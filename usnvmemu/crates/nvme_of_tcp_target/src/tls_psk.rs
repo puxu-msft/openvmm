@@ -178,14 +178,14 @@ pub fn generate_psk_digest(
 fn hkdf_extract(salt: &[u8], ikm: &[u8], hash: TlsPskHash) -> Vec<u8> {
     match hash {
         TlsPskHash::Sha256 => {
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(salt)
-                .expect("HMAC accepts any key length");
+            let mut mac =
+                <Hmac<Sha256> as Mac>::new_from_slice(salt).expect("HMAC accepts any key length");
             mac.update(ikm);
             mac.finalize().into_bytes().to_vec()
         }
         TlsPskHash::Sha384 => {
-            let mut mac = <Hmac<Sha384> as Mac>::new_from_slice(salt)
-                .expect("HMAC accepts any key length");
+            let mut mac =
+                <Hmac<Sha384> as Mac>::new_from_slice(salt).expect("HMAC accepts any key length");
             mac.update(ikm);
             mac.finalize().into_bytes().to_vec()
         }
@@ -269,7 +269,13 @@ pub fn derive_tls_psk(
     let salt = vec![0u8; hash.output_len()];
     let prk = hkdf_extract(&salt, retained_psk, hash);
     let context = format!("{:02} {}", hash.hmac_id(), digest_str);
-    hkdf_expand_label(&prk, "nvme-tls-psk", context.as_bytes(), hash.output_len(), hash)
+    hkdf_expand_label(
+        &prk,
+        "nvme-tls-psk",
+        context.as_bytes(),
+        hash.output_len(),
+        hash,
+    )
 }
 
 /// **TP-8011 step 3** — 构造 PSK identity (TLS ClientHello / ServerHello 用)。
@@ -358,7 +364,8 @@ mod tests {
     #[test]
     fn vt_tlspsk_derive_tls_psk_sha256_length_and_determinism() {
         let psk = [0x44u8; 32];
-        let digest = generate_psk_digest(&psk, "nqn.host", "nqn.subsys", TlsPskHash::Sha256).unwrap();
+        let digest =
+            generate_psk_digest(&psk, "nqn.host", "nqn.subsys", TlsPskHash::Sha256).unwrap();
         let tls_psk = derive_tls_psk(&psk, &digest, TlsPskHash::Sha256).unwrap();
         assert_eq!(tls_psk.len(), 32, "TLS PSK SHA-256 应 32 byte");
         let tls_psk2 = derive_tls_psk(&psk, &digest, TlsPskHash::Sha256).unwrap();
@@ -444,25 +451,24 @@ mod tests {
         // self-consistent 锁定 + 不变量。
         let prk = vec![0x77u8; 32];
         // 1) 输出长度
-        let out = hkdf_expand_label(&prk, "nvme-tls-psk", b"01 digest", 32, TlsPskHash::Sha256)
-            .unwrap();
+        let out =
+            hkdf_expand_label(&prk, "nvme-tls-psk", b"01 digest", 32, TlsPskHash::Sha256).unwrap();
         assert_eq!(out.len(), 32);
         // 2) deterministic
         let out2 =
-            hkdf_expand_label(&prk, "nvme-tls-psk", b"01 digest", 32, TlsPskHash::Sha256)
-                .unwrap();
+            hkdf_expand_label(&prk, "nvme-tls-psk", b"01 digest", 32, TlsPskHash::Sha256).unwrap();
         assert_eq!(out, out2);
         // 3) label 变 → 输出变
-        let out3 = hkdf_expand_label(&prk, "other-label", b"01 digest", 32, TlsPskHash::Sha256)
-            .unwrap();
+        let out3 =
+            hkdf_expand_label(&prk, "other-label", b"01 digest", 32, TlsPskHash::Sha256).unwrap();
         assert_ne!(out, out3);
         // 4) context 变 → 输出变
-        let out4 = hkdf_expand_label(&prk, "nvme-tls-psk", b"02 digest", 32, TlsPskHash::Sha256)
-            .unwrap();
+        let out4 =
+            hkdf_expand_label(&prk, "nvme-tls-psk", b"02 digest", 32, TlsPskHash::Sha256).unwrap();
         assert_ne!(out, out4);
         // 5) length 超 hash_len 应 reject (单 block only)
-        let err = hkdf_expand_label(&prk, "nvme-tls-psk", b"x", 64, TlsPskHash::Sha256)
-            .unwrap_err();
+        let err =
+            hkdf_expand_label(&prk, "nvme-tls-psk", b"x", 64, TlsPskHash::Sha256).unwrap_err();
         assert!(format!("{err:#}").contains("超过单 block"));
     }
 
