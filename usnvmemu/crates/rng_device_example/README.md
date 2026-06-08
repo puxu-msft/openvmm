@@ -1,7 +1,7 @@
 # rng_device_example
 
 最小 PCIe 硬件 RNG (random number generator) 教学 example — **第二个**基于
-[`pcie_device_sdk`](../pcie_device_sdk/) 的 PcieDevice
+[`pcie_device_sdk`](/usnvmemu/crates/pcie_device_sdk/) 的 PcieDevice
 实现，证明 SDK 不止能写 NVMe。
 
 > ✅ SHIPPED — Phase I3 (commit `7402dd62`)。
@@ -31,6 +31,6 @@ cargo run --release --bin rng_device_example_vsock -- --seed 42 --vsock-port 500
 
 ## 参考
 
-- SDK：[`../pcie_device_sdk/README.md`](../pcie_device_sdk/README.md)
-- 同期 NVMe demo：[`../nvme_firmware/README.md`](../nvme_firmware/README.md)
-- spec：[`../../specs/2026-05-29-pcie-remote-design.md`](../../specs/2026-05-29-pcie-remote-design.md)
+- SDK：[`../pcie_device_sdk/README.md`](/usnvmemu/crates/pcie_device_sdk/README.md)
+- 同期 NVMe demo：[`../nvme_firmware/README.md`](/usnvmemu/crates/nvme_firmware/README.md)
+- spec：[`../../specs/2026-05-29-pcie-remote-design.md`](/usnvmemu/docs/pcie-remote-phase/2026-05-29-design.md)

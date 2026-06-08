@@ -37,6 +37,6 @@ vfio-user) 自动注入。
 
 ## 参考
 
-- 上层教学：[`../nvme_firmware/README.md`](../nvme_firmware/README.md)
-- spec：[`../../specs/2026-05-29-pcie-remote-design.md`](../../specs/2026-05-29-pcie-remote-design.md)
-- vsock / TCP framing：[`../../specs/2026-06-04-vfio-user-wire-reference.md`](../../specs/2026-06-04-vfio-user-wire-reference.md) (vfio-user 一脉)
+- 上层教学：[`../nvme_firmware/README.md`](/usnvmemu/crates/nvme_firmware/README.md)
+- spec：[`../../specs/2026-05-29-pcie-remote-design.md`](/usnvmemu/docs/pcie-remote-phase/2026-05-29-design.md)
+- vsock / TCP framing：[`../../specs/2026-06-04-vfio-user-wire-reference.md`](/usnvmemu/crates/vfio_user_transport/docs/specs/2026-06-04-vfio-user-wire-reference.md) (vfio-user 一脉)

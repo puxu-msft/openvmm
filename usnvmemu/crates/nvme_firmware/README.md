@@ -1,6 +1,6 @@
 # nvme_firmware — 用户态 NVMe 控制器示例
 
-通过 [pcie_remote 协议](../../specs/2026-05-29-pcie-remote-design.md)
+通过 [pcie_remote 协议](/usnvmemu/docs/pcie-remote-phase/2026-05-29-design.md)
 把一个**完全运行在 host 用户态**的 NVMe 2.0 控制器暴露给 OpenHCL VM 中
 的 guest（Windows / Linux），让 guest 的 `nvme.sys` / `nvme` 内核驱动
 看到并使用一块 "真"虚拟 NVMe 盘。
@@ -17,17 +17,17 @@
 ```
 ┌─────────────────────── Host Windows ───────────────────────┐
 │                                                            │
-│   nvme_firmware.exe                           │
-│   (本 example - Rust 用户态进程)                            │
-│   ┌─────────────────┐  ┌────────────────────────────┐      │
-│   │  NvmeController │←→│ pcie_device_sdk  │      │
-│   │  · CC/CSTS regs │  │ · transport (vsock/tcp)    │      │
-│   │  · SQ/CQ mgmt   │  │ · DMA token routing        │      │
-│   │  · PRP DMA      │  │ · MSI-X fire_interrupt     │      │
-│   │  · NS HashMap   │  │ · MMIO callbacks           │      │
-│   │  · SMART/AEN... │  └────────────────────────────┘      │
-│   └─────────────────┘             ↑                        │
-│   ↑ backing files                 │ vsock / TCP            │
+│   nvme_firmware.exe                                        │
+│   (本 example - Rust 用户态进程)                           │
+│   ┌─────────────────┐    ┌────────────────────────────┐    │
+│   │  NvmeController │←→│ pcie_device_sdk            │    │
+│   │  · CC/CSTS regs │    │ · transport (vsock/tcp)    │    │
+│   │  · SQ/CQ mgmt   │    │ · DMA token routing        │    │
+│   │  · PRP DMA      │    │ · MSI-X fire_interrupt     │    │
+│   │  · NS HashMap   │    │ · MMIO callbacks           │    │
+│   │  · SMART/AEN... │    └────────────────────────────┘    │
+│   └─────────────────┘             ↑                       │
+│   ↑ backing files                 │ vsock / TCP           │
 │   │ (per NSID)                    │                        │
 └───┼───────────────────────────────┼────────────────────────┘
     │                               │
@@ -184,12 +184,12 @@ nvme_firmware --tcp-addr 127.0.0.1:50000 \
 
 | 文件 | 内容 |
 |------|------|
-| [src/main.rs](src/main.rs) | 入口 + clap CLI + reconnect loop |
-| [src/cmd.rs](src/cmd.rs) | NVMe Sqe/Cqe wire types + opcode/fid/sc 常量 + IdentifyController/Namespace builder（用 nvme_spec crate 200+ 字段） |
-| [src/regs.rs](src/regs.rs) | BAR0 寄存器 layout + CC/CSTS/CAP/AQA 等 bit field |
-| [src/controller/mod.rs](src/controller/mod.rs) | NvmeController 主结构 + state machine（enable/disable/reset/tick）+ DMA 完成回调（PRP list / dual / single）+ SMART/AEN/Self-Test/Error log 真追踪 + Reservation 状态机 |
-| [src/controller/admin.rs](src/controller/admin.rs) | Admin command dispatch (15+ opcode) |
-| [src/controller/io.rs](src/controller/io.rs) | NVM IO command dispatch (Read/Write/Flush/Compare/Reservation/…) |
+| [src/main.rs](/usnvmemu/crates/nvme_firmware/src/main.rs) | 入口 + clap CLI + reconnect loop |
+| [src/cmd.rs](/usnvmemu/crates/nvme_firmware/src/cmd.rs) | NVMe Sqe/Cqe wire types + opcode/fid/sc 常量 + IdentifyController/Namespace builder（用 nvme_spec crate 200+ 字段） |
+| [src/regs.rs](/usnvmemu/crates/nvme_firmware/src/regs.rs) | BAR0 寄存器 layout + CC/CSTS/CAP/AQA 等 bit field |
+| [src/controller/mod.rs](/usnvmemu/crates/nvme_firmware/src/controller/mod.rs) | NvmeController 主结构 + state machine（enable/disable/reset/tick）+ DMA 完成回调（PRP list / dual / single）+ SMART/AEN/Self-Test/Error log 真追踪 + Reservation 状态机 |
+| [src/controller/admin.rs](/usnvmemu/crates/nvme_firmware/src/controller/admin.rs) | Admin command dispatch (15+ opcode) |
+| [src/controller/io.rs](/usnvmemu/crates/nvme_firmware/src/controller/io.rs) | NVM IO command dispatch (Read/Write/Flush/Compare/Reservation/…) |
 
 ---
 
@@ -241,9 +241,9 @@ impl PcieDevice for MyDevice {
 
 ### 4. 必读
 
-- [SDK source](../../../../vm/devices/pcie_device_sdk/src/)
-- [pcie_remote protocol spec](../../specs/2026-05-29-pcie-remote-design.md)
-- [pcie_remote_device VTL2 shim](../../../../vm/devices/pcie_remote_device/src/)
+- [SDK source](/usnvmemu/crates/pcie_device_sdk/src/)
+- [pcie_remote protocol spec](/usnvmemu/docs/pcie-remote-phase/2026-05-29-design.md)
+- [pcie_remote_device VTL2 shim](/vm/devices/pcie_remote_device/src/)
 
 ---
 
@@ -283,7 +283,7 @@ bash docs/superpowers/scripts/build-windows-cross.sh
 
 ## 历史 Phase
 
-完整开发时间线见 [SESSION_LOG.md](../../PCIE_REMOTE_SESSION_LOG.md)：
+完整开发时间线见 [SESSION_LOG.md](/usnvmemu/docs/pcie-remote-phase/SESSION_LOG.md)：
 
 - **Phase A** — Identify 用 nvme_spec NVMe 2.0c 完整字段
 - **Phase B+C+D** — Admin opcodes + Get Log Page + IO opcodes
@@ -412,11 +412,11 @@ queue parallel dispatch** (M3_PARALLEL_DESIGN.md ADR)。具体 spec coverage
 + test count + reviewer round 详 `README.md` 顶 + Phase 列表。
 
 下游消费者：
-- [`pcie_device_sdk`](../pcie_device_sdk/) — SDK 把
+- [`pcie_device_sdk`](/usnvmemu/crates/pcie_device_sdk/) — SDK 把
   本 controller 跑在 vsock/TCP 之上
-- [`rng_device_example`](../rng_device_example/) — 第二个
+- [`rng_device_example`](/usnvmemu/crates/rng_device_example/) — 第二个
   PcieDevice 教学 example
 - **`nvme_of_tcp_target`** — 把本 controller 包成 NVMe-oF TCP target；
-  详 [`../nvme_of_tcp_target/README.md`](../nvme_of_tcp_target/README.md)
+  详 [`../nvme_of_tcp_target/README.md`](/usnvmemu/crates/nvme_of_tcp_target/README.md)
 - **vfio-user via `vfio_user_transport`** — 把本 controller 通过 vfio-user
   UNIX socket 挂给 QEMU

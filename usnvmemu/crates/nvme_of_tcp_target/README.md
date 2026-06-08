@@ -1,26 +1,26 @@
 # nvme_of_tcp_target
 
 **V-followup-dhchap-4d + V-followup-tls-psk (TP-8011) 全栈** — NVMe-over-Fabrics TCP target backed by
-[`nvme_firmware`](../nvme_firmware/) `NvmeController`。
+[`nvme_firmware`](/usnvmemu/crates/nvme_firmware/) `NvmeController`。
 Linux ≥ 5.0 / Windows Server 2025 上的标准 `nvme-cli` 可通过
 `nvme connect -t tcp` 直接挂载并跑 IO。
 
 > **持续开发的顶层文档** (新加 phase 前必读):
-> - **[PROJECT_VISION.md](../../plans/PROJECT_VISION.md)** — 项目愿景: 用户态 NVMe firmware 为核心 + 3 transport (OpenHCL/OpenVMM/QEMU vfio-user) + NVMe-oF TCP
-> - [ROADMAP.md](../../plans/ROADMAP.md) — 短/中/长期 phase 列表 (动态)，按 Tier 1/2/3 优先级排
-> - [PRINCIPLES.md](../../plans/PRINCIPLES.md) — 不变约束 + coding policy + subagent reviewer prompt 模板 + 测试命名约定
-> - [LESSONS.md](../../plans/LESSONS.md) — 17 条踩坑教训 (含 decision-then-IO 借用模式 / WebFetch 工作流 / 手算 offset 速查表 / doc audit 必配 git log)
-> - [DECISIONS.md](../../plans/DECISIONS.md) — 重大决策 ADR (9 条)
-> - [tls-psk-survey.md](../../plans/2026-06-06-phase-v-followup-tls-psk-survey.md)
+> - **[PROJECT_VISION.md](/usnvmemu/docs/PROJECT_VISION.md)** — 项目愿景: 用户态 NVMe firmware 为核心 + 3 transport (OpenHCL/OpenVMM/QEMU vfio-user) + NVMe-oF TCP
+> - [ROADMAP.md](/usnvmemu/docs/ROADMAP.md) — 短/中/长期 phase 列表 (动态)，按 Tier 1/2/3 优先级排
+> - [PRINCIPLES.md](/usnvmemu/docs/PRINCIPLES.md) — 不变约束 + coding policy + subagent reviewer prompt 模板 + 测试命名约定
+> - [LESSONS.md](/usnvmemu/docs/LESSONS.md) — 17 条踩坑教训 (含 decision-then-IO 借用模式 / WebFetch 工作流 / 手算 offset 速查表 / doc audit 必配 git log)
+> - [DECISIONS.md](/usnvmemu/docs/DECISIONS.md) — 重大决策 ADR (9 条)
+> - [tls-psk-survey.md](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v-followup-tls-psk-survey.md)
 >   — rustls external-PSK 调研 + 决策
-> - [extract-from-openvmm-survey.md](../../plans/2026-06-06-phase-x-extract-from-openvmm-survey.md)
+> - [extract-from-openvmm-survey.md](/usnvmemu/docs/2026-06-06-phase-x-extract-from-openvmm-survey.md)
 >   — 外部化调研 + 决策推迟 (ADR-008/009)
 
 ## Status (2026-06-06)
 
 **所有 phase 代码 + 测试 shipped**: 306 lib + integration tests pass，clippy 0 warning。
 
-**已 verified 在真 Linux nvme-cli**: plaintext `discover` + `connect` + IO (kernel 6.6.114 nvme-tcp.ko, WSL2)。**TLS / mTLS / DH-HMAC-CHAP 等安全栈未走真 Linux nvme-cli 实测**，只走 lib test + Python harness (跨进程但同一份 Rust 算法对自家 Python 算法)。真 third-party host interop 是下一步 HIGH (见 [ROADMAP §1](../../plans/ROADMAP.md))。
+**已 verified 在真 Linux nvme-cli**: plaintext `discover` + `connect` + IO (kernel 6.6.114 nvme-tcp.ko, WSL2)。**TLS / mTLS / DH-HMAC-CHAP 等安全栈未走真 Linux nvme-cli 实测**，只走 lib test + Python harness (跨进程但同一份 Rust 算法对自家 Python 算法)。真 third-party host interop 是下一步 HIGH (见 [ROADMAP §1](/usnvmemu/docs/ROADMAP.md))。
 
 | Phase 组 | 状态 | 关键 commit |
 |---------|------|------------|
@@ -37,9 +37,9 @@ Linux ≥ 5.0 / Windows Server 2025 上的标准 `nvme-cli` 可通过
 | V-followup-prp-list (session-level chunking 16→256 LBA) | ✅ shipped | `2a4d734b` + `619f8d44` |
 | V-followup-tls-psk (TP-8011 deterministic crypto) | ✅ shipped | `43040427` |
 | V-interop-1..8 (真 Linux nvme-cli + Python harness) | ✅ shipped | 多 commit |
-| Linux nvme-cli plaintext discover + connect + IO 真互通 | ✅ verified | [LESSONS](../../plans/LESSONS.md) §14 |
+| Linux nvme-cli plaintext discover + connect + IO 真互通 | ✅ verified | [LESSONS](/usnvmemu/docs/LESSONS.md) §14 |
 
-下一步 HIGH 优先 (见 [ROADMAP §1](../../plans/ROADMAP.md)):
+下一步 HIGH 优先 (见 [ROADMAP §1](/usnvmemu/docs/ROADMAP.md)):
 - real-host CHAP interop (跑真 Linux nvme-cli `--dhchap-secret`)
 - kernel-CI 五元组 anchor for `src/tls_psk.rs`
 - TLS PSK wire 注入 (等 rustls upstream external-PSK API)
@@ -60,7 +60,7 @@ Linux ≥ 5.0 / Windows Server 2025 上的标准 `nvme-cli` 可通过
 - 生产 / 共享 LAN 部署务必加 IP 层 ACL / WireGuard / Tailscale 隧道
 
 > **教学/生产边界**：DH-HMAC-CHAP HMAC-only (无 DH ephemeral)；TLS PSK 仅
-> deterministic crypto，rustls 注入待上游 (详 [tls-psk-survey](../../plans/2026-06-06-phase-v-followup-tls-psk-survey.md))。
+> deterministic crypto，rustls 注入待上游 (详 [tls-psk-survey](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v-followup-tls-psk-survey.md))。
 > 各 section 都标"教学版简化"或"教学/生产边界"段。
 
 ## Build & Run
@@ -172,9 +172,9 @@ cargo test -p nvme_of_tcp_target --test aer_e2e
 
 | 限制 | 原因 | 解除路径 |
 |---|---|---|
-| 单 IO ≤ 128 KiB (256 LBA) | session-level chunking (V-followup-prp-list) 透明 16→256 LBA；> 256 LBA SC=0x18 | future controller PRP-list path (见 [DECISIONS](../../plans/DECISIONS.md) ADR-006) |
-| TLS PSK 不能注入握手 | rustls 0.23 无 external-PSK API | 等 rustls upstream，见 [tls-psk-survey](../../plans/2026-06-06-phase-v-followup-tls-psk-survey.md) |
-| DH-HMAC-CHAP HMAC-only | 教学版无 DH ephemeral key exchange | V-spec-strict-mode (见 [ROADMAP §3](../../plans/ROADMAP.md)) |
+| 单 IO ≤ 128 KiB (256 LBA) | session-level chunking (V-followup-prp-list) 透明 16→256 LBA；> 256 LBA SC=0x18 | future controller PRP-list path (见 [DECISIONS](/usnvmemu/docs/DECISIONS.md) ADR-006) |
+| TLS PSK 不能注入握手 | rustls 0.23 无 external-PSK API | 等 rustls upstream，见 [tls-psk-survey](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v-followup-tls-psk-survey.md) |
+| DH-HMAC-CHAP HMAC-only | 教学版无 DH ephemeral key exchange | V-spec-strict-mode (见 [ROADMAP §3](/usnvmemu/docs/ROADMAP.md)) |
 | `tls_psk.rs` self-consistent 测试 only | 缺 Linux kernel 真五元组 anchor | kernel probe module dump (ROADMAP §1 HIGH) |
 | `parse_negotiate` 多 protocol descriptor 已支持 (V-dhchap-4d) | — | — ✅ |
 | 单 backing file 真 multi-conn 已支持 (V8b `Arc<SharedControllerInner>`) | — | — ✅ |
@@ -557,36 +557,36 @@ target → host:  CapsuleResp SC=0 (通过) / SC=0x83 (失败)
 
 > **2026-06-06 update**: DH-HMAC-CHAP wire 已落地两条：simplified (V-dhchap-3-wire)
 > + spec § 8.13.5 4-message (V-dhchap-4 + 4d 多 descriptor)，自动识别。
-> 详 [DECISIONS](../../plans/DECISIONS.md) ADR-005。
+> 详 [DECISIONS](/usnvmemu/docs/DECISIONS.md) ADR-005。
 
 ## 内部参考
 
 **首选** (持续维护、动态更新):
-- [ROADMAP](../../plans/ROADMAP.md) — 短/中/长期 phase 列表 + 历史 phase 索引
-- [PRINCIPLES](../../plans/PRINCIPLES.md) — coding policy + reviewer prompt 模板
-- [LESSONS](../../plans/LESSONS.md) — 16 条踩坑教训
-- [DECISIONS](../../plans/DECISIONS.md) — 重大决策 ADR (7 条)
+- [ROADMAP](/usnvmemu/docs/ROADMAP.md) — 短/中/长期 phase 列表 + 历史 phase 索引
+- [PRINCIPLES](/usnvmemu/docs/PRINCIPLES.md) — coding policy + reviewer prompt 模板
+- [LESSONS](/usnvmemu/docs/LESSONS.md) — 16 条踩坑教训
+- [DECISIONS](/usnvmemu/docs/DECISIONS.md) — 重大决策 ADR (7 条)
 
 **wire / 算法 reference** (新字段同步更新):
-- wire spec：[`../../specs/2026-06-04-nvme-tcp-wire-reference.md`](../../specs/2026-06-04-nvme-tcp-wire-reference.md)
-- TLS PSK 调研：[`../../plans/2026-06-06-phase-v-followup-tls-psk-survey.md`](../../plans/2026-06-06-phase-v-followup-tls-psk-survey.md)
+- wire spec：[`../../specs/2026-06-04-nvme-tcp-wire-reference.md`](/usnvmemu/crates/nvme_of_tcp_target/docs/specs/2026-06-04-nvme-tcp-wire-reference.md)
+- TLS PSK 调研：[`../../plans/2026-06-06-phase-v-followup-tls-psk-survey.md`](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v-followup-tls-psk-survey.md)
 
 **历史 phase 计划** (已 SHIPPED，保留作设计记录；status banner 见各文件顶):
-- [V (NVMe-oF TCP 总)](../../plans/2026-06-04-phase-v-nvme-of-tcp.md)
-- [V4 detailed](../../plans/2026-06-05-phase-v4-detailed.md) /
-  [V5 detailed](../../plans/2026-06-05-phase-v5-detailed.md) /
-  [V6 detailed](../../plans/2026-06-06-phase-v6-detailed.md) /
-  [V7 short](../../plans/2026-06-06-phase-v7-short.md) /
-  [V8 detailed](../../plans/2026-06-06-phase-v8-detailed.md)
-- [V8e tokio detailed](../../plans/2026-06-06-phase-v8e-tokio-detailed.md) /
-  [V8e-7 dispatch detailed](../../plans/2026-06-06-phase-v8e-7-dispatch-detailed.md)
-- [V-followup-tls detailed](../../plans/2026-06-06-phase-v-followup-tls-detailed.md) /
-  [V-followup-prp-list detailed (SUPERSEDED)](../../plans/2026-06-06-phase-v-followup-prp-list-detailed.md)
+- [V (NVMe-oF TCP 总)](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-04-phase-v-nvme-of-tcp.md)
+- [V4 detailed](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-05-phase-v4-detailed.md) /
+  [V5 detailed](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-05-phase-v5-detailed.md) /
+  [V6 detailed](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v6-detailed.md) /
+  [V7 short](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v7-short.md) /
+  [V8 detailed](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v8-detailed.md)
+- [V8e tokio detailed](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v8e-tokio-detailed.md) /
+  [V8e-7 dispatch detailed](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v8e-7-dispatch-detailed.md)
+- [V-followup-tls detailed](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v-followup-tls-detailed.md) /
+  [V-followup-prp-list detailed (SUPERSEDED)](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v-followup-prp-list-detailed.md)
 
 **Backend / Python harness**:
-- backend controller：[`../nvme_firmware/README.md`](../nvme_firmware/README.md)
-- Python interop harness：[`scripts/interop_py/`](scripts/interop_py/) (9 个 script，详 `scripts/interop_py/README.md`)
-- Integration tests 命名约定：见 [PRINCIPLES §10](../../plans/PRINCIPLES.md)
+- backend controller：[`../nvme_firmware/README.md`](/usnvmemu/crates/nvme_firmware/README.md)
+- Python interop harness：[`scripts/interop_py/`](/usnvmemu/crates/nvme_of_tcp_target/scripts/interop_py/) (9 个 script，详 `scripts/interop_py/README.md`)
+- Integration tests 命名约定：见 [PRINCIPLES §10](/usnvmemu/docs/PRINCIPLES.md)
 
 ## 许可
 

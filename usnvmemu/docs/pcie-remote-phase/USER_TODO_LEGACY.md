@@ -1,8 +1,8 @@
 # 需要用户配合的事项 (2026-05-31 更新)
 
-> **🔼 2026-06-06 audit**: 本文档定格在 PCIe Remote / NVMe userspace 初版闭环时刻 (2026-05-31)。之后项目延伸到 Phase T (Transport 抽象) → Phase U (vfio-user) → Phase V..V-followup-tls/mtls/auth/dhchap/tls-psk (NVMe-oF TCP target)。**最新坐标在 [plans/ROADMAP.md](plans/ROADMAP.md)**；本文档保留为 PCIe/Hyper-V 阶段需求记录。
+> **🔼 2026-06-06 audit**: 本文档定格在 PCIe Remote / NVMe userspace 初版闭环时刻 (2026-05-31)。之后项目延伸到 Phase T (Transport 抽象) → Phase U (vfio-user) → Phase V..V-followup-tls/mtls/auth/dhchap/tls-psk (NVMe-oF TCP target)。**最新坐标在 [plans/ROADMAP.md](/usnvmemu/docs/ROADMAP.md)**；本文档保留为 PCIe/Hyper-V 阶段需求记录。
 >
-> 当前需要用户跑的真机实测项: [plans/ROADMAP.md](plans/ROADMAP.md) §1 (real-host CHAP interop / kernel CI tls-psk vector / multi-portal discovery 实测) + [plans/2026-06-06-phase-v-followup-tls-psk-survey.md](plans/2026-06-06-phase-v-followup-tls-psk-survey.md)。
+> 当前需要用户跑的真机实测项: [plans/ROADMAP.md](/usnvmemu/docs/ROADMAP.md) §1 (real-host CHAP interop / kernel CI tls-psk vector / multi-portal discovery 实测) + [plans/2026-06-06-phase-v-followup-tls-psk-survey.md](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v-followup-tls-psk-survey.md)。
 
 > **🎉 Path C + userspace PCIe/NVMe 全闭环！** 真 Hyper-V 上 OpenHCL VTL2 +
 > pcie_remote + vsock host + **用户态 NVMe SDK** 端到端验证成功：guest Windows

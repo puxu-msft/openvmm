@@ -31,7 +31,7 @@
                        └────────────────────┘
 ```
 
-详 [docs/PROJECT_VISION.md](docs/PROJECT_VISION.md)。
+详 [docs/PROJECT_VISION.md](/usnvmemu/docs/PROJECT_VISION.md)。
 
 ## 目录结构
 
@@ -45,25 +45,28 @@ usnvmemu/
 │   ├── vfio_user_transport/                — vfio-user transport backend (QEMU 接管)
 │   ├── rng_device_example/                 — 第二个 PcieDevice example (RNG, 教学)
 │   └── pcie_remote_test_harness/           — 协议 e2e harness (PCIe Remote 验证)
-├── docs/                                  ← 项目文档
+├── docs/                                  ← 仅跨 crate 治理文档
 │   ├── PROJECT_VISION.md                  — 项目愿景 + 架构图
 │   ├── ROADMAP.md                         — 短/中/长期 phase (Tier 1/2/3 优先级)
 │   ├── PRINCIPLES.md                      — 不变约束 + coding policy
 │   ├── LESSONS.md                         — 17 条踩坑教训
 │   ├── DECISIONS.md                       — 9 条 ADR
-│   ├── PCIE_REMOTE_SESSION_LOG.md         — PCIe Remote 阶段日志 (2026-05-29..05-31)
-│   ├── PCIE_REMOTE_HYPERV_RUNBOOK.md      — Hyper-V 部署 runbook
-│   ├── PCIE_REMOTE_HOTPLUG_DESIGN.md      — K-20 hotplug 设计 (已 shipped)
-│   ├── PCIE_REMOTE_MSHV_DIAGNOSIS.md      — Path B mshv 排查归档
-│   ├── PCIE_REMOTE_USER_TODO_LEGACY.md    — 阶段性 user TODO 快照
-│   ├── PCIE_REMOTE_REVIEW_PENDING.md      — 待用户决定的 LOW 级建议
-│   ├── plans/                             — 15 个 phase 详细计划
-│   └── specs/                             — 4 个 wire reference / design spec
+│   ├── 2026-06-06-phase-x-extract-from-openvmm-survey.md  — 外部化调研 (跨项目)
+│   └── pcie-remote-phase/                 — PCIe Remote 阶段历史 (跨 SDK+harness+主仓 device)
+│       ├── SESSION_LOG.md / HYPERV_RUNBOOK.md / HOTPLUG_DESIGN.md
+│       ├── MSHV_DIAGNOSIS.md / USER_TODO_LEGACY.md / REVIEW_PENDING.md
+│       └── 2026-05-29-{impl,design}.md
 └── scripts/                               ← 部署 / 跨编脚本
     ├── build-windows-cross.sh             — WSL → Windows MSVC cross-build
     ├── setup-pcie-remote.ps1              — vsock GUID 注册
     ├── noop_host_vsock.ps1                — vsock client 调试
     └── hyperv/                            — Hyper-V VM 创建 + IGVM 加载
+
+各 crate 专属文档进 `crates/<X>/docs/`:
+  - nvme_of_tcp_target/docs/{plans,specs}/  — 所有 V* phase + nvme-tcp-wire-reference
+  - vfio_user_transport/docs/{plans,specs}/ — phase-u + vfio-user wire/client spec
+  - pcie_device_sdk/docs/plans/             — phase-t-transport-abstraction
+  - nvme_firmware/{*_DESIGN.md, NVME_LIFECYCLE.md, QEMU_VFIO_USER.md, ZNS_DESIGN.md}
 ```
 
 ## 6 个 crate 的关系 + 各自作用
@@ -114,11 +117,11 @@ sudo nvme list
 
 ### 2. 跑教学 controller behind vfio-user (QEMU 接管)
 
-详 `crates/nvme_firmware/QEMU_VFIO_USER.md`。
+详 [/usnvmemu/crates/nvme_firmware/QEMU_VFIO_USER.md](/usnvmemu/crates/nvme_firmware/QEMU_VFIO_USER.md)。
 
 ### 3. 跑 OpenHCL VTL2 真 PCIe Remote 路径
 
-详 `docs/PCIE_REMOTE_HYPERV_RUNBOOK.md`。
+详 [/usnvmemu/docs/pcie-remote-phase/HYPERV_RUNBOOK.md](/usnvmemu/docs/pcie-remote-phase/HYPERV_RUNBOOK.md)。
 
 ## 状态 (2026-06-08)
 
@@ -126,7 +129,7 @@ sudo nvme list
 - **已 verified 真 host**: Linux nvme-cli plaintext discover + connect + IO；真 Hyper-V e2e (PCIe Remote 路径 v20 NVMe 完全闭环)
 - **未 verified 真 host**: TLS/mTLS/CHAP (只 lib test + Python harness)；vfio-user QEMU e2e (只 lib unit test)
 
-下一步 HIGH (见 [ROADMAP §1](docs/ROADMAP.md)):
+下一步 HIGH (见 [ROADMAP §1](/usnvmemu/docs/ROADMAP.md)):
 1. NVMe-oF real-host CHAP interop (`--dhchap-secret`)
 2. vfio-user QEMU 真 e2e harness (scripts/qemu_interop/)
 3. NVMe TLS PSK kernel-CI 五元组 anchor
@@ -138,7 +141,7 @@ workspace member** (在 `<root>/Cargo.toml` 的 `exclude = [...]` 里)。
 
 - `crates/*/Cargo.toml` 通过 `path = "../../../support/..."` 引 openvmm 主仓内
   部 crate (pal_async / mesh / nvme_spec / 等)
-- 未来 (Phase X, [ADR-008](docs/DECISIONS.md)) 计划独立成新 repo
+- 未来 (Phase X, [ADR-008](/usnvmemu/docs/DECISIONS.md)) 计划独立成新 repo
   `userspace-nvme-firmware`；目前耦合度调研已完成，留待 V-followup-firmware-rename
   后一起做
 

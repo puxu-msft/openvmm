@@ -177,6 +177,6 @@ host 端 noop_host vsock_main 已经有 outer reconnect loop（v3 加的），�
 
 ### 引用
 
-- v1 实测验证：[../PCIE_REMOTE_SESSION_LOG.md](../PCIE_REMOTE_SESSION_LOG.md) `--stress-bad-frames` 段
-- v1 worker.rs::run: [../../../vm/devices/pcie_remote_device/src/worker.rs](../../../vm/devices/pcie_remote_device/src/worker.rs)
-- BoxedTransport: [../../../vm/devices/pcie_remote_device/src/prepared.rs](../../../vm/devices/pcie_remote_device/src/prepared.rs)
+- v1 实测验证：[../PCIE_REMOTE_SESSION_LOG.md](SESSION_LOG.md) `--stress-bad-frames` 段
+- v1 worker.rs::run: [../../../vm/devices/pcie_remote_device/src/worker.rs](/vm/devices/pcie_remote_device/src/worker.rs)
+- BoxedTransport: [../../../vm/devices/pcie_remote_device/src/prepared.rs](/vm/devices/pcie_remote_device/src/prepared.rs)

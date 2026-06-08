@@ -22,13 +22,13 @@ OpenHCL VTL2 / OpenVMM 端是 **server**，本 stub 是 **client**：
 ## 真用法
 
 主要给测试用：跑 OpenHCL VTL2 + worker spawn 流程验证；详
-[../../PCIE_REMOTE_SESSION_LOG.md](../../PCIE_REMOTE_SESSION_LOG.md) 早期 "noop_host" 段 + spec
-[../../specs/2026-05-29-pcie-remote-design.md](../../specs/2026-05-29-pcie-remote-design.md)
+[../../PCIE_REMOTE_SESSION_LOG.md](/usnvmemu/docs/pcie-remote-phase/SESSION_LOG.md) 早期 "noop_host" 段 + spec
+[../../specs/2026-05-29-pcie-remote-design.md](/usnvmemu/docs/pcie-remote-phase/2026-05-29-design.md)
 K-NEW-A..E + K-NEW-G/H 段。
 
 ## 升级路径
 
 要写真有 device 行为的 host 端，**不要扩 noop_host**；用
-[`pcie_device_sdk`](../pcie_device_sdk/) +
+[`pcie_device_sdk`](/usnvmemu/crates/pcie_device_sdk/) +
 `nvme_firmware` / `rng_device_example` 作为模板。
 noop_host 是协议 e2e harness，不是 device 实现模板。

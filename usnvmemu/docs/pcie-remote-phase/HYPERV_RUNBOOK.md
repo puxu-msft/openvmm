@@ -4,7 +4,7 @@
 > 删除了所有不准确的"未确定/可能"段落。请优先阅读本 runbook 而不是历史
 > 段落如 USER_TODO 旧版备份。
 
-完成 [USER_TODO.md](USER_TODO.md) §A（加 Hyper-V Administrators 组）后，
+完成 [USER_TODO.md](USER_TODO_LEGACY.md) §A（加 Hyper-V Administrators 组）后，
 Claude 可从 WSL 用 `/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`
 驱动所有命令，**不再需要人工**。
 

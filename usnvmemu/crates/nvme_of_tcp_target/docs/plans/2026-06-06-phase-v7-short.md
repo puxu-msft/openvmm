@@ -1,6 +1,6 @@
 # Phase V7 短 plan — Discovery Subsystem (Get Log Page 0x70)
 
-> **✅ SHIPPED (2026-06-06 audit)** — V7a/b/c-fix 全段落地 (commits `3f3b79b1` → `dcfec8ed`)；105 tests reviewer-clean；CNTRLTYPE patch 修 reviewer H-1 BLOCK，Linux nvme-cli `nvme discover` 真生产可用。V-interop-5/6 又修了 DiscoveryEntry layout + LPO offset (见 [LESSONS.md](LESSONS.md) §1)。本文档保留为初版 Discovery 设计记录。
+> **✅ SHIPPED (2026-06-06 audit)** — V7a/b/c-fix 全段落地 (commits `3f3b79b1` → `dcfec8ed`)；105 tests reviewer-clean；CNTRLTYPE patch 修 reviewer H-1 BLOCK，Linux nvme-cli `nvme discover` 真生产可用。V-interop-5/6 又修了 DiscoveryEntry layout + LPO offset (见 [LESSONS.md](/usnvmemu/docs/LESSONS.md) §1)。本文档保留为初版 Discovery 设计记录。
 
 > **Status:** plan delivered (subagent ab6e80a3); 实现推下轮会话
 > **Date:** 2026-06-06

@@ -139,9 +139,9 @@ NVMe-oF TCP。
 **Context**：早期纠结 Path A (OpenVMM Linux) / Path B (mshv) / Path C
 (OpenHCL VTL2)。
 
-**Decision**：Path C，理由见 [../PCIE_REMOTE_SESSION_LOG.md](../PCIE_REMOTE_SESSION_LOG.md) 早期段。
+**Decision**：Path C，理由见 [../PCIE_REMOTE_SESSION_LOG.md](/usnvmemu/docs/pcie-remote-phase/SESSION_LOG.md) 早期段。
 
-**Status**：active；Path A 仍可跑，Path B (mshv) [MSHV_DIAGNOSIS.md](../PCIE_REMOTE_MSHV_DIAGNOSIS.md)
+**Status**：active；Path A 仍可跑，Path B (mshv) [MSHV_DIAGNOSIS.md](/usnvmemu/docs/pcie-remote-phase/MSHV_DIAGNOSIS.md)
 搁置。
 
 ---

@@ -1,6 +1,6 @@
 # Phase V — NVMe-over-Fabrics TCP Target Backend
 
-> **✅ SHIPPED — 已大幅超越本文档 (2026-06-06 audit)** — V1..V8 + V8e tokio + V-followup-tls/mtls/auth/dhchap-3/dhchap-4/prp-list 全段落地。原本"non-goals" (TLS 1.3 / DH-HMAC-CHAP / multi-portal Discovery) 全部已实现并 reviewer-clean。最新坐标见 [ROADMAP.md](ROADMAP.md) §0。本文档保留为初版 design vision 记录。
+> **✅ SHIPPED — 已大幅超越本文档 (2026-06-06 audit)** — V1..V8 + V8e tokio + V-followup-tls/mtls/auth/dhchap-3/dhchap-4/prp-list 全段落地。原本"non-goals" (TLS 1.3 / DH-HMAC-CHAP / multi-portal Discovery) 全部已实现并 reviewer-clean。最新坐标见 [ROADMAP.md](/usnvmemu/docs/ROADMAP.md) §0。本文档保留为初版 design vision 记录。
 
 > **Status:** design draft
 > **Date:** 2026-06-04

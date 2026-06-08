@@ -3,16 +3,16 @@
 > **🔼 2026-06-06 audit**: 本日志覆盖 PCIe Remote v1/v2 实施 (2026-05-29 → 2026-05-31)，最终里程碑是 Phase 10 完成 + 真 Hyper-V e2e 验证 + Phase I3 第二个 PcieDevice (RNG) example。
 >
 > **本日志没记的后续工作 (2026-05-31 → 2026-06-06)**：
-> - **NVMe userspace 教学 controller 完善**: Phase J / K / L / M / N / O / P / **Q1-Q12** / **R1+R3+R4** / **S1-S7** (NVMe 2.0 spec 全覆盖 + 多轮 reviewer)。详 [`examples/nvme_firmware/README.md`](examples/nvme_firmware/README.md)。
+> - **NVMe userspace 教学 controller 完善**: Phase J / K / L / M / N / O / P / **Q1-Q12** / **R1+R3+R4** / **S1-S7** (NVMe 2.0 spec 全覆盖 + 多轮 reviewer)。详 [`crates/nvme_firmware/README.md`](/usnvmemu/crates/nvme_firmware/README.md)。
 > - **Phase T**: `trait Transport` 抽出 + 3 backend。
-> - **Phase U1-U5 + U-followup**: vfio-user SDK + NVMe behind QEMU。详 [`specs/2026-06-05-vfio-user-client-design.md`](specs/2026-06-05-vfio-user-client-design.md)。
-> - **Phase V → V8 → V8e → V-followup-tls/mtls/auth/dhchap-3/4/4d/prp-list/tls-psk**: NVMe-oF TCP target 全栈。详 [`examples/nvme_of_tcp_target/README.md`](examples/nvme_of_tcp_target/README.md) + [`plans/ROADMAP.md`](plans/ROADMAP.md)。
-> - **K-20 hotplug** 已 ✅ shipped (commits `a99cdc63` + `64da8fb6`)，已自标在 [`K20_HOTPLUG_DESIGN.md`](K20_HOTPLUG_DESIGN.md)。
+> - **Phase U1-U5 + U-followup**: vfio-user SDK + NVMe behind QEMU。详 [`specs/2026-06-05-vfio-user-client-design.md`](/usnvmemu/crates/vfio_user_transport/docs/specs/2026-06-05-vfio-user-client-design.md)。
+> - **Phase V → V8 → V8e → V-followup-tls/mtls/auth/dhchap-3/4/4d/prp-list/tls-psk**: NVMe-oF TCP target 全栈。详 [`crates/nvme_of_tcp_target/README.md`](/usnvmemu/crates/nvme_of_tcp_target/README.md) + [`plans/ROADMAP.md`](/usnvmemu/docs/ROADMAP.md)。
+> - **K-20 hotplug** 已 ✅ shipped (commits `a99cdc63` + `64da8fb6`)，已自标在 [`K20_HOTPLUG_DESIGN.md`](HOTPLUG_DESIGN.md)。
 >
 > **新工作不再写本日志**；统一去：
-> - [`plans/ROADMAP.md`](plans/ROADMAP.md) — 当前坐标 + 下一步 HIGH
-> - [`plans/DECISIONS.md`](plans/DECISIONS.md) — 重大决策 ADR
-> - [`plans/LESSONS.md`](plans/LESSONS.md) — 踩坑教训
+> - [`plans/ROADMAP.md`](/usnvmemu/docs/ROADMAP.md) — 当前坐标 + 下一步 HIGH
+> - [`plans/DECISIONS.md`](/usnvmemu/docs/DECISIONS.md) — 重大决策 ADR
+> - [`plans/LESSONS.md`](/usnvmemu/docs/LESSONS.md) — 踩坑教训
 >
 > 本日志保留为 PCIe Remote 阶段 (2026-05-29 → 2026-05-31) 实施实录。
 
@@ -21,8 +21,8 @@
 ## 会话信息
 - **开始**：2026-05-29 06:43
 - **关键里程碑**：2026-05-29 ~15:40 完成真 KVM 端到端 e2e 验证
-- **Spec**：[usnvmemu/docs/specs/2026-05-29-pcie-remote-design.md](specs/2026-05-29-pcie-remote-design.md)（v3.1，经 3 轮 reviewer 评审）
-- **Plan**：[usnvmemu/docs/plans/2026-05-29-pcie-remote-impl.md](plans/2026-05-29-pcie-remote-impl.md)（v2）
+- **Spec**：[usnvmemu/docs/specs/2026-05-29-pcie-remote-design.md](2026-05-29-design.md)（v3.1，经 3 轮 reviewer 评审）
+- **Plan**：[usnvmemu/docs/plans/2026-05-29-pcie-remote-impl.md](2026-05-29-impl.md)（v2）
 - **分支**：`feat/pcie-remote-experimental`
 
 ## 最终状态：✅ 真 KVM 上完整端到端验证成功
@@ -100,7 +100,7 @@ OpenHCL 在 OpenVMM 上启动需要 **WHP 或 mshv** hypervisor（提供 VTL2）
 | 实际跨编 | ❌ 缺 `lib.exe` (cc-rs 找；llvm-ar 不能 100% 替代) + `clang-cl` |
 | **替代方案**：用户在 Windows 原生 `cargo build -p openvmm` | 用户自做更简单 |
 
-详见 [docs/superpowers/PCIE_REMOTE_USER_TODO_LEGACY.md](USER_TODO.md)。
+详见 [docs/superpowers/PCIE_REMOTE_USER_TODO_LEGACY.md](USER_TODO_LEGACY.md)。
 
 ## 测试统计（截至此 log）
 
@@ -125,7 +125,7 @@ OpenHCL 在 OpenVMM 上启动需要 **WHP 或 mshv** hypervisor（提供 VTL2）
 > 见末尾 "🎉🎉🎉 真 Hyper-V 端到端验证" 段）。只剩项 3 (跨编 openvmm.exe，
 > 用户可选) 和项 4 (CVM 真机，需硬件)。当前 USER_TODO 已对应更新。
 
-详见 [USER_TODO.md](USER_TODO.md)。简要（**原始历史快照**）：
+详见 [USER_TODO.md](USER_TODO_LEGACY.md)。简要（**原始历史快照**）：
 
 1. ~~OpenHCL 真 VTL2 验证~~ ✅ 已完成（Path C 已端到端通过）
 2. ~~生产 Hyper-V 上 Path C 真验证~~ ✅ 已完成（noop_host_vsock ↔ VTL2 handshake ok）
@@ -1416,21 +1416,19 @@ PRACT，若 driver 期望真 PI 校验则 INVALID_FIELD（我们没 CRC 引擎�
 ### Phase I1 — ZNS (deferred, design doc)
 
 完整 ZNS 实现 ~1500 行新代码 + zone state machine + 单测，ROI 不对等
-（NVM CS 路径已覆盖核心教学价值）。写 [ZNS_DESIGN.md](docs/superpowers/
-examples/nvme_firmware/ZNS_DESIGN.md) 记录设计 + deferred
+（NVM CS 路径已覆盖核心教学价值）。写 [ZNS_DESIGN.md](/usnvmemu/crates/nvme_firmware/ZNS_DESIGN.md) 记录设计 + deferred
 原因。
 
 ### Phase I2 — README + 架构图 (commit 58ef924c)
 
-[README.md](usnvmemu/crates/nvme_firmware/README.md)
+[README.md](/usnvmemu/crates/nvme_firmware/README.md)
 含 ASCII 架构图 (host → vsock → VTL2 → VTL0)、完整 opcode 覆盖矩阵、
 Windows 真 e2e PowerShell 用法、TCP 模式、代码导览、"how to write next
 PcieDevice" 教程、设计哲学。
 
 ### Phase I3 — 第二个 PCIe device example (commit 7402dd62)
 
-[rng_device_example](docs/superpowers/examples/
-rng_device_example/)：~360 行实现一个最小 PCI 硬件 RNG (BAR0
+[rng_device_example](/usnvmemu/crates/rng_device_example/)：~360 行实现一个最小 PCI 硬件 RNG (BAR0
 6 reg + 1 MSI-X + DMA-write)。证明 SDK 不止能写 NVMe；作为下一个
 PcieDevice 教学模板。splitmix64 LCG (无外部依赖)；--seed 可复现。
 

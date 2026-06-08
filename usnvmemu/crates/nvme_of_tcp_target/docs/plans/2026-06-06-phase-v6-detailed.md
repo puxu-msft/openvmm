@@ -6,7 +6,7 @@
 > **Date:** 2026-06-06
 > **Branch:** `feat/pcie-remote-experimental`
 > **Prereq:** V5 全段完成 (commits ffe4e92a → f77c5876)；84 lib tests + 1 bin smoke + 67 controller
-> **Roadmap 锚:** [`2026-06-04-phase-v-nvme-of-tcp.md`](./2026-06-04-phase-v-nvme-of-tcp.md) § 7 第 V6 行
+> **Roadmap 锚:** [`2026-06-04-phase-v-nvme-of-tcp.md`](2026-06-04-phase-v-nvme-of-tcp.md) § 7 第 V6 行
 > **Spec 参考:**
 > - NVMe Base 2.0c § 5.2 Async Event Request command (Figure 174)
 > - NVMe Base 2.0c § 5.21.1.11 Set Features FID `0x0B`

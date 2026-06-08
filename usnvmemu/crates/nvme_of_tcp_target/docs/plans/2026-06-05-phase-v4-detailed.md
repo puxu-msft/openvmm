@@ -6,8 +6,8 @@
 > **Date:** 2026-06-05
 > **Branch:** `feat/pcie-remote-experimental`
 > **Prereq:** Phase V3（admin in-capsule C2HData ≤ 4 KiB 已 work）+ V3-polish (commit 61ed326d)
-> **Roadmap 节锚:** [`2026-06-04-phase-v-nvme-of-tcp.md`](./2026-06-04-phase-v-nvme-of-tcp.md) § 7 第 V4 行
-> **Wire 参考:** [`2026-06-04-nvme-tcp-wire-reference.md`](../specs/2026-06-04-nvme-tcp-wire-reference.md) §1、§3、§4 (R2T / H2CData / C2HData / flags)
+> **Roadmap 节锚:** [`2026-06-04-phase-v-nvme-of-tcp.md`](2026-06-04-phase-v-nvme-of-tcp.md) § 7 第 V4 行
+> **Wire 参考:** [`2026-06-04-nvme-tcp-wire-reference.md`](/usnvmemu/crates/nvme_of_tcp_target/docs/specs/2026-06-04-nvme-tcp-wire-reference.md) §1、§3、§4 (R2T / H2CData / C2HData / flags)
 > **Goal:** 把 controller-initiated `ctx.dma_read(...)` 翻译成 NVMe-oF TCP R2T → H2CData 闭环；
 > SGL 走 in-capsule data + transport-specific (0x5) 两条路径；MAXH2CDATA 分片；为 V5 IO Write 铺好底
 

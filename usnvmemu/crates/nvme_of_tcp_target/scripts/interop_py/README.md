@@ -1,6 +1,6 @@
 # scripts/interop_py — Python 跨进程 wire 实证 harness
 
-> **uv-managed venv，stdlib only，0 sudo / 0 nvme-cli 依赖**。详 [DECISIONS](../../../../plans/DECISIONS.md) ADR-004。
+> **uv-managed venv，stdlib only，0 sudo / 0 nvme-cli 依赖**。详 [DECISIONS](/usnvmemu/docs/DECISIONS.md) ADR-004。
 
 每个 script 是 1 个独立 Python harness，验某个 wire / 行为。**模式**：起 Rust target → uv run python <script>.py → 退出码 0 = 全 scenario 通过。
 
@@ -39,7 +39,7 @@ uv run python <script>.py
 4. **失败时**：`fail("具体说什么不对")` + sys.exit(1)，让 CI 直接红。
 5. **加 entry 到本表**。
 6. **与 lib test 关系**: lib test 是单进程 in-process；Python harness 是跨
-   进程；两者互补，缺一不可（见 [LESSONS §7](../../../../plans/LESSONS.md)）。
+   进程；两者互补，缺一不可（见 [LESSONS §7](/usnvmemu/docs/LESSONS.md)）。
 
 ## 教学/生产边界
 

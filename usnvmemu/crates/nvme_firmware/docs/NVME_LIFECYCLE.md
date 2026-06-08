@@ -1,6 +1,6 @@
 # NVMe Lifecycle 教程：从 driver init 到完整 IO
 
-这是 [nvme_firmware](../) example 的配套教学文档。把 NVMe
+这是 [nvme_firmware](/usnvmemu/crates/nvme_firmware/) example 的配套教学文档。把 NVMe
 2.0 spec 抽象的 controller lifecycle 落到具体代码行号，让读者按"driver
 看到 controller 一次完整启动 + 用 + 关闭"的时间线对照 spec 阅读。
 
@@ -38,8 +38,8 @@ BAR0: MMIO 64-bit, 8 KiB
 MSI-X: 4 vectors
 ```
 
-代码：[`src/cmd.rs:NvmeController::describe()`](../src/cmd.rs) (PCIe DeviceDescribe)
-+ [`src/regs.rs`](../src/regs.rs) (BAR0 layout)。
+代码：[`src/cmd.rs:NvmeController::describe()`](/usnvmemu/crates/nvme_firmware/src/cmd.rs) (PCIe DeviceDescribe)
++ [`src/regs.rs`](/usnvmemu/crates/nvme_firmware/src/regs.rs) (BAR0 layout)。
 
 ## 第 2 步 — Identify Controller (Admin)
 
@@ -47,7 +47,7 @@ Windows nvme.sys driver 启动时先发 `Identify CNS=0x01`：driver 提供 4 Ki
 PRP1 buffer，controller DMA-write 200+ 字段的 IdentifyController struct
 到该 buffer。
 
-**关键字段** ([cmd.rs build_v2_bytes](../src/cmd.rs))：
+**关键字段** ([cmd.rs build_v2_bytes](/usnvmemu/crates/nvme_firmware/src/cmd.rs))：
 - `VID/SSVID` (0x1414/0)
 - `SN` "PCIE-REMOTE-USRSPACE" (20 ASCII，spec 要 left-justified + space pad)
 - `MN` "OpenHCL Userspace NVMe v2.0" (40 ASCII)
@@ -97,7 +97,7 @@ driver 发 Get Log Page LID=0x02 → controller DMA-write 512 byte SMART
 log；driver 检 critical_warning bit 决定是否走 fallback。
 
 我们的 SMART log 真追踪 host_read_commands / data_units_* / power_on_hours
-等 ([logs.rs:build_smart_health](../src/controller/logs.rs))。
+等 ([logs.rs:build_smart_health](/usnvmemu/crates/nvme_firmware/src/controller/logs.rs))。
 
 ## 第 9 步 — AsyncEventRequest 预投
 
@@ -117,8 +117,8 @@ driver 投 4 条 AER (Identify Controller .aerl + 1) 让 controller 缓冲
 
 1. driver 在 IO SQ N 写一条 SQE：opc=0x02 READ, nsid=1, slba=100, nlb=8 (4 KiB)
 2. driver 写 SQyTDBL → controller MMIO write 回调
-3. [`on_sq_tail_doorbell`](../src/controller/mod.rs) → 算新 entry 数 → DMA-read SQE
-4. 完成回调 dispatch_sqe → [`dispatch_io`](../src/controller/io.rs) → opcode 分流
+3. [`on_sq_tail_doorbell`](/usnvmemu/crates/nvme_firmware/src/controller/mod.rs) → 算新 entry 数 → DMA-read SQE
+4. 完成回调 dispatch_sqe → [`dispatch_io`](/usnvmemu/crates/nvme_firmware/src/controller/io.rs) → opcode 分流
 5. READ：seek+read backing file → DMA-write 4 KiB 到 PRP1
 6. on_dma_complete (NvmReadDmaWrite) → 构 success CQE → post 到 IO CQ N
 7. fire MSI-X vector → driver ISR 读 CQE → 完成
@@ -126,7 +126,7 @@ driver 投 4 条 AER (Identify Controller .aerl + 1) 让 controller 缓冲
 ### 一次 Write 命令的完整路径
 
 1. SQE：opc=0x01 WRITE, nsid=1, slba=200, nlb=16 (8 KiB)
-2. [dispatch_io WRITE](../src/controller/io.rs) → 3 档 PRP 分流：
+2. [dispatch_io WRITE](/usnvmemu/crates/nvme_firmware/src/controller/io.rs) → 3 档 PRP 分流：
    - ≤ 1 page (4 KiB) → 单 PRP1
    - ≤ 2 page (8 KiB) → 双 PRP1+PRP2 (WriteAccum 累积)
    - > 2 page → PRP list (PrpListOp 累积，列页指向所有数据页)
@@ -135,7 +135,7 @@ driver 投 4 条 AER (Identify Controller .aerl + 1) 让 controller 缓冲
 
 ### 关于 FLUSH
 
-driver 用 `FLUSH (opc 0x00)` 拿持久化承诺。我们 [`io.rs FLUSH`](../src/controller/io.rs)
+driver 用 `FLUSH (opc 0x00)` 拿持久化承诺。我们 [`io.rs FLUSH`](/usnvmemu/crates/nvme_firmware/src/controller/io.rs)
 对每个目标 NS 调 file.sync_all()。无 FLUSH 时 Write 走 host page cache
 （无 per-IO fsync 是 Phase H5 性能修复）。
 
@@ -151,7 +151,7 @@ driver 运行期会：
 ## 第 12 步 — Shutdown
 
 driver 写 CC.SHN bit (实际不强制) + CC.EN 1→0：
-- [`disable()`](../src/controller/mod.rs)：清 sqs/cqs/pending_ios/dual_prp_writes/
+- [`disable()`](/usnvmemu/crates/nvme_firmware/src/controller/mod.rs)：清 sqs/cqs/pending_ios/dual_prp_writes/
   prp_list_ops/compare_ops/sqe_inbox/aen_pending/self_test/sanitize/features/
   doorbell/current_ps/irq_coalesce/host_id_lo
 - CSTS.RDY=0
@@ -167,7 +167,7 @@ driver 看到 CSTS.RDY=0 后认 device down。
 
 | Spec § | Topic | 代码位置 |
 |---|---|---|
-| § 3.1 | Controller Registers | [regs.rs](../src/regs.rs) |
+| § 3.1 | Controller Registers | [regs.rs](/usnvmemu/crates/nvme_firmware/src/regs.rs) |
 | § 4.4 | PRP layout | io.rs Read/Write 三档 |
 | § 4.6 | CQE format | cmd.rs Cqe |
 | § 5.2 | AER | mod.rs fire_aen |
@@ -225,11 +225,11 @@ driver 看到 CSTS.RDY=0 后认 device down。
 
 读完本教程的读者，可以尝试：
 
-1. **添加 ZNS** — 见 [ZNS_DESIGN.md](../ZNS_DESIGN.md)，独立 example
+1. **添加 ZNS** — 见 [ZNS_DESIGN.md](/usnvmemu/crates/nvme_firmware/ZNS_DESIGN.md)，独立 example
    `pcie_remote_zns_userspace` 复用 SDK
-2. **添加真 PI Write 路径** — 见 [K4_DESIGN.md](../K4_DESIGN.md)，
+2. **添加真 PI Write 路径** — 见 [K4_DESIGN.md](/usnvmemu/crates/nvme_firmware/K4_DESIGN.md)，
    interleave data + tuple inline 写 backing file
-3. **零拷贝优化** — 见 [M2_MMAP_DESIGN.md](../M2_MMAP_DESIGN.md)，
+3. **零拷贝优化** — 见 [M2_MMAP_DESIGN.md](/usnvmemu/crates/nvme_firmware/M2_MMAP_DESIGN.md)，
    memmap2 替换 file.read/write
 4. **per-queue 并发 dispatch** — 见 mod.rs 头注释 Phase M3 section
 5. **写一个新 PCIe device** — 复制 `rng_device_example` 模板

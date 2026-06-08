@@ -7,8 +7,8 @@
 > 相反；本 spec 描述的是反向 — OpenVMM 当 *client* 去消费外部 vfio-user
 > server。
 >
-> 当前优先级状态见 [PROJECT_VISION.md](../plans/PROJECT_VISION.md) +
-> [ROADMAP.md](../plans/ROADMAP.md)：Tier 1 HIGH 是
+> 当前优先级状态见 [PROJECT_VISION.md](/usnvmemu/docs/PROJECT_VISION.md) +
+> [ROADMAP.md](/usnvmemu/docs/ROADMAP.md)：Tier 1 HIGH 是
 > `V-followup-vfio-user-qemu-harness`（验现有 server 侧路径），本 spec 的
 > client 实施未在 Tier 1/2/3 显式列表中。是否启动实施请由用户重新拍板。
 > Phase B (OpenHCL paravisor 侧) 同样未实施。

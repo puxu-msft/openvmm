@@ -1,9 +1,11 @@
-# NVMe-oF TCP Target — 后续开发 Roadmap (动态文档)
+# usnvmemu Roadmap — 用户态 NVMe Firmware Emulator (动态文档)
 
 > **维护策略**: 本文件 phase 完成时即时更新；废弃 phase 标 ~~strikethrough~~；
 > 新 phase 按 "what / why / acceptance / blockers / commit links" 模板加。
+> 历史上本文件叫 "NVMe-oF TCP Target Roadmap"，2026-06-08 升为项目级 (因
+> firmware-as-core 愿景 + usnvmemu/ 独立)。
 
-> **最后更新**: 2026-06-06 (V-followup-dhchap-4d + V-interop-8 + tls-psk-survey 完成后)
+> **最后更新**: 2026-06-08 (usnvmemu/ 子目录化 + crate 改名 + 文档归属重组)
 
 ## 0. 当前坐标
 
@@ -163,7 +165,7 @@ auth / FAILURE2 from host)，对齐 lib test。
 - `tests/vt_tls_psk_5_*` 系列 e2e (类似 V-followup-tls-3 的 5 个 file)
 - `scripts/interop_py/tls_psk_e2e.py` 用 nvme-cli `--tls`
 
-**Blocker**：rustls upstream（详 [tls-psk-survey](2026-06-06-phase-v-followup-tls-psk-survey.md)）。
+**Blocker**：rustls upstream（详 [tls-psk-survey](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v-followup-tls-psk-survey.md)）。
 
 ### V-followup-fused-cmd (MEDIUM)
 
@@ -218,7 +220,7 @@ storage 到真 PCIe NVMe device，把 nvme-of target 变成 NVMe-oF JBOD gateway
 - 不可变约束 / coding policy → [PRINCIPLES.md](PRINCIPLES.md)
 - 踩过的坑 + 经验 → [LESSONS.md](LESSONS.md)
 - 重大决策 ADR → [DECISIONS.md](DECISIONS.md)
-- TLS PSK 调研 → [2026-06-06-phase-v-followup-tls-psk-survey.md](2026-06-06-phase-v-followup-tls-psk-survey.md)
+- TLS PSK 调研 → [2026-06-06-phase-v-followup-tls-psk-survey.md](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v-followup-tls-psk-survey.md)
 - 外部化调研 → [2026-06-06-phase-x-extract-from-openvmm-survey.md](2026-06-06-phase-x-extract-from-openvmm-survey.md)
 - 各 phase 详 spec → `2026-06-0*-phase-*-detailed.md`
 
@@ -268,7 +270,7 @@ storage 到真 PCIe NVMe device，把 nvme-of target 变成 NVMe-oF JBOD gateway
 
 | Phase 段 | 范围 | 文档归属 | commit 范围 |
 |---------|------|---------|------------|
-| Phase A..J (NVMe userspace 初版) | 单 PRP / SQ-CQ / dual-PRP / CRC PI | [`examples/nvme_firmware/README.md`](../examples/nvme_firmware/README.md) | 早期 (SESSION_LOG 涵盖) |
+| Phase A..J (NVMe userspace 初版) | 单 PRP / SQ-CQ / dual-PRP / CRC PI | [`examples/nvme_firmware/README.md`](/usnvmemu/crates/nvme_firmware/README.md) | 早期 (SESSION_LOG 涵盖) |
 | Phase K1..K9 (NVMe PI + Sanitize + Compare + Reservation) | T10 DIF + Compare PRP-list + NS Management + Sanitize + Doorbell Buffer + Reservation HOSTID | nvme userspace README | (SESSION_LOG 早期截止；后续段散见) |
 | Phase L1..L5 (NVMe ZNS 基础 + Log Page + Directive + Security) | ZNS basics + Identify CNS 0x05/0x06 + Reservation Notification Log + Directive Send/Recv + Security Send/Recv | nvme userspace README | 2026-05-31..06-01 |
 | Phase M1..M3 (NVMe IRQ coalesce + mmap + parallel) | Set Features 0x08 + mmap zero-copy + per-queue parallel ADR | nvme userspace README + `M2_MMAP_DESIGN.md` + `M3_PARALLEL_DESIGN.md` | `003bdb33`..`3658d21f` |
@@ -278,8 +280,8 @@ storage 到真 PCIe NVMe device，把 nvme-of target 变成 NVMe-oF JBOD gateway
 | Phase Q1..Q12 (NVMe 2.0 spec coverage 完整化) | PRACT + ZONE_APPEND PI + Telemetry + ANA + BP + Lockdown + crypto erase + RNM + DeviceCtx::for_testing + mod 拆分 + WSL→Windows MSVC 跨编 | nvme userspace README "## Phase Q 系列" | `e84578c9`..`cfd95e54` |
 | Phase R1+R3+R4 (NVMe SGL + Identify advertise + RBAR) | SGL Data Block + sgls 字段 + RBAR ADR | nvme userspace README "## Phase R 系列" (本次 audit 补) | `f19c193f` |
 | Phase S1..S7 (NVMe NS WP / NS Attach / Controller List / ANA state machine) | Write Protect + COPY conflict + Identify NS NAWUN 等 + NS Attachment 0x15 + Controller List CNS 0x12/13 + Reservation Notification Log + ANA state machine + Change AEN | nvme userspace README "## Phase S 系列" (本次 audit 补) | `d0b36b19`..`f8d847ea` + `10f987f5` |
-| K-20 hotplug (pcie_remote) | listener 永不退 + worker transport refresh | [`../PCIE_REMOTE_HOTPLUG_DESIGN.md`](../PCIE_REMOTE_HOTPLUG_DESIGN.md) (本次 audit 修正) + SESSION_LOG | `a99cdc63` + `64da8fb6` + `93c5fa5f` |
-| Phase I3 (RNG example) | 第二个 PcieDevice 教学 example | [`../examples/rng_device_example/README.md`](../examples/rng_device_example/README.md) (本次 audit 补) | `7402dd62` |
+| K-20 hotplug (pcie_remote) | listener 永不退 + worker transport refresh | [`../PCIE_REMOTE_HOTPLUG_DESIGN.md`](/usnvmemu/docs/pcie-remote-phase/HOTPLUG_DESIGN.md) (本次 audit 修正) + SESSION_LOG | `a99cdc63` + `64da8fb6` + `93c5fa5f` |
+| Phase I3 (RNG example) | 第二个 PcieDevice 教学 example | [`../examples/rng_device_example/README.md`](/usnvmemu/crates/rng_device_example/README.md) (本次 audit 补) | `7402dd62` |
 
 **判据 — 何时写独立 plan，何时跳过**：
 - 写 plan: > 1 day 工作 + 跨多 module + reviewer round 可能 ≥ 2 轮 + 决策点不止 1 个

@@ -1,6 +1,6 @@
 # Phase V8e 详细实施计划 — tokio async refactor（KATO timer / AER wakeup / async controller share）
 
-> **✅ SHIPPED (2026-06-06 audit)** — V8e-1..V8e-6 + V8e-7 全段落地 (commits `06a16176` → `eb04fcf4`)；192 active test + clippy 0；tokio runtime + AsyncSession + AER Notify (< 10ms) + KATO timer + 多 conn 并发 e2e；dispatch_plan 决策表 + bin spawn_blocking 退役。这是项目从 sync TCP 转 tokio 的关键 phase；async/await + lock 教训见 [LESSONS.md](LESSONS.md) §3。本文档保留为完整 design 记录。
+> **✅ SHIPPED (2026-06-06 audit)** — V8e-1..V8e-6 + V8e-7 全段落地 (commits `06a16176` → `eb04fcf4`)；192 active test + clippy 0；tokio runtime + AsyncSession + AER Notify (< 10ms) + KATO timer + 多 conn 并发 e2e；dispatch_plan 决策表 + bin spawn_blocking 退役。这是项目从 sync TCP 转 tokio 的关键 phase；async/await + lock 教训见 [LESSONS.md](/usnvmemu/docs/LESSONS.md) §3。本文档保留为完整 design 记录。
 
 > **Status:** design draft
 > **Date:** 2026-06-06

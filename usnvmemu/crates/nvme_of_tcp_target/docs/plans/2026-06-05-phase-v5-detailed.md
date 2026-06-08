@@ -6,8 +6,8 @@
 > **Date:** 2026-06-05
 > **Branch:** `feat/pcie-remote-experimental`
 > **Prereq:** Phase V4 (V4a + V4b + V4c) 全部完成（commit 665ba1ec）
-> **Roadmap 节锚:** [`2026-06-04-phase-v-nvme-of-tcp.md`](./2026-06-04-phase-v-nvme-of-tcp.md) § 7 第 V5 行
-> **Wire 参考:** [`2026-06-04-nvme-tcp-wire-reference.md`](../specs/2026-06-04-nvme-tcp-wire-reference.md) §1、§3、§4
+> **Roadmap 节锚:** [`2026-06-04-phase-v-nvme-of-tcp.md`](2026-06-04-phase-v-nvme-of-tcp.md) § 7 第 V5 行
+> **Wire 参考:** [`2026-06-04-nvme-tcp-wire-reference.md`](/usnvmemu/crates/nvme_of_tcp_target/docs/specs/2026-06-04-nvme-tcp-wire-reference.md) §1、§3、§4
 > **Spec 参考:**
 > - NVMe Base spec 2.0c § 5.4 (Create IO CQ)、§ 5.5 (Create IO SQ)、§ 6.8 (Read)、§ 6.9 (Write)
 > - NVMe-oF spec 1.1a § 3.3 (Fabric Connect IO queue)、§ 3.5.1 (Fabrics 强制 SGL)

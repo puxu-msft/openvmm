@@ -9,8 +9,8 @@ vfio-user (Nutanix `libvfio-user` 协议) Transport backend for
 
 ## 用途
 
-把 [`nvme_firmware`](../nvme_firmware/) 或任何
-基于 [`pcie_device_sdk`](../pcie_device_sdk/) 的设备
+把 [`nvme_firmware`](/usnvmemu/crates/nvme_firmware/) 或任何
+基于 [`pcie_device_sdk`](/usnvmemu/crates/pcie_device_sdk/) 的设备
 跑成 vfio-user server (UNIX socket)，QEMU / Cloud Hypervisor / SPDK
 可作为 client 接管，guest 看到普通 PCIe 设备 (inbox driver 就消费)。
 
@@ -35,6 +35,6 @@ vfio-user (Nutanix `libvfio-user` 协议) Transport backend for
 
 ## spec
 
-- wire reference: [`../../specs/2026-06-04-vfio-user-wire-reference.md`](../../specs/2026-06-04-vfio-user-wire-reference.md)
-- client design (OpenVMM 一侧, 用作 client 时): [`../../specs/2026-06-05-vfio-user-client-design.md`](../../specs/2026-06-05-vfio-user-client-design.md)
-- ROADMAP: [`../../plans/ROADMAP.md`](../../plans/ROADMAP.md)
+- wire reference: [`../../specs/2026-06-04-vfio-user-wire-reference.md`](/usnvmemu/crates/vfio_user_transport/docs/specs/2026-06-04-vfio-user-wire-reference.md)
+- client design (OpenVMM 一侧, 用作 client 时): [`../../specs/2026-06-05-vfio-user-client-design.md`](/usnvmemu/crates/vfio_user_transport/docs/specs/2026-06-05-vfio-user-client-design.md)
+- ROADMAP: [`../../plans/ROADMAP.md`](/usnvmemu/docs/ROADMAP.md)

@@ -1,7 +1,7 @@
 # tests/ — Integration test suite
 
 > 31 个 integration test 文件 (2026-06-06 audit)；命名约定见
-> [PRINCIPLES §10](../../../plans/PRINCIPLES.md)。
+> [PRINCIPLES §10](/usnvmemu/docs/PRINCIPLES.md)。
 
 ## 命名约定速查
 

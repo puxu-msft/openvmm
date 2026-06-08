@@ -263,7 +263,7 @@ hash"的语义，anchor test 看得出。
 
 **坑**：F 段 (rustls external-PSK survey) 一度纠结"要不要 fork rustls"。
 半天后我意识到决策本身就是 "不接 fork，等上游"，并且要 **同等严肃** 写
-进 plan（[2026-06-06-phase-v-followup-tls-psk-survey.md](2026-06-06-phase-v-followup-tls-psk-survey.md)
+进 plan（[2026-06-06-phase-v-followup-tls-psk-survey.md](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v-followup-tls-psk-survey.md)
 §4 "推荐：路径 A + C 并行"）。
 
 **为什么重要**：不写下来的"不做"决策一周后没人记得为什么；下次有人冲动

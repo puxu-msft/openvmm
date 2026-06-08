@@ -91,7 +91,7 @@ v1 不支持重连。需要 host 重启后整 VM 重启。
 
 ## 参考
 
-- [设计文档](../../../../usnvmemu/docs/specs/2026-05-29-pcie-remote-design.md)
-- [实施计划](../../../../usnvmemu/docs/plans/2026-05-29-pcie-remote-impl.md)
-- [setup.ps1](../../../../usnvmemu/scripts/setup-pcie-remote.ps1)
-- [host SDK 示例](../../../../usnvmemu/crates/pcie_remote_test_harness/)
+- [设计文档](../../../../../usnvmemu/docs/pcie-remote-phase/2026-05-29-design.md)
+- [实施计划](../../../../../usnvmemu/docs/pcie-remote-phase/2026-05-29-impl.md)
+- [setup.ps1](../../../../../usnvmemu/scripts/setup-pcie-remote.ps1)
+- [host SDK 示例](../../../../../usnvmemu/crates/pcie_remote_test_harness/)
