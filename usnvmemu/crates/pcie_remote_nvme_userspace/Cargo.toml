@@ -13,14 +13,14 @@ pcie_remote_userspace_sdk = { path = "../pcie_remote_userspace_sdk" }
 # **Phase U-followup** — vfio-user backend，让 NVMe controller 也能被
 # QEMU `-device vfio-user-pci,socket=...` 直接接管。
 pcie_vfio_user_sdk = { path = "../pcie_vfio_user_sdk" }
-pcie_remote_protocol = { path = "../../../../vm/devices/pcie_remote_protocol" }
-pal_async = { path = "../../../../support/pal/pal_async" }
-guid = { path = "../../../../support/guid", features = ["mesh"] }
+pcie_remote_protocol = { path = "../../../vm/devices/pcie_remote_protocol" }
+pal_async = { path = "../../../support/pal/pal_async" }
+guid = { path = "../../../support/guid", features = ["mesh"] }
 # 复用仓库内的 NVMe 2.0c spec 定义（完整 Cap/Cc/Csts bitfield、Command/
 # Completion、IdentifyController 全部字段、AdminOpcode/NvmOpcode 枚举）。
 # 这让我们不用手写 1000+ 行 spec 类型，专注 controller 行为实现。
-nvme_spec = { path = "../../../../vm/devices/storage/nvme_spec" }
-storage_string = { path = "../../../../vm/devices/storage/storage_string" }
+nvme_spec = { path = "../../../vm/devices/storage/nvme_spec" }
+storage_string = { path = "../../../vm/devices/storage/storage_string" }
 clap = { version = "4.6", features = ["derive"] }
 anyhow = "1.0.102"
 tracing = "0.1.44"

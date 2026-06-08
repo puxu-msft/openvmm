@@ -132,6 +132,13 @@ async fn serve(stream: TcpStream) -> Result<()> {
             Some(HostBody::Reset(r)) => {
                 tracing::info!(seq, kind = r.kind, "reset (ignored)");
             }
+            Some(HostBody::DmaCompletion(d)) => {
+                // 2026-06-08 audit-pass-4 修：搬到 usnvmemu/ 后发现
+                // pcie_remote_protocol 早已加 DmaCompletion variant，
+                // noop_host 是 noop 测试 stub，直接忽略即可（与 vsock_main
+                // 同一处理）。
+                tracing::debug!(seq, token = d.token, ok = d.ok, "DMA completion (ignored)");
+            }
             None => {
                 tracing::warn!(seq, "ToHost missing body");
             }

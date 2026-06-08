@@ -5,11 +5,11 @@ edition = "2024"
 description = "Userspace SDK for implementing PCIe devices over the pcie_remote vsock protocol."
 
 [dependencies]
-pcie_remote_protocol = { path = "../../../../vm/devices/pcie_remote_protocol" }
-pal_async = { path = "../../../../support/pal/pal_async" }
-mesh = { path = "../../../../support/mesh" }
-guid = { path = "../../../../support/guid", features = ["mesh"] }
-vmsocket = { path = "../../../../support/vmsocket" }
+pcie_remote_protocol = { path = "../../../vm/devices/pcie_remote_protocol" }
+pal_async = { path = "../../../support/pal/pal_async" }
+mesh = { path = "../../../support/mesh" }
+guid = { path = "../../../support/guid", features = ["mesh"] }
+vmsocket = { path = "../../../support/vmsocket" }
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 futures = "0.3.32"

@@ -13,7 +13,7 @@ path = "src/vsock_main.rs"
 required-features = []
 
 [dependencies]
-pcie_remote_protocol = { path = "../../../../vm/devices/pcie_remote_protocol" }
+pcie_remote_protocol = { path = "../../../vm/devices/pcie_remote_protocol" }
 prost = "0.13"
 anyhow = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net", "time"] }
@@ -21,9 +21,9 @@ tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-guid = { path = "../../../../support/guid" }
-vmsocket = { path = "../../../../support/vmsocket" }
-pal_async = { path = "../../../../support/pal/pal_async" }
+guid = { path = "../../../support/guid" }
+vmsocket = { path = "../../../support/vmsocket" }
+pal_async = { path = "../../../support/pal/pal_async" }
 clap = { version = "4", features = ["derive"] }
 
 [target.'cfg(windows)'.dependencies]

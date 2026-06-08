@@ -13,9 +13,9 @@ path = "src/main.rs"
 
 [dependencies]
 pcie_remote_userspace_sdk = { path = "../pcie_remote_userspace_sdk" }
-pcie_remote_protocol = { path = "../../../../vm/devices/pcie_remote_protocol" }
-pal_async = { path = "../../../../support/pal/pal_async" }
-guid = { path = "../../../../support/guid", features = ["mesh"] }
+pcie_remote_protocol = { path = "../../../vm/devices/pcie_remote_protocol" }
+pal_async = { path = "../../../support/pal/pal_async" }
+guid = { path = "../../../support/guid", features = ["mesh"] }
 clap = { version = "4.6", features = ["derive"] }
 anyhow = "1.0.102"
 tracing = "0.1.44"
