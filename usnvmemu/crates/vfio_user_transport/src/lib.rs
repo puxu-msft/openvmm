@@ -32,6 +32,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod config;
 pub mod dma;
 pub mod framing;
 pub mod handshake;
@@ -41,6 +42,7 @@ pub mod server;
 pub mod session;
 pub mod transport;
 
+pub use config::ConfigSpace;
 pub use dma::DmaError;
 pub use dma::DmaRegion;
 pub use dma::DmaTable;
@@ -58,6 +60,5 @@ pub use proto::Header;
 pub use proto::HeaderFlags;
 pub use proto::ProtoError;
 pub use server::serve_unix;
-pub use session::Regions;
 pub use session::VfioUserSession;
 pub use transport::NoopTransport;

@@ -9,7 +9,7 @@
 //! 公开 API（`fire_interrupt` / `dma_read` / `dma_write` / `*_fire_and_forget`）
 //! 完全保持向后兼容，所以 PcieDevice 实现 0 改动。
 
-use pcie_remote_protocol::DeviceDescribe;
+use crate::describe::DeviceDescribe;
 
 /// **Phase T** — 设备原语 trait：所有 `DeviceCtx` 方法最终落到的"后端"。
 ///
@@ -58,6 +58,11 @@ pub trait Transport {
 pub trait PcieDevice: 'static {
     /// 设备描述：vendor/device ID、class、BAR 布局、MSI-X 向量数等。
     /// 在 handshake 阶段调用一次。
+    ///
+    /// **契约（review M-1）**：`describe()` 应在 device 生命周期内**静态**
+    /// （多次调用返回等价结果）。adapter 可能缓存其结果（如 vfio-user 据此
+    /// 懒构造 PCI config space）；运行期改变 BAR/MSI-X 布局不被支持。复位
+    /// （FLR）会重置 config space base/Command 但布局不变。
     fn describe(&self) -> DeviceDescribe;
 
     /// guest 对 cfg space 中带 side-effect 的 offset 做了一次 32 位写。

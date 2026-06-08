@@ -9,7 +9,6 @@
 //! 新 device instance（教学 NVMe controller 重 open backing file）。
 
 use crate::handshake::server_handshake;
-use crate::session::Regions;
 use crate::session::VfioUserSession;
 use anyhow::Context as _;
 use pcie_device_sdk::PcieDevice;
@@ -23,7 +22,7 @@ use std::path::Path;
 pub fn serve_unix<P, D, F>(socket_path: P, mut device_factory: F) -> anyhow::Result<()>
 where
     P: AsRef<Path>,
-    D: PcieDevice + Regions,
+    D: PcieDevice,
     F: FnMut() -> anyhow::Result<D>,
 {
     let path = socket_path.as_ref();

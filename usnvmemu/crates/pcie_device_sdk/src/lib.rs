@@ -57,23 +57,26 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod describe;
 mod device;
 mod openhcl_transport;
 mod run;
 mod transport;
 
+pub use describe::BarKind;
+pub use describe::BarLayout;
+pub use describe::Capability;
+pub use describe::DeviceDescribe;
 pub use device::DeviceCtx;
 pub use device::PcieDevice;
 pub use device::Transport;
 pub use openhcl_transport::OpenhclVsockTransport;
 // **Phase Q10** — re-export protocol types so example crates can use them
 // in test fixtures (DeviceCtx::for_testing 输出 outbound 包).
+// **Phase W1** — `DeviceDescribe` / `BarKind` 等已改指向中立 [`describe`] 模块；
+// wire 类型仍可经 `pcie_remote_protocol::` 路径访问（W2 撤此 pub use）。
 pub use pcie_remote_protocol;
-pub use pcie_remote_protocol::BarInfo;
-pub use pcie_remote_protocol::CapabilityBlob;
-pub use pcie_remote_protocol::DeviceDescribe;
 pub use pcie_remote_protocol::ToOpenhcl;
-pub use pcie_remote_protocol::bar_info::Kind as BarKind;
 pub use run::RunOptions;
 pub use run::run;
 pub use transport::WireStream;

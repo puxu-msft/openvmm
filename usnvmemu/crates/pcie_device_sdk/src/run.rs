@@ -29,6 +29,50 @@ use pcie_remote_protocol::codec;
 use pcie_remote_protocol::to_host::Body as HostBody;
 use std::time::Duration;
 
+/// **Phase W1** — 中立 [`crate::DeviceDescribe`] → pcie_remote wire DTO。
+///
+/// 这是 openhcl adapter 的 wire↔domain seam：中立 domain 类型在此转成
+/// protobuf 编码形态（HelloAck 内发给 VTL2）。W2 拆 crate 后本函数随
+/// openhcl adapter 走；其它 adapter（vfio-user / nvme-of）有各自的转换或
+/// 直接消费 domain 类型，core 不依赖任何 wire crate。
+fn to_wire(d: crate::DeviceDescribe) -> pcie_remote_protocol::DeviceDescribe {
+    use pcie_remote_protocol::BarInfo;
+    use pcie_remote_protocol::CapabilityBlob;
+    use pcie_remote_protocol::bar_info::Kind as WireKind;
+
+    pcie_remote_protocol::DeviceDescribe {
+        vendor_id: d.vendor_id as u32,
+        device_id: d.device_id as u32,
+        class_code: d.class_code,
+        revision: d.revision as u32,
+        subsystem_vendor: d.subsystem_vendor as u32,
+        subsystem_device: d.subsystem_device as u32,
+        bars: d
+            .bars
+            .into_iter()
+            .map(|b| BarInfo {
+                index: b.index as u32,
+                size: b.size,
+                kind: match b.kind {
+                    crate::BarKind::Mmio32 => WireKind::Mmio32,
+                    crate::BarKind::Mmio64 => WireKind::Mmio64,
+                } as i32,
+                prefetchable: b.prefetchable,
+            })
+            .collect(),
+        msix_count: d.msix_count,
+        capabilities: d
+            .capabilities
+            .into_iter()
+            .map(|c| CapabilityBlob {
+                cap_id: c.cap_id as u32,
+                raw: c.raw,
+            })
+            .collect(),
+        cfg_write_side_effect_offsets: d.cfg_write_side_effect_offsets,
+    }
+}
+
 /// `run` 行为可调项。
 pub struct RunOptions {
     /// 周期 tick 间隔（驱动 `PcieDevice::tick`）。默认 5s。NVMe 等不需要
@@ -78,7 +122,7 @@ pub async fn run<D: PcieDevice>(
         "SDK received Hello"
     );
 
-    let describe = device.describe();
+    let describe = to_wire(device.describe());
     let ack = HelloAck {
         ok: true,
         reason: String::new(),
@@ -297,8 +341,8 @@ mod tests {
     }
 
     impl crate::PcieDevice for CaptureDevice {
-        fn describe(&self) -> pcie_remote_protocol::DeviceDescribe {
-            pcie_remote_protocol::DeviceDescribe::default()
+        fn describe(&self) -> crate::DeviceDescribe {
+            crate::DeviceDescribe::default()
         }
         fn mmio_read(&mut self, bar: u32, offset: u64, size: u32) -> u64 {
             self.last_mmio_read = Some((bar, offset, size));

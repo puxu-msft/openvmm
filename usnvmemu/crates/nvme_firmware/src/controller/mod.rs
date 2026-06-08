@@ -2341,20 +2341,20 @@ impl NvmeController {
 impl PcieDevice for NvmeController {
     fn describe(&self) -> DeviceDescribe {
         DeviceDescribe {
-            vendor_id: self.vid as u32,
+            vendor_id: self.vid,
             // PCI Device ID = 0xC0DE — matches OpenHCL noop convention 便于
             // ohcldiag-dev / guest 区分本设备实例。
             device_id: 0xc0de,
             class_code: 0x01_08_02, // Mass Storage / NVMe (PCIe class 01.08.02)
             revision: 1,
-            subsystem_vendor: self.ssvid as u32,
+            subsystem_vendor: self.ssvid,
             subsystem_device: 0,
-            bars: vec![BarInfo {
+            bars: vec![BarLayout {
                 index: 0,
                 size: BAR0_SIZE,
                 // NVMe spec 不强求 64-bit BAR；用 32-bit 简化 cfg space。
                 // BAR0 = MMIO 32 不消耗 BAR1，省 PCIe BAR slots。
-                kind: BarKind::Mmio32 as i32,
+                kind: BarKind::Mmio32,
                 prefetchable: false,
             }],
             msix_count: self.msix_count as u32,
@@ -2487,20 +2487,9 @@ pub(super) fn parse_prp_list(data: &[u8]) -> Vec<u64> {
         .collect()
 }
 
-/// **Phase U-followup** — 让 vfio-user backend 拿到 BAR0/MSI-X 描述。
-///
-/// 当前 inline 实现（无 cfg gate）— 直接把 vfio_user_transport 当 hard dep
-/// 加进 controller crate。教学版可接受；如真要进 production 应抽到
-/// `vfio_user_glue.rs` 并加 `#[cfg(feature = "vfio-user")]` 让 pcie_remote
-/// 单跑无 vfio_user 依赖（**review M1** 留 Phase V 清理）。
-impl vfio_user_transport::Regions for NvmeController {
-    fn bar0_size(&self) -> u64 {
-        crate::regs::BAR0_SIZE
-    }
-    fn msix_count(&self) -> u32 {
-        self.msix_count as u32
-    }
-}
+// **Phase W1 (ADR-010)** — 原 `impl vfio_user_transport::Regions for NvmeController`
+// 已删除：vfio-user backend 现统一从中立 `describe()` 派生 BAR0/MSI-X/config，
+// 不再要求 controller 额外实现 vfio-user 专属 trait（消除"描述模型分叉"）。
 
 #[cfg(test)]
 mod tests;

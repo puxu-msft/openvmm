@@ -161,16 +161,16 @@ impl RngDevice {
 impl PcieDevice for RngDevice {
     fn describe(&self) -> DeviceDescribe {
         DeviceDescribe {
-            vendor_id: VID as u32,
-            device_id: DID as u32,
+            vendor_id: VID,
+            device_id: DID,
             class_code: CLASS_CODE,
             revision: 0x01,
             subsystem_vendor: 0,
             subsystem_device: 0,
-            bars: vec![pcie_remote_protocol::BarInfo {
+            bars: vec![BarLayout {
                 index: 0,
                 size: BAR0_SIZE,
-                kind: pcie_remote_protocol::bar_info::Kind::Mmio64 as i32,
+                kind: BarKind::Mmio64,
                 prefetchable: false,
             }],
             msix_count: MSIX_COUNT as u32,

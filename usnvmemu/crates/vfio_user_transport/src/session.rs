@@ -6,8 +6,8 @@
 //!
 //! 本 phase 覆盖纯查询 / 同步 IO 命令：
 //! - `DeviceGetInfo` — 回 PCI flags + num_regions=9 + num_irqs=5
-//! - `DeviceGetRegionInfo` — BAR0 走 [`Regions`] 描述，其它 size=0
-//! - `DeviceGetIrqInfo` — MSI-X 按 [`Regions::msix_count`]，其它 0
+//! - `DeviceGetRegionInfo` — BAR0 / config 走 [`PcieDevice::describe`] 派生，其它 size=0
+//! - `DeviceGetIrqInfo` — MSI-X 按 `describe().msix_count`，其它 0
 //! - `RegionRead` / `RegionWrite` — 直接调 [`PcieDevice::mmio_read/write`]
 //! - `DeviceReset` — 调 [`PcieDevice::reset`]
 //!
@@ -35,25 +35,9 @@ use pcie_device_sdk::PcieDevice;
 use std::os::unix::net::UnixStream;
 use zerocopy::IntoBytes;
 
-/// 设备的 region/MSI-X 静态描述，由 [`PcieDevice`] 实现者通过
-/// `describe()` 间接提供；vfio-user backend 需要它回 `GET_REGION_INFO`
-/// 等查询。当前提取的最小子集：
-///
-/// - `bar0_size`：BAR0 字节数（NVMe controller 8 KiB）
-/// - `config_size`：PCI config space 字节数（标准 PCIe 4 KiB；legacy PCI 256 B）
-/// - `msix_count`：MSI-X 向量数（>0 时 GET_IRQ_INFO index=MSIX 回此值）
-///
-/// 用 trait 而非具体 struct，方便测试 mock。
-pub trait Regions {
-    /// BAR0 字节数。NVMe = 8 KiB；返 0 表示无 BAR0。
-    fn bar0_size(&self) -> u64;
-    /// PCI config space 字节数。标准 PCIe = 4096；返 0 跳过。
-    fn config_size(&self) -> u64 {
-        4096
-    }
-    /// MSI-X 向量数。NVMe controller 一般 = io_queues + 1。
-    fn msix_count(&self) -> u32;
-}
+// **Phase W1** — `Regions` trait 已删除（ADR-010）。设备的 BAR/MSI-X/config
+// 描述统一从 `PcieDevice::describe` 的中立 `pcie_device_sdk::DeviceDescribe`
+// 派生，不再要求实现者额外实现一个 vfio-user 专属 trait（消除"描述模型分叉"）。
 
 /// Server-side session：握手已完成，循环派发入站命令到 [`PcieDevice`]。
 ///
@@ -84,6 +68,10 @@ pub struct VfioUserSession {
     /// `dma_read`/`dma_write` 完成 wire round-trip 后入队；`pump_one` 在
     /// inbound 处理后 drain，调 `device.on_dma_complete(token, ok, data, ctx)`。
     pub(crate) pending_completions: std::collections::VecDeque<DmaCompletion>,
+    /// **Phase W1** — host-side PCI config space 状态机，首次访问时由
+    /// `device.describe()` 懒构造。服务 CONFIG region 读写（identity /
+    /// BAR probe），取代此前误把 CONFIG 当 BAR MMIO 转给 `mmio_read` 的 bug。
+    config: Option<crate::ConfigSpace>,
 }
 
 /// 一条等待投递给 device 的 DMA 完成事件。
@@ -107,7 +95,18 @@ impl VfioUserSession {
             irq_vectors: crate::irq::IrqVectors::default(),
             next_server_msg_id: 0x8000,
             pending_completions: std::collections::VecDeque::new(),
+            config: None,
         }
+    }
+
+    /// **Phase W1** — 懒构造并借出 host-side config space。首访由
+    /// `device.describe()` 合成（identity / BAR / capability）；describe() 是
+    /// 静态的，构造一次后复用。
+    fn config_for<D: PcieDevice>(&mut self, device: &D) -> &mut crate::ConfigSpace {
+        if self.config.is_none() {
+            self.config = Some(crate::ConfigSpace::new(&device.describe()));
+        }
+        self.config.as_mut().expect("config just initialized above")
     }
 
     /// 阻塞处理一条入站消息：read → dispatch → 自动 reply。
@@ -118,7 +117,7 @@ impl VfioUserSession {
     /// - `Ok(false)` — peer 关闭 socket；caller 应退出
     /// - `Err` — **协议层硬错误**（unknown command / wire 解析失败），caller
     ///   应 close socket
-    pub fn pump_one<D: PcieDevice + Regions>(&mut self, device: &mut D) -> anyhow::Result<bool> {
+    pub fn pump_one<D: PcieDevice>(&mut self, device: &mut D) -> anyhow::Result<bool> {
         let msg = match read_message(&mut self.stream) {
             Ok(m) => m,
             Err(e) => {
@@ -167,7 +166,7 @@ impl VfioUserSession {
     }
 
     /// 内部 dispatch — 按 [`Command`] 路由到对应处理函数。
-    fn dispatch<D: PcieDevice + Regions>(
+    fn dispatch<D: PcieDevice>(
         &mut self,
         cmd: Command,
         msg: Message,
@@ -207,7 +206,7 @@ impl VfioUserSession {
         }
     }
 
-    fn handle_get_info<D: Regions>(
+    fn handle_get_info<D: PcieDevice>(
         &mut self,
         id: u16,
         _msg: &Message,
@@ -223,7 +222,7 @@ impl VfioUserSession {
         write_message(&mut self.stream, &hdr, pl.as_bytes(), &[]).context("write GET_INFO reply")
     }
 
-    fn handle_get_region_info<D: Regions>(
+    fn handle_get_region_info<D: PcieDevice>(
         &mut self,
         id: u16,
         msg: &Message,
@@ -244,9 +243,15 @@ impl VfioUserSession {
             }
         };
         let idx = req.index;
+        // **Phase W1** — BAR/config 描述统一从中立 describe() 派生（不再 Regions）。
+        let desc = device.describe();
         let (flags, size) = match idx {
             x if x == pci_region::BAR0 => {
-                let s = device.bar0_size();
+                let s = desc
+                    .bars
+                    .iter()
+                    .find(|b| b.index == 0)
+                    .map_or(0, |b| b.size);
                 if s == 0 {
                     (0u32, 0u64)
                 } else {
@@ -255,7 +260,7 @@ impl VfioUserSession {
             }
             x if x == pci_region::CONFIG => (
                 region_flags::READ | region_flags::WRITE,
-                device.config_size(),
+                crate::ConfigSpace::SIZE as u64,
             ),
             // BAR1..5 / ROM / VGA — 教学版无支持，size=0+flags=0。
             _ if idx < pci_region::NUM_REGIONS => (0u32, 0u64),
@@ -277,7 +282,7 @@ impl VfioUserSession {
             .context("write GET_REGION_INFO reply")
     }
 
-    fn handle_get_irq_info<D: Regions>(
+    fn handle_get_irq_info<D: PcieDevice>(
         &mut self,
         id: u16,
         msg: &Message,
@@ -297,7 +302,7 @@ impl VfioUserSession {
         };
         let idx = req.index;
         let (flags, count) = match idx {
-            x if x == pci_irq::MSIX => (irq_info::EVENTFD, device.msix_count()),
+            x if x == pci_irq::MSIX => (irq_info::EVENTFD, device.describe().msix_count),
             x if x < pci_irq::NUM_IRQS => (0u32, 0u32),
             _ => {
                 self.send_err(id, Command::DeviceGetIrqInfo, libc::EINVAL as u32);
@@ -341,7 +346,13 @@ impl VfioUserSession {
             self.send_err(id, Command::RegionRead, libc::EINVAL as u32);
             return Ok(());
         }
-        let value = device.mmio_read(bar, offset, count as u32);
+        // **Phase W1** — CONFIG region 走 host-side config space（identity /
+        // BAR probe）；BAR region 才转设备 MMIO。修复此前 CONFIG 误当 MMIO 的 bug。
+        let value = if bar == pci_region::CONFIG {
+            self.config_for(device).read(offset, count as u32)
+        } else {
+            device.mmio_read(bar, offset, count as u32)
+        };
         // Reply payload = RegionAccessPayload echo + value bytes.
         let mut reply_payload =
             Vec::with_capacity(core::mem::size_of::<RegionAccessPayload>() + count);
@@ -391,12 +402,18 @@ impl VfioUserSession {
         let mut val_bytes = [0u8; 8];
         val_bytes[..count].copy_from_slice(&msg.payload[req_struct_len..]);
         let value = u64::from_le_bytes(val_bytes);
-        // 调 PcieDevice — 它通过 DeviceCtx 反向触发 DMA/中断；Phase U3 还没
-        // 给 vfio-user backend 实现 Transport，先用 NoopTransport 屏蔽
-        // dma/irq（U4/U5 接通后真正生效）。
-        let mut t = crate::transport::NoopTransport;
-        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut t);
-        device.mmio_write(&mut ctx, bar, offset, count as u32, value);
+        // **Phase W1** — CONFIG region 写入 host-side config space（Command RW /
+        // BAR base+size-probe）；BAR region 才转设备 MMIO。
+        if bar == pci_region::CONFIG {
+            self.config_for(device).write(offset, count as u32, value);
+        } else {
+            // 调 PcieDevice — 它通过 DeviceCtx 反向触发 DMA/中断；Phase U3 还没
+            // 给 vfio-user backend 实现 Transport，先用 NoopTransport 屏蔽
+            // dma/irq（U4/U5 接通后真正生效）。
+            let mut t = crate::transport::NoopTransport;
+            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut t);
+            device.mmio_write(&mut ctx, bar, offset, count as u32, value);
+        }
         // Reply: echo struct only (no data).
         let echo = RegionAccessPayload {
             offset,
@@ -415,6 +432,10 @@ impl VfioUserSession {
         device: &mut D,
     ) -> anyhow::Result<()> {
         device.reset(0); // kind=0 == FLR
+        // **Phase W1 / review M-1** — FLR 复位 config space：丢弃缓存，下次访问
+        // 按 `device.describe()` 重建（BAR base 归 0 / Command 清零），符合 PCI
+        // FLR 语义，也避免"describe() 运行期变化但缓存 stale"的隐患。
+        self.config = None;
         let hdr = Header::reply_ok(id, Command::DeviceReset, 0);
         write_message(&mut self.stream, &hdr, &[], &[]).context("write DEVICE_RESET reply")
     }
@@ -538,9 +559,11 @@ mod tests {
     use crate::HEADER_LEN;
     use crate::HeaderFlags;
     use crate::framing::write_message as fw_write;
+    use pcie_device_sdk::BarKind;
+    use pcie_device_sdk::BarLayout;
     use pcie_device_sdk::DeviceCtx;
+    use pcie_device_sdk::DeviceDescribe;
     use pcie_device_sdk::PcieDevice as Pde;
-    use pcie_device_sdk::pcie_remote_protocol::DeviceDescribe;
     use std::os::unix::net::UnixStream;
     use std::thread;
 
@@ -558,7 +581,25 @@ mod tests {
     }
     impl Pde for MockDev {
         fn describe(&self) -> DeviceDescribe {
-            DeviceDescribe::default()
+            // **Phase W1** — 取代被删的 `Regions`：BAR0 8 KiB + 8 MSI-X 由
+            // describe() 提供；identity 供 config-space 路由测试断言。
+            DeviceDescribe {
+                vendor_id: 0x1234,
+                device_id: 0x5678,
+                class_code: 0x01_08_02,
+                revision: 1,
+                subsystem_vendor: 0,
+                subsystem_device: 0,
+                bars: vec![BarLayout {
+                    index: 0,
+                    size: 8192,
+                    kind: BarKind::Mmio32,
+                    prefetchable: false,
+                }],
+                msix_count: 8,
+                capabilities: vec![],
+                cfg_write_side_effect_offsets: vec![],
+            }
         }
         fn mmio_read(&mut self, _bar: u32, offset: u64, _size: u32) -> u64 {
             *self.bar0.get((offset / 8) as usize).unwrap_or(&0)
@@ -578,14 +619,6 @@ mod tests {
         }
         fn reset(&mut self, kind: u32) {
             self.last_reset = kind;
-        }
-    }
-    impl Regions for MockDev {
-        fn bar0_size(&self) -> u64 {
-            8192
-        }
-        fn msix_count(&self) -> u32 {
-            8
         }
     }
 
@@ -747,6 +780,118 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(val, 0xCAFEBABEDEADBEEF);
+    }
+
+    /// **Phase W1 acceptance** — CONFIG region 读出正确 vendor/device ID。
+    /// 此前 bug：CONFIG 被误当 BAR MMIO 转给 `mmio_read`，guest 拿到 bar0[0]=0
+    /// 而非 identity。现走 host-side config space。
+    #[test]
+    fn config_region_read_returns_identity() {
+        let (server, mut client) = pair();
+        let mut sess = VfioUserSession::new(server, neg());
+        let mut dev = MockDev::new();
+        let _h = thread::spawn(move || {
+            sess.pump_one(&mut dev).unwrap();
+        });
+        // READ CONFIG region @ offset 0x00, 4 bytes = vendor(0x1234) + device(0x5678)。
+        let req = RegionAccessPayload {
+            offset: 0x00,
+            region: crate::proto::pci_region::CONFIG,
+            count: 4,
+        };
+        let hdr = Header::command(1, Command::RegionRead, req.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, req.as_bytes(), &[]).unwrap();
+        let reply = read_message(&mut client).unwrap();
+        let off = core::mem::size_of::<RegionAccessPayload>();
+        let val = u32::from_le_bytes(reply.payload[off..off + 4].try_into().unwrap());
+        // vendor 0x1234 @0x00, device 0x5678 @0x02 → 小端 u32 = 0x5678_1234。
+        assert_eq!(val, 0x5678_1234);
+    }
+
+    /// **Phase W1** — CONFIG region BAR size-probe 走 config space（非 mmio）。
+    /// 写全 1 → 回读 size mask（MockDev BAR0 = 8 KiB → 0xFFFFE000）。若仍误入
+    /// mmio，回读会是写入值 0xFFFFFFFF。
+    #[test]
+    fn config_region_bar_size_probe() {
+        let (server, mut client) = pair();
+        let mut sess = VfioUserSession::new(server, neg());
+        let mut dev = MockDev::new();
+        let _h = thread::spawn(move || {
+            sess.pump_one(&mut dev).unwrap();
+            sess.pump_one(&mut dev).unwrap();
+        });
+        let cfg = crate::proto::pci_region::CONFIG;
+        // WRITE 全 1 到 BAR0 (cfg offset 0x10)。
+        let req = RegionAccessPayload {
+            offset: 0x10,
+            region: cfg,
+            count: 4,
+        };
+        let mut pl = Vec::new();
+        pl.extend_from_slice(req.as_bytes());
+        pl.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let hdr = Header::command(1, Command::RegionWrite, pl.len() as u32);
+        fw_write(&mut client, &hdr, &pl, &[]).unwrap();
+        let _ = read_message(&mut client).unwrap();
+        // READ 回读 size mask。
+        let req = RegionAccessPayload {
+            offset: 0x10,
+            region: cfg,
+            count: 4,
+        };
+        let hdr = Header::command(2, Command::RegionRead, req.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, req.as_bytes(), &[]).unwrap();
+        let reply = read_message(&mut client).unwrap();
+        let off = core::mem::size_of::<RegionAccessPayload>();
+        let val = u32::from_le_bytes(reply.payload[off..off + 4].try_into().unwrap());
+        assert_eq!(val, 0xFFFF_E000, "8 KiB BAR size mask");
+    }
+
+    /// **Phase W1 / review M-1** — DEVICE_RESET (FLR) 复位 config space：
+    /// 写过的 Command 寄存器在 reset 后回到默认 0（config 缓存被丢弃重建）。
+    #[test]
+    fn config_reset_rebuilds_state() {
+        let (server, mut client) = pair();
+        let mut sess = VfioUserSession::new(server, neg());
+        let mut dev = MockDev::new();
+        let _h = thread::spawn(move || {
+            for _ in 0..4 {
+                if !sess.pump_one(&mut dev).unwrap() {
+                    break;
+                }
+            }
+        });
+        let cfg = crate::proto::pci_region::CONFIG;
+        // WRITE Command (0x04) = 0x0006。
+        let req = RegionAccessPayload {
+            offset: 0x04,
+            region: cfg,
+            count: 2,
+        };
+        let mut pl = Vec::new();
+        pl.extend_from_slice(req.as_bytes());
+        pl.extend_from_slice(&0x0006u16.to_le_bytes());
+        let hdr = Header::command(1, Command::RegionWrite, pl.len() as u32);
+        fw_write(&mut client, &hdr, &pl, &[]).unwrap();
+        let _ = read_message(&mut client).unwrap();
+
+        // DEVICE_RESET (FLR)。
+        let hdr = Header::command(2, Command::DeviceReset, 0);
+        fw_write(&mut client, &hdr, &[], &[]).unwrap();
+        let _ = read_message(&mut client).unwrap();
+
+        // READ Command → 0（reset 后 config 重建）。
+        let req = RegionAccessPayload {
+            offset: 0x04,
+            region: cfg,
+            count: 2,
+        };
+        let hdr = Header::command(3, Command::RegionRead, req.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, req.as_bytes(), &[]).unwrap();
+        let reply = read_message(&mut client).unwrap();
+        let off = core::mem::size_of::<RegionAccessPayload>();
+        let val = u16::from_le_bytes(reply.payload[off..off + 2].try_into().unwrap());
+        assert_eq!(val, 0x0000, "FLR 后 Command 寄存器复位为 0");
     }
 
     /// REGION_READ 非法 size = 3 → 服务端回 EINVAL。
