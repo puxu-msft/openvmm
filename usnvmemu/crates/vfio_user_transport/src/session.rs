@@ -39,6 +39,13 @@ use zerocopy::IntoBytes;
 // 描述统一从 `PcieDevice::describe` 的中立 `pcie_device_core::DeviceDescribe`
 // 派生，不再要求实现者额外实现一个 vfio-user 专属 trait（消除"描述模型分叉"）。
 
+/// **review M-2 (诚实标注)** — bulk REGION_READ/WRITE 的保守防-OOM 上限，
+/// **不是协议常量**。正确值应是握手协商的 `max_data_xfer_size`（server caps
+/// 已宣告 1 MiB，见 handshake.rs）；当前 `Negotiated` 只存了 caps JSON 原始
+/// 串、未 parse 出数值字段，故暂用此硬编码 —— 补 parse + 用协商值见 ROADMAP。
+/// READ / WRITE 共用同一上限（对称）。
+pub(crate) const MAX_REGION_ACCESS: usize = 4096;
+
 /// Server-side session：握手已完成，循环派发入站命令到 [`PcieDevice`]。
 ///
 /// **Phase U4**：内部持 [`crate::DmaTable`] 跟踪 client 通告的 guest RAM
@@ -371,26 +378,36 @@ impl VfioUserSession {
         offset: u64,
         count: usize,
     ) -> Vec<u8> {
-        if matches!(count, 1 | 2 | 4 | 8) {
-            let v = device.mmio_read(bar, offset, count as u32);
-            return v.to_le_bytes()[..count].to_vec();
-        }
+        // 对齐感知寄存器粒度分块（与 WRITE / config bulk 共用，见 access.rs）：
+        // 落在 dword 寄存器上的段整体读，其余退化到更小粒度。
         let mut out = Vec::with_capacity(count);
-        let mut pos = 0;
-        while pos < count {
-            let rem = count - pos;
-            let sz = if rem >= 4 {
-                4
-            } else if rem >= 2 {
-                2
-            } else {
-                1
-            };
-            let v = device.mmio_read(bar, offset + pos as u64, sz as u32);
-            out.extend_from_slice(&v.to_le_bytes()[..sz]);
-            pos += sz;
+        for (abs, sz) in
+            crate::access::register_chunks(offset, count, crate::access::MAX_CHUNK_MMIO)
+        {
+            let v = device.mmio_read(bar, abs, sz);
+            out.extend_from_slice(&v.to_le_bytes()[..sz as usize]);
         }
         out
+    }
+
+    /// **vfio-spec** — bulk 写 BAR/MMIO region：对称 [`Self::read_bar_bytes`]，
+    /// 按 [`register_chunks`](crate::access::register_chunks) 拆成寄存器粒度后
+    /// 逐段 `mmio_write`（每段触发其 MMIO 写副作用，如 doorbell）。
+    fn write_bar_bytes<D: PcieDevice>(
+        device: &mut D,
+        ctx: &mut pcie_device_core::DeviceCtx<'_>,
+        bar: u32,
+        offset: u64,
+        data: &[u8],
+    ) {
+        for (abs, sz) in
+            crate::access::register_chunks(offset, data.len(), crate::access::MAX_CHUNK_MMIO)
+        {
+            let start = (abs - offset) as usize;
+            let mut buf = [0u8; 8];
+            buf[..sz as usize].copy_from_slice(&data[start..start + sz as usize]);
+            device.mmio_write(ctx, bar, abs, sz, u64::from_le_bytes(buf));
+        }
     }
 
     fn handle_region_read<D: PcieDevice>(
@@ -417,13 +434,7 @@ impl VfioUserSession {
         let bar = req.region;
         // **vfio-spec (libvfio-user oracle)** — REGION_READ 允许 bulk（如 guest
         // 一次 dump 整个 config header）；1/2/4/8 是我们 MMIO 寄存器的约束、非协议
-        // 约束。仅校验 count 上限防 OOM + region 越界。
-        //
-        // **review M-2 (诚实标注)**：4096 是保守防-OOM 上限，**不是协议常量**。
-        // 正确值应是握手协商的 `max_data_xfer_size`（server caps 已宣告 1 MiB，
-        // 见 handshake.rs）。当前 `Negotiated` 只存了 caps JSON 原始串、未 parse
-        // 出数值字段，故暂用硬编码 —— 补 parse + 用协商值见 ROADMAP。
-        const MAX_REGION_ACCESS: usize = 4096;
+        // 约束。仅校验 count 上限防 OOM + region 越界（上限见 [`MAX_REGION_ACCESS`]）。
         if count == 0 || count > MAX_REGION_ACCESS {
             self.send_err(id, Command::RegionRead, libc::EINVAL as u32);
             return Ok(());
@@ -474,11 +485,10 @@ impl VfioUserSession {
         let count = req.count as usize;
         let offset = req.offset;
         let bar = req.region;
-        // **vfio-spec / review M-1** — WRITE 目前只支持 1/2/4/8（寄存器粒度 +
-        // 小 config write）。bulk REGION_WRITE（count>8）**未实现**：显式拒，既保
-        // 协议清晰，也**就近保护**下面 `[0u8; 8]` 不越界 panic（不依赖远处隐式
-        // 耦合）。补 bulk-write（config `write_bytes` + BAR chunk）见 ROADMAP。
-        if !matches!(count, 1 | 2 | 4 | 8) {
+        // **vfio-spec** — REGION_WRITE 与 READ 对称，允许 bulk（任意长度连续写）。
+        // 仅校验 count 上限防 OOM（[`MAX_REGION_ACCESS`]）；payload 须恰好携带
+        // struct + count 字节的数据。
+        if count == 0 || count > MAX_REGION_ACCESS {
             self.send_err(id, Command::RegionWrite, libc::EINVAL as u32);
             return Ok(());
         }
@@ -491,21 +501,19 @@ impl VfioUserSession {
             self.send_err(id, Command::RegionWrite, libc::EINVAL as u32);
             return Ok(());
         }
-        debug_assert!(count <= 8, "WRITE count 已被上面 1/2/4/8 gate 限制");
-        let mut val_bytes = [0u8; 8];
-        val_bytes[..count].copy_from_slice(&msg.payload[req_struct_len..]);
-        let value = u64::from_le_bytes(val_bytes);
+        let data = &msg.payload[req_struct_len..];
         // **Phase W1** — CONFIG region 写入 host-side config space（Command RW /
-        // BAR base+size-probe）；BAR region 才转设备 MMIO。
+        // BAR base+size-probe）；BAR region 才转设备 MMIO。两者都按寄存器粒度
+        // 分块（见 access.rs），保留 ≤8 字节寄存器的宽度语义。
         if bar == pci_region::CONFIG {
-            self.config_for(device).write(offset, count as u32, value);
+            self.config_for(device).write_bytes(offset, data);
         } else {
             // 调 PcieDevice — 它通过 DeviceCtx 反向触发 DMA/中断；Phase U3 还没
             // 给 vfio-user backend 实现 Transport，先用 NoopTransport 屏蔽
             // dma/irq（U4/U5 接通后真正生效）。
             let mut t = crate::transport::NoopTransport;
             let mut ctx = pcie_device_core::DeviceCtx::new(&mut t);
-            device.mmio_write(&mut ctx, bar, offset, count as u32, value);
+            Self::write_bar_bytes(device, &mut ctx, bar, offset, data);
         }
         // Reply: echo struct only (no data).
         let echo = RegionAccessPayload {
@@ -875,6 +883,92 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(val, 0xCAFEBABEDEADBEEF);
+    }
+
+    /// **vfio-spec** — bulk REGION_WRITE（count>8）：写 12 字节到 BAR0 再读回，
+    /// 对称验证 WRITE/READ bulk 路径 + 寄存器粒度分块往返。
+    #[test]
+    fn region_write_bulk_then_read_roundtrip() {
+        let (server, mut client) = pair();
+        let mut sess = VfioUserSession::new(server, neg());
+        let mut dev = MockDev::new();
+        let _h = thread::spawn(move || {
+            sess.pump_one(&mut dev).unwrap();
+            sess.pump_one(&mut dev).unwrap();
+        });
+        // bulk WRITE 12 字节 @ BAR0 offset 0（chunk = 8 + 4）。
+        let data: Vec<u8> = (0..12u8).map(|i| 0xA0 ^ i).collect();
+        let req = RegionAccessPayload {
+            offset: 0,
+            region: 0,
+            count: 12,
+        };
+        let mut pl = Vec::new();
+        pl.extend_from_slice(req.as_bytes());
+        pl.extend_from_slice(&data);
+        let hdr = Header::command(1, Command::RegionWrite, pl.len() as u32);
+        fw_write(&mut client, &hdr, &pl, &[]).unwrap();
+        let _ = read_message(&mut client).unwrap();
+
+        // bulk READ 12 字节回读。
+        let req = RegionAccessPayload {
+            offset: 0,
+            region: 0,
+            count: 12,
+        };
+        let hdr = Header::command(2, Command::RegionRead, req.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, req.as_bytes(), &[]).unwrap();
+        let reply = read_message(&mut client).unwrap();
+        let off = core::mem::size_of::<RegionAccessPayload>();
+        assert_eq!(
+            &reply.payload[off..off + 12],
+            &data[..],
+            "bulk write→read 往返一致"
+        );
+    }
+
+    /// **vfio-spec** — bulk REGION_WRITE 落到 CONFIG region 跨 BAR0 dword 时，
+    /// 寄存器粒度分块（config max=4）保证那 4 字节走 size-probe 而非 byte 平写。
+    /// 写全 1 的 8 字节（BAR0+BAR1）→ 回读 BAR0 仍是 8 KiB size mask（证明 bulk
+    /// config write 内的 dword 命中了 BAR-probe 语义，没被当裸字节写穿）。
+    #[test]
+    fn config_bulk_write_preserves_bar_probe() {
+        let (server, mut client) = pair();
+        let mut sess = VfioUserSession::new(server, neg());
+        let mut dev = MockDev::new();
+        let _h = thread::spawn(move || {
+            sess.pump_one(&mut dev).unwrap();
+            sess.pump_one(&mut dev).unwrap();
+        });
+        let cfg = crate::proto::pci_region::CONFIG;
+        // bulk WRITE 8 字节全 1 @ 0x10（BAR0 dword + BAR1 dword）。
+        let req = RegionAccessPayload {
+            offset: 0x10,
+            region: cfg,
+            count: 8,
+        };
+        let mut pl = Vec::new();
+        pl.extend_from_slice(req.as_bytes());
+        pl.extend_from_slice(&[0xFFu8; 8]);
+        let hdr = Header::command(1, Command::RegionWrite, pl.len() as u32);
+        fw_write(&mut client, &hdr, &pl, &[]).unwrap();
+        let _ = read_message(&mut client).unwrap();
+
+        // READ BAR0（0x10, 4 字节）→ size mask，不是裸 0xFFFFFFFF。
+        let req = RegionAccessPayload {
+            offset: 0x10,
+            region: cfg,
+            count: 4,
+        };
+        let hdr = Header::command(2, Command::RegionRead, req.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, req.as_bytes(), &[]).unwrap();
+        let reply = read_message(&mut client).unwrap();
+        let off = core::mem::size_of::<RegionAccessPayload>();
+        let val = u32::from_le_bytes(reply.payload[off..off + 4].try_into().unwrap());
+        assert_eq!(
+            val, 0xFFFF_E000,
+            "bulk config write 内的 BAR0 dword 仍走 size-probe（8 KiB mask）"
+        );
     }
 
     /// **Phase W1 acceptance** — CONFIG region 读出正确 vendor/device ID。

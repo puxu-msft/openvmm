@@ -32,6 +32,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod access;
 pub mod config;
 pub mod dma;
 pub mod framing;

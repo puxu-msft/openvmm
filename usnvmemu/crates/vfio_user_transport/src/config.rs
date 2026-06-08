@@ -123,6 +123,22 @@ impl ConfigSpace {
         }
         // 其余字段只读：PCI 硬件对 RO 字段的写无效，静默忽略。
     }
+
+    /// **vfio-spec** — bulk 写 `data` 到 `offset`（config region 允许任意长度
+    /// 访问）。按 [`register_chunks`](crate::access::register_chunks) 拆成寄存器
+    /// 粒度后逐段调 [`Self::write`]，从而**保留每个寄存器的 PCI RW 语义**
+    /// （落在 BAR dword 上的 4 字节仍走 size-probe / base mask；Command 走 RW；
+    /// 其余 RO 忽略）——而非 byte-by-byte 平写丢掉寄存器宽度语义。
+    pub fn write_bytes(&mut self, offset: u64, data: &[u8]) {
+        for (abs, sz) in
+            crate::access::register_chunks(offset, data.len(), crate::access::MAX_CHUNK_CONFIG)
+        {
+            let start = (abs - offset) as usize;
+            let mut buf = [0u8; 8];
+            buf[..sz as usize].copy_from_slice(&data[start..start + sz as usize]);
+            self.write(abs, sz, u64::from_le_bytes(buf));
+        }
+    }
 }
 
 #[cfg(test)]
