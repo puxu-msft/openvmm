@@ -158,17 +158,34 @@ adapter 各自转换（中立 → wire，转换在 adapter 内）：
 - `usnvmemu/crates/nvme_firmware/Cargo.toml` + `src/{main,lib}.rs` + `src/controller/mod.rs`（describe）
 - `/Cargo.toml`（exclude 列表 line 65-74）
 
-## 8. Out of scope —— vfio-user spec-complete track（独立追踪，ROADMAP）
+## 8. vfio-user spec-complete track（独立追踪）
 
-Phase W 是**结构正确性**，不含 vfio-user 协议完整性。复核挖出的 spec gap 另立 track：
+Phase W 是**结构正确性**，不含 vfio-user 协议完整性。复核挖出的 spec gap 状态：
 
-| gap | 证据 | 严重 |
-|---|---|---|
-| DMA 同步读 head-of-line 阻塞（等 reply 时不能处理插入 cmd，真 QEMU 并发会断） | `dma.rs:260-264` 自承 | **高** |
-| mmap 共享内存 DMA 完全没做（强制 message-mediated） | `dma.rs:8-26` | 高（性能） |
-| DEVICE_GET_REGION_IO_FDS 不实现 | `session.rs:197-200` ENOTSUP | 中 |
-| migration / dirty-page tracking 无 | `handshake.rs:20-21` | 低（教学可省） |
+| gap | 证据 | 严重 | 状态 |
+|---|---|---|---|
+| DMA 同步读 head-of-line 阻塞（等 reply 时插入 cmd → 连接挂，真 QEMU 并发会断） | `dma.rs` 自承 | **高（correctness）** | ✅ **已修** `b1cb8574`（`read_reply_deferring_inbound` + `inbound_queue` defer + pump_one 顶部 dispatch；回归测试 `dma_read_sync_defers_interleaved_inbound`） |
+| mmap 共享内存 DMA（强制 message-mediated） | `dma.rs:8-26` | 高（**性能**，非 correctness） | ⏳ 设计就绪，待专注一轮 + QEMU harness 验性能（见下） |
+| DEVICE_GET_REGION_IO_FDS 不实现 | `session.rs` ENOTSUP | 中 | spec 允许省（client fallback）；保持 ENOTSUP 合规 |
+| migration / dirty-page tracking 无 | `handshake.rs` | 低 | 教学可省 |
 
-cfg-space identity 源 + capability list 由 **W1 顺带补**（与描述模型统一同源）。
+### mmap DMA 设计（待执行，clean scope）
 
-> 注：本 Phase 不外部化仓库（ADR-008 路径 C 仍推迟）；W2 的 core 零 pal_async 边界为将来外部化铺路，但不是本 Phase 目标。
+message-mediated DMA（当前路径）功能正确但每次 DMA 走 wire round-trip；真 vfio-user
+高性能路径是 mmap 客户端 memfd 零拷贝。**为何留专注一轮而非现在赶**：① 是性能优化非
+correctness（message 路径 work）；② 真性能收益**需 QEMU harness 端到端验证**（harness
+是 ROADMAP HIGH 未做项），无 harness 时 rush unsafe mmap = 不可验证的投机，违背
+"spec-complete 须可验证"。
+
+**设计（避免 DmaRegion Copy 涟漪）**：
+- `DmaTable` 加并行 `mmaps: BTreeMap<u64, memmap2::Mmap>`（addr → mmap），`DmaRegion`
+  保持 Copy（纯元数据）。
+- `handle_dma_map` 改能取 `msg.fds` 所有权（dispatch 传 `&mut Message` 或 move）：带 fd
+  时用 `memmap2` 按 `offset/size` map，存 `mmaps`；不带 fd 退回 message-mediated。
+- `dma_read/write`：先查 `mmaps` 命中 → 本地 memcpy（零 wire round-trip）；miss → 现有
+  `dma_*_sync` 消息路径。
+- memmap2 map 是 unsafe，加第 2 处 `#[allow(unsafe_code)]` + SAFETY 注释（crate 已有 1 处先例）。
+- 单测：用临时文件/memfd 当 DMA_MAP fd，验 `dma_read` 从 mmap 读出正确字节 + miss 时退回消息路径。
+
+> 注：仓库外部化（Phase X）按 [ADR-008](/usnvmemu/docs/DECISIONS.md) 仍推迟（需 X1 试水定时）；
+> W2 的 core 零 pal_async/零 wire 边界让 core 成为最易抽出的 crate，为将来外部化大幅铺路。
