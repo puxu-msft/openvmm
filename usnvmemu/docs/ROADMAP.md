@@ -117,10 +117,11 @@ realize 成功。教训记 [LESSONS.md](LESSONS.md) §21（"版本不带≠协�
 - DMA head-of-line 阻塞修复 + review H-1（reply flag 判据）`b1cb8574` + fixup。
 
 **⏳ 诚实 defer（reviewer M-1/M-2/M-4 标注，待补）**：
-- **bulk REGION_WRITE**：当前 WRITE 仅 1/2/4/8（`[0u8;8]` 假设）；补 config
-  `write_bytes` + BAR chunk write（对称 READ 的 bulk）。
+- ~~**bulk REGION_WRITE**~~ **✅ 2026-06-09 done**（commit 4a539d9c）：WRITE 对称
+  支持 bulk + 抽出共享对齐感知 register-granular chunker（`src/access.rs`，
+  READ/WRITE/config 三路 DRY 复用）；config max=4 / MMIO max=8 区分寄存器宽度。
 - **用协商 `max_data_xfer_size` 替代硬编码 4096**：需先在 `Negotiated` parse 出
-  数值字段（当前只存 caps JSON 原始串）。
+  数值字段（当前只存 caps JSON 原始串）。← **下一个 vfio spec-complete HIGH**
 - **`region_access_ok` 缓存 BAR layout**：当前每次 region 访问 alloc describe() Vec。
 - **mmap 零拷贝 DMA**：见 Phase W plan §8 设计（DmaTable 并行 mmaps + memfd 单测）。
 - **真 guest OS 引导**：当前 QEMU e2e 用 `-S` 暂停 CPU，只验到 realize/PCI 枚举；
