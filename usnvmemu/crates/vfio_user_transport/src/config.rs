@@ -88,6 +88,15 @@ impl ConfigSpace {
         u64::from_le_bytes(buf)
     }
 
+    /// **vfio-spec** — bulk 读 `len` 字节（config region 允许任意长度访问，如
+    /// guest 一次性 dump 整个 config header）。越界字节读 0。
+    pub fn read_bytes(&self, offset: u64, len: usize) -> Vec<u8> {
+        let off = offset as usize;
+        (0..len)
+            .map(|i| self.bytes.get(off + i).copied().unwrap_or(0))
+            .collect()
+    }
+
     /// 写 `size` 字节，按 PCI RW 语义过滤（BAR mask / Command RW / 其余 RO）。
     pub fn write(&mut self, offset: u64, size: u32, value: u64) {
         let off = offset as usize;

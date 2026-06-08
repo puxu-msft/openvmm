@@ -341,6 +341,58 @@ impl VfioUserSession {
             .context("write GET_IRQ_INFO reply")
     }
 
+    /// **vfio-spec (libvfio-user oracle 复核)** — REGION 访问边界校验：
+    /// `[offset, offset+count)` 须落在该 region 的 size 内。region size 与
+    /// `GET_REGION_INFO` 同源（CONFIG = 4 KiB / BAR0 = describe 派生 / 其余 = 0）。
+    /// bogus region index（如 0xdeadbeef）或越界 → false，caller 回 EINVAL。
+    fn region_access_ok<D: PcieDevice>(device: &D, region: u32, offset: u64, count: usize) -> bool {
+        let size = if region == pci_region::CONFIG {
+            crate::ConfigSpace::SIZE as u64
+        } else if region == pci_region::BAR0 {
+            device
+                .describe()
+                .bars
+                .iter()
+                .find(|b| b.index == 0)
+                .map_or(0, |b| b.size)
+        } else {
+            0
+        };
+        offset
+            .checked_add(count as u64)
+            .is_some_and(|end| end <= size)
+    }
+
+    /// **vfio-spec** — BAR/MMIO region read：1/2/4/8 字节走单次 `mmio_read`
+    /// （保持寄存器粒度语义）；bulk（其它长度）按 ≤4 字节对齐 chunk 逐段拼。
+    fn read_bar_bytes<D: PcieDevice>(
+        device: &mut D,
+        bar: u32,
+        offset: u64,
+        count: usize,
+    ) -> Vec<u8> {
+        if matches!(count, 1 | 2 | 4 | 8) {
+            let v = device.mmio_read(bar, offset, count as u32);
+            return v.to_le_bytes()[..count].to_vec();
+        }
+        let mut out = Vec::with_capacity(count);
+        let mut pos = 0;
+        while pos < count {
+            let rem = count - pos;
+            let sz = if rem >= 4 {
+                4
+            } else if rem >= 2 {
+                2
+            } else {
+                1
+            };
+            let v = device.mmio_read(bar, offset + pos as u64, sz as u32);
+            out.extend_from_slice(&v.to_le_bytes()[..sz]);
+            pos += sz;
+        }
+        out
+    }
+
     fn handle_region_read<D: PcieDevice>(
         &mut self,
         id: u16,
@@ -363,18 +415,25 @@ impl VfioUserSession {
         let count = req.count as usize;
         let offset = req.offset;
         let bar = req.region;
-        if !matches!(count, 1 | 2 | 4 | 8) {
+        // **vfio-spec (libvfio-user oracle)** — REGION_READ 允许 bulk（如 guest
+        // 一次 dump 整个 config header）；1/2/4/8 是我们 MMIO 寄存器的约束、非协议
+        // 约束。仅校验 count 上限防 OOM + region 越界。
+        const MAX_REGION_ACCESS: usize = 4096;
+        if count == 0 || count > MAX_REGION_ACCESS {
             self.send_err(id, Command::RegionRead, libc::EINVAL as u32);
             return Ok(());
         }
-        // **Phase W1** — CONFIG region 走 host-side config space（identity /
-        // BAR probe）；BAR region 才转设备 MMIO。修复此前 CONFIG 误当 MMIO 的 bug。
-        let value = if bar == pci_region::CONFIG {
-            self.config_for(device).read(offset, count as u32)
+        if !Self::region_access_ok(device, bar, offset, count) {
+            self.send_err(id, Command::RegionRead, libc::EINVAL as u32);
+            return Ok(());
+        }
+        // CONFIG → host-side config space（identity / BAR probe，bulk 直读）；
+        // BAR/MMIO → 按 ≤8 字节 chunk 逐段 device.mmio_read 拼出 bulk（保持寄存器粒度）。
+        let data: Vec<u8> = if bar == pci_region::CONFIG {
+            self.config_for(device).read_bytes(offset, count)
         } else {
-            device.mmio_read(bar, offset, count as u32)
+            Self::read_bar_bytes(device, bar, offset, count)
         };
-        // Reply payload = RegionAccessPayload echo + value bytes.
         let mut reply_payload =
             Vec::with_capacity(core::mem::size_of::<RegionAccessPayload>() + count);
         let echo = RegionAccessPayload {
@@ -383,9 +442,7 @@ impl VfioUserSession {
             count: count as u32,
         };
         reply_payload.extend_from_slice(echo.as_bytes());
-        // value 低 count*8 位有效；按 size 写出。
-        let val_bytes = value.to_le_bytes();
-        reply_payload.extend_from_slice(&val_bytes[..count]);
+        reply_payload.extend_from_slice(&data);
         let hdr = Header::reply_ok(id, Command::RegionRead, reply_payload.len() as u32);
         write_message(&mut self.stream, &hdr, &reply_payload, &[])
             .context("write REGION_READ reply")
@@ -417,6 +474,11 @@ impl VfioUserSession {
             return Ok(());
         }
         if msg.payload.len() != req_struct_len + count {
+            self.send_err(id, Command::RegionWrite, libc::EINVAL as u32);
+            return Ok(());
+        }
+        // **vfio-spec** — region index / 越界校验（bogus region → EINVAL）。
+        if !Self::region_access_ok(device, bar, offset, count) {
             self.send_err(id, Command::RegionWrite, libc::EINVAL as u32);
             return Ok(());
         }
@@ -917,25 +979,60 @@ mod tests {
         assert_eq!(val, 0x0000, "FLR 后 Command 寄存器复位为 0");
     }
 
-    /// REGION_READ 非法 size = 3 → 服务端回 EINVAL。
+    /// **vfio-spec (libvfio-user oracle)** — REGION_READ 拒绝语义：count=0 /
+    /// bogus region index / 越界 → EINVAL（session 不 close）。bogus-region 是
+    /// libvfio-user 官方 client 的合规检查（此前我们误返 success）。
     #[test]
-    fn region_read_invalid_size_rejected() {
+    fn region_read_rejects_bogus_and_oob() {
+        let cfg = crate::proto::pci_region::CONFIG;
+        let check_einval = |region: u32, offset: u64, count: u32| {
+            let (server, mut client) = pair();
+            let mut sess = VfioUserSession::new(server, neg());
+            let mut dev = MockDev::new();
+            let h = thread::spawn(move || sess.pump_one(&mut dev));
+            let req = RegionAccessPayload {
+                offset,
+                region,
+                count,
+            };
+            let hdr = Header::command(1, Command::RegionRead, req.as_bytes().len() as u32);
+            fw_write(&mut client, &hdr, req.as_bytes(), &[]).unwrap();
+            let reply = read_message(&mut client).unwrap();
+            assert!(reply.header.flags().is_error(), "expected error reply");
+            let errno = reply.header.error_no;
+            assert_eq!(errno, libc::EINVAL as u32);
+            assert!(h.join().unwrap().unwrap(), "参数错不应 close session");
+        };
+        check_einval(0, 0, 0); // count=0
+        check_einval(0xdead_beef, 0, 4); // bogus region index（oracle 合规检查）
+        check_einval(cfg, 4094, 4); // CONFIG 越界（4094+4 > 4096）
+    }
+
+    /// **vfio-spec (libvfio-user oracle)** — bulk REGION_READ：CONFIG region 一次
+    /// 读 64 字节（config header），且非 1/2/4/8 的 count 也合法（bulk）。此前
+    /// 我们 1/2/4/8 限制太严，官方 client bulk 读 config 被拒。
+    #[test]
+    fn region_read_bulk_config_header() {
+        let cfg = crate::proto::pci_region::CONFIG;
         let (server, mut client) = pair();
         let mut sess = VfioUserSession::new(server, neg());
         let mut dev = MockDev::new();
         let h = thread::spawn(move || sess.pump_one(&mut dev));
         let req = RegionAccessPayload {
             offset: 0,
-            region: 0,
-            count: 3,
+            region: cfg,
+            count: 64,
         };
-        let hdr = Header::command(7, Command::RegionRead, req.as_bytes().len() as u32);
+        let hdr = Header::command(1, Command::RegionRead, req.as_bytes().len() as u32);
         fw_write(&mut client, &hdr, req.as_bytes(), &[]).unwrap();
         let reply = read_message(&mut client).unwrap();
-        assert!(reply.header.flags().is_error());
-        let err = reply.header.error_no;
-        assert_eq!(err, libc::EINVAL as u32);
-        // **review M1** — 参数错（非法 size）不应 close session：返 Ok(true)。
+        assert!(!reply.header.flags().is_error());
+        let off = core::mem::size_of::<RegionAccessPayload>();
+        let body = &reply.payload[off..];
+        assert_eq!(body.len(), 64, "bulk read 返 64 字节");
+        // MockDev describe vendor 0x1234 / device 0x5678 @ config 0x00 / 0x02
+        assert_eq!(u16::from_le_bytes([body[0], body[1]]), 0x1234);
+        assert_eq!(u16::from_le_bytes([body[2], body[3]]), 0x5678);
         assert!(h.join().unwrap().unwrap());
     }
 
