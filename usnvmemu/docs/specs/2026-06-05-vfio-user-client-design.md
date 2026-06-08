@@ -39,7 +39,7 @@
    spec][spec]）。
 2. Guest 看到的就是一颗普通 PCIe BDF；**Linux nvme.ko / Windows
    stornvme.sys 等 inbox driver 0 改动**即可枚举与使用。
-3. 起步对端：本仓 `docs/superpowers/examples/pcie_vfio_user_sdk` 暴露的
+3. 起步对端：本仓 `usnvmemu/crates/pcie_vfio_user_sdk` 暴露的
    NVMe demo（自闭环，无外部依赖）。
 4. P1 扩到 SPDK NVMe vfio-user target、Windows guest interop、反向 QEMU
    挂载验证。
@@ -128,8 +128,8 @@ openvmm/openvmm_entry/
 └── src/lib.rs                resolve VfioUserClientHandle → 与 VfioCdevDeviceHandle 同位置接入
                               (lib.rs L850-925 附近)
 
-docs/superpowers/specs/2026-06-05-vfio-user-client-design.md   ← 本文
-docs/superpowers/specs/2026-06-04-vfio-user-wire-reference.md  ← 协议字节级权威参考
+usnvmemu/docs/specs/2026-06-05-vfio-user-client-design.md   ← 本文
+usnvmemu/docs/specs/2026-06-04-vfio-user-wire-reference.md  ← 协议字节级权威参考
 ```
 
 ### 4.2 Layer 边界纪律

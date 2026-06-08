@@ -66,7 +66,7 @@ Linux ≥ 5.0 / Windows Server 2025 上的标准 `nvme-cli` 可通过
 ## Build & Run
 
 ```bash
-cd docs/superpowers/examples/nvme_of_tcp_target
+cd usnvmemu/crates/nvme_of_tcp_target
 truncate -s 1G /tmp/ns1.img         # 1 GiB 空 backing file
 cargo run --release -- \
   --listen 127.0.0.1:4420 \

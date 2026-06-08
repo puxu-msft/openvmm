@@ -250,7 +250,7 @@ impl PcieDevice for MyDevice {
 ## 测试
 
 ```bash
-cd docs/superpowers/examples/pcie_remote_nvme_userspace
+cd usnvmemu/crates/pcie_remote_nvme_userspace
 cargo test          # 11+ 单测
 cargo clippy --tests -- -D warnings  # 干净
 ```
@@ -283,7 +283,7 @@ bash docs/superpowers/scripts/build-windows-cross.sh
 
 ## 历史 Phase
 
-完整开发时间线见 [SESSION_LOG.md](../../SESSION_LOG.md)：
+完整开发时间线见 [SESSION_LOG.md](../../PCIE_REMOTE_SESSION_LOG.md)：
 
 - **Phase A** — Identify 用 nvme_spec NVMe 2.0c 完整字段
 - **Phase B+C+D** — Admin opcodes + Get Log Page + IO opcodes

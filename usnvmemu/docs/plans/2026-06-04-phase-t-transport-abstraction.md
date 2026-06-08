@@ -113,13 +113,13 @@ cargo test  # nvme: 67 / userspace_sdk: 7-8 / device_sdk: 2
 ## 附录 A：受影响文件清单
 
 绝对路径：
-- `docs/superpowers/examples/pcie_remote_userspace_sdk/src/device.rs`（PcieDevice + DeviceCtx）
-- `docs/superpowers/examples/pcie_remote_userspace_sdk/src/run.rs`（主循环 + 8 wire 单测）
-- `docs/superpowers/examples/pcie_remote_userspace_sdk/src/transport.rs`（旧 `Transport` 别名重命名点）
-- `docs/superpowers/examples/pcie_remote_userspace_sdk/src/lib.rs`（re-export）
-- `docs/superpowers/examples/pcie_remote_userspace_sdk/Cargo.toml`
-- `docs/superpowers/examples/pcie_remote_nvme_userspace/Cargo.toml`（删 protocol 依赖）
-- `docs/superpowers/examples/pcie_remote_nvme_userspace/src/controller/{mod,admin,io,completion,mmio,reservation}.rs`（~50 ctx 调用点）
-- `docs/superpowers/examples/pcie_remote_nvme_userspace/src/controller/tests.rs`（13 `for_testing` 改写）
-- `docs/superpowers/examples/pcie_remote_nvme_userspace/src/main.rs`（不动）
+- `usnvmemu/crates/pcie_remote_userspace_sdk/src/device.rs`（PcieDevice + DeviceCtx）
+- `usnvmemu/crates/pcie_remote_userspace_sdk/src/run.rs`（主循环 + 8 wire 单测）
+- `usnvmemu/crates/pcie_remote_userspace_sdk/src/transport.rs`（旧 `Transport` 别名重命名点）
+- `usnvmemu/crates/pcie_remote_userspace_sdk/src/lib.rs`（re-export）
+- `usnvmemu/crates/pcie_remote_userspace_sdk/Cargo.toml`
+- `usnvmemu/crates/pcie_remote_nvme_userspace/Cargo.toml`（删 protocol 依赖）
+- `usnvmemu/crates/pcie_remote_nvme_userspace/src/controller/{mod,admin,io,completion,mmio,reservation}.rs`（~50 ctx 调用点）
+- `usnvmemu/crates/pcie_remote_nvme_userspace/src/controller/tests.rs`（13 `for_testing` 改写）
+- `usnvmemu/crates/pcie_remote_nvme_userspace/src/main.rs`（不动）
 - workspace `/Cargo.toml` 加 `pcie_device_sdk` member

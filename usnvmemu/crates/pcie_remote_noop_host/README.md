@@ -22,7 +22,7 @@ OpenHCL VTL2 / OpenVMM 端是 **server**，本 stub 是 **client**：
 ## 真用法
 
 主要给测试用：跑 OpenHCL VTL2 + worker spawn 流程验证；详
-[../../SESSION_LOG.md](../../SESSION_LOG.md) 早期 "noop_host" 段 + spec
+[../../PCIE_REMOTE_SESSION_LOG.md](../../PCIE_REMOTE_SESSION_LOG.md) 早期 "noop_host" 段 + spec
 [../../specs/2026-05-29-pcie-remote-design.md](../../specs/2026-05-29-pcie-remote-design.md)
 K-NEW-A..E + K-NEW-G/H 段。
 

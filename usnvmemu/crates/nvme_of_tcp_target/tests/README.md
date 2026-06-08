@@ -63,7 +63,7 @@
 ## 跑全部
 
 ```bash
-cd docs/superpowers/examples/nvme_of_tcp_target
+cd usnvmemu/crates/nvme_of_tcp_target
 cargo test                # 全部
 cargo test --test vt_dhchap4_spec_wire_e2e  # 单文件
 ```

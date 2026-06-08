@@ -70,7 +70,7 @@
 1. **单文件 ≤ 800 行**软上限；超 1000 行必须 split (`session.rs` 已超，待
    refactor — 当前默认接受)。
 2. **新功能优先扩 existing module，不开新 crate**；nvme-of 教学课程统一在
-   `docs/superpowers/examples/nvme_of_tcp_target/`。
+   `usnvmemu/crates/nvme_of_tcp_target/`。
 3. **测试文件**：`tests/vt_<phase>_<topic>.rs`，便于 grep + 报告。
 4. **公开 API doc**：`///` 必含 一句话 summary + 调用 example (若有) + 失败
    case。

@@ -18,12 +18,12 @@
 `openvmm/Cargo.toml` exclude 段：
 ```
 exclude = [
-  "docs/superpowers/examples/pcie_remote_noop_host",
-  "docs/superpowers/examples/pcie_remote_userspace_sdk",
-  "docs/superpowers/examples/pcie_remote_nvme_userspace",
-  "docs/superpowers/examples/pcie_remote_rng_userspace",
-  "docs/superpowers/examples/pcie_vfio_user_sdk",
-  "docs/superpowers/examples/nvme_of_tcp_target",
+  "usnvmemu/crates/pcie_remote_noop_host",
+  "usnvmemu/crates/pcie_remote_userspace_sdk",
+  "usnvmemu/crates/pcie_remote_nvme_userspace",
+  "usnvmemu/crates/pcie_remote_rng_userspace",
+  "usnvmemu/crates/pcie_vfio_user_sdk",
+  "usnvmemu/crates/nvme_of_tcp_target",
   "docs/superpowers/examples/vmrs_log_scanner",
 ]
 ```
@@ -127,8 +127,8 @@ git filter-repo \
   --path vm/devices/pcie_remote_device \
   --path vm/devices/pcie_remote_resources \
   --path-rename docs/superpowers/examples/:./crates/ \
-  --path-rename docs/superpowers/plans/:./docs/plans/ \
-  --path-rename docs/superpowers/specs/:./docs/specs/ \
+  --path-rename usnvmemu/docs/plans/:./docs/plans/ \
+  --path-rename usnvmemu/docs/specs/:./docs/specs/ \
   --path-rename vm/devices/:./vendor/
 ```
 

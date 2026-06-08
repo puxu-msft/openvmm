@@ -24,7 +24,7 @@
 1. 编译 OpenVMM：`cargo build -p openvmm`
 2. 编译并启动 host stub：
    ```bash
-   cd docs/superpowers/examples/pcie_remote_noop_host
+   cd usnvmemu/crates/pcie_remote_noop_host
    cargo run
    ```
    预期看到 `pcie_remote_noop_host: listening (loopback only)`。
@@ -91,7 +91,7 @@ v1 不支持重连。需要 host 重启后整 VM 重启。
 
 ## 参考
 
-- [设计文档](../../../../docs/superpowers/specs/2026-05-29-pcie-remote-design.md)
-- [实施计划](../../../../docs/superpowers/plans/2026-05-29-pcie-remote-impl.md)
+- [设计文档](../../../../usnvmemu/docs/specs/2026-05-29-pcie-remote-design.md)
+- [实施计划](../../../../usnvmemu/docs/plans/2026-05-29-pcie-remote-impl.md)
 - [setup.ps1](../../../../docs/superpowers/scripts/setup-pcie-remote.ps1)
-- [host SDK 示例](../../../../docs/superpowers/examples/pcie_remote_noop_host/)
+- [host SDK 示例](../../../../usnvmemu/crates/pcie_remote_noop_host/)

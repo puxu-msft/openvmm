@@ -165,7 +165,7 @@ C:\temp\pcie_remote_exp\ohcldiag-dev.exe $VmName inspect vm | Select-Object -Fir
 
 ```powershell
 $vmid = (Get-VM pcie-remote-exp).Id
-# AF_HYPERV 客户端（vsock_main.rs 跨编自 docs/superpowers/examples/pcie_remote_noop_host）
+# AF_HYPERV 客户端（vsock_main.rs 跨编自 usnvmemu/crates/pcie_remote_noop_host）
 C:\temp\pcie_remote_exp\pcie_remote_noop_host_vsock.exe `
     --vm-id $vmid --port 50000 --retries 60 --retry-ms 500
 ```
@@ -238,7 +238,7 @@ Remove-VM -Name pcie-remote-exp -Force
 ```bash
 # Terminal 1: host stub (TCP server mode)
 cd /home/xp/refs/openvmm
-cargo run --manifest-path docs/superpowers/examples/pcie_remote_noop_host/Cargo.toml --bin pcie_remote_noop_host_tcp
+cargo run --manifest-path usnvmemu/crates/pcie_remote_noop_host/Cargo.toml --bin pcie_remote_noop_host_tcp
 
 # Terminal 2: OpenVMM with --hv (KVM)
 sg kvm "target/debug/openvmm \
@@ -281,6 +281,6 @@ host stub: received Hello ... sent HelloAck
 | `openhcl/Set-OpenHCL-HyperV-VM.ps1` | Microsoft 官方：设 vssd `GuestFeatureSet=0x201` + `FirmwareFile`（已被 §2 New-VM 创建成功后才有意义）|
 | `docs/superpowers/scripts/setup-pcie-remote.ps1` | 注册 vsock service GUID + ACL |
 | `docs/superpowers/scripts/hyperv/` | 历史 PS 脚本（部分已过时，见各文件头部 deprecation note）|
-| `docs/superpowers/examples/pcie_remote_noop_host/` | host 端 TCP 与 vsock client（OpenVMM / OpenHCL 对端）|
+| `usnvmemu/crates/pcie_remote_noop_host/` | host 端 TCP 与 vsock client（OpenVMM / OpenHCL 对端）|
 | `docs/superpowers/examples/vmrs_log_scanner/` | `.vmrs` RAM 字符串扫描器（OpenHCL 启动失败时诊断用；已用于定位本节"真根因发现"中的 retrofit 路径加载失败问题，详见 [SESSION_LOG.md](SESSION_LOG.md)）|
 | `Guide/src/user_guide/openhcl/run/hyperv.md` | Microsoft 官方 OpenHCL on Hyper-V 文档（本 runbook 的依据）|

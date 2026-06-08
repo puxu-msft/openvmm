@@ -6,9 +6,9 @@
 
 > **2026-05-30 STATUS：实施计划已全部完成。** Phase 1 ~ 10 落地完毕，
 > 真 Linux KVM (OpenVMM 路径) + 真 Hyper-V (OpenHCL 路径) 端到端
-> 全部验证通过。最新成果详见 [../SESSION_LOG.md](../SESSION_LOG.md)
+> 全部验证通过。最新成果详见 [../PCIE_REMOTE_SESSION_LOG.md](../PCIE_REMOTE_SESSION_LOG.md)
 > 的"2026-05-30 🎉🎉🎉 真 Hyper-V 端到端验证"段（emoji 标题，
-> 用 `grep -n "真 Hyper-V 端到端验证" docs/superpowers/SESSION_LOG.md` 定位）；
+> 用 `grep -n "真 Hyper-V 端到端验证" docs/superpowers/PCIE_REMOTE_SESSION_LOG.md` 定位）；
 > K-IDs 表见 [../specs/2026-05-29-pcie-remote-design.md](../specs/2026-05-29-pcie-remote-design.md) §10。
 >
 > **2026-05-30 v2 重构：完整 BAR/MSIX/MMIO/InterruptFire/DMA 闭环。**
@@ -24,7 +24,7 @@
 
 **Tech Stack:** Rust 1.95、prost、mesh::MeshPayload、pal_async (futures::io)、support/vmsocket、pci_core (ConfigSpaceType0Emulator + MsixEmulator)、chipset_device (IoResult::Defer)。
 
-**Reference Spec:** [docs/superpowers/specs/2026-05-29-pcie-remote-design.md](../specs/2026-05-29-pcie-remote-design.md)（v3.1）
+**Reference Spec:** [usnvmemu/docs/specs/2026-05-29-pcie-remote-design.md](../specs/2026-05-29-pcie-remote-design.md)（v3.1）
 
 **Execution mode:** 无人值守，phase-by-phase commit；reviewer 已完成 v1→v2 收口。
 
@@ -368,7 +368,7 @@ pub use proto::*;
   - 同时 `workspace.exclude`（若不存在则添加）加入：
     ```toml
     exclude = [
-        "docs/superpowers/examples/pcie_remote_noop_host",
+        "usnvmemu/crates/pcie_remote_noop_host",
     ]
     ```
     （pcie_remote_device 在 Phase 2 创建；workspace 此时引用一个不存在的 path 会 cargo error。**所以本 step 把 device crate 路径与 members 一起写好，Phase 2 创建空壳让 workspace 能 resolve。** —— 在 Phase 2 Step 2.0 完成）
@@ -2245,15 +2245,15 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Phase 8 ─ host SDK 示例 + setup.ps1 + Guide
 
 **Files:**
-- Create: `docs/superpowers/examples/pcie_remote_noop_host/Cargo.toml`
-- Create: `docs/superpowers/examples/pcie_remote_noop_host/src/main.rs`
+- Create: `usnvmemu/crates/pcie_remote_noop_host/Cargo.toml`
+- Create: `usnvmemu/crates/pcie_remote_noop_host/src/main.rs`
 - Create: `docs/superpowers/scripts/setup-pcie-remote.ps1`
 - Create: `Guide/src/reference/openhcl/devices/pcie_remote.md`
 - Modify: `Cargo.toml`（workspace.exclude 已在 Phase 1 加）
 
 ### Step 8.1 — host noop stub（F-18：仅 bind 127.0.0.1）
 
-- [ ] Create `docs/superpowers/examples/pcie_remote_noop_host/Cargo.toml`：
+- [ ] Create `usnvmemu/crates/pcie_remote_noop_host/Cargo.toml`：
 
 ```toml
 [package]
@@ -2271,7 +2271,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 ```
 
-- [ ] Create `docs/superpowers/examples/pcie_remote_noop_host/src/main.rs`：
+- [ ] Create `usnvmemu/crates/pcie_remote_noop_host/src/main.rs`：
 
 ```rust
 //! Minimal host stub. Listens 127.0.0.1:48914, replies HelloAck with a
@@ -2411,7 +2411,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 > **2026-05-30 实际结果**：未走 wget alpine 路径；最终用 `--linux-direct` +
 > 仓库 OpenVMM-friendly kernel（来自 cargo xflowey 拉取的 fixture）跑通
-> 真 KVM end-to-end。详见 [../SESSION_LOG.md](../SESSION_LOG.md) 真 KVM
+> 真 KVM end-to-end。详见 [../PCIE_REMOTE_SESSION_LOG.md](../PCIE_REMOTE_SESSION_LOG.md) 真 KVM
 > 端到端证据段。下面的探索性占位代码保留作历史。
 
 - [x] Run: 检查仓库 fixtures。`ls petri/test_artifacts/ 2>/dev/null` 或下载一个 ~20MB 的 alpine kernel + initrd。
@@ -2449,10 +2449,10 @@ target/debug/openvmm \
 
 ### Step 9.4 — Commit 实验结果
 
-- [ ] Append results to `docs/superpowers/SESSION_LOG.md`，commit：
+- [ ] Append results to `docs/superpowers/PCIE_REMOTE_SESSION_LOG.md`，commit：
 
 ```bash
-git add docs/superpowers/SESSION_LOG.md
+git add docs/superpowers/PCIE_REMOTE_SESSION_LOG.md
 git commit -m "docs: Phase 9 — OpenVMM + linux guest experiment results
 
 - noop host stub serves HelloAck
@@ -2479,7 +2479,7 @@ git commit -m "docs: Phase 9 — OpenVMM + linux guest experiment results
 ### Step 10.3 — Commit
 
 ```bash
-git add docs/superpowers/SESSION_LOG.md
+git add docs/superpowers/PCIE_REMOTE_SESSION_LOG.md
 git commit -m "docs: Phase 10 — OpenHCL IGVM + vsock handshake validated"
 ```
 
@@ -2500,6 +2500,6 @@ git commit -m "docs: Phase 10 — OpenHCL IGVM + vsock handshake validated"
 
 **实际执行额外达成（计划外）：**
 - K-1 到 K-19 全部 spec gap 已实现并通过测试
-- Path C Hyper-V 创建陷阱（`-GuestStateIsolationType OpenHCL`）已定位 + 文档化（[../HYPERV_RUNBOOK.md](../HYPERV_RUNBOOK.md)）
+- Path C Hyper-V 创建陷阱（`-GuestStateIsolationType OpenHCL`）已定位 + 文档化（[../PCIE_REMOTE_HYPERV_RUNBOOK.md](../PCIE_REMOTE_HYPERV_RUNBOOK.md)）
 - 诊断工具 `vmrs_log_scanner` + `vmrs_log_scanner_win` 已实现并 commit
 - Hyper-V 自定义 VM 重建脚本 `docs/superpowers/scripts/hyperv/create_openhcl_vm_correct.ps1`

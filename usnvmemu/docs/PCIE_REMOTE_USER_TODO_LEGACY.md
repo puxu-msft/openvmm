@@ -78,12 +78,12 @@ Start-VM → PSSession 等就绪 → guest 内 `Get-CimInstance Win32_PnPEntity`
 
 仓库自带 userspace SDK：
 
-- **SDK**：`docs/superpowers/examples/pcie_remote_userspace_sdk/`
+- **SDK**：`usnvmemu/crates/pcie_remote_userspace_sdk/`
   - `src/lib.rs` — crate-level doc + 30 行最小例子骨架
   - `src/device.rs` — `trait PcieDevice` 7 方法签名 + `DeviceCtx` API
     （3 必须：`describe` / `mmio_read` / `mmio_write`；4 可选：
     `cfg_write_side_effect` / `reset` / `tick` / `on_dma_complete`）
-- **Reference impl**：`docs/superpowers/examples/pcie_remote_nvme_userspace/`
+- **Reference impl**：`usnvmemu/crates/pcie_remote_nvme_userspace/`
   完整 NVMe 1.4 子集（Admin + IO SQ/CQ + Identify + NVM Read/Write
   含 dual-PRP + FLUSH + VWC），~1600 行 Rust。
 - 设计要点见 spec §10 K-NEW-I / K-NEW-J / K-NEW-K。

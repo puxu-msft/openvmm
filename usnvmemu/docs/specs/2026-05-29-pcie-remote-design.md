@@ -667,7 +667,7 @@ Write-Host "Registered service GUID: $ServiceGuid (ACL: Admin/SYSTEM only)"
 ### 7.2 新增运维资产
 
 - `docs/superpowers/scripts/setup-pcie-remote.ps1`：service GUID + ACL 注册
-- `docs/superpowers/examples/pcie_remote_noop_host/`：host SDK 用法示例（独立 repo 也提供副本）
+- `usnvmemu/crates/pcie_remote_noop_host/`：host SDK 用法示例（独立 repo 也提供副本）
 - `Guide/src/reference/openhcl/devices/pcie_remote.md`：用户文档（中文 + EN）
 
 ### 7.3 不修改
@@ -749,7 +749,7 @@ Write-Host "Registered service GUID: $ServiceGuid (ACL: Admin/SYSTEM only)"
 | K-17 | ✅ | P2·测试 | resolver duplicate 注册 panic 契约测试 | resolver.rs `add_async_resolver_duplicate_panics_contract_documented` | e5bbfac8 |
 | K-18 | ✅ | P2·Rust | codec/protocol 拒绝 MMIO size ∈ {0,3,5,6,7,>8} | `is_valid_mmio_size` + size_tests + worker.rs guard | e5bbfac8 |
 | K-19 | ✅ | P2·架构 | `handshake_timeout_ms ≤ config_timeout/2` 校验 + warn | options.rs `parse_pcie_remote_entries` + 2 tests | e5bbfac8 |
-| K-20 | ✅ v2 实施 + 真 Hyper-V 验证 | P2·部署 | 延迟接入 / hotplug | listener 永不退 + worker transport_swap + Lost 不退 worker + state Lost → Live 复活；详 [../K20_HOTPLUG_DESIGN.md](../K20_HOTPLUG_DESIGN.md)、commits a99cdc63 + 64da8fb6 | 真 Hyper-V 实测：kill noop → worker Lost 但保留 → 重起 noop → interrupts_fired 持续递增 (214 = 7 旧 + 207 新) |
+| K-20 | ✅ v2 实施 + 真 Hyper-V 验证 | P2·部署 | 延迟接入 / hotplug | listener 永不退 + worker transport_swap + Lost 不退 worker + state Lost → Live 复活；详 [../PCIE_REMOTE_HOTPLUG_DESIGN.md](../PCIE_REMOTE_HOTPLUG_DESIGN.md)、commits a99cdc63 + 64da8fb6 | 真 Hyper-V 实测：kill noop → worker Lost 但保留 → 重起 noop → interrupts_fired 持续递增 (214 = 7 旧 + 207 新) |
 | K-21 | 🟦 v2 | P2·测试 | path C 真 Hyper-V CI（hyperv-runner）| v2；当前只有手工 e2e（已通过，SESSION_LOG 记录）| — |
 | K-22 | 🟦 v2 | P2·测试 | Linux guest 完整测试矩阵 | v2；当前 spec §5 仅 Windows guest。2026-05-30 补：Windows guest 验证已有一键脚本 `docs/superpowers/scripts/hyperv/attach_vhdx_and_verify_lspci.ps1`（挂 VHDX + Start-VM + PSSession + `Win32_PnPEntity` 过滤 VEN_1414&DEV_C0DE），Linux guest 矩阵仍是 v2 backlog | — |
 
@@ -771,9 +771,9 @@ Write-Host "Registered service GUID: $ServiceGuid (ACL: Admin/SYSTEM only)"
 | K-NEW-F | ✅ | P2·观察性 | worker_stats 9-counter inspect 暴露（mmio_read_results / interrupts_fired / interrupts_oob / read_gpa_requests / write_gpa_requests / dma_rate_limit_rejects / inflight_current / inflight_peak / consecutive_bad_frames）| worker.rs::WorkerStats + Inspect derive；device.rs 持 Arc | **真 Hyper-V e2e**：8/9 counter 数值与 noop 端发送数 100% 对应（math 验证 80/3=26、108/4=27、64MiB/64KB=1024 等）|
 | K-NEW-G | ✅ | P2·观察性 | Lost/Revive 诊断字段：`last_lost_at_ms` / `last_revive_at_ms` / `revive_count` / `last_lost_reason`（位标记 `READ_ERR=1`，`WRITE_ERR=2`，`DISPATCH_FAIL=4`，`WORKER_EXIT=8`，可 OR）。配合 K-NEW-F 的 9-counter 用 `ohcldiag-dev inspect` 直接看到 host 重连前的离线时长 + 复活次数 + 最近一次 Lost 触发原因 | worker.rs::WorkerStats + worker.rs::lost_reason 模块；worker/worker_tests.rs 中 record_lost / record_revive 单测覆盖 | 单测：reason 位 OR 累加、revive_count 单调递增、`last_lost_at_ms` 写入 unix-ms |
 | K-NEW-H | ✅ | P2·部署 | DMA 速率限制 env override：`OPENHCL_PCIE_REMOTE_DMA_BPS=<bytes/sec>`（u64）。`0` = 禁用速率限制（仅协议 `MAX_DMA_BYTES` 仍生效）；`>0` = 自定义阈值；未设置 = 沿用 64 MiB/s 默认。**env 仅在 `Worker::new` 启动期读一次并缓存到 `dma_rate_limit_bps_cached`；K-20 swap-arm 复活路径不重读**，避免运行期 env 漂移导致诊断混乱 | worker.rs::`dma_rate_limit_bps()` + `DMA_RATE_LIMIT_DEFAULT_BPS` | 启动 log `pcie_remote: DMA rate limit override via env bps=…`；解析失败 fall back + warn |
-| K-NEW-I | ✅ | P2·开发体验 | **userspace SDK**：`pcie_remote_userspace_sdk`（~500 行）把 vsock 连接 / handshake / select loop / EOF 自处理，用户只实现 `trait PcieDevice` 即可暴露任意 PCIe 设备给 guest。3 必须方法（`describe` / `mmio_read` / `mmio_write`）+ 4 可选（`cfg_write_side_effect` / `reset` / `tick` / `on_dma_complete`）。`DeviceCtx` 提供 `fire_interrupt` / `dma_read` / `dma_write`（token 关联请求-响应，device 实现保持纯同步无需 async）。`#![forbid(unsafe_code)]` | `docs/superpowers/examples/pcie_remote_userspace_sdk/{lib,device,run,transport}.rs` | 通过 K-NEW-J 的 NVMe 实现间接验证整套 trait API；EOF/reconnect 路径在真 Hyper-V K-20 hotplug 中验证 |
-| K-NEW-J | ✅ | P2·参考实现 | **NVMe 1.4 spec 子集 userspace 实现**：`pcie_remote_nvme_userspace`（~1600 行）作为 SDK 的 reference impl。覆盖 Admin SQ/CQ + IO SQ/CQ + Identify Controller/Namespace/NS list (CNS 0/1/2/3/6) + Create/Delete IO SQ/CQ + NVM Read/Write（含 dual-PRP）+ FLUSH + VWC=1 通告。Doorbell/CAP/CC/CSTS 寄存器按 spec L4 实现；SQ wrap 双段 fetch；packed struct field copy-out 避免 unaligned ref | `docs/superpowers/examples/pcie_remote_nvme_userspace/{main,controller,cmd,regs}.rs` | **真 Hyper-V e2e**：见 K-NEW-K |
-| K-NEW-K | ✅ | P1·端到端 | **真 Hyper-V guest 完整 NVMe 链路**：guest Windows `nvme.sys` 加载 → `Get-Disk` 见 1 GiB 盘 (BusType=NVMe) → `diskpart clean / create partition / format fs=fat32` 全部成功 → `Set-Content N:\hello.txt` + `Get-Content` round-trip 正确 → host backing file `xxd` 验证 FAT32 boot sector + 文件名 + 内容字节真实持久化。**用户原目标"用户态写 PCIe 设备 + guest 真把它当真盘"100% 闭环** | 见 [SESSION_LOG.md](../SESSION_LOG.md) "v20 NVMe 完全闭环" 章节 | guest `Get-Volume N` FileSystem=FAT32 + Get-Content 回显写入字符串 + host `strings nvme_backing.img` 显示 `PCIE` / `HELLO   TXT` / `Hello from PCIe userspace SDK!` |
+| K-NEW-I | ✅ | P2·开发体验 | **userspace SDK**：`pcie_remote_userspace_sdk`（~500 行）把 vsock 连接 / handshake / select loop / EOF 自处理，用户只实现 `trait PcieDevice` 即可暴露任意 PCIe 设备给 guest。3 必须方法（`describe` / `mmio_read` / `mmio_write`）+ 4 可选（`cfg_write_side_effect` / `reset` / `tick` / `on_dma_complete`）。`DeviceCtx` 提供 `fire_interrupt` / `dma_read` / `dma_write`（token 关联请求-响应，device 实现保持纯同步无需 async）。`#![forbid(unsafe_code)]` | `usnvmemu/crates/pcie_remote_userspace_sdk/{lib,device,run,transport}.rs` | 通过 K-NEW-J 的 NVMe 实现间接验证整套 trait API；EOF/reconnect 路径在真 Hyper-V K-20 hotplug 中验证 |
+| K-NEW-J | ✅ | P2·参考实现 | **NVMe 1.4 spec 子集 userspace 实现**：`pcie_remote_nvme_userspace`（~1600 行）作为 SDK 的 reference impl。覆盖 Admin SQ/CQ + IO SQ/CQ + Identify Controller/Namespace/NS list (CNS 0/1/2/3/6) + Create/Delete IO SQ/CQ + NVM Read/Write（含 dual-PRP）+ FLUSH + VWC=1 通告。Doorbell/CAP/CC/CSTS 寄存器按 spec L4 实现；SQ wrap 双段 fetch；packed struct field copy-out 避免 unaligned ref | `usnvmemu/crates/pcie_remote_nvme_userspace/{main,controller,cmd,regs}.rs` | **真 Hyper-V e2e**：见 K-NEW-K |
+| K-NEW-K | ✅ | P1·端到端 | **真 Hyper-V guest 完整 NVMe 链路**：guest Windows `nvme.sys` 加载 → `Get-Disk` 见 1 GiB 盘 (BusType=NVMe) → `diskpart clean / create partition / format fs=fat32` 全部成功 → `Set-Content N:\hello.txt` + `Get-Content` round-trip 正确 → host backing file `xxd` 验证 FAT32 boot sector + 文件名 + 内容字节真实持久化。**用户原目标"用户态写 PCIe 设备 + guest 真把它当真盘"100% 闭环** | 见 [SESSION_LOG.md](../PCIE_REMOTE_SESSION_LOG.md) "v20 NVMe 完全闭环" 章节 | guest `Get-Volume N` FileSystem=FAT32 + Get-Content 回显写入字符串 + host `strings nvme_backing.img` 显示 `PCIE` / `HELLO   TXT` / `Hello from PCIe userspace SDK!` |
 
 K-NEW-A/B/D 是 v2 重构在 BAR + MSIX + MMIO + cfg_write_side_effect 真正
 接通后才浮现的新安全约束；v1 cfg-only 时这些数据通路根本不存在，故不
@@ -787,7 +787,7 @@ select loop、EOF 处理）封装成 SDK，让 reference impl 之外的新设备
 30 行起步；K-NEW-J 是 SDK 第一个真实使用方（NVMe），同时是 guest
 真把"用户态字节流"当 SSD 用的 100% 闭环证据 (K-NEW-K)。
 
-**写自己 PCIe 设备的最小例子**：见 `docs/superpowers/examples/pcie_remote_userspace_sdk/src/lib.rs`
+**写自己 PCIe 设备的最小例子**：见 `usnvmemu/crates/pcie_remote_userspace_sdk/src/lib.rs`
 crate-level doc + `device.rs` 的 `trait PcieDevice` 注释；NVMe (K-NEW-J)
 是完整工业级 reference。
 
@@ -813,7 +813,7 @@ Path C **完全闭环**：
 | handshake 成功 → worker spawn | `[2.346s] pcie_remote: vsock handshake ok, worker spawned id=11111111-...` |
 | K-8 CVM_ALLOWED marker | 上述日志通过 cvm_tracing filter 仍可见 |
 
-工件位置：详见 [HYPERV_RUNBOOK.md](../HYPERV_RUNBOOK.md) §"工件清单"。
+工件位置：详见 [HYPERV_RUNBOOK.md](../PCIE_REMOTE_HYPERV_RUNBOOK.md) §"工件清单"。
 
 ### 真根因发现：Hyper-V VM 创建必须用 `-GuestStateIsolationType OpenHCL`
 
@@ -830,6 +830,6 @@ Path C **完全闭环**：
 - 正解：`New-VM -GuestStateIsolationType OpenHCL` 在创建时指定（参 `openhcl/Set-OpenHCL-HyperV-VM.ps1`
   和 `Guide/src/user_guide/openhcl/run/hyperv.md`）
 
-详见 [SESSION_LOG.md](../SESSION_LOG.md) "🎉🎉🎉 真 Hyper-V 端到端验证" 段。
+详见 [SESSION_LOG.md](../PCIE_REMOTE_SESSION_LOG.md) "🎉🎉🎉 真 Hyper-V 端到端验证" 段。
 
 

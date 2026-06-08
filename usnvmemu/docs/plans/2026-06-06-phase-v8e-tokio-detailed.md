@@ -356,7 +356,7 @@ V8e-6 (e2e + manual, 30+280 LOC, 4h, 低风险)
 2. cargo test -p nvme_of_tcp_target --no-fail-fast 2>&1 | tee /tmp/v8e_baseline.txt
    baseline 应为 124 active + 1 bin smoke + controller_core 73 全 green
 3. 起 V8e-1：
-   a. 改 docs/superpowers/examples/nvme_of_tcp_target/Cargo.toml 加 tokio + tokio-util
+   a. 改 usnvmemu/crates/nvme_of_tcp_target/Cargo.toml 加 tokio + tokio-util
    b. 写 src/async_runtime.rs 空 mod + 顶层 doc
    c. 写 src/framing.rs read_pdu_async / write_pdu_async stub
    d. 写 tests/v8e1_tokio_dep_smoke.rs 5 测

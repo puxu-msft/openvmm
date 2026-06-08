@@ -274,7 +274,7 @@ storage 到真 PCIe NVMe device，把 nvme-of target 变成 NVMe-oF JBOD gateway
 | Phase Q1..Q12 (NVMe 2.0 spec coverage 完整化) | PRACT + ZONE_APPEND PI + Telemetry + ANA + BP + Lockdown + crypto erase + RNM + DeviceCtx::for_testing + mod 拆分 + WSL→Windows MSVC 跨编 | nvme userspace README "## Phase Q 系列" | `e84578c9`..`cfd95e54` |
 | Phase R1+R3+R4 (NVMe SGL + Identify advertise + RBAR) | SGL Data Block + sgls 字段 + RBAR ADR | nvme userspace README "## Phase R 系列" (本次 audit 补) | `f19c193f` |
 | Phase S1..S7 (NVMe NS WP / NS Attach / Controller List / ANA state machine) | Write Protect + COPY conflict + Identify NS NAWUN 等 + NS Attachment 0x15 + Controller List CNS 0x12/13 + Reservation Notification Log + ANA state machine + Change AEN | nvme userspace README "## Phase S 系列" (本次 audit 补) | `d0b36b19`..`f8d847ea` + `10f987f5` |
-| K-20 hotplug (pcie_remote) | listener 永不退 + worker transport refresh | [`../K20_HOTPLUG_DESIGN.md`](../K20_HOTPLUG_DESIGN.md) (本次 audit 修正) + SESSION_LOG | `a99cdc63` + `64da8fb6` + `93c5fa5f` |
+| K-20 hotplug (pcie_remote) | listener 永不退 + worker transport refresh | [`../PCIE_REMOTE_HOTPLUG_DESIGN.md`](../PCIE_REMOTE_HOTPLUG_DESIGN.md) (本次 audit 修正) + SESSION_LOG | `a99cdc63` + `64da8fb6` + `93c5fa5f` |
 | Phase I3 (RNG example) | 第二个 PcieDevice 教学 example | [`../examples/pcie_remote_rng_userspace/README.md`](../examples/pcie_remote_rng_userspace/README.md) (本次 audit 补) | `7402dd62` |
 
 **判据 — 何时写独立 plan，何时跳过**：

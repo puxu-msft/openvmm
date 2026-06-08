@@ -21,8 +21,8 @@
 ## 会话信息
 - **开始**：2026-05-29 06:43
 - **关键里程碑**：2026-05-29 ~15:40 完成真 KVM 端到端 e2e 验证
-- **Spec**：[docs/superpowers/specs/2026-05-29-pcie-remote-design.md](specs/2026-05-29-pcie-remote-design.md)（v3.1，经 3 轮 reviewer 评审）
-- **Plan**：[docs/superpowers/plans/2026-05-29-pcie-remote-impl.md](plans/2026-05-29-pcie-remote-impl.md)（v2）
+- **Spec**：[usnvmemu/docs/specs/2026-05-29-pcie-remote-design.md](specs/2026-05-29-pcie-remote-design.md)（v3.1，经 3 轮 reviewer 评审）
+- **Plan**：[usnvmemu/docs/plans/2026-05-29-pcie-remote-impl.md](plans/2026-05-29-pcie-remote-impl.md)（v2）
 - **分支**：`feat/pcie-remote-experimental`
 
 ## 最终状态：✅ 真 KVM 上完整端到端验证成功
@@ -100,7 +100,7 @@ OpenHCL 在 OpenVMM 上启动需要 **WHP 或 mshv** hypervisor（提供 VTL2）
 | 实际跨编 | ❌ 缺 `lib.exe` (cc-rs 找；llvm-ar 不能 100% 替代) + `clang-cl` |
 | **替代方案**：用户在 Windows 原生 `cargo build -p openvmm` | 用户自做更简单 |
 
-详见 [docs/superpowers/USER_TODO.md](USER_TODO.md)。
+详见 [docs/superpowers/PCIE_REMOTE_USER_TODO_LEGACY.md](USER_TODO.md)。
 
 ## 测试统计（截至此 log）
 
@@ -188,7 +188,7 @@ OpenHCL 在 OpenVMM 上启动需要 **WHP 或 mshv** hypervisor（提供 VTL2）
 > 最末"🎉🎉🎉 真 Hyper-V 端到端验证"段。**本段保留作侦查日志参考。**
 
 **新增工件**：
-- `docs/superpowers/examples/pcie_remote_noop_host/src/vsock_main.rs` —— Windows AF_HYPERV 客户端变体，跨编 `pcie_remote_noop_host_vsock.exe` 成功
+- `usnvmemu/crates/pcie_remote_noop_host/src/vsock_main.rs` —— Windows AF_HYPERV 客户端变体，跨编 `pcie_remote_noop_host_vsock.exe` 成功
 - `/mnt/c/temp/pcie_remote_exp/enable_vmbus_redirect.ps1` —— 通过 WMI ModifySystemSettings 设置 `vssd.VMBusMessageRedirection = 1`（VTL2 vsock listener 必需）
 - `/mnt/c/temp/pcie_remote_exp/switch_igvm.ps1` —— 不重建 VM 切换 IGVM 文件 + VTL2 内存
 - `/mnt/c/temp/pcie_remote_exp/boot_and_read_com1.ps1` —— 异步读 COM1 命名管道
@@ -1422,7 +1422,7 @@ examples/pcie_remote_nvme_userspace/ZNS_DESIGN.md) 记录设计 + deferred
 
 ### Phase I2 — README + 架构图 (commit 58ef924c)
 
-[README.md](docs/superpowers/examples/pcie_remote_nvme_userspace/README.md)
+[README.md](usnvmemu/crates/pcie_remote_nvme_userspace/README.md)
 含 ASCII 架构图 (host → vsock → VTL2 → VTL0)、完整 opcode 覆盖矩阵、
 Windows 真 e2e PowerShell 用法、TCP 模式、代码导览、"how to write next
 PcieDevice" 教程、设计哲学。

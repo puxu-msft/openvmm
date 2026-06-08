@@ -66,7 +66,7 @@ string)，但**未注入 TLS 握手**，因为 rustls 0.23 没有公开 external
 短期 (本 fork 不动):
 - 维持 `tls_psk.rs` 当前状态（deterministic crypto + 13 单元测试 + SHA-256/384
   双 dispatch e2e）。
-- 在 `docs/superpowers/plans/2026-06-06-phase-v-followup-tls-psk-survey.md` 留
+- 在 `usnvmemu/docs/plans/2026-06-06-phase-v-followup-tls-psk-survey.md` 留
   路径 C 实验脚本：当用户想做真 Linux interop 时，可拿 SpiderOak fork rebuild。
 - 不引 git dep 入主线 `Cargo.toml`，避免 fork stale 风险。
 

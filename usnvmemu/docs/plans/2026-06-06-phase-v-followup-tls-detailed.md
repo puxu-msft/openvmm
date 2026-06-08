@@ -227,7 +227,7 @@ V-followup-TLS 完成后下一阶段优先级：
 执行起始命令：
 ```bash
 git log --oneline -5  # 验 HEAD = afb90654
-cd docs/superpowers/examples/nvme_of_tcp_target
+cd usnvmemu/crates/nvme_of_tcp_target
 cargo test --all-targets 2>&1 | tail -5  # 验 197 baseline
 # 开始 V-followup-tls-1
 ```

@@ -144,7 +144,7 @@ reviewer H-2 警告 "interop 边缘 case 会错拒"。V-dhchap-4d 修了代码�
 **坑**：`cd /home/xp/refs/openvmm && cargo test` 会 build 整个 openvmm
 workspace (含 openssl-sys dep 缺) → fail。
 
-**修法**：cd 到 `docs/superpowers/examples/nvme_of_tcp_target/` 再跑 cargo。
+**修法**：cd 到 `usnvmemu/crates/nvme_of_tcp_target/` 再跑 cargo。
 本仓库 nvme_of_tcp_target 是独立 crate，不属于 openvmm workspace member。
 
 ---

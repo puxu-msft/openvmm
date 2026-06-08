@@ -21,7 +21,7 @@
 
 ### L-4 — 中英文括号混排风格
 
-- 文件：`docs/superpowers/HYPERV_RUNBOOK.md` 多处
+- 文件：`docs/superpowers/PCIE_REMOTE_HYPERV_RUNBOOK.md` 多处
 - 现状：中文文本里圆括号包英文，如 `期望（实测真 Hyper-V 输出）：`
 - 主 agent 决策：**不修**。是项目整体风格，docs/ 所有中文文档一致；统一改
   会触及很多文件且无功能意义
@@ -36,7 +36,7 @@
 
 ### L-8 — USER_TODO §C "Service GUID 注册" 是历史段
 
-- 文件：`docs/superpowers/USER_TODO.md:78-83`
+- 文件：`docs/superpowers/PCIE_REMOTE_USER_TODO_LEGACY.md:78-83`
 - 现状：§C 是"一次性已完成"参考段（onboarding 时回查用）
 - 主 agent 决策：**不修**。删了反而损失了 onboarding 路径文档；H-2 已把
   脚本路径修对了，内容上完整
