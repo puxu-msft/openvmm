@@ -1,0 +1,9 @@
+[project]
+name = "vfio_user_interop_py"
+version = "0.1.0"
+description = "Python 跨进程 vfio-user 客户端 harness — 真 wire 验证 vfio_user_transport server（stdlib only, 0 sudo / 0 QEMU）"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.uv]
+managed = true
