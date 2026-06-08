@@ -252,6 +252,43 @@ pub fn handle_dma_unmap(
     write_message(stream, &hdr, pl.as_bytes(), &[]).context("write DMA_UNMAP reply")
 }
 
+/// **Phase W (vfio-spec head-of-line 修复)** — 等待一条 server-initiated 请求
+/// 的 reply，期间把**非本次 reply** 的入站帧 defer 到 `inbound_queue`。
+///
+/// vfio-user spec：两方向 msg_id 独立、无严格请求/应答顺序，client 完全可能在
+/// 我们等 DMA reply 时插一条 REGION_READ 等 inbound command。此前 `dma_*_sync`
+/// 盲读下一帧当 reply → 校验失败 → 连接挂（真 QEMU 并发 blocker）。现在按
+/// msg_id 精确匹配本次 reply；其余帧 defer，等当前 device 回调栈 unwind 后由
+/// `VfioUserSession::pump_one` 顶部安全 dispatch（避免 device 重入）。
+///
+/// server-initiated msg_id 唯一标识本次请求（顶位 0x8000，与 client msg_id 不撞），
+/// 故 `msg_id == expected` 即本次 reply。
+///
+/// **DoS 注记**：恶意 peer 持续插帧会让 `inbound_queue` 无界增长（教学版未设
+/// 上限）；真生产应加 backpressure / 队列上限，留 future hardening。
+pub(crate) fn read_reply_deferring_inbound(
+    stream: &mut UnixStream,
+    expected_msg_id: u16,
+    inbound_queue: &mut std::collections::VecDeque<crate::framing::Message>,
+) -> anyhow::Result<crate::framing::Message> {
+    loop {
+        let frame = read_message(stream).context("read while waiting server-request reply")?;
+        // packed header 字段先 copy 到局部，避免 unaligned ref。
+        let frame_id = frame.header.msg_id;
+        if frame_id == expected_msg_id {
+            return Ok(frame);
+        }
+        let frame_cmd = frame.header.cmd;
+        tracing::debug!(
+            deferred_id = frame_id,
+            deferred_cmd = frame_cmd,
+            awaiting = expected_msg_id,
+            "DMA wait: defer interleaved inbound frame (head-of-line 修复)"
+        );
+        inbound_queue.push_back(frame);
+    }
+}
+
 /// 服务端发起的同步 DMA_READ：发 request → 等 reply。
 ///
 /// 返 `(msg_id, data)`：`msg_id` 就是我们用过的 wire id（=token，写给
@@ -269,6 +306,7 @@ pub fn dma_read_sync(
     stream: &mut UnixStream,
     table: &DmaTable,
     next_server_msg_id: &mut u16,
+    inbound_queue: &mut std::collections::VecDeque<crate::framing::Message>,
     gpa: u64,
     len: u32,
 ) -> anyhow::Result<(u16, Vec<u8>)> {
@@ -289,7 +327,7 @@ pub fn dma_read_sync(
         count: len as u64,
     };
     write_message(stream, &hdr, req.as_bytes(), &[]).context("write DMA_READ request")?;
-    let reply = read_message(stream).context("read DMA_READ reply")?;
+    let reply = read_reply_deferring_inbound(stream, msg_id, inbound_queue)?;
     validate_dma_reply(&reply, msg_id, Command::DmaRead)?;
     let want = core::mem::size_of::<DmaRwHdrPayload>() + len as usize;
     if reply.payload.len() != want {
@@ -311,6 +349,7 @@ pub fn dma_write_sync(
     stream: &mut UnixStream,
     table: &DmaTable,
     next_server_msg_id: &mut u16,
+    inbound_queue: &mut std::collections::VecDeque<crate::framing::Message>,
     gpa: u64,
     data: &[u8],
 ) -> anyhow::Result<u16> {
@@ -334,7 +373,7 @@ pub fn dma_write_sync(
     );
     payload.extend_from_slice(data);
     write_message(stream, &hdr, &payload, &[]).context("write DMA_WRITE request")?;
-    let reply = read_message(stream).context("read DMA_WRITE reply")?;
+    let reply = read_reply_deferring_inbound(stream, msg_id, inbound_queue)?;
     validate_dma_reply(&reply, msg_id, Command::DmaWrite)?;
     Ok(msg_id)
 }
@@ -500,7 +539,8 @@ mod tests {
         // 启 server thread 发 DMA_READ 阻塞等
         let h = thread::spawn(move || -> anyhow::Result<(u16, Vec<u8>)> {
             let mut next = 0x8000u16;
-            dma_read_sync(&mut server, &table, &mut next, 0x1100, 8)
+            let mut queue = std::collections::VecDeque::new();
+            dma_read_sync(&mut server, &table, &mut next, &mut queue, 0x1100, 8)
         });
         // 客户端模拟 QEMU：read request → 发 reply 带 8 byte
         let req = read_message(&mut client).unwrap();
@@ -530,6 +570,62 @@ mod tests {
         assert_eq!(data, vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22]);
     }
 
+    /// **Phase W (head-of-line 修复)** — client 在我们等 DMA reply 时插一条
+    /// REGION_READ：DMA reply 仍按 msg_id 正确返回（不被误判），interleaved 帧
+    /// defer 到 queue 待 pump_one 后续处理。此前盲读会把 REGION_READ 当 DMA
+    /// reply 校验失败 → 连接挂（真 QEMU 并发 blocker）。
+    #[test]
+    fn dma_read_sync_defers_interleaved_inbound() {
+        let (mut server, mut client) = pair();
+        let mut table = DmaTable::default();
+        table
+            .insert(DmaRegion {
+                addr: 0x1000,
+                size: 0x1000,
+                readable: true,
+                writeable: true,
+            })
+            .unwrap();
+        let h = thread::spawn(move || {
+            let mut next = 0x8000u16;
+            let mut queue = std::collections::VecDeque::new();
+            let r = dma_read_sync(&mut server, &table, &mut next, &mut queue, 0x1100, 8);
+            (r, queue)
+        });
+        // client 读 DMA_READ 请求
+        let req = read_message(&mut client).unwrap();
+        let req_id = req.header.msg_id;
+        // 先插一条 interleaved inbound（client msg_id=0x42 的 REGION_READ）
+        let inter = Header::command(0x42, Command::RegionRead, 0);
+        fw_write(&mut client, &inter, &[], &[]).unwrap();
+        // 再发真 DMA_READ reply（msg_id = 请求的 server-initiated id）
+        let mut reply_pl = Vec::new();
+        reply_pl.extend_from_slice(
+            DmaRwHdrPayload {
+                addr: 0x1100,
+                count: 8,
+            }
+            .as_bytes(),
+        );
+        reply_pl.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let rhdr = Header::reply_ok(req_id, Command::DmaRead, reply_pl.len() as u32);
+        fw_write(&mut client, &rhdr, &reply_pl, &[]).unwrap();
+        let (r, queue) = h.join().unwrap();
+        let (msg_id, data) = r.unwrap();
+        assert_eq!(msg_id, 0x8000);
+        assert_eq!(
+            data,
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            "DMA reply 正确返回，未被 interleaved 帧干扰"
+        );
+        // interleaved REGION_READ 被 defer，等 pump_one 后续 dispatch
+        assert_eq!(queue.len(), 1, "interleaved 帧应 defer 到 queue");
+        let q_id = queue[0].header.msg_id;
+        let q_cmd = queue[0].header.cmd;
+        assert_eq!(q_id, 0x42);
+        assert_eq!(q_cmd, Command::RegionRead as u16);
+    }
+
     #[test]
     fn dma_read_outside_region_fails() {
         let server = pair().0;
@@ -544,7 +640,8 @@ mod tests {
             })
             .unwrap();
         let mut next = 0x8000u16;
-        let r = dma_read_sync(&mut server, &table, &mut next, 0x9999, 8);
+        let mut queue = std::collections::VecDeque::new();
+        let r = dma_read_sync(&mut server, &table, &mut next, &mut queue, 0x9999, 8);
         assert!(r.is_err());
     }
 
@@ -562,7 +659,15 @@ mod tests {
             .unwrap();
         let h = thread::spawn(move || -> anyhow::Result<u16> {
             let mut next = 0x8000u16;
-            dma_write_sync(&mut server, &table, &mut next, 0x2200, &[1, 2, 3, 4])
+            let mut queue = std::collections::VecDeque::new();
+            dma_write_sync(
+                &mut server,
+                &table,
+                &mut next,
+                &mut queue,
+                0x2200,
+                &[1, 2, 3, 4],
+            )
         });
         let req = read_message(&mut client).unwrap();
         {
@@ -602,7 +707,15 @@ mod tests {
             })
             .unwrap();
         let mut next = 0x8000u16;
-        let r = dma_write_sync(&mut server, &table, &mut next, 0x1100, &[1, 2, 3]);
+        let mut queue = std::collections::VecDeque::new();
+        let r = dma_write_sync(
+            &mut server,
+            &table,
+            &mut next,
+            &mut queue,
+            0x1100,
+            &[1, 2, 3],
+        );
         assert!(r.is_err());
         let msg = format!("{:#}", r.unwrap_err());
         assert!(msg.contains("not writeable"), "got: {msg}");

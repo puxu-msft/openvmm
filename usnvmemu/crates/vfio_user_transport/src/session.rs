@@ -72,6 +72,10 @@ pub struct VfioUserSession {
     /// `device.describe()` 懒构造。服务 CONFIG region 读写（identity /
     /// BAR probe），取代此前误把 CONFIG 当 BAR MMIO 转给 `mmio_read` 的 bug。
     config: Option<crate::ConfigSpace>,
+    /// **Phase W (vfio-spec head-of-line 修复)** — 在等 server-initiated DMA
+    /// reply 期间收到的、非本次 reply 的入站帧 defer 到此队列；`pump_one`
+    /// 顶部在 device 回调栈 unwind 后再 dispatch（避免 device 重入）。
+    inbound_queue: std::collections::VecDeque<crate::framing::Message>,
 }
 
 /// 一条等待投递给 device 的 DMA 完成事件。
@@ -96,6 +100,7 @@ impl VfioUserSession {
             next_server_msg_id: 0x8000,
             pending_completions: std::collections::VecDeque::new(),
             config: None,
+            inbound_queue: std::collections::VecDeque::new(),
         }
     }
 
@@ -118,6 +123,12 @@ impl VfioUserSession {
     /// - `Err` — **协议层硬错误**（unknown command / wire 解析失败），caller
     ///   应 close socket
     pub fn pump_one<D: PcieDevice>(&mut self, device: &mut D) -> anyhow::Result<bool> {
+        // **Phase W (head-of-line 修复)** — 优先处理 DMA 等待期间 defer 的入站帧。
+        // 这些帧在 device 回调栈里收到、当时不能重入 device；现 dispatch 已 unwind，
+        // 安全 dispatch。每次处理一条，caller 的 pump loop 自然继续 drain。
+        if let Some(deferred) = self.inbound_queue.pop_front() {
+            return self.dispatch_one(deferred, device);
+        }
         let msg = match read_message(&mut self.stream) {
             Ok(m) => m,
             Err(e) => {
@@ -131,6 +142,16 @@ impl VfioUserSession {
                 return Err(e);
             }
         };
+        self.dispatch_one(msg, device)
+    }
+
+    /// 解析一帧的 command 并 dispatch + drain DMA 完成事件。pump_one 的正常
+    /// 入站帧与 head-of-line defer 的帧共用此路径（DRY）。
+    fn dispatch_one<D: PcieDevice>(
+        &mut self,
+        msg: Message,
+        device: &mut D,
+    ) -> anyhow::Result<bool> {
         let msg_id = msg.header.msg_id;
         let cmd_u = msg.header.cmd;
         let cmd = match Command::try_from(cmd_u) {
@@ -481,6 +502,7 @@ impl pcie_device_core::Transport for VfioUserSession {
             &mut self.stream,
             &self.dma_table,
             &mut self.next_server_msg_id,
+            &mut self.inbound_queue,
             gpa,
             len,
         ) {
@@ -520,6 +542,7 @@ impl pcie_device_core::Transport for VfioUserSession {
             &mut self.stream,
             &self.dma_table,
             &mut self.next_server_msg_id,
+            &mut self.inbound_queue,
             gpa,
             &data,
         ) {
