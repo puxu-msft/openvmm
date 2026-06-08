@@ -21,7 +21,7 @@ use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
 use nvme_of_tcp_target::{
     AsyncSession, SharedControllerInner, accept_and_handshake_async, build_acceptor_with_mtls,
 };
-use pcie_remote_nvme_userspace::NvmeController;
+use nvme_firmware::NvmeController;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;

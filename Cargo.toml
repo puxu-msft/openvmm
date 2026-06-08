@@ -65,11 +65,11 @@ members = [
 exclude = [
   "xsync",
   "Guide/mdbook-openvmm-shim",
-  "usnvmemu/crates/pcie_remote_noop_host",
-  "usnvmemu/crates/pcie_remote_userspace_sdk",
-  "usnvmemu/crates/pcie_remote_nvme_userspace",
-  "usnvmemu/crates/pcie_remote_rng_userspace",
-  "usnvmemu/crates/pcie_vfio_user_sdk",
+  "usnvmemu/crates/pcie_remote_test_harness",
+  "usnvmemu/crates/pcie_device_sdk",
+  "usnvmemu/crates/nvme_firmware",
+  "usnvmemu/crates/rng_device_example",
+  "usnvmemu/crates/vfio_user_transport",
   "usnvmemu/crates/nvme_of_tcp_target",
   "docs/superpowers/examples/vmrs_log_scanner",
 ]

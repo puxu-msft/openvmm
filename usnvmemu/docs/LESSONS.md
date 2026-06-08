@@ -306,8 +306,8 @@ fork 时又得重新走一遍 cost-benefit。
 - **审 SESSION_LOG** 时只看顶 header 自标 "覆盖 2026-05-29 → 2026-05-31"，
   没核 git log 发现 Phase J / K / L / M / N / O / P / Q1-Q12 / R / S /
   T / U1-U5 + U-followup / V 整族都没写进日志。
-- **审 example crates** 时没数有几个 crate；4 个 (`pcie_remote_userspace_sdk` /
-  `pcie_vfio_user_sdk` / `pcie_remote_rng_userspace` / `pcie_remote_noop_host`)
+- **审 example crates** 时没数有几个 crate；4 个 (`pcie_device_sdk` /
+  `vfio_user_transport` / `rng_device_example` / `pcie_remote_test_harness`)
   完全没 README。
 - **审 ROADMAP §6** "历史 phase plan 索引" 时**只列有 `.md` plan 的**，
   漏掉所有 "无独立 plan 但 shipped" 的工作 (NVMe userspace Q/R/S 等)。

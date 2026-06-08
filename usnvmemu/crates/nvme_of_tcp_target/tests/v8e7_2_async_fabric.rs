@@ -29,7 +29,7 @@ use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
 use nvme_of_tcp_target::{
     AsyncSession, DispatchOutcome, SharedControllerInner, accept_and_handshake_async,
 };
-use pcie_remote_nvme_userspace::NvmeController;
+use nvme_firmware::NvmeController;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -316,12 +316,12 @@ async fn v8e7_2_disconnect_async_sweeps_io_queue_via_drop() {
     sess.io_queues
         .insert(1, nvme_of_tcp_target::io_queue::IoQueueState::new_sq(1));
     // controller 端 install IO CQ/SQ：用 NvmeController API 即可
-    use pcie_remote_nvme_userspace::cmd::Sqe;
+    use nvme_firmware::cmd::Sqe;
     use zerocopy::FromZeros as _;
     {
         let mut c = sess.controller().controller.lock();
-        let mut t = pcie_vfio_user_sdk::NoopTransport;
-        let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut t);
+        let mut t = vfio_user_transport::NoopTransport;
+        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut t);
         // Create IO CQ qid=1
         let mut sqe = Sqe::new_zeroed();
         sqe.cdw0 = 0x05;

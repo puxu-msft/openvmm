@@ -1,0 +1,30 @@
+[package]
+name = "pcie_remote_test_harness"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "pcie_remote_test_harness_tcp"
+path = "src/main.rs"
+
+[[bin]]
+name = "pcie_remote_test_harness_vsock"
+path = "src/vsock_main.rs"
+required-features = []
+
+[dependencies]
+pcie_remote_protocol = { path = "../../../vm/devices/pcie_remote_protocol" }
+prost = "0.13"
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+guid = { path = "../../../support/guid" }
+vmsocket = { path = "../../../support/vmsocket" }
+pal_async = { path = "../../../support/pal/pal_async" }
+clap = { version = "4", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+socket2 = "0.6"

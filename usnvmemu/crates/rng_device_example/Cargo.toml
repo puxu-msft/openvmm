@@ -1,0 +1,23 @@
+[package]
+name = "rng_device_example"
+version = "0.1.0"
+edition = "2024"
+description = "Minimal PCIe RNG (random number generator) device via pcie_remote SDK; second example showing SDK universality beyond NVMe."
+
+# 显式不属于父 workspace —— 与父 Cargo.toml exclude 互为保险。
+[workspace]
+
+[[bin]]
+name = "rng_device_example"
+path = "src/main.rs"
+
+[dependencies]
+pcie_device_sdk = { path = "../pcie_device_sdk" }
+pcie_remote_protocol = { path = "../../../vm/devices/pcie_remote_protocol" }
+pal_async = { path = "../../../support/pal/pal_async" }
+guid = { path = "../../../support/guid", features = ["mesh"] }
+clap = { version = "4.6", features = ["derive"] }
+anyhow = "1.0.102"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# 用 std::time::Instant + 自实现 LCG，避免外部 rand 依赖让 example 自洽

@@ -368,7 +368,7 @@ pub use proto::*;
   - 同时 `workspace.exclude`（若不存在则添加）加入：
     ```toml
     exclude = [
-        "usnvmemu/crates/pcie_remote_noop_host",
+        "usnvmemu/crates/pcie_remote_test_harness",
     ]
     ```
     （pcie_remote_device 在 Phase 2 创建；workspace 此时引用一个不存在的 path 会 cargo error。**所以本 step 把 device crate 路径与 members 一起写好，Phase 2 创建空壳让 workspace 能 resolve。** —— 在 Phase 2 Step 2.0 完成）
@@ -2245,19 +2245,19 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Phase 8 ─ host SDK 示例 + setup.ps1 + Guide
 
 **Files:**
-- Create: `usnvmemu/crates/pcie_remote_noop_host/Cargo.toml`
-- Create: `usnvmemu/crates/pcie_remote_noop_host/src/main.rs`
+- Create: `usnvmemu/crates/pcie_remote_test_harness/Cargo.toml`
+- Create: `usnvmemu/crates/pcie_remote_test_harness/src/main.rs`
 - Create: `docs/superpowers/scripts/setup-pcie-remote.ps1`
 - Create: `Guide/src/reference/openhcl/devices/pcie_remote.md`
 - Modify: `Cargo.toml`（workspace.exclude 已在 Phase 1 加）
 
 ### Step 8.1 — host noop stub（F-18：仅 bind 127.0.0.1）
 
-- [ ] Create `usnvmemu/crates/pcie_remote_noop_host/Cargo.toml`：
+- [ ] Create `usnvmemu/crates/pcie_remote_test_harness/Cargo.toml`：
 
 ```toml
 [package]
-name = "pcie_remote_noop_host"
+name = "pcie_remote_test_harness"
 version = "0.1.0"
 edition = "2024"
 
@@ -2271,7 +2271,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 ```
 
-- [ ] Create `usnvmemu/crates/pcie_remote_noop_host/src/main.rs`：
+- [ ] Create `usnvmemu/crates/pcie_remote_test_harness/src/main.rs`：
 
 ```rust
 //! Minimal host stub. Listens 127.0.0.1:48914, replies HelloAck with a
@@ -2394,7 +2394,7 @@ async fn serve(stream: tokio::net::TcpStream) -> Result<()> {
 git add docs/superpowers/examples/ docs/superpowers/scripts/ Guide/src/reference/openhcl/devices/
 git commit -m "docs(pcie_remote): host SDK example + setup.ps1 + Guide
 
-- examples/pcie_remote_noop_host: minimal tokio-based stub (bind 127.0.0.1 only)
+- examples/pcie_remote_test_harness: minimal tokio-based stub (bind 127.0.0.1 only)
 - setup-pcie-remote.ps1: service GUID + Admin/SYSTEM ACL (SDDL applied)
 - Guide doc: 4 deployment forms + security caveats
 
@@ -2428,7 +2428,7 @@ wget -nv https://github.com/alpinelinux/aports/raw/master/main/linux-virt/...   
 
 ### Step 9.2 — 启动 host stub
 
-- [ ] Run: `cargo run -p pcie_remote_noop_host 2>&1 &`
+- [ ] Run: `cargo run -p pcie_remote_test_harness 2>&1 &`
 - [ ] Verify: `ss -tnl | grep 48914`，确认仅监听 127.0.0.1
 
 ### Step 9.3 — 启动 OpenVMM + Linux guest

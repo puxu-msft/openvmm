@@ -3,7 +3,7 @@
 > **🔼 2026-06-06 audit**: 本日志覆盖 PCIe Remote v1/v2 实施 (2026-05-29 → 2026-05-31)，最终里程碑是 Phase 10 完成 + 真 Hyper-V e2e 验证 + Phase I3 第二个 PcieDevice (RNG) example。
 >
 > **本日志没记的后续工作 (2026-05-31 → 2026-06-06)**：
-> - **NVMe userspace 教学 controller 完善**: Phase J / K / L / M / N / O / P / **Q1-Q12** / **R1+R3+R4** / **S1-S7** (NVMe 2.0 spec 全覆盖 + 多轮 reviewer)。详 [`examples/pcie_remote_nvme_userspace/README.md`](examples/pcie_remote_nvme_userspace/README.md)。
+> - **NVMe userspace 教学 controller 完善**: Phase J / K / L / M / N / O / P / **Q1-Q12** / **R1+R3+R4** / **S1-S7** (NVMe 2.0 spec 全覆盖 + 多轮 reviewer)。详 [`examples/nvme_firmware/README.md`](examples/nvme_firmware/README.md)。
 > - **Phase T**: `trait Transport` 抽出 + 3 backend。
 > - **Phase U1-U5 + U-followup**: vfio-user SDK + NVMe behind QEMU。详 [`specs/2026-06-05-vfio-user-client-design.md`](specs/2026-06-05-vfio-user-client-design.md)。
 > - **Phase V → V8 → V8e → V-followup-tls/mtls/auth/dhchap-3/4/4d/prp-list/tls-psk**: NVMe-oF TCP target 全栈。详 [`examples/nvme_of_tcp_target/README.md`](examples/nvme_of_tcp_target/README.md) + [`plans/ROADMAP.md`](plans/ROADMAP.md)。
@@ -42,8 +42,8 @@
 
 ```bash
 # Terminal 1: host stub (client，spec §3.3 OpenVMM/OpenHCL is server)
-$ cargo run -p pcie_remote_noop_host
-pcie_remote_noop_host: client mode — connecting to OpenVMM/OpenHCL addr=127.0.0.1:48914
+$ cargo run -p pcie_remote_test_harness
+pcie_remote_test_harness: client mode — connecting to OpenVMM/OpenHCL addr=127.0.0.1:48914
 connected
 received Hello magic=0x52504345 version=1 instance_id_len=16
 sent HelloAck
@@ -188,7 +188,7 @@ OpenHCL 在 OpenVMM 上启动需要 **WHP 或 mshv** hypervisor（提供 VTL2）
 > 最末"🎉🎉🎉 真 Hyper-V 端到端验证"段。**本段保留作侦查日志参考。**
 
 **新增工件**：
-- `usnvmemu/crates/pcie_remote_noop_host/src/vsock_main.rs` —— Windows AF_HYPERV 客户端变体，跨编 `pcie_remote_noop_host_vsock.exe` 成功
+- `usnvmemu/crates/pcie_remote_test_harness/src/vsock_main.rs` —— Windows AF_HYPERV 客户端变体，跨编 `pcie_remote_test_harness_vsock.exe` 成功
 - `/mnt/c/temp/pcie_remote_exp/enable_vmbus_redirect.ps1` —— 通过 WMI ModifySystemSettings 设置 `vssd.VMBusMessageRedirection = 1`（VTL2 vsock listener 必需）
 - `/mnt/c/temp/pcie_remote_exp/switch_igvm.ps1` —— 不重建 VM 切换 IGVM 文件 + VTL2 内存
 - `/mnt/c/temp/pcie_remote_exp/boot_and_read_com1.ps1` —— 异步读 COM1 命名管道
@@ -363,17 +363,17 @@ OpenHCL boot 起来，下一步可以：
 3. 同时启 host vsock client:
    ```powershell
    $vmid = (Get-VM pcie-remote-exp).Id
-   pcie_remote_noop_host_vsock.exe --vm-id $vmid --port 50000 --retries 60 --retry-ms 500
+   pcie_remote_test_harness_vsock.exe --vm-id $vmid --port 50000 --retries 60 --retry-ms 500
    ```
 
 ### 输出（成功！）
 
 Host noop_host_vsock:
 ```
-INFO pcie_remote_noop_host_vsock: vsock client connecting vm_id=2a0a... port=50000
-INFO pcie_remote_noop_host_vsock: connected
-INFO pcie_remote_noop_host_vsock: received Hello magic=0x52504345 version=1
-INFO pcie_remote_noop_host_vsock: sent HelloAck
+INFO pcie_remote_test_harness_vsock: vsock client connecting vm_id=2a0a... port=50000
+INFO pcie_remote_test_harness_vsock: connected
+INFO pcie_remote_test_harness_vsock: received Hello magic=0x52504345 version=1
+INFO pcie_remote_test_harness_vsock: sent HelloAck
 ```
 
 OpenHCL VTL2 kmsg:
@@ -692,7 +692,7 @@ kmsg:
 
 ### 工件
 
-- `/mnt/c/temp/pcie_remote_exp/pcie_remote_noop_host_vsock.exe` (current 含 stress 模式)
+- `/mnt/c/temp/pcie_remote_exp/pcie_remote_test_harness_vsock.exe` (current 含 stress 模式)
 - `--stress-dma-count 2048` → K-NEW-C 验证
 - `--stress-bad-frames 8` → A4 Lost 验证
 - `--stress-dma-count 0 --stress-bad-frames 0`（默认）→ periodic 模式仅
@@ -836,7 +836,7 @@ Lost/Revive 诊断字段 + state inspect 在真 Hyper-V 上点亮。
    last_revive_at_ms = 0       ← 尚未复活
    revive_count      = 0
    ```
-5. 重启 noop（`pcie_remote_noop_host_vsock.exe --vm-id <vm-guid> --port 50000`）→
+5. 重启 noop（`pcie_remote_test_harness_vsock.exe --vm-id <vm-guid> --port 50000`）→
    K-20 listener 重连 → state=Live，K-NEW-G 全部字段点亮：
    ```
    state             = "Live"   ← K-243d0d44 inspect surface ✅
@@ -875,11 +875,11 @@ guest Windows Server 真见到
 
 继 K-20/K-NEW-G/H 之后，完成"用户态写 PCIe 设备"工作的两步：
 
-1. **`pcie_remote_userspace_sdk` (commit 45f7ea19)**：把 noop 一次性 demo
+1. **`pcie_device_sdk` (commit 45f7ea19)**：把 noop 一次性 demo
    抽成可复用 SDK；trait `PcieDevice` + `DeviceCtx`（含 DMA 完成回调）+
    `run()` 主循环。NVMe 此后只关心 NVMe 语义，不重新写 wire protocol。
 
-2. **`pcie_remote_nvme_userspace` (commit c32b364f)**：~600 行 Rust 实现
+2. **`nvme_firmware` (commit c32b364f)**：~600 行 Rust 实现
    NVMe spec 1.4 最小子集（regs/cmd/controller/main 四个模块）+ backing
    文件支持。SDK + NVMe controller 都 build pass，全 Windows cross-compile
    ok。
@@ -1417,20 +1417,20 @@ PRACT，若 driver 期望真 PI 校验则 INVALID_FIELD（我们没 CRC 引擎�
 
 完整 ZNS 实现 ~1500 行新代码 + zone state machine + 单测，ROI 不对等
 （NVM CS 路径已覆盖核心教学价值）。写 [ZNS_DESIGN.md](docs/superpowers/
-examples/pcie_remote_nvme_userspace/ZNS_DESIGN.md) 记录设计 + deferred
+examples/nvme_firmware/ZNS_DESIGN.md) 记录设计 + deferred
 原因。
 
 ### Phase I2 — README + 架构图 (commit 58ef924c)
 
-[README.md](usnvmemu/crates/pcie_remote_nvme_userspace/README.md)
+[README.md](usnvmemu/crates/nvme_firmware/README.md)
 含 ASCII 架构图 (host → vsock → VTL2 → VTL0)、完整 opcode 覆盖矩阵、
 Windows 真 e2e PowerShell 用法、TCP 模式、代码导览、"how to write next
 PcieDevice" 教程、设计哲学。
 
 ### Phase I3 — 第二个 PCIe device example (commit 7402dd62)
 
-[pcie_remote_rng_userspace](docs/superpowers/examples/
-pcie_remote_rng_userspace/)：~360 行实现一个最小 PCI 硬件 RNG (BAR0
+[rng_device_example](docs/superpowers/examples/
+rng_device_example/)：~360 行实现一个最小 PCI 硬件 RNG (BAR0
 6 reg + 1 MSI-X + DMA-write)。证明 SDK 不止能写 NVMe；作为下一个
 PcieDevice 教学模板。splitmix64 LCG (无外部依赖)；--seed 可复现。
 

@@ -36,7 +36,7 @@
 //! [`Self::token_high_water`] 取回。**修 V3-polish review M-1**：跨 cmd
 //! 单调，不再每次 default() 重启撞 controller pending_ios 残留。
 
-use pcie_remote_userspace_sdk::Transport;
+use pcie_device_sdk::Transport;
 use std::collections::VecDeque;
 
 /// 一次 dma_write 调用的快照：caller 通过 (gpa, data) 判断这是 PRP1 data

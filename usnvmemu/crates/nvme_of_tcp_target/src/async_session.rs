@@ -792,8 +792,8 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         let ofst = pf.ofst;
         let value = pf.value;
         let ok = {
-            let mut t = pcie_vfio_user_sdk::NoopTransport;
-            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut t);
+            let mut t = vfio_user_transport::NoopTransport;
+            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut t);
             self.controller
                 .controller
                 .lock()
@@ -1257,7 +1257,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             AdminAerDecision, AdminBlockedOpcDecision, DiscoveryWhitelistDecision,
             decide_admin_aer_path, decide_admin_blocked_opc, decide_admin_discovery_whitelist,
         };
-        use pcie_remote_nvme_userspace::cmd::Sqe;
+        use nvme_firmware::cmd::Sqe;
 
         let mut sqe = Sqe::read_from_bytes(sqe_bytes)
             .map_err(|_| anyhow::anyhow!("V8e-7-3 admin SQE 不是 64 byte"))?;
@@ -1322,7 +1322,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         let conn_id = self.conn_id;
         let immediate_cqe = {
             let mut c = self.controller.controller.lock();
-            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
             c.nvme_admin_dispatch_with_conn(&mut ctx, sqe, cid, 0, conn_id)
         };
 
@@ -1353,7 +1353,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
     async fn handle_admin_aer_fast_path_async(
         &mut self,
         cid: u16,
-        mut sqe: pcie_remote_nvme_userspace::cmd::Sqe,
+        mut sqe: nvme_firmware::cmd::Sqe,
     ) -> anyhow::Result<()> {
         sqe.prp1 = crate::PRP1_SENTINEL;
         sqe.prp2 = 0;
@@ -1362,7 +1362,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         let conn_id = self.conn_id;
         let immediate = {
             let mut c = self.controller.controller.lock();
-            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
             c.nvme_admin_dispatch_with_conn(&mut ctx, sqe, cid, 0, conn_id)
         };
         self.next_token = tcp_t.token_high_water();
@@ -1403,7 +1403,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
     /// (与 V_HOST_IO_NLB_MAX 一致)。
     async fn handle_io_cmd_async(&mut self, cid: u16, sqe_bytes: &[u8]) -> anyhow::Result<()> {
         use crate::dispatch_plan::{IoNlbDecision, decide_io_nlb_check, prp2_sentinel_for_nlb};
-        use pcie_remote_nvme_userspace::cmd::Sqe;
+        use nvme_firmware::cmd::Sqe;
 
         let mut sqe = Sqe::read_from_bytes(sqe_bytes)
             .map_err(|_| anyhow::anyhow!("V8e-7-3 IO SQE 不是 64 byte"))?;
@@ -1456,7 +1456,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             crate::tcp_transport::TcpAdminTransport::new_with_token_base(self.next_token);
         let immediate_cqe = {
             let mut c = self.controller.controller.lock();
-            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
             c.nvme_io_dispatch(&mut ctx, sq_id, sqe, cid, cq_id)
         };
         self.run_post_dispatch_async(cid, immediate_cqe, tcp_t)
@@ -1477,7 +1477,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
     async fn handle_io_cmd_chunked_async(
         &mut self,
         cid: u16,
-        original_sqe: pcie_remote_nvme_userspace::cmd::Sqe,
+        original_sqe: nvme_firmware::cmd::Sqe,
         sq_id: u16,
         cq_id: u16,
         opc: u8,
@@ -1514,7 +1514,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
                 crate::tcp_transport::TcpAdminTransport::new_with_token_base(self.next_token);
             let immediate_cqe = {
                 let mut c = self.controller.controller.lock();
-                let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
                 c.nvme_io_dispatch(&mut ctx, sq_id, sub_sqe, cid, cq_id)
             };
 
@@ -1557,7 +1557,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
     async fn run_post_dispatch_chunked_async(
         &mut self,
         cid: u16,
-        immediate_cqe: Option<pcie_remote_nvme_userspace::cmd::Cqe>,
+        immediate_cqe: Option<nvme_firmware::cmd::Cqe>,
         mut tcp_t: crate::tcp_transport::TcpAdminTransport,
         emit_capsule_resp: bool,
     ) -> anyhow::Result<u8> {
@@ -1594,7 +1594,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             cmd_cumulative_offset = cmd_cumulative_offset.saturating_add(read_req.len);
             {
                 let mut c = self.controller.controller.lock();
-                let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
                 c.nvme_admin_complete_dma(&mut ctx, read_req.token, true, bytes);
             }
         }
@@ -1602,7 +1602,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         // Phase 3: sync / async write-out
         if let Some(cqe) = immediate_cqe {
             let mut c = self.controller.controller.lock();
-            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
             c.nvme_post_cqe(&mut ctx, cqe);
         } else if !had_pending_reads {
             let mut data_tokens = Vec::with_capacity(tcp_t.writes.len());
@@ -1617,7 +1617,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             }
             for tok in data_tokens {
                 let mut c = self.controller.controller.lock();
-                let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
                 c.nvme_admin_complete_dma(&mut ctx, tok, true, Vec::new());
             }
         }
@@ -1671,7 +1671,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
     async fn run_post_dispatch_async(
         &mut self,
         cid: u16,
-        immediate_cqe: Option<pcie_remote_nvme_userspace::cmd::Cqe>,
+        immediate_cqe: Option<nvme_firmware::cmd::Cqe>,
         mut tcp_t: crate::tcp_transport::TcpAdminTransport,
     ) -> anyhow::Result<()> {
         // Phase 1.5: mixed-path guard
@@ -1716,7 +1716,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             // 第 3 段：lock-complete
             {
                 let mut c = self.controller.controller.lock();
-                let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
                 c.nvme_admin_complete_dma(&mut ctx, read_req.token, true, bytes);
             }
         }
@@ -1724,7 +1724,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         // Phase 3: 同步 / 异步 write-out
         if let Some(cqe) = immediate_cqe {
             let mut c = self.controller.controller.lock();
-            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
             c.nvme_post_cqe(&mut ctx, cqe);
         } else if !had_pending_reads {
             let mut data_tokens = Vec::with_capacity(tcp_t.writes.len());
@@ -1740,7 +1740,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             }
             for tok in data_tokens {
                 let mut c = self.controller.controller.lock();
-                let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
                 c.nvme_admin_complete_dma(&mut ctx, tok, true, Vec::new());
             }
         }
@@ -1885,7 +1885,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
                 if c.nvme_pending_aer_count_for_conn(conn_id) == 0 {
                     false
                 } else {
-                    let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                    let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
                     c.nvme_fire_aen_for_conn(
                         &mut ctx, /*type*/ 0, /*info*/ 0, /*log_id*/ 0, conn_id,
                     )
@@ -1960,7 +1960,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         let conn_id = self.conn_id;
         let fired = {
             let mut c = self.controller.controller.lock();
-            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
             c.nvme_fire_aen_for_conn(&mut ctx, aen_type, aen_info, log_id, conn_id)
         };
         self.next_token = tcp_t.token_high_water();

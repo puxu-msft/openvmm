@@ -20,7 +20,7 @@
 #![allow(missing_docs)]
 
 use nvme_of_tcp_target::{SharedControllerInner, V2Session};
-use pcie_remote_nvme_userspace::NvmeController;
+use nvme_firmware::NvmeController;
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
@@ -40,7 +40,7 @@ fn make_shared(backing: &std::path::Path) -> Arc<SharedControllerInner> {
 
 /// minimal in-test Transport that ignores all writes / reads。
 struct NullTransport;
-impl pcie_remote_userspace_sdk::Transport for NullTransport {
+impl pcie_device_sdk::Transport for NullTransport {
     fn fire_interrupt(&mut self, _msix_index: u32) {}
     fn dma_write(&mut self, _gpa: u64, _data: Vec<u8>) -> u64 {
         0
@@ -51,8 +51,8 @@ impl pcie_remote_userspace_sdk::Transport for NullTransport {
 }
 
 /// 构造一条 AER admin SQE（opc=0xC AsyncEventRequest），cid 在 cdw0 bits 31:16。
-fn make_aer_sqe(cid: u16) -> pcie_remote_nvme_userspace::cmd::Sqe {
-    let mut sqe = pcie_remote_nvme_userspace::cmd::Sqe::new_zeroed();
+fn make_aer_sqe(cid: u16) -> nvme_firmware::cmd::Sqe {
+    let mut sqe = nvme_firmware::cmd::Sqe::new_zeroed();
     sqe.cdw0 = ((cid as u32) << 16) | 0xC;
     sqe
 }
@@ -64,7 +64,7 @@ fn push_aer(shared: &Arc<SharedControllerInner>, cid: u16, conn_id: u32) {
         nvme_of_tcp_target::ADMIN_CQ_SIZE,
     );
     let mut t = NullTransport;
-    let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut t);
+    let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut t);
     let r = c.nvme_admin_dispatch_with_conn(&mut ctx, make_aer_sqe(cid), cid, 0, conn_id);
     assert!(r.is_none(), "AER 应 async（None）");
 }
@@ -97,7 +97,7 @@ fn v8c_two_conns_each_have_own_aer_queue() {
     {
         let mut c = shared.controller.lock();
         let mut t = NullTransport;
-        let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut t);
+        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut t);
         let fired = c.nvme_fire_aen_for_conn(&mut ctx, 0x01, 0x00, 0x02, conn_a);
         assert!(fired, "应 fire conn_a 的 AER");
     }
@@ -211,7 +211,7 @@ fn v8c_legacy_dispatch_conn_id_zero_still_works() {
             nvme_of_tcp_target::ADMIN_CQ_SIZE,
         );
         let mut t = NullTransport;
-        let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut t);
+        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut t);
         // 走 legacy nvme_admin_dispatch（不带 conn_id）
         let r = c.nvme_admin_dispatch(&mut ctx, make_aer_sqe(0xDEAD), 0xDEAD, 0);
         assert!(r.is_none());

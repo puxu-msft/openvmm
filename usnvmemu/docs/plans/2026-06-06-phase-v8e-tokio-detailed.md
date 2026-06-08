@@ -227,7 +227,7 @@ clippy `await_holding_lock = deny` 做编译期防御。
 **目标**：controller 加 `Arc<tokio::sync::Notify> aen_notify`；fire_aen_for_conn / fire_aen 后 `notify_waiters`；session `pump_one_async` 加第 3 arm；唤醒后自检 conn-id 计数。
 
 **文件**：
-- `crates/pcie_remote_nvme_userspace/src/controller/aer.rs`（或 mod.rs）：加 `pub fn aen_notify_handle(&self) -> Arc<Notify>`；fire 末尾 `notify_waiters()`
+- `crates/nvme_firmware/src/controller/aer.rs`（或 mod.rs）：加 `pub fn aen_notify_handle(&self) -> Arc<Notify>`；fire 末尾 `notify_waiters()`
 - `src/session.rs`：
   - V2Session 加 `aen_notify: Arc<Notify>`（accept_and_handshake_async 内 clone）
   - `pump_one_async` 第 3 arm：`_ = self.aen_notify.notified() => { /* self-check + drain */ }`

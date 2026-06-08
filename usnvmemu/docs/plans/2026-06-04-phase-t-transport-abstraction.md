@@ -11,7 +11,7 @@
 
 ## 1. 目标
 
-把当前 vsock/protobuf 强耦合的 `pcie_remote_userspace_sdk::DeviceCtx` 抽成"传输无关"的
+把当前 vsock/protobuf 强耦合的 `pcie_device_sdk::DeviceCtx` 抽成"传输无关"的
 `pcie_device_sdk` crate，使 `NvmeController` 主体只依赖 `trait Transport` 五原语
 （`dma_read`、`dma_write`、`dma_read_fire_and_forget`、`dma_write_fire_and_forget`、`fire_interrupt`）。
 Phase U/V 只需新增 backend，不动 controller。
@@ -24,12 +24,12 @@ docs/superpowers/examples/
 │   Cargo.toml   deps: anyhow + tracing + parking_lot only
 │   src/lib.rs   trait Transport + trait PcieDevice + DeviceCtx<'a, T>
 │                + InMemoryTransport + TransportEvent
-├── pcie_remote_userspace_sdk/         ── 改：depends on pcie_device_sdk
+├── pcie_device_sdk/         ── 改：depends on pcie_device_sdk
 │   提供 OpenhclVsockTransport: pcie_device_sdk::Transport
 │   pub type DeviceCtx<'a> = pcie_device_sdk::DeviceCtx<'a, OpenhclVsockTransport>;
 │   原 byte-stream `type Transport = …` 改名 `WireStream`
-├── pcie_remote_nvme_userspace/        ── 改：controller body 改 use pcie_device_sdk::*
-│   main.rs 仍用 pcie_remote_userspace_sdk runner
+├── nvme_firmware/        ── 改：controller body 改 use pcie_device_sdk::*
+│   main.rs 仍用 pcie_device_sdk runner
 │   Cargo.toml 删除 pcie_remote_protocol 依赖
 ```
 
@@ -47,7 +47,7 @@ workspace `Cargo.toml` 加 member。1 个 object-safety 单测。下游无影响
 
 ### Step 2 + 3（同 PR — `trait PcieDevice` 签名变会击穿所有 impl）
 
-**Step 2** — `pcie_remote_userspace_sdk` 切内部：
+**Step 2** — `pcie_device_sdk` 切内部：
 - 加 `pcie_device_sdk` 依赖
 - 从 `pcie_device_sdk` re-export `PcieDevice`/`DeviceCtx`/`Transport`
 - 旧 byte-stream `Transport` 别名 → `WireStream`
@@ -56,7 +56,7 @@ workspace `Cargo.toml` 加 member。1 个 object-safety 单测。下游无影响
 - `DeviceCtx::for_testing` 留 `#[deprecated]` shim
 
 **Step 3** — NVMe controller：
-- `use pcie_remote_userspace_sdk::*;` → `use pcie_device_sdk::*;`（controller body）
+- `use pcie_device_sdk::*;` → `use pcie_device_sdk::*;`（controller body）
 - 给约 50 个方法/helper 加 `<T: Transport>`
 - `main.rs` 与 `tests.rs` 不动
 
@@ -64,7 +64,7 @@ workspace `Cargo.toml` 加 member。1 个 object-safety 单测。下游无影响
 - `pcie_device_sdk` 加 `InMemoryTransport` + `TransportEvent` 枚举
 - 重写 13 处 `DeviceCtx::for_testing` 测试调用 → `InMemoryTransport`
 - `Body::ReadGpa { gpa, len, .. }` 匹配 → `TransportEvent::DmaRead { gpa, len, .. }`
-- 删 `pcie_remote_nvme_userspace/Cargo.toml` 里 `pcie_remote_protocol`
+- 删 `nvme_firmware/Cargo.toml` 里 `pcie_remote_protocol`
 - 删 `DeviceCtx::for_testing` shim
 
 ### Step 5 — Fmt + clippy + 全测试
@@ -99,27 +99,27 @@ cargo test  # nvme: 67 / userspace_sdk: 7-8 / device_sdk: 2
 ## 7. Acceptance
 
 - [ ] 67 NVMe tests + 7 SDK tests + ≥2 新 `pcie_device_sdk` tests pass
-- [ ] `pcie_remote_nvme_userspace/Cargo.toml` 不再列 `pcie_remote_protocol`
+- [ ] `nvme_firmware/Cargo.toml` 不再列 `pcie_remote_protocol`
 - [ ] `pcie_device_sdk/Cargo.toml` deps = `anyhow + tracing + parking_lot`
 - [ ] `cargo fmt --check` + `cargo clippy -- -D warnings` 三 crate 全绿
-- [ ] Manual OpenHCL smoke：`pcie_remote_nvme_userspace --vm-id <id> --port 50000` 仍能驱动 guest NVMe
+- [ ] Manual OpenHCL smoke：`nvme_firmware --vm-id <id> --port 50000` 仍能驱动 guest NVMe
 
 ## 8. Out of scope（留 U/V）
 
 - Phase U：`VfioUserTransport` impl
 - Phase V：`NvmeOfTcpTransport` impl
-- 将 `pcie_remote_nvme_userspace` 拆 lib + bin，让 `pal_async`/`guid` 仅 OpenHCL bin 引入
+- 将 `nvme_firmware` 拆 lib + bin，让 `pal_async`/`guid` 仅 OpenHCL bin 引入
 
 ## 附录 A：受影响文件清单
 
 绝对路径：
-- `usnvmemu/crates/pcie_remote_userspace_sdk/src/device.rs`（PcieDevice + DeviceCtx）
-- `usnvmemu/crates/pcie_remote_userspace_sdk/src/run.rs`（主循环 + 8 wire 单测）
-- `usnvmemu/crates/pcie_remote_userspace_sdk/src/transport.rs`（旧 `Transport` 别名重命名点）
-- `usnvmemu/crates/pcie_remote_userspace_sdk/src/lib.rs`（re-export）
-- `usnvmemu/crates/pcie_remote_userspace_sdk/Cargo.toml`
-- `usnvmemu/crates/pcie_remote_nvme_userspace/Cargo.toml`（删 protocol 依赖）
-- `usnvmemu/crates/pcie_remote_nvme_userspace/src/controller/{mod,admin,io,completion,mmio,reservation}.rs`（~50 ctx 调用点）
-- `usnvmemu/crates/pcie_remote_nvme_userspace/src/controller/tests.rs`（13 `for_testing` 改写）
-- `usnvmemu/crates/pcie_remote_nvme_userspace/src/main.rs`（不动）
+- `usnvmemu/crates/pcie_device_sdk/src/device.rs`（PcieDevice + DeviceCtx）
+- `usnvmemu/crates/pcie_device_sdk/src/run.rs`（主循环 + 8 wire 单测）
+- `usnvmemu/crates/pcie_device_sdk/src/transport.rs`（旧 `Transport` 别名重命名点）
+- `usnvmemu/crates/pcie_device_sdk/src/lib.rs`（re-export）
+- `usnvmemu/crates/pcie_device_sdk/Cargo.toml`
+- `usnvmemu/crates/nvme_firmware/Cargo.toml`（删 protocol 依赖）
+- `usnvmemu/crates/nvme_firmware/src/controller/{mod,admin,io,completion,mmio,reservation}.rs`（~50 ctx 调用点）
+- `usnvmemu/crates/nvme_firmware/src/controller/tests.rs`（13 `for_testing` 改写）
+- `usnvmemu/crates/nvme_firmware/src/main.rs`（不动）
 - workspace `/Cargo.toml` 加 `pcie_device_sdk` member

@@ -7,7 +7,7 @@
 //!
 //! 所有 on-wire struct 用 `#[repr(C, packed)]` + zerocopy `FromBytes/IntoBytes`；
 //! 字段都是 LE on x86_64。BE 主机本 crate compile error（与
-//! pcie_vfio_user_sdk 一致）。
+//! vfio_user_transport 一致）。
 
 use thiserror::Error;
 use zerocopy::FromBytes;

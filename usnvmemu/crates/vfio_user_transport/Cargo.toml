@@ -1,0 +1,19 @@
+[package]
+name = "vfio_user_transport"
+version = "0.1.0"
+edition = "2024"
+description = "vfio-user (Nutanix libvfio-user 协议) Transport backend for pcie_device_sdk PcieDevice 实现，让同一份用户态 PCIe 设备通过 QEMU -device vfio-user-pci,socket=... 直接被 QEMU 接管。"
+
+[dependencies]
+pcie_device_sdk = { path = "../pcie_device_sdk" }
+anyhow = "1.0.102"
+thiserror = "1.0"
+tracing = "0.1.44"
+parking_lot = "0.12.5"
+nix = { version = "0.30", features = ["socket", "uio", "fs", "event"] }
+zerocopy = { version = "0.8", features = ["derive"] }
+bytes = "1.10"
+libc = "0.2"
+
+[dev-dependencies]
+tracing-subscriber = "0.3.23"

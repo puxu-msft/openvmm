@@ -80,13 +80,13 @@ QEMU vfio-user 是行业标准 (8+ / Cloud Hypervisor / SPDK)，缺这一条
 意味着第 3 条接入只是"代码 shipped"而非"真生产可用"。
 
 **Acceptance**：
-- 启 `pcie_remote_nvme_userspace --vfio-user-socket /tmp/nvme.sock`
+- 启 `nvme_firmware --vfio-user-socket /tmp/nvme.sock`
 - QEMU `-device vfio-user-pci,socket=/tmp/nvme.sock` 启 guest
 - guest 看到 NVMe BDF，nvme list / nvme id-ctrl / IO 通
 - harness 在 CI 跑 (需 QEMU 8+ in test runner)
 
 **Blockers**：QEMU 8+ in test env；现在的 QEMU_VFIO_USER.md 散在
-`pcie_remote_nvme_userspace/`，集中到 `scripts/qemu_interop/README.md`。
+`nvme_firmware/`，集中到 `scripts/qemu_interop/README.md`。
 
 ### V-followup-discovery-multi-portal-real (Tier 2, MEDIUM, 预计 1 day)
 
@@ -108,27 +108,31 @@ auth / FAILURE2 from host)，对齐 lib test。
 **Why**：lib test 覆盖了，但 Python harness 缺；跨进程实证 wire 错误路径才能
 保 Linux nvme-cli 拿到正确 FAILURE1 diagnostic。
 
-### V-followup-firmware-rename + transport-tutorial (Tier 2, MEDIUM, 预计 1-2 days)
+### ✅ V-followup-firmware-rename (Tier 2, 2026-06-08 已 SHIPPED — crate 改名部分)
 
-**What**：按 firmware-as-core 愿景重命名 + 加教学:
-- `pcie_remote_nvme_userspace` → `nvme_firmware` (强调 "是 firmware")
-- `pcie_remote_userspace_sdk` → `pcie_device_sdk` (去 "remote" 暗示，强调通用)
-- `pcie_remote_protocol` → `pcie_remote_wire` (强调 "是 wire 协议之一")
-- 写 `docs/HOW_TO_ADD_TRANSPORT.md` — 教学加第 5 条 transport (e.g. iSCSI / NBD)
+**What (已做)**：按 firmware-as-core 愿景重命名 crate (跟 usnvmemu/ 搬迁一起):
+- `pcie_remote_nvme_userspace` → **`nvme_firmware`** ✅
+- `pcie_remote_userspace_sdk` → **`pcie_device_sdk`** ✅
+- `pcie_vfio_user_sdk` → **`vfio_user_transport`** ✅ (它是 transport backend 不是 SDK)
+- `pcie_remote_rng_userspace` → **`rng_device_example`** ✅
+- `pcie_remote_noop_host` → **`pcie_remote_test_harness`** ✅ (保留 pcie_remote_ 因专测该协议)
+- `nvme_of_tcp_target` 保留 (名字已准确)
 
-**Why**：现命名带 "pcie_remote" 让人误以为 firmware 跟 PCIe Remote 协议绑定，
-事实上已是 transport-agnostic 的。命名也是文档。
+全 `git mv` 保 history；306 tests + clippy 0 warning 维持。
 
-**Acceptance**：
-- 全 grep 改完；306 tests 仍过；clippy 0 warning
-- 改名都用 `git mv` 保 history
-- `HOW_TO_ADD_TRANSPORT.md` 含真 example: 加一条 toy "stdio-pipe" transport
-
-**Blockers**：跟 Phase X (仓库拆分) 一起做更好，避免双轨；建议同期做。
+**What (仍未做, 留后续)**：
+- `pcie_remote_protocol` → `pcie_remote_wire` — 该 crate 在主仓 `vm/devices/`，
+  VTL2 path 还在用；等 Phase X3 仓库拆分一起动
+- `docs/HOW_TO_ADD_TRANSPORT.md` — 教学加第 5 条 transport (e.g. iSCSI / NBD /
+  toy stdio-pipe)。**Tier 2 剩余 HIGH 项**
 
 ### Phase X — 把项目搬出 openvmm 仓库 (Tier 3, MEDIUM-LARGE, 预计 1 week, 分 X1-X4 子段)
 
-**What**：把 `docs/superpowers/examples/*` 7 crates + 文档 + `vm/devices/pcie_remote_*`
+> **进度**: usnvmemu/ 子目录化 + crate 改名 (2026-06-08) 已完成 Phase X 的
+> 内部重组部分 (相当于 X3 的"新 repo 结构"先在原仓内立好)。剩余 X1 (git dep
+> 试水) / X2 (pal_async → tokio) / X4 (真独立 repo + vendor) 待做。
+
+**What**：把 `usnvmemu/crates/*` 6 crate + 文档 + `vm/devices/pcie_remote_*`
 搬出 openvmm，作为独立仓库。openvmm 仅留 VTL2 device 部分。
 
 **Why**：教学项目独立有利于贡献者门槛 + CI 速度 + 文档/代码一体。
@@ -194,7 +198,7 @@ auth / FAILURE2 from host)，对齐 lib test。
 
 ### V10 — DMA Backend (HUGE)
 
-**What**：替换 `pcie_remote_nvme_userspace` 教学 controller 的 file-backed
+**What**：替换 `nvme_firmware` 教学 controller 的 file-backed
 storage 到真 PCIe NVMe device，把 nvme-of target 变成 NVMe-oF JBOD gateway。
 
 ### V-spec-strict-mode (MEDIUM-LARGE)
@@ -264,7 +268,7 @@ storage 到真 PCIe NVMe device，把 nvme-of target 变成 NVMe-oF JBOD gateway
 
 | Phase 段 | 范围 | 文档归属 | commit 范围 |
 |---------|------|---------|------------|
-| Phase A..J (NVMe userspace 初版) | 单 PRP / SQ-CQ / dual-PRP / CRC PI | [`examples/pcie_remote_nvme_userspace/README.md`](../examples/pcie_remote_nvme_userspace/README.md) | 早期 (SESSION_LOG 涵盖) |
+| Phase A..J (NVMe userspace 初版) | 单 PRP / SQ-CQ / dual-PRP / CRC PI | [`examples/nvme_firmware/README.md`](../examples/nvme_firmware/README.md) | 早期 (SESSION_LOG 涵盖) |
 | Phase K1..K9 (NVMe PI + Sanitize + Compare + Reservation) | T10 DIF + Compare PRP-list + NS Management + Sanitize + Doorbell Buffer + Reservation HOSTID | nvme userspace README | (SESSION_LOG 早期截止；后续段散见) |
 | Phase L1..L5 (NVMe ZNS 基础 + Log Page + Directive + Security) | ZNS basics + Identify CNS 0x05/0x06 + Reservation Notification Log + Directive Send/Recv + Security Send/Recv | nvme userspace README | 2026-05-31..06-01 |
 | Phase M1..M3 (NVMe IRQ coalesce + mmap + parallel) | Set Features 0x08 + mmap zero-copy + per-queue parallel ADR | nvme userspace README + `M2_MMAP_DESIGN.md` + `M3_PARALLEL_DESIGN.md` | `003bdb33`..`3658d21f` |
@@ -275,7 +279,7 @@ storage 到真 PCIe NVMe device，把 nvme-of target 变成 NVMe-oF JBOD gateway
 | Phase R1+R3+R4 (NVMe SGL + Identify advertise + RBAR) | SGL Data Block + sgls 字段 + RBAR ADR | nvme userspace README "## Phase R 系列" (本次 audit 补) | `f19c193f` |
 | Phase S1..S7 (NVMe NS WP / NS Attach / Controller List / ANA state machine) | Write Protect + COPY conflict + Identify NS NAWUN 等 + NS Attachment 0x15 + Controller List CNS 0x12/13 + Reservation Notification Log + ANA state machine + Change AEN | nvme userspace README "## Phase S 系列" (本次 audit 补) | `d0b36b19`..`f8d847ea` + `10f987f5` |
 | K-20 hotplug (pcie_remote) | listener 永不退 + worker transport refresh | [`../PCIE_REMOTE_HOTPLUG_DESIGN.md`](../PCIE_REMOTE_HOTPLUG_DESIGN.md) (本次 audit 修正) + SESSION_LOG | `a99cdc63` + `64da8fb6` + `93c5fa5f` |
-| Phase I3 (RNG example) | 第二个 PcieDevice 教学 example | [`../examples/pcie_remote_rng_userspace/README.md`](../examples/pcie_remote_rng_userspace/README.md) (本次 audit 补) | `7402dd62` |
+| Phase I3 (RNG example) | 第二个 PcieDevice 教学 example | [`../examples/rng_device_example/README.md`](../examples/rng_device_example/README.md) (本次 audit 补) | `7402dd62` |
 
 **判据 — 何时写独立 plan，何时跳过**：
 - 写 plan: > 1 day 工作 + 跨多 module + reviewer round 可能 ≥ 2 轮 + 决策点不止 1 个

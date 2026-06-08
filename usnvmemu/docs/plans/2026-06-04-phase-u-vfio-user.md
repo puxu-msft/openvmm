@@ -1,6 +1,6 @@
 # Phase U — vfio-user Backend
 
-> **✅ SHIPPED (2026-06-06 audit)** — `pcie_vfio_user_sdk` crate 落地 (U1-U5)，NVMe controller behind vfio-user 接 QEMU 模式跑通 (commit `2d284030` Phase U-followup)。同时 `usnvmemu/docs/specs/2026-06-05-vfio-user-client-design.md` 走了 round-2 reviewer 收敛 14 条 caveat (`9b2e1dca`)。本文档保留为历史 design 记录。
+> **✅ SHIPPED (2026-06-06 audit)** — `vfio_user_transport` crate 落地 (U1-U5)，NVMe controller behind vfio-user 接 QEMU 模式跑通 (commit `2d284030` Phase U-followup)。同时 `usnvmemu/docs/specs/2026-06-05-vfio-user-client-design.md` 走了 round-2 reviewer 收敛 14 条 caveat (`9b2e1dca`)。本文档保留为历史 design 记录。
 
 > **Status:** design draft（执行前再细化）
 > **Date:** 2026-06-04
@@ -30,7 +30,7 @@
 ## 3. 新 crate
 
 ```
-usnvmemu/crates/pcie_vfio_user_sdk/  ── NEW
+usnvmemu/crates/vfio_user_transport/  ── NEW
   Cargo.toml   deps: pcie_device_sdk + nix (fd-passing) + bytes
                      + futures + anyhow + tracing （NO tokio NO libvfio-user）
   src/lib.rs                 mod 声明 + serve_unix(path, factory)
@@ -119,7 +119,7 @@ eventfd trigger；CLI 加 `--vfio-user-sock`；QEMU + Linux guest 见 `nvme0n1`�
 
 ```bash
 # Term 1
-./target/release/pcie_remote_nvme_userspace \
+./target/release/nvme_firmware \
     --vfio-user-sock /tmp/nvme.sock \
     --backing-file /tmp/ns1.img
 
@@ -172,7 +172,7 @@ qemu-system-x86_64 -enable-kvm -m 1G -smp 2 \
 
 ## 14. Acceptance
 
-- [ ] `pcie_vfio_user_sdk` cargo build + clippy 0 warning
+- [ ] `vfio_user_transport` cargo build + clippy 0 warning
 - [ ] 单测 ≥ 30，覆盖 7 个 message family
 - [ ] CLI `--vfio-user-sock` 启动 + QEMU + Linux guest 见 NVMe 盘 + mkfs + 大文件 IO
 - [ ] 现有 67 NVMe + 7 SDK + OpenHCL e2e 不回归

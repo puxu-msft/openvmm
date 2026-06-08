@@ -38,8 +38,8 @@ use crate::r2t::encode_r2t;
 use crate::tcp_transport::TcpAdminTransport;
 use crate::ttag::TtagAllocator;
 use anyhow::Context as _;
-use pcie_remote_nvme_userspace::NvmeController;
-use pcie_remote_nvme_userspace::cmd::Sqe;
+use nvme_firmware::NvmeController;
+use nvme_firmware::cmd::Sqe;
 use std::collections::HashMap;
 use std::net::TcpStream;
 use zerocopy::FromBytes;
@@ -406,7 +406,7 @@ impl V2Session {
         // **V8c** — fire 仅本 conn 的最早 pending AER；其它 conn 的 AER 不动
         let conn_id = self.conn_id;
         let fired = self.with_controller(|c| {
-            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
             c.nvme_fire_aen_for_conn(&mut ctx, aen_type, aen_info, log_id, conn_id)
         });
         self.next_token = tcp_t.token_high_water();
@@ -526,7 +526,7 @@ impl V2Session {
 
         // ─── Phase 1：dispatch ─────────────────────────────────────────
         let immediate_cqe = self.with_controller(|c| {
-            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
             c.nvme_io_dispatch(&mut ctx, sq_id, sqe, cid, cq_id)
         });
 
@@ -608,7 +608,7 @@ impl V2Session {
             let mut tcp_t = TcpAdminTransport::new_with_token_base(self.next_token);
             let conn_id = self.conn_id;
             let immediate = self.with_controller(|c| {
-                let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
                 c.nvme_admin_dispatch_with_conn(&mut ctx, sqe, cid, 0, conn_id)
             });
             self.next_token = tcp_t.token_high_water();
@@ -699,7 +699,7 @@ impl V2Session {
         // ─── Phase 1：dispatch ─────────────────────────────────────────
         let conn_id = self.conn_id;
         let immediate_cqe = self.with_controller(|c| {
-            let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+            let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
             c.nvme_admin_dispatch_with_conn(&mut ctx, sqe, cid, 0, conn_id)
         });
 
@@ -746,7 +746,7 @@ impl V2Session {
     fn run_post_dispatch(
         &mut self,
         cid: u16,
-        immediate_cqe: Option<pcie_remote_nvme_userspace::cmd::Cqe>,
+        immediate_cqe: Option<nvme_firmware::cmd::Cqe>,
         mut tcp_t: TcpAdminTransport,
     ) -> anyhow::Result<()> {
         // ─── Phase 1.5：mixed-path guard ─────────────────────────────
@@ -793,7 +793,7 @@ impl V2Session {
             // （锁外 R2T+H2CData wire I/O），现在用 with_controller 短锁
             // 调 complete_dma，让 controller post_cqe + 推进 pending_ios。
             self.with_controller(|c| {
-                let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
                 c.nvme_admin_complete_dma(&mut ctx, read_req.token, true, bytes);
             });
         }
@@ -801,7 +801,7 @@ impl V2Session {
         // ─── Phase 3：同步 / 异步 write-out 路径 ─────────────────────
         if let Some(cqe) = immediate_cqe {
             self.with_controller(|c| {
-                let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
                 c.nvme_post_cqe(&mut ctx, cqe);
             });
         } else if !had_pending_reads {
@@ -818,7 +818,7 @@ impl V2Session {
             }
             for tok in data_tokens {
                 self.with_controller(|c| {
-                    let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut tcp_t);
+                    let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut tcp_t);
                     c.nvme_admin_complete_dma(&mut ctx, tok, true, Vec::new());
                 });
             }
@@ -979,7 +979,7 @@ impl V2Session {
     #[allow(dead_code)]
     fn write_capsule_resp_from_cqe(
         &mut self,
-        cqe: &pcie_remote_nvme_userspace::cmd::Cqe,
+        cqe: &nvme_firmware::cmd::Cqe,
     ) -> anyhow::Result<()> {
         self.write_capsule_resp_bytes(cqe.as_bytes())
     }
@@ -1106,8 +1106,8 @@ impl V2Session {
         // **review M2** — NoopTransport 只在 V2 验证安全（CC.EN=1 等 reg
         // 写入路径不 invoke ctx.dma_*/fire_interrupt）。V5 真 IO 上线后
         // 应换成完整 transport bridge。
-        let mut t = pcie_vfio_user_sdk::NoopTransport;
-        let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut t);
+        let mut t = vfio_user_transport::NoopTransport;
+        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut t);
         // **review H2** — 用 narrow wrapper；offset 不在白名单时返 false。
         // **V8b** — 短锁；NoopTransport ctx.dma_* / fire_interrupt 都是 no-op，
         // closure 内不会触发 read_pdu，安全持锁。

@@ -27,7 +27,7 @@ use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
 use nvme_of_tcp_target::{
     AsyncSession, PumpEvent, SharedControllerInner, V2Session, accept_and_handshake_async,
 };
-use pcie_remote_nvme_userspace::NvmeController;
+use nvme_firmware::NvmeController;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use zerocopy::IntoBytes;
@@ -210,7 +210,7 @@ async fn v8e3_async_session_drop_cleans_pending_aers() {
             nvme_of_tcp_target::ADMIN_CQ_SIZE,
         );
         let mut t = NullTransport;
-        let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut t);
+        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut t);
         for cid in [1u16, 2u16] {
             let r = c.nvme_admin_dispatch_with_conn(&mut ctx, make_aer_sqe(cid), cid, 0, conn_id);
             assert!(r.is_none(), "AER should queue async");
@@ -293,7 +293,7 @@ fn std_tcp_pair() -> (std::net::TcpStream, std::net::TcpStream) {
 
 // helper: null transport for direct controller push (V8c/V8d 同模式)
 struct NullTransport;
-impl pcie_remote_userspace_sdk::Transport for NullTransport {
+impl pcie_device_sdk::Transport for NullTransport {
     fn fire_interrupt(&mut self, _msix_index: u32) {}
     fn dma_write(&mut self, _gpa: u64, _data: Vec<u8>) -> u64 {
         0
@@ -303,9 +303,9 @@ impl pcie_remote_userspace_sdk::Transport for NullTransport {
     }
 }
 
-fn make_aer_sqe(cid: u16) -> pcie_remote_nvme_userspace::cmd::Sqe {
+fn make_aer_sqe(cid: u16) -> nvme_firmware::cmd::Sqe {
     use zerocopy::FromZeros as _;
-    let mut sqe = pcie_remote_nvme_userspace::cmd::Sqe::new_zeroed();
+    let mut sqe = nvme_firmware::cmd::Sqe::new_zeroed();
     sqe.cdw0 = ((cid as u32) << 16) | 0xC;
     sqe
 }

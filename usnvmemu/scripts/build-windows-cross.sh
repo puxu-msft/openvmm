@@ -3,8 +3,8 @@
 # 不需要 xwin，复用本机已装的 VS Build Tools + Windows SDK。
 #
 # 用法（在 WSL 内仓库根目录）:
-#   ./docs/superpowers/scripts/build-windows-cross.sh <crate-name>
-#   ./docs/superpowers/scripts/build-windows-cross.sh ohcldiag-dev
+#   ./usnvmemu/scripts/build-windows-cross.sh <crate-name>
+#   ./usnvmemu/scripts/build-windows-cross.sh ohcldiag-dev
 #
 # 前置 (WSL 端)：
 #   sudo apt install clang-tools-20 llvm        # 提供 clang-cl-20 / llvm-lib-20
@@ -35,9 +35,10 @@ export OPENVMM_WINDOWS_CROSS_TOOL="$TOOLDIR/cross_tool.py"
 rm -f ~/.cache/windows-cross/cross-x86_64.json
 
 # **Phase Q12** — 对 exclude 列表里的 standalone example，cd 到目录构建
-# 而不 -p（否则 'package ID 不匹配'）。判断标准：example 目录存在 +
+# 而不 -p（否则 'package ID 不匹配'）。判断标准：crate 目录存在 +
 # 根 Cargo.toml exclude 列表含此路径。
-EXAMPLE_DIR="docs/superpowers/examples/$CRATE"
+# 2026-06-08 修：crate 已搬到 usnvmemu/crates/ (原 docs/superpowers/examples/)。
+EXAMPLE_DIR="usnvmemu/crates/$CRATE"
 if [ -d "$EXAMPLE_DIR" ] && grep -q "\"$EXAMPLE_DIR\"" Cargo.toml; then
     echo "Building $CRATE (standalone example) for x86_64-pc-windows-msvc..."
     cd "$EXAMPLE_DIR"

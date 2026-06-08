@@ -39,7 +39,7 @@
    spec][spec]）。
 2. Guest 看到的就是一颗普通 PCIe BDF；**Linux nvme.ko / Windows
    stornvme.sys 等 inbox driver 0 改动**即可枚举与使用。
-3. 起步对端：本仓 `usnvmemu/crates/pcie_vfio_user_sdk` 暴露的
+3. 起步对端：本仓 `usnvmemu/crates/vfio_user_transport` 暴露的
    NVMe demo（自闭环，无外部依赖）。
 4. P1 扩到 SPDK NVMe vfio-user target、Windows guest interop、反向 QEMU
    挂载验证。
@@ -51,7 +51,7 @@
 - OpenHCL VTL2 paravisor 客户端实现 — Phase B 另开 spec。
 - migration / hot-plug / AER / PM cap 转发 — 推到 P2，仅在 Backend
   trait 留扩展点。
-- 本仓 `pcie_vfio_user_sdk` **server 侧**任何协议补全 / 重构 — 79+
+- 本仓 `vfio_user_transport` **server 侧**任何协议补全 / 重构 — 79+
   tests 不下水。
 - 写任何新 guest driver — 我们消费现有 driver。
 
@@ -102,7 +102,7 @@ vm/devices/pci/
 │   ├── deps: vfio_user_wire + nix + libc + thiserror
 │   ├── #![cfg(target_os = "linux")]
 │   ├── framing.rs   UnixStream sendmsg/recvmsg + SCM_RIGHTS
-│   │                 → 直接 vendor pcie_vfio_user_sdk::framing::into_owned_fd
+│   │                 → 直接 vendor vfio_user_transport::framing::into_owned_fd
 │   │                   的 unsafe + SAFETY 注释（禁重写，对照 SDK 单测）
 │   ├── transport.rs trait Transport { recv() / send_with_fds() }（sync，sans-IO 风格）
 │   └── eventfd.rs   薄包装（Linux only）
@@ -206,14 +206,14 @@ pub enum DmaChannel {
   `#![deny(unsafe_code)]`（rust-reviewer R2 caveat C1）— workspace
   lints 通常不含此项，sans-IO crate 必须单独 deny 才能闭环 finding 8。
 
-### 4.4 server crate (`pcie_vfio_user_sdk`) 关系
+### 4.4 server crate (`vfio_user_transport`) 关系
 
 - **不重构、不 re-export**。其 `proto.rs` / `framing.rs` 与 Layer 1
   形态接近但语义方向相反（server 是 receiver，client 是 sender；server
   state machine 与 client outbound build 不重合）。
 - **一致性手段**：Layer 1 单测套用 server 同款 golden byte vectors，每
   改 wire 必须双向 golden 对齐；CI 跑 `cargo test -p vfio_user_wire -p
-  pcie_vfio_user_sdk` 双绿。
+  vfio_user_transport` 双绿。
 - server 的 79 tests 不动；wire 层"共享"是字节级 + 测试级，不是代码级。
 - **golden vector 单一 source of truth**（architect R2 caveat 3）：放
   `vm/devices/pci/vfio_user_wire/tests/golden/*.bin`；server crate 通过
@@ -331,7 +331,7 @@ end-to-end, including:
   - Any socket path under world-writable parent directories
   - Any server running with different effective uid than this client
 
-P0 builds are validated ONLY against `pcie_vfio_user_sdk` demo server
+P0 builds are validated ONLY against `vfio_user_transport` demo server
 in-tree. Production deployments must wait for P1 completion (F1+F3+F6).
 ```
 

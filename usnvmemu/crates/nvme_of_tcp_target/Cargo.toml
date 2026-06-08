@@ -2,14 +2,14 @@
 name = "nvme_of_tcp_target"
 version = "0.1.0"
 edition = "2024"
-description = "NVMe-over-Fabrics TCP target backed by pcie_remote_nvme_userspace NvmeController；标准 nvme-cli (Linux ≥ 5.0 / Windows Server 2025) 可 `nvme connect -t tcp` 直接挂载。"
+description = "NVMe-over-Fabrics TCP target backed by nvme_firmware NvmeController；标准 nvme-cli (Linux ≥ 5.0 / Windows Server 2025) 可 `nvme connect -t tcp` 直接挂载。"
 
 [dependencies]
-pcie_remote_nvme_userspace = { path = "../pcie_remote_nvme_userspace" }
+nvme_firmware = { path = "../nvme_firmware" }
 # **V2** — 复用 NoopTransport stub 给 controller.mmio_write_impl(ctx)；
 # CC.EN=1 等 Property Set 路径不会触发 dma/interrupt，stub 安全。
-pcie_vfio_user_sdk = { path = "../pcie_vfio_user_sdk" }
-pcie_remote_userspace_sdk = { path = "../pcie_remote_userspace_sdk" }
+vfio_user_transport = { path = "../vfio_user_transport" }
+pcie_device_sdk = { path = "../pcie_device_sdk" }
 anyhow = "1.0.102"
 thiserror = "1.0"
 tracing = "0.1.44"

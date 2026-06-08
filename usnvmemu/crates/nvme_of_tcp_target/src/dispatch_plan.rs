@@ -21,7 +21,7 @@
 #![allow(missing_docs)]
 
 use crate::aer::{ADMIN_OPC_AER, MAX_PENDING_AERS};
-use pcie_remote_nvme_userspace::cmd::Sqe;
+use nvme_firmware::cmd::Sqe;
 
 /// 一条 capsule cmd PDU 的粗分类（fabric / admin / IO / 非法长度）。
 ///

@@ -49,7 +49,7 @@
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use nvme_of_tcp_target::V2Session;
-use pcie_remote_nvme_userspace::NvmeController;
+use nvme_firmware::NvmeController;
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -275,7 +275,7 @@ async fn main() -> Result<()> {
     // **V7 / V8a** — discovery mode 必填 target NQN + addr 多 portal；
     // zip 配对（必须等长且非空）；spawn 时 clone 给每条 conn handler
     let discovery_portals: Vec<
-        pcie_remote_nvme_userspace::controller::discovery_log::DiscoveryPortal,
+        nvme_firmware::controller::discovery_log::DiscoveryPortal,
     > = if cli.discovery_mode {
         if cli.discovery_target_nqn.is_empty() || cli.discovery_target_addr.is_empty() {
             anyhow::bail!(
@@ -295,7 +295,7 @@ async fn main() -> Result<()> {
             .iter()
             .zip(cli.discovery_target_addr.iter())
         {
-            let portal = pcie_remote_nvme_userspace::controller::discovery_log::DiscoveryPortal::from_ipv4_addr(
+            let portal = nvme_firmware::controller::discovery_log::DiscoveryPortal::from_ipv4_addr(
                 nqn, addr,
             )
             .with_context(|| format!("parse --discovery-target-addr {addr:?}"))?;
@@ -384,7 +384,7 @@ async fn main() -> Result<()> {
             .iter()
             .zip(cli.discovery_target_addr.iter())
         {
-            let p = pcie_remote_nvme_userspace::controller::discovery_log::DiscoveryPortal::from_ipv4_addr(
+            let p = nvme_firmware::controller::discovery_log::DiscoveryPortal::from_ipv4_addr(
                     nqn, addr,
                 )
                 .with_context(|| format!("parse V8f discovery_target_addr {addr:?}"))?;

@@ -24,7 +24,7 @@ use nvme_of_tcp_target::fabric::{self, ConnectData, ConnectFabricFields, fctype}
 use nvme_of_tcp_target::framing::{read_pdu, write_pdu};
 use nvme_of_tcp_target::pdu::{CommonHdr, DataPsh, IcPsh, R2tPsh, pdu_type};
 use nvme_of_tcp_target::{SharedController, SharedControllerInner, V2Session};
-use pcie_remote_nvme_userspace::NvmeController;
+use nvme_firmware::NvmeController;
 use std::io::Write as _;
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;

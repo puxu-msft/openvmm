@@ -20,7 +20,7 @@ use nvme_of_tcp_target::{
     AsyncSession, SharedControllerInner, accept_and_handshake_async,
     accept_and_handshake_async_with_auth,
 };
-use pcie_remote_nvme_userspace::NvmeController;
+use nvme_firmware::NvmeController;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;

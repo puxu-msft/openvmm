@@ -11,7 +11,7 @@
 
 ## 1. 当前状态
 
-- **Controller 层 (pcie_remote_nvme_userspace)** 已**完整实现** PRP-list path
+- **Controller 层 (nvme_firmware)** 已**完整实现** PRP-list path
   (Phase E): `controller/io.rs::dispatch_io` 在 `bytes > 2 * NVME_PAGE_SIZE`
   时进 PRP-list 分支，分配 `op_id` + 入 `prp_list_ops` HashMap + dma_read
   PRP list page → dma_write data pages

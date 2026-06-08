@@ -1,7 +1,7 @@
 # nvme_of_tcp_target
 
 **V-followup-dhchap-4d + V-followup-tls-psk (TP-8011) 全栈** — NVMe-over-Fabrics TCP target backed by
-[`pcie_remote_nvme_userspace`](../pcie_remote_nvme_userspace/) `NvmeController`。
+[`nvme_firmware`](../nvme_firmware/) `NvmeController`。
 Linux ≥ 5.0 / Windows Server 2025 上的标准 `nvme-cli` 可通过
 `nvme connect -t tcp` 直接挂载并跑 IO。
 
@@ -227,7 +227,7 @@ cargo test -p nvme_of_tcp_target
 cargo test -p nvme_of_tcp_target --test bin_smoke
 
 # 完整套（含 controller backend）
-cd ../pcie_remote_nvme_userspace && cargo test --lib
+cd ../nvme_firmware && cargo test --lib
 ```
 
 预期 78 + 1 + 67 = 146 测试全 green。
@@ -584,7 +584,7 @@ target → host:  CapsuleResp SC=0 (通过) / SC=0x83 (失败)
   [V-followup-prp-list detailed (SUPERSEDED)](../../plans/2026-06-06-phase-v-followup-prp-list-detailed.md)
 
 **Backend / Python harness**:
-- backend controller：[`../pcie_remote_nvme_userspace/README.md`](../pcie_remote_nvme_userspace/README.md)
+- backend controller：[`../nvme_firmware/README.md`](../nvme_firmware/README.md)
 - Python interop harness：[`scripts/interop_py/`](scripts/interop_py/) (9 个 script，详 `scripts/interop_py/README.md`)
 - Integration tests 命名约定：见 [PRINCIPLES §10](../../plans/PRINCIPLES.md)
 

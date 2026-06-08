@@ -3,7 +3,7 @@
 # 角色：vsock client。OpenHCL（VTL2 内）是 server (vsock listen on $VsockPort)。
 # 此脚本在 Windows host 上跑 AF_HYPERV connect 到 (target_vm_id, service_guid)。
 #
-# 协议：与 docs/superpowers/examples/pcie_remote_noop_host/src/main.rs 完全等价
+# 协议：与 docs/superpowers/examples/pcie_remote_test_harness/src/main.rs 完全等价
 # 的最小 noop 设备，但走 vsock 而非 TCP。
 #
 # 用法（管理员或 Hyper-V Administrators）：
@@ -14,7 +14,7 @@
 #
 # ⚠ 这是最小可工作版本，仅响应 Hello + MMIO read 0。完整的 host SDK
 # （DMA、interrupt、cfg-side-effect）请用 Rust 版 host_stub（在 Windows 上
-# 跨编或原生编 docs/superpowers/examples/pcie_remote_noop_host）。
+# 跨编或原生编 docs/superpowers/examples/pcie_remote_test_harness）。
 
 param(
     [Parameter(Mandatory=$true)]

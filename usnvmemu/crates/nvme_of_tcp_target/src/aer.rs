@@ -26,7 +26,7 @@
 ///
 /// **V6c-polish (review M-1)** — re-export controller `admin_opc` 模块的
 /// 同名常量，避免双源 magic number 漂移。
-pub use pcie_remote_nvme_userspace::cmd::admin_opc::ASYNC_EVENT_REQUEST as ADMIN_OPC_AER;
+pub use nvme_firmware::cmd::admin_opc::ASYNC_EVENT_REQUEST as ADMIN_OPC_AER;
 
 /// session 镜像可同时持有的最多 pending AER 数。
 /// 与 controller `aen_pending` 容量协同；超过此值 session 直接返
@@ -81,7 +81,7 @@ mod tests {
     /// `MAX_PENDING_AERS=4` 一致。controller 默认 AERL 漂移立刻被该测试捕获。
     #[test]
     fn max_pending_aers_aligns_with_controller_identify_aerl() {
-        use pcie_remote_nvme_userspace::cmd::IdentifyController;
+        use nvme_firmware::cmd::IdentifyController;
         // Identify Controller bytes 259 = AERL field (spec § 5.15.2.1 Figure 312)
         let id = IdentifyController::build_v2_bytes(0x1414, 0, 1);
         let aerl_zero_based = id[259];

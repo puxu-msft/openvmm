@@ -34,9 +34,9 @@ in-flight save/restore — 全部 V-followup。
 
 ```
 docs/superpowers/examples/
-├── pcie_remote_userspace_sdk/
-├── pcie_remote_nvme_userspace/       （existing，refactor 后变薄）
-├── pcie_vfio_user_sdk/               （Phase U 加）
+├── pcie_device_sdk/
+├── nvme_firmware/       （existing，refactor 后变薄）
+├── vfio_user_transport/               （Phase U 加）
 ├── nvme_controller_core/             NEW V0 —— lib crate
 │   src/{lib.rs, transport.rs, cmd.rs, sgl.rs, pi.rs, regs.rs, controller/}
 └── nvme_of_tcp_target/               NEW V1 —— sibling example crate
@@ -45,8 +45,8 @@ docs/superpowers/examples/
          transport_impl.rs, tests/}
 ```
 
-V0 把 `pcie_remote_nvme_userspace/src/{controller,cmd,sgl,pi,regs}.rs` 上提到
-`nvme_controller_core` lib；`pcie_remote_nvme_userspace` 变 thin adapter；
+V0 把 `nvme_firmware/src/{controller,cmd,sgl,pi,regs}.rs` 上提到
+`nvme_controller_core` lib；`nvme_firmware` 变 thin adapter；
 `nvme_of_tcp_target` 也只挂 `nvme_controller_core`，0 重复代码。
 
 ## 4. NVMe TCP Transport Spec 1.0a 对照

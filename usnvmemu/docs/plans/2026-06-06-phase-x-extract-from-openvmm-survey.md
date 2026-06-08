@@ -18,11 +18,11 @@
 `openvmm/Cargo.toml` exclude 段：
 ```
 exclude = [
-  "usnvmemu/crates/pcie_remote_noop_host",
-  "usnvmemu/crates/pcie_remote_userspace_sdk",
-  "usnvmemu/crates/pcie_remote_nvme_userspace",
-  "usnvmemu/crates/pcie_remote_rng_userspace",
-  "usnvmemu/crates/pcie_vfio_user_sdk",
+  "usnvmemu/crates/pcie_remote_test_harness",
+  "usnvmemu/crates/pcie_device_sdk",
+  "usnvmemu/crates/nvme_firmware",
+  "usnvmemu/crates/rng_device_example",
+  "usnvmemu/crates/vfio_user_transport",
   "usnvmemu/crates/nvme_of_tcp_target",
   "docs/superpowers/examples/vmrs_log_scanner",
 ]
@@ -95,14 +95,14 @@ vmsocket = { git = "...", rev = "<sha>" }
 - `PolledSocket` → `tokio::net::TcpStream`
 - `PolledTimer` → `tokio::time::Sleep`
 
-`nvme_of_tcp_target` 已经全 tokio (V8e refactor)，只剩 `pcie_remote_userspace_sdk` + `pcie_remote_nvme_userspace` 还用 pal_async。
+`nvme_of_tcp_target` 已经全 tokio (V8e refactor)，只剩 `pcie_device_sdk` + `nvme_firmware` 还用 pal_async。
 
 **代价**: 大 (≈ 3-5 天)。但 `nvme_of_tcp_target` 早已 tokio，证明这条路工程上 OK；剩下两 crate 也都是 worker loop + socket 模式，迁移直接。
 
 **收益**:
 - 完全脱离 openvmm runtime 生态
 - 新贡献者门槛骤降 (tokio 是 Rust 生态主流)
-- `pcie_vfio_user_sdk` 已经全 tokio，统一栈
+- `vfio_user_transport` 已经全 tokio，统一栈
 
 ## 3. 推荐路径 (按 phase)
 
@@ -112,7 +112,7 @@ vmsocket = { git = "...", rev = "<sha>" }
 
 ### Phase X2 — pal_async fork minimal 或 tokio 替换 (3-5 day)
 
-对 `pcie_remote_userspace_sdk` + `pcie_remote_nvme_userspace` 换 runtime。这是单 phase 内能搞定的最大瓶颈。
+对 `pcie_device_sdk` + `nvme_firmware` 换 runtime。这是单 phase 内能搞定的最大瓶颈。
 
 ### Phase X3 — vendor 剩余 + 新 repo 立 (1 day)
 
@@ -146,7 +146,7 @@ git filter-repo \
 - 长期维护成本: fork pal_async = 持续追 openvmm 主线 vs tokio = stable 接口
 - 见 [LESSONS §3 async + locks 灾难](LESSONS.md)，我们已经吃过 pal_async 的苦了
 
-但 `pcie_remote_userspace_sdk` 是 OpenHCL VTL2 跑的，**runtime 限于 VTL2 paravisor 支持**。VTL2 不能跑 tokio (no_std-ish, 用 pal_async)。这意味着：
+但 `pcie_device_sdk` 是 OpenHCL VTL2 跑的，**runtime 限于 VTL2 paravisor 支持**。VTL2 不能跑 tokio (no_std-ish, 用 pal_async)。这意味着：
 - VTL2 路径必须保留 pal_async
 - 用户态路径（OpenVMM dev / vfio-user / nvme-of-tcp target）可换 tokio
 - 折中: pal_async 用 feature flag 切

@@ -23,7 +23,7 @@ use nvme_of_tcp_target::fabric::{self, ConnectData, ConnectFabricFields, fctype}
 use nvme_of_tcp_target::framing::{Pdu, read_pdu_async, write_pdu_async};
 use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
 use nvme_of_tcp_target::{AsyncSession, SharedControllerInner, accept_and_handshake_async};
-use pcie_remote_nvme_userspace::NvmeController;
+use nvme_firmware::NvmeController;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::{TcpListener, TcpStream};

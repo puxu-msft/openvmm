@@ -28,7 +28,7 @@
 ## 2. 文件清单
 
 **新增**：
-- `pcie_remote_nvme_userspace/src/controller/discovery_log.rs` — Figure 350 header + 1024B/entry × N (~140 LOC)
+- `nvme_firmware/src/controller/discovery_log.rs` — Figure 350 header + 1024B/entry × N (~140 LOC)
 - `nvme_of_tcp_target/tests/discovery_e2e.rs` — e2e (~120 LOC)
 
 **修改**：

@@ -24,7 +24,7 @@ use nvme_of_tcp_target::fabric::{
 use nvme_of_tcp_target::framing::{Pdu, read_pdu_async, write_pdu_async};
 use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
 use nvme_of_tcp_target::{AsyncSession, SharedControllerInner, accept_and_handshake_async};
-use pcie_remote_nvme_userspace::NvmeController;
+use nvme_firmware::NvmeController;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::{TcpListener, TcpStream};
@@ -37,7 +37,7 @@ fn make_discovery_shared() -> (Arc<SharedControllerInner>, tempfile::NamedTempFi
     let mut c = NvmeController::open(std::slice::from_ref(&path), 0x1414, 0, &[]).unwrap();
     // 注入 discovery portal 让 controller 切 discovery mode
     let portal =
-        pcie_remote_nvme_userspace::controller::discovery_log::DiscoveryPortal::from_ipv4_addr(
+        nvme_firmware::controller::discovery_log::DiscoveryPortal::from_ipv4_addr(
             "nqn.2014-08.org.nvmexpress:teaching:disk",
             "127.0.0.1:4420",
         )
@@ -187,7 +187,7 @@ fn build_get_log_page_discovery(cid: u16, bytes: u32) -> Pdu {
 #[tokio::test(flavor = "multi_thread")]
 async fn v_interop_6_libnvme_two_phase_discover_with_lpo() {
     use core::mem::offset_of;
-    use pcie_remote_nvme_userspace::controller::discovery_log::DiscoveryEntry;
+    use nvme_firmware::controller::discovery_log::DiscoveryEntry;
 
     let (shared, _backing) = make_discovery_shared();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -374,7 +374,7 @@ async fn v_interop_6_capture_discovery_log_wire() {
 #[tokio::test(flavor = "multi_thread")]
 async fn v_interop_6_decode_discovery_log_at_anchored_offsets() {
     use core::mem::offset_of;
-    use pcie_remote_nvme_userspace::controller::discovery_log::DiscoveryEntry;
+    use nvme_firmware::controller::discovery_log::DiscoveryEntry;
 
     // 触发 capture (本 test 自包含；不依赖测试运行顺序)
     let (shared, _backing) = make_discovery_shared();

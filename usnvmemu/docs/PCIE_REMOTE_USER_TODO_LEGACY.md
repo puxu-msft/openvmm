@@ -23,7 +23,7 @@
 | K-8/K-11/K-15/K-17/K-18/K-19 spec gaps | ✅ 全部清零 | 48 tests pass |
 | inspect 暴露 device state + Lost/Revive 诊断 | ✅ 2026-05-30 | `ohcldiag-dev inspect pcie_remote` 节点直接看到 `Connecting`/`Live`/`Lost` + `last_lost_at_ms` / `last_revive_at_ms` / `revive_count` / `last_lost_reason`（位标记 READ_ERR=1 / WRITE_ERR=2 / DISPATCH_FAIL=4 / WORKER_EXIT=8）|
 | DMA 速率限制 env override | ✅ 2026-05-30 | `OPENHCL_PCIE_REMOTE_DMA_BPS=<bytes/sec>`：`0`=禁用、`>0`=自定义、未设置=64 MiB/s。启动期读一次缓存，K-20 swap 复活不重读 |
-| **userspace 写 PCIe 设备闭环 (SDK + NVMe example)** | ✅ 2026-05-31 | `pcie_remote_userspace_sdk` ~500 行 + `pcie_remote_nvme_userspace` ~1600 行 reference impl；真 Hyper-V guest 完整 FAT32 format + 文件读写 + backing file 字节持久化；44 unit + 3 e2e + clippy -D warnings 全绿 |
+| **userspace 写 PCIe 设备闭环 (SDK + NVMe example)** | ✅ 2026-05-31 | `pcie_device_sdk` ~500 行 + `nvme_firmware` ~1600 行 reference impl；真 Hyper-V guest 完整 FAT32 format + 文件读写 + backing file 字节持久化；44 unit + 3 e2e + clippy -D warnings 全绿 |
 
 ## ✅ 已闭环路径
 
@@ -78,12 +78,12 @@ Start-VM → PSSession 等就绪 → guest 内 `Get-CimInstance Win32_PnPEntity`
 
 仓库自带 userspace SDK：
 
-- **SDK**：`usnvmemu/crates/pcie_remote_userspace_sdk/`
+- **SDK**：`usnvmemu/crates/pcie_device_sdk/`
   - `src/lib.rs` — crate-level doc + 30 行最小例子骨架
   - `src/device.rs` — `trait PcieDevice` 7 方法签名 + `DeviceCtx` API
     （3 必须：`describe` / `mmio_read` / `mmio_write`；4 可选：
     `cfg_write_side_effect` / `reset` / `tick` / `on_dma_complete`）
-- **Reference impl**：`usnvmemu/crates/pcie_remote_nvme_userspace/`
+- **Reference impl**：`usnvmemu/crates/nvme_firmware/`
   完整 NVMe 1.4 子集（Admin + IO SQ/CQ + Identify + NVM Read/Write
   含 dual-PRP + FLUSH + VWC），~1600 行 Rust。
 - 设计要点见 spec §10 K-NEW-I / K-NEW-J / K-NEW-K。

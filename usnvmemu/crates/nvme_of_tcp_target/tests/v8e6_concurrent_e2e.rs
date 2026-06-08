@@ -26,7 +26,7 @@
 use nvme_of_tcp_target::framing::{read_pdu_async, write_pdu_async};
 use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
 use nvme_of_tcp_target::{PumpEvent, SharedControllerInner, accept_and_handshake_async};
-use pcie_remote_nvme_userspace::NvmeController;
+use nvme_firmware::NvmeController;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

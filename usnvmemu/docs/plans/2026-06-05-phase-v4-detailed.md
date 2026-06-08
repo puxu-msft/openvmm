@@ -151,7 +151,7 @@ feat(nvme-of-tcp): Phase V4a — R2T encoder + H2CData reassembler + TTAG alloca
 | 修改 | `nvme_of_tcp_target/src/tcp_transport.rs` | 删 V3 dma_read warn-only；新加 `pending_reads: VecDeque<PendingHostRead { gpa, len, token }>`；`dma_read` 入队；新增 `pop_read()`、`new_with_token_base(u64) -> Self`、`token_high_water() -> u64`。**修 R-1 + R-2**。 |
 | 修改 | `nvme_of_tcp_target/src/session.rs` | `V2Session` 字段加 `next_token: u64`、`ttag_alloc: TtagAllocator`；`handle_admin_cmd` 内：dispatch 后若 `tcp_t.pending_reads` 非空，**为每条 read** alloc ttag → emit R2T → 调内嵌 `await_host_data` 收齐 → `nvme_admin_complete_dma(tok, true, bytes)` → loop 直到 pending_reads 空 → Phase 3 drain captured writes 不变。 |
 | 修改 | `nvme_of_tcp_target/src/session.rs` | sentinel scheme 改：删 `PRP1_SENTINEL` 单值；改用 `prp1_sentinel_for_ttag(ttag: u16) -> u64`。 |
-| 修改 | `pcie_remote_nvme_userspace/src/sgl.rs` | `SglType::TransportSpecific` 在 target 侧可接受（PCIe path 仍 reject）；放开 `parse_transport_specific` 入口；保持 67 测试不回归。 |
+| 修改 | `nvme_firmware/src/sgl.rs` | `SglType::TransportSpecific` 在 target 侧可接受（PCIe path 仍 reject）；放开 `parse_transport_specific` 入口；保持 67 测试不回归。 |
 
 #### controller wrapper 改动
 

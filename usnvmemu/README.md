@@ -6,8 +6,8 @@
 ```text
                 ┌────────────────────────────────────┐
                 │     用户态 NVMe firmware (core)     │
-                │      pcie_remote_nvme_userspace    │
-                │  + nvme_of_tcp_target (NVMe-oF 层) │
+                │            nvme_firmware            │
+                │  + nvme_of_tcp_target (NVMe-oF 层)  │
                 │ ────────────────────────────────── │
                 │  trait Transport (5 原语)           │
                 └─────────┬───────────┬───────────────┘
@@ -39,12 +39,12 @@
 usnvmemu/
 ├── README.md                              ← 本文件 (项目入口)
 ├── crates/                                ← 6 个 Rust crate
-│   ├── pcie_remote_nvme_userspace/        — 用户态 NVMe firmware 主体
-│   ├── nvme_of_tcp_target/                — NVMe-oF TCP target (firmware + wire 包装)
-│   ├── pcie_remote_userspace_sdk/         — PcieDevice SDK + trait Transport
-│   ├── pcie_vfio_user_sdk/                — vfio-user transport backend (QEMU 接管)
-│   ├── pcie_remote_rng_userspace/         — 第二个 PcieDevice example (RNG, 教学)
-│   └── pcie_remote_noop_host/             — 协议 e2e harness (PCIe Remote 验证)
+│   ├── nvme_firmware/                      — 用户态 NVMe firmware 主体
+│   ├── nvme_of_tcp_target/                 — NVMe-oF TCP target (firmware + wire 包装)
+│   ├── pcie_device_sdk/                    — PcieDevice SDK + trait Transport
+│   ├── vfio_user_transport/                — vfio-user transport backend (QEMU 接管)
+│   ├── rng_device_example/                 — 第二个 PcieDevice example (RNG, 教学)
+│   └── pcie_remote_test_harness/           — 协议 e2e harness (PCIe Remote 验证)
 ├── docs/                                  ← 项目文档
 │   ├── PROJECT_VISION.md                  — 项目愿景 + 架构图
 │   ├── ROADMAP.md                         — 短/中/长期 phase (Tier 1/2/3 优先级)
@@ -72,26 +72,28 @@ usnvmemu/
 
 | crate | 作用 | 类型 |
 |------|------|------|
-| `pcie_remote_userspace_sdk` | **PcieDevice SDK** — 定义 `trait Transport` (5 原语 dma_read/write/fire_and_forget/fire_interrupt)。任何用户态 PCIe 设备都基于它。 | Library |
-| `pcie_remote_nvme_userspace` | **用户态 NVMe firmware 本体** — 完整 NVMe 2.0 spec coverage (Phase A→S7)；transport-agnostic (controller core 只 use `std/zerocopy/super/crate/pcie_remote_userspace_sdk`)。 | Library + Bin |
+| `pcie_device_sdk` | **PcieDevice SDK** — 定义 `trait Transport` (5 原语 dma_read/write/fire_and_forget/fire_interrupt)。任何用户态 PCIe 设备都基于它。 | Library |
+| `nvme_firmware` | **用户态 NVMe firmware 本体** — 完整 NVMe 2.0 spec coverage (Phase A→S7)；transport-agnostic (controller core 只 use `std/zerocopy/super/crate/pcie_device_sdk`)。 | Library + Bin |
 | `nvme_of_tcp_target` | **NVMe-oF TCP target** — 在 NVMe firmware 之上包 NVMe-oF TCP wire 协议 (V1-V8e + V-followup-tls/auth/dhchap)，让 Linux nvme-cli 直接连。 | Bin |
-| `pcie_vfio_user_sdk` | **vfio-user transport backend** — 把 `trait Transport` 接到 vfio-user UNIX socket，让 QEMU/Cloud Hypervisor/SPDK 接管。 | Library |
+| `vfio_user_transport` | **vfio-user transport backend** — 把 `trait Transport` 接到 vfio-user UNIX socket，让 QEMU/Cloud Hypervisor/SPDK 接管。 | Library |
 
 ### 教学 / harness
 
 | crate | 作用 |
 |------|------|
-| `pcie_remote_rng_userspace` | **第二个 PcieDevice example** (~360 LOC)，最小 RNG 设备；证明 SDK 不限 NVMe，可作新设备教学模板。 |
-| `pcie_remote_noop_host` | **PCIe Remote 协议 e2e harness**，两个 bin (TCP + vsock) 主动 connect server 验协议；不是 device。 |
+| `rng_device_example` | **第二个 PcieDevice example** (~360 LOC)，最小 RNG 设备；证明 SDK 不限 NVMe，可作新设备教学模板。 |
+| `pcie_remote_test_harness` | **PCIe Remote 协议 e2e harness**，两个 bin (TCP + vsock) 主动 connect server 验协议；不是 device。 |
 
-> **关于命名**: `pcie_remote_` 前缀是历史包袱（最初项目叫 "OpenHCL/OpenVMM 远程
-> PCIe 实验设备"）。从 firmware-as-core 视角看 "remote" 是 transport 的事，跟
-> firmware 没关系。计划在 ROADMAP Tier 2 `V-followup-firmware-rename` 重构:
-> - `pcie_remote_nvme_userspace` → `nvme_firmware`
-> - `pcie_remote_userspace_sdk` → `pcie_device_sdk`
-> - `pcie_vfio_user_sdk` → `vfio_user_transport`
-> - `pcie_remote_rng_userspace` → `rng_device_example`
-> - `pcie_remote_noop_host` → `pcie_remote_test_harness`
+> **关于命名 (2026-06-08 已重构)**: 历史上这些 crate 叫 `pcie_remote_*`
+> （最初项目叫 "OpenHCL/OpenVMM 远程 PCIe 实验设备"）。从 firmware-as-core
+> 视角看 "remote" 是 transport 的事，跟 firmware 没关系。已按 ROADMAP Tier 2
+> `V-followup-firmware-rename` 重构完成:
+> - `pcie_remote_nvme_userspace` → **`nvme_firmware`** (强调"是 firmware")
+> - `pcie_remote_userspace_sdk` → **`pcie_device_sdk`** (去 "remote"，强调通用 PCIe 设备 SDK)
+> - `pcie_vfio_user_sdk` → **`vfio_user_transport`** (它是 transport backend 不是 SDK)
+> - `pcie_remote_rng_userspace` → **`rng_device_example`** (教学 example)
+> - `pcie_remote_noop_host` → **`pcie_remote_test_harness`** (协议 e2e harness, 保留 pcie_remote_ 因它专测该协议)
+> - `nvme_of_tcp_target` 保留 (名字已准确)
 
 ## 快速上手
 
@@ -112,7 +114,7 @@ sudo nvme list
 
 ### 2. 跑教学 controller behind vfio-user (QEMU 接管)
 
-详 `crates/pcie_remote_nvme_userspace/QEMU_VFIO_USER.md`。
+详 `crates/nvme_firmware/QEMU_VFIO_USER.md`。
 
 ### 3. 跑 OpenHCL VTL2 真 PCIe Remote 路径
 

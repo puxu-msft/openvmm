@@ -3,7 +3,7 @@
 
 //! **Phase V** — NVMe-over-Fabrics TCP target。
 //!
-//! 把 [`pcie_remote_nvme_userspace::NvmeController`] 暴露在 TCP port 4420，
+//! 把 [`nvme_firmware::NvmeController`] 暴露在 TCP port 4420，
 //! 任何安装了 nvme-tcp host 驱动（Linux ≥ 5.0 / Windows Server 2025）的机器
 //! `nvme connect -t tcp -a <host> -n <NQN>` 即可挂载。
 //!
@@ -139,7 +139,7 @@ pub use tls_identity::extract_host_identities;
 ///   数据破坏 / DoS。
 pub struct SharedControllerInner {
     /// controller 整把短锁。
-    pub controller: parking_lot::Mutex<pcie_remote_nvme_userspace::NvmeController>,
+    pub controller: parking_lot::Mutex<nvme_firmware::NvmeController>,
     /// per-conn token slab base 全局原子分配。起值见 [`TOKEN_SLAB_START`]。
     pub next_conn_token_base: std::sync::atomic::AtomicU64,
     /// **V8c** — per-conn ID 全局原子分配（1 起；0 保留为 legacy/无关联）。
@@ -167,7 +167,7 @@ pub const TOKEN_SLAB_SIZE: u64 = 1u64 << 40;
 impl SharedControllerInner {
     /// 从 owned controller 构造 shared wrapper；token base 起 [`TOKEN_SLAB_START`]，
     /// conn_id 起 1（0 保留为 legacy/无关联）。
-    pub fn new(controller: pcie_remote_nvme_userspace::NvmeController) -> Self {
+    pub fn new(controller: nvme_firmware::NvmeController) -> Self {
         Self {
             controller: parking_lot::Mutex::new(controller),
             next_conn_token_base: std::sync::atomic::AtomicU64::new(TOKEN_SLAB_START),

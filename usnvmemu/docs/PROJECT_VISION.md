@@ -16,7 +16,7 @@
 ```
                 ┌────────────────────────────────────┐
                 │     用户态 NVMe firmware (core)     │
-                │  pcie_remote_nvme_userspace        │
+                │  nvme_firmware        │
                 │  + nvme_of_tcp_target (NVMe-oF 层) │
                 │  ─────────────────────────────────  │
                 │  trait Transport (5 原语)           │
@@ -47,14 +47,14 @@
 
 | 组件 | 当前路径 | 状态 |
 |------|---------|------|
-| Firmware core (NVMe controller) | `pcie_remote_nvme_userspace` | ✅ Phase A→S7 完整 |
-| `trait Transport` (5 原语) | `pcie_remote_userspace_sdk/src/device.rs` | ✅ 已抽出 |
-| PCIe Remote transport | `pcie_remote_userspace_sdk/src/openhcl_transport.rs` | ✅ vsock + TCP 双 backend |
-| vfio-user transport | `pcie_vfio_user_sdk/src/transport.rs` | ✅ Phase U1-U5 + U-followup |
+| Firmware core (NVMe controller) | `nvme_firmware` | ✅ Phase A→S7 完整 |
+| `trait Transport` (5 原语) | `pcie_device_sdk/src/device.rs` | ✅ 已抽出 |
+| PCIe Remote transport | `pcie_device_sdk/src/openhcl_transport.rs` | ✅ vsock + TCP 双 backend |
+| vfio-user transport | `vfio_user_transport/src/transport.rs` | ✅ Phase U1-U5 + U-followup |
 | NVMe-oF TCP wire 层 | `nvme_of_tcp_target` | ✅ V1..V8e + V-followup-tls/auth/dhchap |
 
 **真依赖 grep 验证**:
-- NVMe controller core (`controller/*.rs`) — runtime-agnostic，只 use `std/zerocopy/super/crate/pcie_remote_userspace_sdk`
+- NVMe controller core (`controller/*.rs`) — runtime-agnostic，只 use `std/zerocopy/super/crate/pcie_device_sdk`
 - `pal_async` 只出现在 `main.rs` (bin 入口) 和 controller 的一行 comment 里
 
 意味着: **controller 已经可移植**。换 transport 不用改 controller。换 runtime 只需改 bin。
@@ -69,7 +69,7 @@
 
 ### 3.2 OpenVMM dev (TCP + PCIe Remote)
 
-**现状**: ✅ TCP backend (`pcie_remote_noop_host_tcp` + bin TCP 模式)；测试覆盖完整。
+**现状**: ✅ TCP backend (`pcie_remote_test_harness_tcp` + bin TCP 模式)；测试覆盖完整。
 
 **缺口**: 同 3.1 受 pal_async 约束。
 
@@ -103,9 +103,14 @@
 
 ### Tier 2 (firmware 演进 + 文档统一)
 
-4. **统一 firmware crate 命名**：当前 `pcie_remote_nvme_userspace` 名字带 transport 暗示（pcie_remote）。建议改 `nvme_firmware` 或 `nvme_controller`，让"是个 firmware"显式
-5. **`trait Transport` doc + example**：写一份 "如何加第 5 条 transport (e.g. iSCSI / NBD)" 教程
-6. **`pcie_remote_userspace_sdk` 改名 `pcie_device_sdk`**：去掉 "remote" 暗示，强调它是通用 PCIe 设备 SDK
+4. ✅ **统一 firmware crate 命名 (2026-06-08 已做)**：`pcie_remote_nvme_userspace`
+   → `nvme_firmware`；`pcie_remote_userspace_sdk` → `pcie_device_sdk`；
+   `pcie_vfio_user_sdk` → `vfio_user_transport`；`pcie_remote_rng_userspace`
+   → `rng_device_example`；`pcie_remote_noop_host` → `pcie_remote_test_harness`
+5. **`trait Transport` doc + example**：写一份 "如何加第 5 条 transport (e.g. iSCSI / NBD)" 教程 (`docs/HOW_TO_ADD_TRANSPORT.md`)，**仍未做**
+6. ✅ **文档归属重组 (2026-06-08 已做)**：crate 专属 phase plan / wire spec 进
+   `crates/<X>/docs/`；仅跨 crate 治理文档 (VISION/ROADMAP/PRINCIPLES/LESSONS/DECISIONS)
+   留顶层 `docs/`
 
 ### Tier 3 (外部化 + 长期)
 
@@ -114,28 +119,33 @@
 
 ## 5. 仓库重组建议 (Phase X 之后形态)
 
+> **2026-06-08 update**: crate 改名 + usnvmemu/ 子目录化 + 文档归属重组已在
+> *原仓内* 完成 (Phase X3 的"新 repo 结构"先立好)。下表是最终独立 repo 形态。
+
 ```
-userspace-nvme-firmware/                # 新仓
+userspace-nvme-firmware/                # 新仓 (现 usnvmemu/)
 ├── README.md                           # "用户态 NVMe firmware + 3 transport"
 ├── crates/
-│   ├── nvme_firmware/                  # 原 pcie_remote_nvme_userspace 改名
-│   ├── nvme_of_tcp/                    # 原 nvme_of_tcp_target 改名
-│   ├── pcie_device_sdk/                # 原 pcie_remote_userspace_sdk 改名
-│   ├── pcie_vfio_user_sdk/             # 不变
-│   ├── pcie_protocol/                  # 原 pcie_remote_protocol 改名
-│   └── examples/
-│       ├── rng_device/                 # 原 pcie_remote_rng_userspace
-│       └── noop_host/                  # 原 pcie_remote_noop_host
-├── docs/
+│   ├── nvme_firmware/                  # ✅ 已改名 (原 pcie_remote_nvme_userspace)
+│   │   └── docs/                       # ✅ NVMe firmware 专属 plan/spec
+│   ├── nvme_of_tcp_target/             # 保留名
+│   │   └── docs/{plans,specs}/         # ✅ 所有 V* phase + nvme-tcp-wire-reference
+│   ├── pcie_device_sdk/                # ✅ 已改名 (原 pcie_remote_userspace_sdk)
+│   │   └── docs/plans/                 # ✅ phase-t-transport-abstraction
+│   ├── vfio_user_transport/            # ✅ 已改名 (原 pcie_vfio_user_sdk)
+│   │   └── docs/{plans,specs}/         # ✅ phase-u + vfio-user wire/client spec
+│   ├── pcie_remote_protocol/           # 待 X3 从主仓搬 (→ pcie_remote_wire)
+│   ├── rng_device_example/             # ✅ 已改名 (原 pcie_remote_rng_userspace)
+│   └── pcie_remote_test_harness/       # ✅ 已改名 (原 pcie_remote_noop_host)
+├── docs/                               # 仅跨 crate 治理文档
 │   ├── PROJECT_VISION.md (本文)
-│   ├── ARCHITECTURE.md                 # firmware ↔ transport 边界图
 │   ├── ROADMAP.md / PRINCIPLES.md / LESSONS.md / DECISIONS.md
-│   ├── plans/                          # phase plans
-│   └── specs/                          # wire references
+│   ├── pcie-remote-phase/             # ✅ PCIe Remote 阶段历史 (跨 SDK+harness+主仓 device)
+│   └── 2026-06-06-phase-x-extract-from-openvmm-survey.md  # 跨项目外部化
 ├── scripts/
-│   ├── interop_py/                     # nvme-of-tcp Python harness
-│   └── qemu_interop/                   # 新: vfio-user QEMU harness
-└── vendor/                             # vendor 进来的 openvmm 小 dep
+│   ├── (nvme-of-tcp Python harness 在 crates/nvme_of_tcp_target/scripts/interop_py/)
+│   └── qemu_interop/                   # 新: vfio-user QEMU harness (待做)
+└── vendor/                             # vendor 进来的 openvmm 小 dep (X4)
     ├── nvme_spec/
     └── storage_string/
 

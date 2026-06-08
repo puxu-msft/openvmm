@@ -140,7 +140,7 @@ Get-VM $VmName | Select-Object Name,Version,State,Generation,IsolationType
 > 在 vsock 路径上由 Hyper-V 自动处理 routing；ohcldiag-dev 直接走 AF_HYPERV
 > 高 VTL channel 工作，不依赖 GuestCommunicationServices reg key。
 >
-> 如果你的 host 端程序是本仓库提供的 `pcie_remote_noop_host_vsock.exe`，
+> 如果你的 host 端程序是本仓库提供的 `pcie_remote_test_harness_vsock.exe`，
 > AF_HYPERV connect 内核会自动处理 ACL，**跳过本节即可**。本节只在你想
 > 给**任意第三方用户态 service** 注册 GUID 白名单时才需要。
 
@@ -165,8 +165,8 @@ C:\temp\pcie_remote_exp\ohcldiag-dev.exe $VmName inspect vm | Select-Object -Fir
 
 ```powershell
 $vmid = (Get-VM pcie-remote-exp).Id
-# AF_HYPERV 客户端（vsock_main.rs 跨编自 usnvmemu/crates/pcie_remote_noop_host）
-C:\temp\pcie_remote_exp\pcie_remote_noop_host_vsock.exe `
+# AF_HYPERV 客户端（vsock_main.rs 跨编自 usnvmemu/crates/pcie_remote_test_harness）
+C:\temp\pcie_remote_exp\pcie_remote_test_harness_vsock.exe `
     --vm-id $vmid --port 50000 --retries 60 --retry-ms 500
 ```
 
@@ -177,13 +177,13 @@ noop_host 加了两个 stress 参数，可主动触发健壮性边界：
 ```powershell
 # 验证 K-NEW-C: DMA 速率限制 (64 MiB/s)
 # burst 发 2048 个 64KB ReadGpa = 128 MiB → 1024 个应被 rate limit 拒绝
-pcie_remote_noop_host_vsock.exe --vm-id $vmid --port 50000 `
+pcie_remote_test_harness_vsock.exe --vm-id $vmid --port 50000 `
     --stress-dma-count 2048
 # 然后看 ohcldiag-dev pcie-remote-exp inspect "vm/pcie_remote_vmbus:.../worker_stats"
 # 应见 dma_rate_limit_rejects 接近 1024
 
 # 验证 A4: 连续 ≥4 OOB InterruptFire → worker 进 Lost
-pcie_remote_noop_host_vsock.exe --vm-id $vmid --port 50000 `
+pcie_remote_test_harness_vsock.exe --vm-id $vmid --port 50000 `
     --stress-bad-frames 8
 # 应见 consecutive_bad_frames=4，OpenHCL kmsg "going Lost consecutive=0x4"
 ```
@@ -194,10 +194,10 @@ pcie_remote_noop_host_vsock.exe --vm-id $vmid --port 50000 `
 
 ```powershell
 # host 端日志（noop_host_vsock 自身 stdout）
-# INFO pcie_remote_noop_host_vsock: vsock client connecting vm_id=... port=50000
-# INFO pcie_remote_noop_host_vsock: connected
-# INFO pcie_remote_noop_host_vsock: received Hello magic=0x52504345 version=1
-# INFO pcie_remote_noop_host_vsock: sent HelloAck
+# INFO pcie_remote_test_harness_vsock: vsock client connecting vm_id=... port=50000
+# INFO pcie_remote_test_harness_vsock: connected
+# INFO pcie_remote_test_harness_vsock: received Hello magic=0x52504345 version=1
+# INFO pcie_remote_test_harness_vsock: sent HelloAck
 
 # OpenHCL VTL2 端日志（从 host 调 ohcldiag-dev）
 C:\temp\pcie_remote_exp\ohcldiag-dev.exe pcie-remote-exp kmsg | Select-String pcie_remote
@@ -238,7 +238,7 @@ Remove-VM -Name pcie-remote-exp -Force
 ```bash
 # Terminal 1: host stub (TCP server mode)
 cd /home/xp/refs/openvmm
-cargo run --manifest-path usnvmemu/crates/pcie_remote_noop_host/Cargo.toml --bin pcie_remote_noop_host_tcp
+cargo run --manifest-path usnvmemu/crates/pcie_remote_test_harness/Cargo.toml --bin pcie_remote_test_harness_tcp
 
 # Terminal 2: OpenVMM with --hv (KVM)
 sg kvm "target/debug/openvmm \
@@ -270,7 +270,7 @@ host stub: received Hello ... sent HelloAck
 | pcie_remote `rejected (handshake_timeout_ms=N > max M)` | K-19 — handshake_timeout > config_timeout/2 | IGVM cmdline 改小 handshake_timeout_ms（≤2500ms） |
 | pcie_remote `vsock handshake timeout; device absent` | host client 没在 VTL2 listener 启动后 2s 内连入 | 先启 VM，立刻并行启 host client，retries=60 retry-ms=500 |
 | OpenVMM `vtl2 is not supported on this hypervisor` | KVM 不支持 VTL2 | 走 Hyper-V (path C) |
-| TCP bind failed Address already in use | host stub 还在跑 | `pkill -f pcie_remote_noop_host` |
+| TCP bind failed Address already in use | host stub 还在跑 | `pkill -f pcie_remote_test_harness` |
 
 ---
 
@@ -281,6 +281,6 @@ host stub: received Hello ... sent HelloAck
 | `openhcl/Set-OpenHCL-HyperV-VM.ps1` | Microsoft 官方：设 vssd `GuestFeatureSet=0x201` + `FirmwareFile`（已被 §2 New-VM 创建成功后才有意义）|
 | `docs/superpowers/scripts/setup-pcie-remote.ps1` | 注册 vsock service GUID + ACL |
 | `docs/superpowers/scripts/hyperv/` | 历史 PS 脚本（部分已过时，见各文件头部 deprecation note）|
-| `usnvmemu/crates/pcie_remote_noop_host/` | host 端 TCP 与 vsock client（OpenVMM / OpenHCL 对端）|
+| `usnvmemu/crates/pcie_remote_test_harness/` | host 端 TCP 与 vsock client（OpenVMM / OpenHCL 对端）|
 | `docs/superpowers/examples/vmrs_log_scanner/` | `.vmrs` RAM 字符串扫描器（OpenHCL 启动失败时诊断用；已用于定位本节"真根因发现"中的 retrofit 路径加载失败问题，详见 [SESSION_LOG.md](SESSION_LOG.md)）|
 | `Guide/src/user_guide/openhcl/run/hyperv.md` | Microsoft 官方 OpenHCL on Hyper-V 文档（本 runbook 的依据）|

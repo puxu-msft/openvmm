@@ -24,7 +24,7 @@
 use nvme_of_tcp_target::framing::{read_pdu_async, write_pdu_async};
 use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
 use nvme_of_tcp_target::{PumpEvent, SharedControllerInner, accept_and_handshake_async};
-use pcie_remote_nvme_userspace::NvmeController;
+use nvme_firmware::NvmeController;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
@@ -67,9 +67,9 @@ async fn send_icreq(s: &mut TcpStream) {
 /// 通过 controller dispatch_with_conn 路径 push 一条 AER 给指定 conn，并
 /// notify wakeup 给 session。模拟 V8e-6 后真 dispatch 路径的行为。
 fn push_aer_and_notify(shared: &Arc<SharedControllerInner>, cid: u16, conn_id: u32) {
-    use pcie_remote_nvme_userspace::cmd::Sqe;
+    use nvme_firmware::cmd::Sqe;
     struct NullTransport;
-    impl pcie_remote_userspace_sdk::Transport for NullTransport {
+    impl pcie_device_sdk::Transport for NullTransport {
         fn fire_interrupt(&mut self, _: u32) {}
         fn dma_write(&mut self, _: u64, _: Vec<u8>) -> u64 {
             0
@@ -85,7 +85,7 @@ fn push_aer_and_notify(shared: &Arc<SharedControllerInner>, cid: u16, conn_id: u
             nvme_of_tcp_target::ADMIN_CQ_SIZE,
         );
         let mut t = NullTransport;
-        let mut ctx = pcie_remote_userspace_sdk::DeviceCtx::new(&mut t);
+        let mut ctx = pcie_device_sdk::DeviceCtx::new(&mut t);
         let mut sqe = Sqe::new_zeroed();
         sqe.cdw0 = ((cid as u32) << 16) | 0xC;
         let _ = c.nvme_admin_dispatch_with_conn(&mut ctx, sqe, cid, 0, conn_id);

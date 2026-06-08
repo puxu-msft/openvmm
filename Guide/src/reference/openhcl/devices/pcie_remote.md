@@ -24,10 +24,10 @@
 1. 编译 OpenVMM：`cargo build -p openvmm`
 2. 编译并启动 host stub：
    ```bash
-   cd usnvmemu/crates/pcie_remote_noop_host
+   cd usnvmemu/crates/pcie_remote_test_harness
    cargo run
    ```
-   预期看到 `pcie_remote_noop_host: listening (loopback only)`。
+   预期看到 `pcie_remote_test_harness: listening (loopback only)`。
 3. 启动 OpenVMM 加 CLI 参数：
    ```bash
    target/debug/openvmm \
@@ -46,7 +46,7 @@ WSL2 默认开启 `localhostForwarding`，OpenVMM 在 WSL 内 bind `127.0.0.1` �
 1. fork 仓库并自建 IGVM，cmdline policy 选 `APPEND_CHOSEN`。
 2. host 上一次性注册 service GUID + ACL（管理员 PowerShell）：
    ```powershell
-   .\docs\superpowers\scripts\setup-pcie-remote.ps1 -VsockPort 50000
+   .\usnvmemu\scripts\setup-pcie-remote.ps1 -VsockPort 50000
    ```
 3. host 实验程序用 AF_HYPERV connect 到 `(target_vm_id, computed_service_guid)`。
 4. OpenHCL boot cmdline append：
@@ -93,5 +93,5 @@ v1 不支持重连。需要 host 重启后整 VM 重启。
 
 - [设计文档](../../../../usnvmemu/docs/specs/2026-05-29-pcie-remote-design.md)
 - [实施计划](../../../../usnvmemu/docs/plans/2026-05-29-pcie-remote-impl.md)
-- [setup.ps1](../../../../docs/superpowers/scripts/setup-pcie-remote.ps1)
-- [host SDK 示例](../../../../usnvmemu/crates/pcie_remote_noop_host/)
+- [setup.ps1](../../../../usnvmemu/scripts/setup-pcie-remote.ps1)
+- [host SDK 示例](../../../../usnvmemu/crates/pcie_remote_test_harness/)

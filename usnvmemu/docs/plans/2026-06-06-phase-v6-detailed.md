@@ -75,7 +75,7 @@
 - 改 `session.rs`：V2Session + `pending_aers: Vec<PendingAer>`；`handle_admin_cmd` 入口 peek opc=0x0C → AER fast-path（调 dispatch 让 controller 接，跳过 Phase 2..5 不 bail，push pending_aers，超 MAX 返 SC=0x05）
 - 新 `aer.rs`：`PendingAer { cid, sq_id, registered_at }`、`ADMIN_OPC_AER: u8 = 0x0C`、`MAX_PENDING_AERS: usize = 4`、`peek_admin_opc(sqe) -> u8`
 - 改 `lib.rs`：`pub mod aer`
-- 改 `pcie_remote_nvme_userspace/src/lib.rs`：新 `nvme_pending_aer_count() -> usize`
+- 改 `nvme_firmware/src/lib.rs`：新 `nvme_pending_aer_count() -> usize`
 
 **controller wrapper**：`nvme_pending_aer_count` (read-only)
 
@@ -95,7 +95,7 @@
 - 新 helper `drain_aer_completions() -> Result<usize>` — 创 fresh TcpAdminTransport → controller drain wrapper → 每 16B CQE 走 `write_capsule_resp_bytes` → cap `MAX_DRAIN_PER_TICK=4` → 刷 `pending_aers` 镜像
 - 改 `framing.rs`：新增 `FramingError::ReadTimeout`（`io::ErrorKind::WouldBlock` / `TimedOut` 映射）
 - 改 `bin/nvme_of_tcp_target.rs`：`pump_one()` → `pump_one_with_events(Duration::from_millis(100))`
-- 改 `pcie_remote_nvme_userspace/src/lib.rs`：`nvme_fire_aen`、`nvme_drain_aer_completions`、`nvme_has_pending_aen_event`
+- 改 `nvme_firmware/src/lib.rs`：`nvme_fire_aen`、`nvme_drain_aer_completions`、`nvme_has_pending_aen_event`
 
 **Wire 路径**：
 
