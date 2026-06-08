@@ -331,3 +331,26 @@ fork 时又得重新走一遍 cost-benefit。
 
 **来源**：2026-06-06 audit pass 3 (commit `5c2ea335` 后 immediate
 follow-up)。
+
+---
+
+## 18. 大规模 move/rename 后用脚本 + 死链扫描器修 link, 别手算深度 (HIGH)
+
+**坑** (2026-06-08 usnvmemu/ 重组实测): 把 6 crate + 几十个文档搬目录 + 改名,
+markdown link 关系成网。手算相对路径深度 (`../../../../`) 错了好几次 (跟
+[[lesson §1]] offset 同类病: 手算 = false confidence)。
+
+**修法**:
+1. 写权威 `old basename → new repo-root 路径` 映射表, Python 脚本对每个
+   .md 的每个 `](...)` link 自动 `os.path.relpath` 重算。
+2. 配死链扫描器 (解析所有 link target, `os.path.exists` 验), 迭代到 0 broken。
+3. **跨目录链接优先用 repo-root-absolute `/usnvmemu/...`** (GitHub 渲染 `/`
+   开头 = repo root, 官方文档确认), 消除深度脆弱。同目录裸名保留。
+4. mdBook (Guide) 例外: 它的 `/` 指 book root 非 repo root, 必须相对路径。
+5. multi-line 分割的 "链接" (markdown 不允许 () 内换行) 脚本会误判, 手动核。
+
+**为什么 repo-root-absolute 更好**: `/usnvmemu/docs/ROADMAP.md` 不受文件深度
+影响; 文件再搬目录, 链接不变。未来独立 repo 时全局 `/usnvmemu/` → `/` 一次转。
+
+**来源**: usnvmemu/ 子目录化 + crate 改名 + 文档归属重组 (commit
+94d2f94a / 文档重组 / 849a3f83), 3 轮 Python 脚本 + 死链扫描达 0 broken。
