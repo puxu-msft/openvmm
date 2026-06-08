@@ -407,3 +407,34 @@ if frame_id == expected_msg_id && frame.header.flags().is_reply() { return Ok(fr
 
 **来源**: vfio-user head-of-line fix 的 review H-1(rust-reviewer),commit
 `b1cb8574` 引入 → fixup 修。
+
+---
+
+## 21. "这版本不带某功能" ≠ "上游不支持/需 fork" —— 先查上游合入历史 (MEDIUM)
+
+**坑**: 验 vfio-user 第 3 条接入时，用环境里现成的 QEMU **8.2** 实测，发现
+`-device vfio-user-pci` 不存在（只有 vhost-user），就下结论写进 ROADMAP：
+"主线 QEMU 无 vfio-user 客户端、从未并入主线、真 QEMU e2e 需带补丁的 fork
+源码编译"。据此把真 QEMU e2e **整个 defer 到 future**，退回到只用自家 Python
+client 验证。
+
+**为什么错**: vfio-user 客户端（`vfio-user-pci` 设备）由 Nutanix/John Levon
+**已在 QEMU 10.1（2025-08）合入上游主线**。我手上的 8.2 只是**早于该版本**，
+不是"上游不支持"。用 linuxbrew 装 **QEMU 11.0.1**，`-device
+{"driver":"vfio-user-pci","socket":{...}}` 直接 realize 成功——真 QEMU e2e
+不仅可行，还立刻抓出 2 个自家测试全绿的握手 bug（见 [[lesson §20]]）。
+
+**根本教训**: 从"我手上这个二进制不带 X"**不能**推出"上游不支持 X / 需要
+fork"。这是把**单个版本的快照**当成**项目能力的全集**。正确动作：
+1. **查上游合入历史**（release notes / 邮件列表 / commit log / `git log --grep`），
+   确认功能是"从未有"还是"某版本后才有"；
+2. 若是后者，**装够新的版本**再下结论，别基于旧版本写"不支持/需 fork"；
+3. 尤其当结论会**砍掉一整条验证路径**（本例：真 QEMU e2e → defer future）时，
+   下结论前的版本核查不是可选项。
+
+**与 [[lesson §20]] 咬合**: §20 说"独立第二实现才能 catch self-consistent bug"。
+本例差点因为"误判上游不支持"而**永远拿不到那个独立实现（真 QEMU）**——错误的
+版本认知会直接剥夺最有价值的 oracle。
+
+**来源**: ROADMAP V-followup-vfio-user-cross-process-harness 段曾写的错误
+"现实修正"，2026-06-09 用 QEMU 11.0.1 实测推翻并更正。

@@ -94,19 +94,26 @@ V-followup-vfio-user-qemu-harness。
 - 需要 host root + 写小 kmod (~ 50 LOC)，用户须授权或代提
 - WSL2 kernel 已开 `nvme-tcp` / `nvme-auth` 内置；EXPORT_SYMBOL_GPL OK
 
-### V-followup-vfio-user-cross-process-harness (Tier 1, 进行中)
+### ✅ V-followup-vfio-user-cross-process-harness (Tier 1, 2026-06-09 SHIPPED — 含真 QEMU 11 e2e)
 
-**现实修正**：主线 QEMU（8.2 实测）**无 vfio-user 客户端**（`-device vfio-user-pci`
-不存在；只有 vhost-user，另一协议）——vfio-user client 支持从未并入主线。故"真
-QEMU e2e"在普通环境跑不了。沿用 nvme_of 的成熟模式做**跨进程 wire 实证**：
+**纠错（曾误判）**：早先基于 QEMU **8.2** 实测下结论"主线 QEMU 无 vfio-user
+客户端、需 fork 编译"——**该结论错误**。vfio-user 客户端（`vfio-user-pci` 设备）
+由 Nutanix/John Levon 在 **QEMU 10.1（2025-08）合入上游主线**。用 linuxbrew
+**QEMU 11.0.1** 实测：`-device {"driver":"vfio-user-pci","socket":{...}}` 直接
+realize 成功。教训记 [LESSONS.md](LESSONS.md) §21（"版本不带≠协议不支持"）。
 
-**✅ 已做**：
+**✅ 已做（三层 oracle，独立性递增）**：
 - `vfio_user_transport/scripts/interop_py/`：Python stdlib vfio-user 客户端
   harness（`enumerate_smoke.py` 自包含 spawn+验+清理，13 断言：握手 / GET_INFO /
   全 9 region info / **CONFIG 读真验 W1 identity/class** / IRQ / BAR-probe / FLR）。
 - **libvfio-user 官方 client 做 differential oracle**（需 `libjson-c-dev`）：独立
   C 实现验证我们协议层 + 抓到 2 个真 conformance bug（commit `533432ec`：bogus
   region 应 EINVAL / bulk REGION_READ），复现见 interop_py/README.md。
+- **✅ 真 QEMU 11 e2e**（`scripts/qemu_interop/`，commit `b7d5adc4`）：真 QEMU
+  以 `vfio-user-pci` realize 我们的 server，跑完整 VERSION/GET_INFO/GET_REGION_INFO/
+  config 读/DMA_MAP 握手，QMP `query-pci` 确认 guest PCI 总线见 NVMe(0x1414/0xc0de)。
+  抓到 2 个自家测试全绿的握手 bug（commit `f8fdf220`：version-minor 协商须
+  `min(client,server)` / max_msg_fds 须 ≤ QEMU 16 上限）。
 - DMA head-of-line 阻塞修复 + review H-1（reply flag 判据）`b1cb8574` + fixup。
 
 **⏳ 诚实 defer（reviewer M-1/M-2/M-4 标注，待补）**：
@@ -116,10 +123,12 @@ QEMU e2e"在普通环境跑不了。沿用 nvme_of 的成熟模式做**跨进程
   数值字段（当前只存 caps JSON 原始串）。
 - **`region_access_ok` 缓存 BAR layout**：当前每次 region 访问 alloc describe() Vec。
 - **mmap 零拷贝 DMA**：见 Phase W plan §8 设计（DmaTable 并行 mmaps + memfd 单测）。
-- **真 QEMU**：需带 vfio-user 补丁的 QEMU fork 源码编译（Oracle/Nutanix 分支），重，留 future。
+- **真 guest OS 引导**：当前 QEMU e2e 用 `-S` 暂停 CPU，只验到 realize/PCI 枚举；
+  引导 kernel+rootfs 看 `/dev/nvme0` 真读写需 IO queue DMA 全路径 + initramfs，留 future。
 
 **Why**：[PROJECT_VISION §3.3](PROJECT_VISION.md) firmware-as-core 第 3 条接入。
-独立 oracle 已把 vfio-user 从"loopback 单测"推到"官方实现验证协议层"。
+真 QEMU 11 e2e 把 vfio-user 从"自家 client 验自家 server"推到"第三方独立实现
+（真 QEMU）驱动协议全握手"——Tier 1"真 host e2e harness"目标达成。
 
 ### V-followup-discovery-multi-portal-real (Tier 2, MEDIUM, 预计 1 day)
 
