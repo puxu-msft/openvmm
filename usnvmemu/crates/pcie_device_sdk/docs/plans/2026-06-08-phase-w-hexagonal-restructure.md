@@ -1,6 +1,6 @@
 # Phase W — pcie_device_sdk 补全 hexagonal 结构
 
-> **Status:** W1 ✅ / W2 ✅ / W4 ✅ SHIPPED；W3 pending（device 层 lib/bin 拆分）
+> **Status:** W1–W4 ✅ SHIPPED（crate 重命名按 ADR-009 推迟到 Phase X 仓库拆分）
 > **Date:** 2026-06-08
 > **Prereqः** Phase T（ADR-002，出站 `trait Transport` 已抽）/ Phase U（vfio-user）/ Phase V（NVMe-oF TCP）均已 shipped
 > **决策依据:** [ADR-010](/usnvmemu/crates/pcie_device_sdk/docs/DECISIONS.md)
@@ -12,8 +12,10 @@
 >   - ⚠️ **crate 重命名 `pcie_device_sdk`→`pcie_transport_openhcl` 推迟**：ADR-009
 >     明确"命名重构等仓库拆分（Phase X）一起走，避免双轨"。现在改名会双重改名，
 >     故 W2 只做结构抽取，保留旧 crate 名直到 Phase X。
-> - **W3** ⏳ pending — device 层解耦（`nvme_firmware` 拆 lib + feature-gate transport）
-> - **W4** ✅ dma-completion 语义契约文档 + LESSONS §19（对称性是伪需求）
+> - **W3** ✅ device 层解耦 — controller 只依赖 `pcie_device_core` + feature-gate
+>   transport（`openhcl` / `vfio-user`，default=both）。`cargo build
+>   --no-default-features --lib` 证明 controller 零 transport 依赖。`27b4159d`
+> - **W4** ✅ dma-completion 语义契约文档 + LESSONS §19（对称性是伪需求）`baa73fe7`
 
 ---
 

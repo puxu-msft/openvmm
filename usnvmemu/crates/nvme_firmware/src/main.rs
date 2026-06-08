@@ -47,6 +47,9 @@ mod sgl {
 use anyhow::Result;
 use anyhow::anyhow;
 use clap::Parser;
+// **Phase W3 (review M-1)** — controller 入口仅 transport 路径用；neither build
+// 下显式不引用，不靠 blanket `allow(unused_imports)` 掩盖悬空。
+#[cfg(any(feature = "openhcl", feature = "vfio-user"))]
 use controller::NvmeController;
 #[cfg(feature = "openhcl")]
 use pcie_device_sdk::*;

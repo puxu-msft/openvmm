@@ -66,7 +66,12 @@ subagent 对照代码 confirm)，抽象是**非对称且泄漏**的，5 条结�
 "minimal maintenance" 达不到可托付正确性的标准)；它最多当 differential oracle 校验我们
 手写 wire。替代品成熟前不改此立场。
 
-**Status**：active；Phase W 计划已 architect-review，W1 起手。
+**Status**：active；**W1–W4 已 SHIPPED**（commits `3100a102` / `e9139833` /
+`249483c3` / `96539f25` / `baa73fe7` / `27b4159d`）。core 抽出 + 撤 wire 泄漏 +
+描述模型分叉消除 + vfio-user cfg-space 修复 + device 层 feature-gate 解耦全部落地。
+**crate 重命名 `pcie_device_sdk`→`pcie_transport_openhcl` 按 ADR-009 推迟到
+Phase X 仓库拆分**（避免双轨改名）。vfio-user spec-complete（DMA head-of-line /
+mmap）另立 track。
 
 ---
 
