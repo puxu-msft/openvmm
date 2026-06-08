@@ -418,6 +418,11 @@ impl VfioUserSession {
         // **vfio-spec (libvfio-user oracle)** — REGION_READ 允许 bulk（如 guest
         // 一次 dump 整个 config header）；1/2/4/8 是我们 MMIO 寄存器的约束、非协议
         // 约束。仅校验 count 上限防 OOM + region 越界。
+        //
+        // **review M-2 (诚实标注)**：4096 是保守防-OOM 上限，**不是协议常量**。
+        // 正确值应是握手协商的 `max_data_xfer_size`（server caps 已宣告 1 MiB，
+        // 见 handshake.rs）。当前 `Negotiated` 只存了 caps JSON 原始串、未 parse
+        // 出数值字段，故暂用硬编码 —— 补 parse + 用协商值见 ROADMAP。
         const MAX_REGION_ACCESS: usize = 4096;
         if count == 0 || count > MAX_REGION_ACCESS {
             self.send_err(id, Command::RegionRead, libc::EINVAL as u32);
@@ -469,6 +474,10 @@ impl VfioUserSession {
         let count = req.count as usize;
         let offset = req.offset;
         let bar = req.region;
+        // **vfio-spec / review M-1** — WRITE 目前只支持 1/2/4/8（寄存器粒度 +
+        // 小 config write）。bulk REGION_WRITE（count>8）**未实现**：显式拒，既保
+        // 协议清晰，也**就近保护**下面 `[0u8; 8]` 不越界 panic（不依赖远处隐式
+        // 耦合）。补 bulk-write（config `write_bytes` + BAR chunk）见 ROADMAP。
         if !matches!(count, 1 | 2 | 4 | 8) {
             self.send_err(id, Command::RegionWrite, libc::EINVAL as u32);
             return Ok(());
@@ -482,6 +491,7 @@ impl VfioUserSession {
             self.send_err(id, Command::RegionWrite, libc::EINVAL as u32);
             return Ok(());
         }
+        debug_assert!(count <= 8, "WRITE count 已被上面 1/2/4/8 gate 限制");
         let mut val_bytes = [0u8; 8];
         val_bytes[..count].copy_from_slice(&msg.payload[req_struct_len..]);
         let value = u64::from_le_bytes(val_bytes);
@@ -1034,6 +1044,25 @@ mod tests {
         assert_eq!(u16::from_le_bytes([body[0], body[1]]), 0x1234);
         assert_eq!(u16::from_le_bytes([body[2], body[3]]), 0x5678);
         assert!(h.join().unwrap().unwrap());
+    }
+
+    /// **review L-2** — bulk BAR read（非 1/2/4/8）走 `read_bar_bytes` chunk 路径：
+    /// 拆成 ≤4 字节 `mmio_read` 拼回 count 字节；1/2/4/8 走单次 `mmio_read`。
+    #[test]
+    fn read_bar_bytes_chunks_and_single() {
+        let mut dev = MockDev::new();
+        dev.bar0[0] = 0x0807_0605_0403_0201;
+        // count=4 → 单次 mmio_read（低 4 字节）
+        assert_eq!(
+            VfioUserSession::read_bar_bytes(&mut dev, 0, 0, 4),
+            vec![0x01, 0x02, 0x03, 0x04]
+        );
+        // count=6（非 1/2/4/8）→ chunk 4+2。MockDev mmio_read 忽略 offset 内 8 字节
+        // 粒度，两 chunk 都取 bar0[0] 低字节：[01,02,03,04] + [01,02]。
+        assert_eq!(
+            VfioUserSession::read_bar_bytes(&mut dev, 0, 0, 6),
+            vec![0x01, 0x02, 0x03, 0x04, 0x01, 0x02]
+        );
     }
 
     /// DEVICE_RESET 触发 device.reset(0)。

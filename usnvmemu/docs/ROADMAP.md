@@ -94,24 +94,32 @@ V-followup-vfio-user-qemu-harness。
 - 需要 host root + 写小 kmod (~ 50 LOC)，用户须授权或代提
 - WSL2 kernel 已开 `nvme-tcp` / `nvme-auth` 内置；EXPORT_SYMBOL_GPL OK
 
-### V-followup-vfio-user-qemu-harness (Tier 1, HIGH 优先, 预计 1-2 days)
+### V-followup-vfio-user-cross-process-harness (Tier 1, 进行中)
 
-**What**：写 `scripts/qemu_interop/` Python (或 bash) harness 跑真 QEMU 接管模式
-e2e。当前 vfio-user 路径只有 lib unit test，**没有真 QEMU 验过**——firmware-as-core
-愿景的第 3 条接入缺真 host 实测。
+**现实修正**：主线 QEMU（8.2 实测）**无 vfio-user 客户端**（`-device vfio-user-pci`
+不存在；只有 vhost-user，另一协议）——vfio-user client 支持从未并入主线。故"真
+QEMU e2e"在普通环境跑不了。沿用 nvme_of 的成熟模式做**跨进程 wire 实证**：
 
-**Why**：[PROJECT_VISION §3.3](PROJECT_VISION.md) 标的明显缺口；
-QEMU vfio-user 是行业标准 (8+ / Cloud Hypervisor / SPDK)，缺这一条
-意味着第 3 条接入只是"代码 shipped"而非"真生产可用"。
+**✅ 已做**：
+- `vfio_user_transport/scripts/interop_py/`：Python stdlib vfio-user 客户端
+  harness（`enumerate_smoke.py` 自包含 spawn+验+清理，13 断言：握手 / GET_INFO /
+  全 9 region info / **CONFIG 读真验 W1 identity/class** / IRQ / BAR-probe / FLR）。
+- **libvfio-user 官方 client 做 differential oracle**（需 `libjson-c-dev`）：独立
+  C 实现验证我们协议层 + 抓到 2 个真 conformance bug（commit `533432ec`：bogus
+  region 应 EINVAL / bulk REGION_READ），复现见 interop_py/README.md。
+- DMA head-of-line 阻塞修复 + review H-1（reply flag 判据）`b1cb8574` + fixup。
 
-**Acceptance**：
-- 启 `nvme_firmware --vfio-user-socket /tmp/nvme.sock`
-- QEMU `-device vfio-user-pci,socket=/tmp/nvme.sock` 启 guest
-- guest 看到 NVMe BDF，nvme list / nvme id-ctrl / IO 通
-- harness 在 CI 跑 (需 QEMU 8+ in test runner)
+**⏳ 诚实 defer（reviewer M-1/M-2/M-4 标注，待补）**：
+- **bulk REGION_WRITE**：当前 WRITE 仅 1/2/4/8（`[0u8;8]` 假设）；补 config
+  `write_bytes` + BAR chunk write（对称 READ 的 bulk）。
+- **用协商 `max_data_xfer_size` 替代硬编码 4096**：需先在 `Negotiated` parse 出
+  数值字段（当前只存 caps JSON 原始串）。
+- **`region_access_ok` 缓存 BAR layout**：当前每次 region 访问 alloc describe() Vec。
+- **mmap 零拷贝 DMA**：见 Phase W plan §8 设计（DmaTable 并行 mmaps + memfd 单测）。
+- **真 QEMU**：需带 vfio-user 补丁的 QEMU fork 源码编译（Oracle/Nutanix 分支），重，留 future。
 
-**Blockers**：QEMU 8+ in test env；现在的 QEMU_VFIO_USER.md 散在
-`nvme_firmware/`，集中到 `scripts/qemu_interop/README.md`。
+**Why**：[PROJECT_VISION §3.3](PROJECT_VISION.md) firmware-as-core 第 3 条接入。
+独立 oracle 已把 vfio-user 从"loopback 单测"推到"官方实现验证协议层"。
 
 ### V-followup-discovery-multi-portal-real (Tier 2, MEDIUM, 预计 1 day)
 

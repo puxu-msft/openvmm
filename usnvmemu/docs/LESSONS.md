@@ -375,3 +375,35 @@ MMIO read/write、cfg、reset、dma-completion 统一成一个 `Inbound` enum)�
 
 **来源**: ADR-010 / Phase W; architect subagent 复核否决了 generic 对称 trait
 这个过度设计。教训: 抽象前先问"三个实现里有几个真用得上这个 variant"。
+
+## 20. self-consistent 假设当 wire 判据是反模式 —— 修自家两端也逃不过 (HIGH)
+
+**坑**: 修 vfio-user DMA head-of-line 阻塞(等 reply 时 defer 插入帧)时,
+`read_reply_deferring_inbound` 用 `frame.msg_id == expected` 单条件判定"这是
+本次 reply"。注释还自辩"server-initiated id 顶位 0x8000,与 client id 不撞"。
+
+**为什么错**: vfio-user spec 两方向 msg_id **独立**、**不保留**顶位。client 的
+inbound command 完全可能 msg_id 撞上我们的 server-initiated id → 被误当 reply
+吞掉 → command 丢失 + `validate_dma_reply` 因 cmd/flag mismatch 报错 → 连接挂。
+**这正是在"修一个对称性/head-of-line bug"的 commit 里,又引入一个同类 bug** ——
+用 self-consistent 约定(我自己两端的"顶位默契")当 wire 判据。
+
+**修法**: wire 判据必须用**协议语义**(reply flag `is_reply()`),不用自家编号约定:
+```rust
+if frame_id == expected_msg_id && frame.header.flags().is_reply() { return Ok(frame); }
+```
+
+**两条根本教训**:
+1. **[[lesson §2]] self-consistent ≠ spec-conformant 适用于"我自己写的两端"**。
+   自写 server + 自写 client(或 Python harness),共享的错误假设两边都不报错、
+   单测全绿。**catch 它的是独立第二实现**(libvfio-user 官方 client / kernel /
+   libnvme)。任何"我两端都这么约定所以对"的推理都可疑。
+2. **不跳 subagent review**。本 bug 是跳过 review 直接 commit、被用户质问"是否糊弄"
+   后补 review 才抓到的。单测绿(测试数据 self-consistent 不撞)不等于 review 过。
+   见 [[lesson §4]]。
+
+**判据速记**: 写任何 wire 匹配/校验时问自己"这是协议字段(flag/type)还是我的
+编号范围/顶位/两端默契?"。后者一律换前者。
+
+**来源**: vfio-user head-of-line fix 的 review H-1(rust-reviewer),commit
+`b1cb8574` 引入 → fixup 修。

@@ -275,7 +275,12 @@ pub(crate) fn read_reply_deferring_inbound(
         let frame = read_message(stream).context("read while waiting server-request reply")?;
         // packed header 字段先 copy 到局部，避免 unaligned ref。
         let frame_id = frame.header.msg_id;
-        if frame_id == expected_msg_id {
+        // **review H-1** — 必须**同时**是 REPLY flag 且 msg_id 匹配。vfio-user 两
+        // 方向 msg_id 独立、spec **不保留**顶位 0x8000；client 的 inbound command
+        // 完全可能 msg_id 撞上我们 server-initiated id。只认 msg_id 会把这条
+        // command 误当 reply 吞掉 → command 丢失 + 连接挂（与本 fix 要根除的
+        // head-of-line bug 同类）。reply flag 才是协议语义判据。
+        if frame_id == expected_msg_id && frame.header.flags().is_reply() {
             return Ok(frame);
         }
         let frame_cmd = frame.header.cmd;
@@ -623,6 +628,56 @@ mod tests {
         let q_id = queue[0].header.msg_id;
         let q_cmd = queue[0].header.cmd;
         assert_eq!(q_id, 0x42);
+        assert_eq!(q_cmd, Command::RegionRead as u16);
+    }
+
+    /// **review H-1** — inbound COMMAND 的 msg_id 即使**撞上**我们 server-initiated
+    /// id（0x8000），也必须 defer（它非 reply flag），不被误当本次 DMA reply。
+    /// 此前只认 msg_id 会把它吞掉 → command 丢失 + 连接挂（与 head-of-line 同类）。
+    #[test]
+    fn dma_reply_match_requires_reply_flag_not_just_id() {
+        let (mut server, mut client) = pair();
+        let mut table = DmaTable::default();
+        table
+            .insert(DmaRegion {
+                addr: 0x1000,
+                size: 0x1000,
+                readable: true,
+                writeable: true,
+            })
+            .unwrap();
+        let h = thread::spawn(move || {
+            let mut next = 0x8000u16;
+            let mut queue = std::collections::VecDeque::new();
+            let r = dma_read_sync(&mut server, &table, &mut next, &mut queue, 0x1100, 8);
+            (r, queue)
+        });
+        let req = read_message(&mut client).unwrap();
+        let req_id = req.header.msg_id; // = 0x8000
+        // 插一条 COMMAND，msg_id **故意 == req_id**（撞顶位），但是 command 非 reply。
+        let collide = Header::command(req_id, Command::RegionRead, 0);
+        fw_write(&mut client, &collide, &[], &[]).unwrap();
+        // 真 reply（msg_id == req_id，reply flag）。
+        let mut reply_pl = Vec::new();
+        reply_pl.extend_from_slice(
+            DmaRwHdrPayload {
+                addr: 0x1100,
+                count: 8,
+            }
+            .as_bytes(),
+        );
+        reply_pl.extend_from_slice(&[9u8; 8]);
+        let rhdr = Header::reply_ok(req_id, Command::DmaRead, reply_pl.len() as u32);
+        fw_write(&mut client, &rhdr, &reply_pl, &[]).unwrap();
+        let (r, queue) = h.join().unwrap();
+        let (_id, data) = r.unwrap();
+        assert_eq!(data, vec![9u8; 8], "撞 id 的 command 没被误当 reply");
+        assert_eq!(
+            queue.len(),
+            1,
+            "撞 id 的 command 仍被 defer（因非 reply flag）"
+        );
+        let q_cmd = queue[0].header.cmd;
         assert_eq!(q_cmd, Command::RegionRead as u16);
     }
 

@@ -32,6 +32,37 @@ python3 enumerate_smoke.py      # 自动 build + spawn server，无需手动起
 send/recv/expect_reply / version_handshake / get_info / get_region_info /
 get_irq_info / region_read/write / device_reset）。
 
+## libvfio-user 官方 client（differential oracle，gold standard）
+
+Python harness 与我们 server 同源（可能共享错误假设）。**真正的 spec-conformance
+oracle 是 [libvfio-user](https://github.com/nutanix/libvfio-user)（Nutanix 官方 C
+实现）的 `samples/client`** —— 独立第二实现，catch self-consistent 测试看不到的 bug
+（LESSONS §2）。真 QEMU 8.2 主线**无** vfio-user 客户端（只有 vhost-user），故 libvfio-user
+client 是这里能跑的最强验证。
+
+复现：
+```bash
+sudo apt install -y libjson-c-dev libcmocka-dev      # libvfio-user 构建依赖
+git clone --depth 1 https://github.com/nutanix/libvfio-user.git /tmp/libvfio-user
+cd /tmp/libvfio-user && meson setup build && ninja -C build
+# 起我们的 server，再用官方 client 连入：
+nvme_firmware --vfio-user-sock /tmp/x.sock --backing-file /tmp/x.img &
+/tmp/libvfio-user/build/samples/client /tmp/x.sock
+```
+
+**已验证（官方实现确认我们的协议层）**：VERSION 握手 / bogus-region → EINVAL /
+GET_DEVICE_INFO(9 region, 5 irq) / GET_REGION_INFO 全 9 region 尺寸+flags /
+bulk config-space read。
+
+**oracle 抓到并已修的 2 个真 conformance bug**（commit `533432ec`）：
+1. bogus region 访问应 EINVAL（此前不校验 region index → 误返 success）。
+2. bulk REGION_READ（config header 一次读 64 字节；此前 1/2/4/8 限制太严）。
+
+**已知 diverge（非通用 spec，不追）**：client 之后断言 identity == `0xdead/0xbeef/
+0xcafe/0xbabe`（它写死 libvfio-user 自带 sample server 的身份，我们是 NVMe
+`0x1414/0xc0de`），再之后用 `VFIO_USER_DEVICE_FEATURE`（dirty-page 迁移，我们未实现）。
+这些是 sample-server-specific / 高级 migration feature，不是协议枚举层的合规缺口。
+
 ## 后续 scenario（待加）
 
 - DMA head-of-line 跨进程版：DMA_MAP + doorbell 触发 server DMA_READ + 等待期插
