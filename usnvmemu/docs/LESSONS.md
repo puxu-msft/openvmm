@@ -354,3 +354,24 @@ markdown link 关系成网。手算相对路径深度 (`../../../../`) 错了好
 
 **来源**: usnvmemu/ 子目录化 + crate 改名 + 文档归属重组 (commit
 94d2f94a / 文档重组 / 849a3f83), 3 轮 Python 脚本 + 死链扫描达 0 broken。
+
+## 19. 对称性是伪需求 —— read/write/completion 三者语义本不齐 (MEDIUM)
+
+**坑**: Phase W 设计时一度想给 transport 抽一个"对称全双工入站 trait"(把
+MMIO read/write、cfg、reset、dma-completion 统一成一个 `Inbound` enum)。
+
+**为什么错**:
+- **PCI read 必须同步返回值, write 没有** —— 强塞进一个 enum 等于用 `Option`
+  把"读一定有值/写一定没值"的编译期保证换成运行期 match。
+- **dma-completion 不是所有 transport 的真入站事件** —— pcie_remote 是真异步
+  wire 帧; vfio-user 的 DMA 是同步往返, adapter 合成一条完成事件。强求"对称"
+  逼每个 adapter 假装有这个事件。
+- **nvme-of 一个入站 variant 都不用** —— 它没有 MMIO/cfg/reset。两家不足以
+  证成一个抽象 (YAGNI)。
+
+**正确做法**: 保留 `PcieDevice` 现有**非对称**入站方法 (read 返值/write 不返);
+入站派发是 **adapter 私事**, 不进 core trait。`on_dma_complete` 文档明确它是
+"transport 内部 token 完成通知", 不是对称入站事件 (见 device.rs 该方法 doc)。
+
+**来源**: ADR-010 / Phase W; architect subagent 复核否决了 generic 对称 trait
+这个过度设计。教训: 抽象前先问"三个实现里有几个真用得上这个 variant"。

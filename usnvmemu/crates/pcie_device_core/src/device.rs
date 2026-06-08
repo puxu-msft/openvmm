@@ -96,6 +96,13 @@ pub trait PcieDevice: 'static {
     ///   `ok=false` 时 `data` 为空（read 失败 / gpa 越界 / rate limit 拒绝）。
     /// - 对 `dma_write`：`data` 始终为空；`ok` 表示写入成功。
     ///
+    /// **语义契约（W4 / ADR-010）**：本回调是 *transport 内部的 token 完成通知*，
+    /// **不是**跨 transport 对称的"入站事件"。不同 backend 产生它的方式不同：
+    /// pcie_remote 是 host 收到一帧真异步 `DmaCompletion` wire 消息；vfio-user
+    /// 的 DMA 是 *同步* 往返，adapter 在 wire round-trip 完成后 *合成* 一条完成
+    /// 事件投递。device 只依赖"token 终会被回调一次"这个契约，不应假设其底层
+    /// 是同步还是异步。
+    ///
     /// 默认实现 no-op；只发 `dma_*_fire_and_forget` 的设备无需 override。
     fn on_dma_complete(&mut self, ctx: &mut DeviceCtx<'_>, token: u64, ok: bool, data: Vec<u8>) {
         let _ = (ctx, token, ok, data);

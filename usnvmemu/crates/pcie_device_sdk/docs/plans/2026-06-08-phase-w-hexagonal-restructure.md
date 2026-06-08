@@ -1,10 +1,19 @@
 # Phase W — pcie_device_sdk 补全 hexagonal 结构
 
-> **Status:** planning（已 architect-review，准备执行 W1）
+> **Status:** W1 ✅ / W2 ✅ / W4 ✅ SHIPPED；W3 pending（device 层 lib/bin 拆分）
 > **Date:** 2026-06-08
 > **Prereqः** Phase T（ADR-002，出站 `trait Transport` 已抽）/ Phase U（vfio-user）/ Phase V（NVMe-oF TCP）均已 shipped
 > **决策依据:** [ADR-010](/usnvmemu/crates/pcie_device_sdk/docs/DECISIONS.md)
 > **Successor:** vfio-user spec-complete track（独立，见 §8）
+>
+> **进度（commit）**：
+> - **W1** ✅ 中立描述模型 + vfio-user cfg-space 修复 — `3100a102`
+> - **W2** ✅ core 抽出 `e9139833` + 纯 consumer 改指 core `249483c3` + vmsocket cfg(windows) `96539f25`
+>   - ⚠️ **crate 重命名 `pcie_device_sdk`→`pcie_transport_openhcl` 推迟**：ADR-009
+>     明确"命名重构等仓库拆分（Phase X）一起走，避免双轨"。现在改名会双重改名，
+>     故 W2 只做结构抽取，保留旧 crate 名直到 Phase X。
+> - **W3** ⏳ pending — device 层解耦（`nvme_firmware` 拆 lib + feature-gate transport）
+> - **W4** ✅ dma-completion 语义契约文档 + LESSONS §19（对称性是伪需求）
 
 ---
 
