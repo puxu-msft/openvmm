@@ -24,6 +24,17 @@
 //!
 //! - **fd 处理**：DMA_MAP 若带 fd，我们 *接收并立即 drop*（关闭），等价不 mmap。
 //!   spec 允许；fd 内核会自动 close。
+//!
+//! ## TODO（spec follow-up，未来扩展前必读）
+//!
+//! 当前 `dma_read_sync`/`dma_write_sync` 把整段 (addr, len) 放进**单条**
+//! DMA_READ/DMA_WRITE 消息。`DMA_READ/WRITE` 方向是 server→client，**接收方是
+//! client**，故单条消息的数据量受 **client 广告的** `max_data_xfer_size` 约束
+//! （per-receiver 语义，见 [`crate::handshake::SERVER_MAX_DATA_XFER_SIZE`] 的反方向）。
+//! 教学 NVMe 当前单次 DMA 远小于 1 MiB（PRP 粒度），未触限；但**将来若要发
+//! > client max_data_xfer_size 的 DMA，必须先 parse `Negotiated.client_caps_json`
+//! 里的 `max_data_xfer_size` 并据此分片**（类似 NVMe-oF 的 MAXH2CDATA 切片），
+//! 否则超 client 接收上限。`VfioUserSession.negotiated` 字段正是这个未来钩子。
 
 use crate::framing::Message;
 use crate::framing::read_message;

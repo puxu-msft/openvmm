@@ -34,6 +34,18 @@ use anyhow::anyhow;
 use std::os::unix::net::UnixStream;
 use zerocopy::IntoBytes;
 
+/// 本 server 广告的 `max_data_xfer_size`（字节）—— 单条 REGION/DMA 消息能携带的
+/// 最大数据量。
+///
+/// **vfio-spec 语义**：`max_data_xfer_size` 是 **per-receiver** 的——发送方不得
+/// 超过接收方广告的值。`REGION_READ/WRITE` 是 client→server（接收方 = 本 server），
+/// 故服务端用**本常量**作为 REGION 访问 `count` 的上限（不是与 client 协商的 min）。
+/// client 广告的值只对反方向（server→client 的 `DMA_READ/WRITE`）有意义。
+///
+/// 1 MiB = spec 默认，且 ≤ QEMU 64 MiB 上限。必须与 [`SERVER_CAPS_JSON`] 里广告的
+/// 数值一致（`server_caps_advertises_declared_max_xfer` 测试钉死，避免 drift）。
+pub const SERVER_MAX_DATA_XFER_SIZE: usize = 1_048_576;
+
 /// 本 server 默认 advertise 的 capabilities JSON（教学路径写死）。
 ///
 /// **review (真 QEMU 11 oracle)** — `max_msg_fds` 须 ≤ 客户端可接受上限。QEMU
@@ -198,6 +210,23 @@ mod tests {
     /// 两端 UnixStream — 一端跑 server_handshake，另一端作 client 发 VERSION。
     fn pair() -> (UnixStream, UnixStream) {
         UnixStream::pair().expect("socketpair")
+    }
+
+    /// **drift gate** — `SERVER_MAX_DATA_XFER_SIZE` 常量须与 `SERVER_CAPS_JSON`
+    /// 里广告的数值一致；任一改了忘改另一个，REGION 上限就和广告脱节。
+    #[test]
+    fn server_caps_advertises_declared_max_xfer() {
+        let needle = format!("\"max_data_xfer_size\":{SERVER_MAX_DATA_XFER_SIZE}");
+        assert!(
+            SERVER_CAPS_JSON.contains(&needle),
+            "SERVER_CAPS_JSON 须广告与 SERVER_MAX_DATA_XFER_SIZE 一致的值：{needle}"
+        );
+        // 字段只出现一次（防残留旧值 / 重复键造成子串匹配误判）。
+        assert_eq!(
+            SERVER_CAPS_JSON.matches("max_data_xfer_size").count(),
+            1,
+            "max_data_xfer_size 字段须恰好出现一次"
+        );
     }
 
     fn client_send_version(stream: &mut UnixStream, major: u16, minor: u16, caps_json: &str) {

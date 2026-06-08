@@ -39,12 +39,14 @@ use zerocopy::IntoBytes;
 // 描述统一从 `PcieDevice::describe` 的中立 `pcie_device_core::DeviceDescribe`
 // 派生，不再要求实现者额外实现一个 vfio-user 专属 trait（消除"描述模型分叉"）。
 
-/// **review M-2 (诚实标注)** — bulk REGION_READ/WRITE 的保守防-OOM 上限，
-/// **不是协议常量**。正确值应是握手协商的 `max_data_xfer_size`（server caps
-/// 已宣告 1 MiB，见 handshake.rs）；当前 `Negotiated` 只存了 caps JSON 原始
-/// 串、未 parse 出数值字段，故暂用此硬编码 —— 补 parse + 用协商值见 ROADMAP。
-/// READ / WRITE 共用同一上限（对称）。
-pub(crate) const MAX_REGION_ACCESS: usize = 4096;
+/// bulk REGION_READ/WRITE 的 `count` 上限 = 本 server 广告的 `max_data_xfer_size`。
+///
+/// **vfio-spec**：`REGION_READ/WRITE` 是 client→server，接收方是本 server，故上限
+/// 取**本端广告值** [`crate::handshake::SERVER_MAX_DATA_XFER_SIZE`]（per-receiver
+/// 语义，非与 client 协商的 min）。真正的每-region 边界由 [`region_access_ok`]
+/// 按 region size 把关（CONFIG 4 KiB / BAR0 describe 派生）；本上限是消息级
+/// anti-DoS 天花板。此前是裸 `4096`（既非协议值、又对 > 4 KiB 的 BAR 误拒）。
+pub(crate) const MAX_REGION_ACCESS: usize = crate::handshake::SERVER_MAX_DATA_XFER_SIZE;
 
 /// Server-side session：握手已完成，循环派发入站命令到 [`PcieDevice`]。
 ///
@@ -370,8 +372,9 @@ impl VfioUserSession {
             .is_some_and(|end| end <= size)
     }
 
-    /// **vfio-spec** — BAR/MMIO region read：1/2/4/8 字节走单次 `mmio_read`
-    /// （保持寄存器粒度语义）；bulk（其它长度）按 ≤4 字节对齐 chunk 逐段拼。
+    /// **vfio-spec** — BAR/MMIO region read：按对齐感知寄存器粒度分块（见
+    /// [`crate::access::register_chunks`]，MMIO max=8），逐段 `mmio_read` 拼接。
+    /// 对齐的 ≤8 字节段整体读（保持寄存器宽度语义），非对齐退化到更小粒度。
     fn read_bar_bytes<D: PcieDevice>(
         device: &mut D,
         bar: u32,
@@ -1140,8 +1143,63 @@ mod tests {
         assert!(h.join().unwrap().unwrap());
     }
 
+    /// **vfio-spec (max_data_xfer_size 修复)** — REGION_READ 可读满整个 BAR0
+    /// region size（MockDev = 8 KiB）。此前裸 `MAX_REGION_ACCESS = 4096` cap 会
+    /// 误拒 4096..8192 的合法访问；现上限 = server 广告 `max_data_xfer_size`
+    /// (1 MiB)，真正的边界由 `region_access_ok` 按 region size 把关。
+    #[test]
+    fn region_read_full_bar_size_above_old_4k_cap() {
+        let (server, mut client) = pair();
+        let mut sess = VfioUserSession::new(server, neg());
+        let mut dev = MockDev::new();
+        let h = thread::spawn(move || sess.pump_one(&mut dev));
+        let req = RegionAccessPayload {
+            offset: 0,
+            region: crate::proto::pci_region::BAR0,
+            count: 8192, // = 整个 BAR0；> 旧 4096 cap
+        };
+        let hdr = Header::command(1, Command::RegionRead, req.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, req.as_bytes(), &[]).unwrap();
+        let reply = read_message(&mut client).unwrap();
+        assert!(
+            !reply.header.flags().is_error(),
+            "满-region 读不应被 cap 误拒"
+        );
+        let off = core::mem::size_of::<RegionAccessPayload>();
+        assert_eq!(reply.payload[off..].len(), 8192, "返回整个 8 KiB BAR0");
+        assert!(h.join().unwrap().unwrap());
+    }
+
+    /// **review L-c (钉死设计意图)** — 真正的 REGION 边界是 `region_access_ok`
+    /// 按 region size 把关，**不是** `MAX_REGION_ACCESS`(1 MiB) 天花板。BAR0 只有
+    /// 8 KiB，请求 count=8193（> region size 但 << 1 MiB）须 EINVAL —— 防将来有人
+    /// 看到 1 MiB 上限误以为能读满 1 MiB 而回退掉 region-size 校验。
+    #[test]
+    fn region_read_above_region_size_but_under_max_rejected() {
+        let (server, mut client) = pair();
+        let mut sess = VfioUserSession::new(server, neg());
+        let mut dev = MockDev::new();
+        let h = thread::spawn(move || sess.pump_one(&mut dev));
+        let req = RegionAccessPayload {
+            offset: 0,
+            region: crate::proto::pci_region::BAR0,
+            count: 8193, // > BAR0 的 8 KiB；远 < MAX_REGION_ACCESS(1 MiB)
+        };
+        let hdr = Header::command(1, Command::RegionRead, req.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, req.as_bytes(), &[]).unwrap();
+        let reply = read_message(&mut client).unwrap();
+        assert!(
+            reply.header.flags().is_error(),
+            "超 region size 须被 region_access_ok 拒"
+        );
+        let errno = reply.header.error_no;
+        assert_eq!(errno, libc::EINVAL as u32);
+        assert!(h.join().unwrap().unwrap(), "参数错不应 close session");
+    }
+
     /// **review L-2** — bulk BAR read（非 1/2/4/8）走 `read_bar_bytes` chunk 路径：
-    /// 拆成 ≤4 字节 `mmio_read` 拼回 count 字节；1/2/4/8 走单次 `mmio_read`。
+    /// 按对齐感知粒度（MMIO max=8）拆 `mmio_read` 拼回 count 字节；对齐的 ≤8 字节
+    /// 段单次读。
     #[test]
     fn read_bar_bytes_chunks_and_single() {
         let mut dev = MockDev::new();
