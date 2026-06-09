@@ -137,6 +137,14 @@ pub struct AsyncSession<S: AsyncSessionStream = TokioStream> {
     /// opt-in。session 已扇区感知，Format 改 lbads 后下条 IO 即按新扇区合成
     /// PRP。0x0D NS Management 不受此开关影响，恒 block。
     pub allow_format: bool,
+    /// **2026-06-09 fused C&W over fabric** — 暂存的 fused FIRST(Compare) 的
+    /// SQE + host cccid，等其 SECOND(Write) 到达配对。session **独占**此 fuse
+    /// 状态（不依赖 controller `pending_fused`）：两条 FIRST / fuse=0 打断 /
+    /// SECOND-without-FIRST / nsid·slba·nlb 不匹配 全在 session 内一致处理，
+    /// 不会出现 session 与 controller 双状态失步（reviewer HIGH-1）。controller
+    /// `nvme_fused_cas` 是无状态原子 CAS（host 两 buffer 经 R2T 取齐后单次
+    /// `&mut self` 调用内 read-compare-write，不中途释放锁 → reviewer HIGH-2）。
+    pub pending_fused: Option<(nvme_firmware::cmd::Sqe, u16)>,
 }
 
 /// **V8e-3** — async 版 ICReq/ICResp handshake。语义与 sync
@@ -242,6 +250,7 @@ where
         chap_secret_store: None,
         chap: None,
         allow_format: false,
+        pending_fused: None,
     })
 }
 
@@ -1419,6 +1428,22 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
 
         // V5b R-5：清 PSDT bits
         sqe.cdw0 &= !(0b11u32 << 14);
+
+        // **2026-06-09 fused C&W over fabric** — fuse bits 9:8（1=FIRST/Compare、
+        // 2=SECOND/Write）。fabric 此前走 `dispatch_io` 无 fuse 处理 → Compare/Write
+        // 当两条独立命令执行 → 零 atomic CAS（Compare 失败 Write 仍写）。改由
+        // session 独占配对 + hoist + controller `nvme_fused_cas` 原子 CAS。
+        let fuse = ((sqe.cdw0 >> 8) & 0x3) as u8;
+        if fuse != 0 {
+            return self.handle_fused_io_async(cid, sqe, fuse).await;
+        }
+        // fuse=0 普通命令到达时若有未配对 FIRST → 打断它 abort（spec § 6.2：
+        // SECOND 必须紧跟 FIRST，中间插入非 fused 命令则 FIRST 失效）。
+        if let Some((_, old_cid)) = self.pending_fused.take() {
+            self.send_capsule_resp_err_async(old_cid, /*INVALID_FIELD*/ 0x02)
+                .await?;
+        }
+
         sqe.prp1 = crate::PRP1_SENTINEL;
 
         let sq_id = self.current_qid;
@@ -1502,6 +1527,122 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         };
         self.run_post_dispatch_async(cid, immediate_cqe, tcp_t)
             .await
+    }
+
+    /// **2026-06-09 fused C&W over fabric** — 处理带 fuse bits 的 IO capsule，
+    /// 做 **原子** Compare-and-Write（spec § 6.2）。
+    ///
+    /// session 独占 fuse 配对（`pending_fused`）：FIRST(Compare,fuse=01) 暂存不
+    /// 响应；SECOND(Write,fuse=10) 到达 → 校验对齐 → **hoist**：先经 R2T 把
+    /// Compare 与 Write 两个 host buffer 取齐，再单次调 controller `nvme_fused_cas`
+    /// 在一把锁内 read-compare-write（真原子，不中途释放锁让别 conn 插队），回双
+    /// CapsuleResp。FIRST 未配对即被打断（再来 FIRST / fuse=0 / 不匹配）→ 旧
+    /// FIRST abort INVALID_FIELD；SECOND 无 FIRST / 非法 fuse=3 → INVALID_FIELD。
+    async fn handle_fused_io_async(
+        &mut self,
+        cid: u16,
+        sqe: nvme_firmware::cmd::Sqe,
+        fuse: u8,
+    ) -> anyhow::Result<()> {
+        use nvme_firmware::cmd::nvm_opc;
+        const SC_INVALID_FIELD: u8 = 0x02; // NVMe Generic: Invalid Field in Command
+
+        match fuse {
+            1 => {
+                // FIRST 必须是 Compare（spec § 6.2 唯一定义的 fused pair）。
+                if sqe.opcode() != nvm_opc::COMPARE {
+                    return self
+                        .send_capsule_resp_err_async(cid, SC_INVALID_FIELD)
+                        .await;
+                }
+                // 已有未配对 FIRST → 被本 FIRST 打断，旧的 abort（spec：SECOND
+                // 必须紧跟 FIRST）。
+                if let Some((_, old_cid)) = self.pending_fused.take() {
+                    self.send_capsule_resp_err_async(old_cid, SC_INVALID_FIELD)
+                        .await?;
+                }
+                self.pending_fused = Some((sqe, cid));
+                Ok(()) // 不响应，等 SECOND
+            }
+            2 => {
+                let write_sqe = sqe;
+                let write_cid = cid;
+                let Some((compare_sqe, compare_cid)) = self.pending_fused.take() else {
+                    // SECOND 无 FIRST → INVALID_FIELD。
+                    return self
+                        .send_capsule_resp_err_async(write_cid, SC_INVALID_FIELD)
+                        .await;
+                };
+                // 校验对齐（session 需 size 发 R2T；nvme_fused_cas 再独立验一遍）。
+                let nsid = compare_sqe.nsid;
+                let slba = compare_sqe.cdw10 as u64 | ((compare_sqe.cdw11 as u64) << 32);
+                let nlb = (compare_sqe.cdw12 & 0xffff) + 1;
+                let w_slba = write_sqe.cdw10 as u64 | ((write_sqe.cdw11 as u64) << 32);
+                let w_nlb = (write_sqe.cdw12 & 0xffff) + 1;
+                if write_sqe.opcode() != nvm_opc::WRITE
+                    || write_sqe.nsid != nsid
+                    || w_slba != slba
+                    || w_nlb != nlb
+                {
+                    // 两条都 INVALID_FIELD（spec § 6.2：fused 两条各 individual CQE）。
+                    self.send_capsule_resp_err_async(compare_cid, SC_INVALID_FIELD)
+                        .await?;
+                    return self
+                        .send_capsule_resp_err_async(write_cid, SC_INVALID_FIELD)
+                        .await;
+                }
+                let sq_id = self.current_qid;
+                let cq_id = match self.io_queues.get(&sq_id) {
+                    Some(crate::io_queue::IoQueueState::Sq { cq_id, .. }) => *cq_id,
+                    _ => anyhow::bail!("fused SECOND 但 current_qid={sq_id} 非 IO SQ"),
+                };
+                // host buffer 大小 = nlb × 当前扇区。
+                let sector = {
+                    let c = self.controller.controller.lock();
+                    1u64 << c.ns_lbads(nsid).unwrap_or(9)
+                };
+                let bytes = (nlb as u64 * sector) as u32;
+                // fused 上限单 PRP ≤ 1 page（controller fused gate 同）。超出 →
+                // 双 INVALID_FIELD（优于让 dma_read R2T 因超 V4_MAX_DMA_READ_BYTES
+                // bail 关连接；给 host 干净拒绝）。
+                if bytes > crate::dispatch_plan::NVME_PRP_PAGE_BYTES {
+                    self.send_capsule_resp_err_async(compare_cid, SC_INVALID_FIELD)
+                        .await?;
+                    return self
+                        .send_capsule_resp_err_async(write_cid, SC_INVALID_FIELD)
+                        .await;
+                }
+                // hoist：先取齐两 host buffer（各按自己 cccid 发 R2T），再原子 CAS。
+                let compare_data = self
+                    .dma_read_via_r2t_async(compare_cid, 0, bytes)
+                    .await
+                    .context("fused: R2T Compare 数据")?;
+                let write_data = self
+                    .dma_read_via_r2t_async(write_cid, 0, bytes)
+                    .await
+                    .context("fused: R2T Write 数据")?;
+                let (c_cqe, w_cqe) = {
+                    let mut c = self.controller.controller.lock();
+                    c.nvme_fused_cas(
+                        sq_id,
+                        cq_id,
+                        compare_sqe,
+                        write_sqe,
+                        &compare_data,
+                        &write_data,
+                    )
+                };
+                // 双 CapsuleResp（CQE bytes 各含自己 cccid，host 配对）。
+                self.write_capsule_resp_bytes_async(c_cqe.as_bytes())
+                    .await?;
+                self.write_capsule_resp_bytes_async(w_cqe.as_bytes()).await
+            }
+            _ => {
+                // fuse=3 reserved → INVALID_FIELD。
+                self.send_capsule_resp_err_async(cid, SC_INVALID_FIELD)
+                    .await
+            }
+        }
     }
 
     /// **V-followup-prp-list session chunking** — 大 IO 拆 sub-cmd。

@@ -1284,6 +1284,144 @@ impl NvmeController {
         self.namespaces.get(&nsid).map(|n| n.lbads)
     }
 
+    /// **2026-06-09 fused C&W over fabric** — 原子 Compare-and-Write。
+    ///
+    /// 在**单次 `&mut self` 调用内**（无 await / 无锁释放）做 read backing →
+    /// 比 `compare_data` → 相等才写 `write_data`，返 (Compare CQE, Write CQE)。
+    /// fabric session 先经 R2T 把两个 host buffer 取齐再调本函数，故 read-compare
+    /// -write 真原子（不像逐 DMA 捕获那样中途释放控制器锁让别的 conn 插队）。
+    ///
+    /// 自校验 spec § 6.2 fused 约束：FIRST=Compare(0x05)/SECOND=Write(0x01)、
+    /// 两条 nsid/slba/nlb 对齐、plain NS、单 PRP（≤1 page）。**TOCTOU 守卫**：
+    /// host buffer 长度必须正好 `nlb × (1<<lbads)`——若 `--allow-format` 下并发
+    /// Format 在 session R2T 取数与本调用间改了 lbads，长度对不上即 abort（防
+    /// 错扇区读写）。`sq_head` 写死 0（fabric 不用 doorbell head）。
+    pub fn nvme_fused_cas(
+        &mut self,
+        sq_id: u16,
+        cq_id: u16,
+        compare_sqe: crate::cmd::Sqe,
+        write_sqe: crate::cmd::Sqe,
+        compare_data: &[u8],
+        write_data: &[u8],
+    ) -> (crate::cmd::Cqe, crate::cmd::Cqe) {
+        use crate::cmd::Cqe;
+        let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+        let c_cid = compare_sqe.cid();
+        let w_cid = write_sqe.cid();
+        let both = |sc_code: u8, sct: u8| {
+            (
+                Cqe::error(c_cid, sq_id, 0, phase, sc_code, sct),
+                Cqe::error(w_cid, sq_id, 0, phase, sc_code, sct),
+            )
+        };
+
+        // spec § 6.2：FIRST=Compare、SECOND=Write，且 nsid/slba/nlb 对齐。
+        let nsid = compare_sqe.nsid;
+        let slba = compare_sqe.cdw10 as u64 | ((compare_sqe.cdw11 as u64) << 32);
+        let nlb = (compare_sqe.cdw12 & 0xffff) + 1;
+        let w_slba = write_sqe.cdw10 as u64 | ((write_sqe.cdw11 as u64) << 32);
+        let w_nlb = (write_sqe.cdw12 & 0xffff) + 1;
+        if compare_sqe.opcode() != nvm_opc::COMPARE
+            || write_sqe.opcode() != nvm_opc::WRITE
+            || write_sqe.nsid != nsid
+            || w_slba != slba
+            || w_nlb != nlb
+        {
+            tracing::warn!(
+                nsid,
+                slba,
+                "fused CAS: opcode/nsid/slba/nlb 不匹配 → INVALID_FIELD"
+            );
+            return both(sc::INVALID_FIELD, 0);
+        }
+
+        // ── 全部 ns 操作收在一个借用作用域内，出来再更新 stats/建 CQE ──
+        enum Outcome {
+            Pass,
+            Fail,
+            Rej(u8, u8),
+            Io,
+        }
+        let outcome = if let Some(ns) = self.namespaces.get_mut(&nsid) {
+            let is_plain =
+                ns.meta_size == 0 && !ns.pi_enabled() && (ns.lbads == 9 || ns.lbads == 12);
+            let sector = 1u64 << ns.lbads;
+            let bytes = (nlb as u64 * sector) as usize;
+            if !is_plain || bytes > NVME_PAGE_SIZE as usize {
+                Outcome::Rej(sc::INVALID_FIELD, 0)
+            } else if compare_data.len() != bytes || write_data.len() != bytes {
+                // TOCTOU：lbads 在 R2T 取数后被 Format 改 → 长度不符 → abort。
+                tracing::warn!(
+                    nsid,
+                    expected = bytes,
+                    got_c = compare_data.len(),
+                    "fused CAS: host buffer 长度 != nlb×sector（Format 改了 lbads？）→ abort"
+                );
+                Outcome::Rej(sc::INVALID_FIELD, 0)
+            } else if slba
+                .checked_add(nlb as u64)
+                .is_none_or(|e| e > ns.total_lba)
+            {
+                Outcome::Rej(sc::LBA_OUT_OF_RANGE, 0)
+            } else {
+                let mut backing = vec![0u8; bytes];
+                match ns.read_at(&mut backing, slba * sector) {
+                    Err(e) => {
+                        tracing::warn!(error = %e, nsid, slba, "fused CAS: backing read fail");
+                        Outcome::Io
+                    }
+                    Ok(()) => {
+                        if compare_data == backing.as_slice() {
+                            match ns.write_at(write_data, slba * sector) {
+                                Ok(()) => Outcome::Pass,
+                                Err(e) => {
+                                    tracing::warn!(error = %e, nsid, slba, "fused CAS: write fail");
+                                    Outcome::Io
+                                }
+                            }
+                        } else {
+                            Outcome::Fail
+                        }
+                    }
+                }
+            }
+        } else {
+            Outcome::Rej(sc::INVALID_NAMESPACE, 0)
+        };
+
+        match outcome {
+            Outcome::Pass => {
+                self.stat_host_reads += 1;
+                self.stat_lba_read += nlb as u64;
+                self.stat_host_writes += 1;
+                self.stat_lba_written += nlb as u64;
+                tracing::info!(
+                    nsid,
+                    slba,
+                    nlb,
+                    "fused CAS: Compare PASS → Write committed (atomic)"
+                );
+                (
+                    Cqe::success(c_cid, sq_id, 0, phase),
+                    Cqe::success(w_cid, sq_id, 0, phase),
+                )
+            }
+            Outcome::Fail => {
+                self.stat_num_err_log_entries += 1;
+                self.push_error_log(sq_id, c_cid, (sc::COMPARE_FAILURE as u16) << 1, slba, nsid);
+                tracing::info!(
+                    nsid,
+                    slba,
+                    "fused CAS: Compare FAIL → Write aborted (atomic)"
+                );
+                both(sc::COMPARE_FAILURE, sc::SCT_MEDIA_DATA_INTEGRITY)
+            }
+            Outcome::Rej(sc_code, sct) => both(sc_code, sct),
+            Outcome::Io => both(sc::DATA_TRANSFER_ERROR, 0),
+        }
+    }
+
     /// **Phase V3** — 让 controller 处理一条 DMA 完成事件（caller 通常
     /// 是 V2Session 在 captured dma_write 全部 emit 完 C2HData 后，回调
     /// 一次 ok=true 触发 controller post_cqe）。

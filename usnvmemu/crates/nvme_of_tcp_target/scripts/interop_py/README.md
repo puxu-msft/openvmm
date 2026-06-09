@@ -27,6 +27,7 @@ uv run python <script>.py
 | `io_size_sweep.py` | V-followup-prp-list (1..256 LBA byte-equal, 257 reject) | 默认 plaintext |
 | `load_test.py` | V-interop-7 (多 conn 并发 IO) | 默认 plaintext |
 | `pure_4k_e2e.py` | **纯-4K over fabric** (Format NS→4K + 扇区感知单/dual PRP + chunking + MDTS cap=32) | 加 `--allow-format` |
+| `fused_cw_e2e.py` | **Fused Compare-and-Write over fabric** (原子 CAS：匹配→Write 生效 / 不匹配→Write 不写 + 双 0x85) | 默认 plaintext |
 
 ## 加新 script
 

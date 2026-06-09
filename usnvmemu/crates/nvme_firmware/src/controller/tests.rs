@@ -739,6 +739,97 @@ fn pure_4k_io_round_trip_mixed_ns() {
     }
 }
 
+/// **2026-06-09 fused C&W over fabric** — `nvme_fused_cas` 原子 CAS 单元测试
+/// （纯 `&mut self`，无需 DeviceCtx/wire）。覆盖 PASS→写、FAIL→**backing 不变**
+/// （原子性核心不变量）、nsid/slba/nlb 不匹配→双 INVALID_FIELD、TOCTOU 长度
+/// 不符→INVALID_FIELD（Format 改 lbads 守卫）。
+#[test]
+fn fused_cas_atomic_compare_and_write() {
+    let mut c = make_ctrl_with_tmp("fused_cas");
+    let sector = 512usize;
+    let lba = 5u64;
+    let off = lba * sector as u64;
+    let p0 = vec![0xC0u8; sector];
+    let p1 = vec![0xC1u8; sector];
+    let p2 = vec![0xC2u8; sector];
+
+    let mk = |opc: u8, cid: u16, slba: u64| -> Sqe {
+        let mut b = [0u8; 64];
+        b[0] = opc;
+        b[2..4].copy_from_slice(&cid.to_le_bytes());
+        b[4..8].copy_from_slice(&1u32.to_le_bytes()); // nsid=1
+        b[40..44].copy_from_slice(&(slba as u32).to_le_bytes()); // cdw10 = SLBA
+        b[48..52].copy_from_slice(&0u32.to_le_bytes()); // cdw12 nlb-1=0 → 1 LBA
+        <Sqe as zerocopy::FromBytes>::read_from_bytes(&b[..]).unwrap()
+    };
+    let sc = |cqe: &crate::cmd::Cqe| ((cqe.dw3 >> 17) & 0xff) as u8;
+    let cid_of = |cqe: &crate::cmd::Cqe| (cqe.dw3 & 0xffff) as u16;
+    let read_lba = |c: &NvmeController| {
+        let mut g = vec![0u8; sector];
+        c.namespaces.get(&1).unwrap().read_at(&mut g, off).unwrap();
+        g
+    };
+
+    // 预置 backing LBA5 = P0
+    c.namespaces
+        .get_mut(&1)
+        .unwrap()
+        .write_at(&p0, off)
+        .unwrap();
+
+    // PASS：compare P0 == backing(P0) → write P1，双 SC=0，CID 各对
+    let (cc, wc) = c.nvme_fused_cas(1, 1, mk(0x05, 0x100, lba), mk(0x01, 0x101, lba), &p0, &p1);
+    assert_eq!((sc(&cc), sc(&wc)), (0, 0), "PASS 双 SC=0");
+    assert_eq!((cid_of(&cc), cid_of(&wc)), (0x100, 0x101), "CQE CID 各自对");
+    assert_eq!(read_lba(&c), p1, "PASS → Write 落盘 P1");
+
+    // FAIL：compare P0 vs backing(P1) → 双 COMPARE_FAILURE，backing **不变**(P1)
+    let (cc, wc) = c.nvme_fused_cas(1, 1, mk(0x05, 0x200, lba), mk(0x01, 0x201, lba), &p0, &p2);
+    assert_eq!(
+        (sc(&cc), sc(&wc)),
+        (sc::COMPARE_FAILURE, sc::COMPARE_FAILURE),
+        "FAIL 双 0x85"
+    );
+    assert_eq!(
+        read_lba(&c),
+        p1,
+        "FAIL → Write **抑制**，backing 仍 P1（原子性不变量）"
+    );
+
+    // nsid/slba/nlb 不匹配（write slba=6 != compare slba=5）→ 双 INVALID_FIELD
+    let (cc, wc) = c.nvme_fused_cas(
+        1,
+        1,
+        mk(0x05, 0x300, lba),
+        mk(0x01, 0x301, lba + 1),
+        &p1,
+        &p2,
+    );
+    assert_eq!(
+        (sc(&cc), sc(&wc)),
+        (sc::INVALID_FIELD, sc::INVALID_FIELD),
+        "不匹配 → 双 INVALID_FIELD"
+    );
+    assert_eq!(read_lba(&c), p1, "不匹配 → backing 不变");
+
+    // TOCTOU：compare_data 长度 != nlb*sector → INVALID_FIELD（Format 改 lbads 守卫）
+    let short = vec![0xC1u8; sector - 1];
+    let (cc, _) = c.nvme_fused_cas(
+        1,
+        1,
+        mk(0x05, 0x400, lba),
+        mk(0x01, 0x401, lba),
+        &short,
+        &p2,
+    );
+    assert_eq!(
+        sc(&cc),
+        sc::INVALID_FIELD,
+        "host buffer 长度不符 → INVALID_FIELD"
+    );
+    assert_eq!(read_lba(&c), p1, "TOCTOU 拒绝 → backing 不变");
+}
+
 /// Phase L1：ZNS NS 初始化 + zone state 默认值。
 #[test]
 fn zns_namespace_init() {
