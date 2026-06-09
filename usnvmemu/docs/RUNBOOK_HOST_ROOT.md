@@ -10,6 +10,63 @@
 
 ---
 
+## 0. 纯-4K Format + IO 真 nvme-cli 互通（Tier 1 HIGH，★最高优先 / 本内核即可做）
+
+> **✅ 2026-06-09 实测达成**：`sudo bash scripts/wsl_4k_format_interop.sh` 在 WSL2 kernel
+> 6.6.114 + nvme-cli 2.8 上 **PASS** —— `id-ns` 确认 LBAF[2] "Data Size: 4096 (in use)"，
+> 8×4K distinct-block round-trip 全等，**独立 backing-file oracle 确认数据落在 5\*4096
+> (=0xc5) 而非 5\*512 (=0xa0)**。纯-4K Format+IO 真 nvme-cli 互通成为继 vfio 真 QEMU、
+> nvme-of plaintext 之后又一条第三方 oracle 验证（本会话 ship 的 firmware 扇区感知偏移
+> 代码由真内核背书，非仅自家测试）。
+
+**为什么先做这个**：① 验的是本会话刚 ship 的新代码（`--allow-format` Format NVM →
+LBAF[2] 纯-4K + 扇区感知 `slba*4096` IO 偏移）——目前只过 lib test + Python harness
+（自家对自家），**缺真 nvme-cli 第三方 oracle**。② 走 plaintext，**不碰
+`CONFIG_NVME_AUTH`，当前 WSL2 内核 6.6.114 直接能跑，无需重编内核**（不像 §1 CHAP）。
+③ 已封装成一键自断言脚本，你只跑一条命令 + 贴回日志。
+
+**代码状态**：firmware `controller/io.rs` + `completion.rs` 扇区感知（`1<<lbads`）；
+fabric `async_session.rs` 扇区感知 chunking；Format 经 `--allow-format` opt-in 放行
+（`dispatch_plan.rs::decide_admin_blocked_opc`）。lib test `pure_4k_io_round_trip_mixed_ns` /
+`pure_4k_write_zeroes_offset` / `pure_4k_copy_offset` 全 revert-verified。
+
+**① 启动 target**（普通用户，**务必带 `--allow-format`**）：
+```bash
+cd usnvmemu/crates/nvme_of_tcp_target
+truncate -s 64M /tmp/ns1.img
+cargo run --bin nvme_of_tcp_target -- \
+  --listen 127.0.0.1:4420 --backing-file /tmp/ns1.img --allow-format
+```
+
+**② 跑一键脚本**（另一个终端，**需 sudo**）：
+```bash
+sudo BACKING=/tmp/ns1.img bash scripts/wsl_4k_format_interop.sh
+```
+脚本做：connect → id-ns(前) → `nvme format --lbaf=2`（LBAF[2]=纯 4K）→ id-ns(后，
+断言 in-use=4096) → 8×4K distinct-block round-trip cmp → **★非零 start-block 写后直读
+backing file 断言数据落在 `5*4096` 而非 `5*512`**（独立 oracle，纯 round-trip 测不出
+"读写都用错 ×512"的自洽 bug）→ disconnect。末尾打 `✅ PASS` / `❌ FAIL(n)`。
+
+**③ 贴回给我**：
+- 脚本 stdout 全部（尤其末尾 PASS/FAIL 行 + 任何 `!! ASSERT FAIL`）。
+- `/tmp/host4k_*.log` 全部（connect / format / idns_before / idns_after / write / read /
+  offset_oracle / disconnect）。
+- 失败时另加 `sudo dmesg | tail -40`。
+
+**已知风险**（我会据贴回迭代，这正是真互通的意义）：
+- `nvme format --lbaf=2` 若报 invalid → 可能内核对 fabric NS 的 Format 支持差异，或我
+  Identify NS 的 LBAF 表 byte layout 与 nvme-cli 解析不符（手算 offset 的老坑），据
+  `host4k_idns_after.log` 对齐。
+- backing[20480]=0x00（非 c5）→ target 的 Flush 未把用户态缓冲落盘，我加 fsync 或改
+  write-through。
+- 设备节点是普通文件而非 `brw-` → 旧会话 `echo >` 垃圾，脚本会 `rm` 后提示重连。
+- STEP 1 connect 打印 `Failed to write to /dev/nvme-fabrics: Invalid argument`（2026-06-09
+  实测见过）→ 多半是**已有同 subsysnqn 的 controller 残留**（上轮没 disconnect）；脚本按
+  subsysnqn 找到既存 controller 继续，asserts 仍 PASS。要干净复现先
+  `sudo nvme disconnect -n nqn.2014-08.org.nvmexpress:teaching:disk`。
+
+---
+
 ## 1. dhchap-4 — 真 nvme-cli DH-HMAC-CHAP 互通（Tier 1 HIGH）
 
 **代码状态**：DHCHAP 4-message spec §8.13.5 wire + simplified wire 两路都过 lib test
