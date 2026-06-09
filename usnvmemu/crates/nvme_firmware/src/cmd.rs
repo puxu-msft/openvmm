@@ -504,7 +504,15 @@ impl IdentifyController {
     /// **V8a** — 默认 CNTRLTYPE=0x01 (NVM IO Controller)；
     /// Discovery Ctrl 用 [`build_v2_bytes_with_cntrltype`]。
     pub fn build_v2_bytes(vid: u16, ssvid: u16, nn: u32) -> Vec<u8> {
-        Self::build_v2_bytes_with_cntrltype(vid, ssvid, nn, 0x01)
+        // 默认 maxcmd 跟随默认队列深度（DEFAULT_MAX_QUEUE_ENTRIES）；生产路径走
+        // build_v2_bytes_with_cntrltype 传真实 MQES+1。
+        Self::build_v2_bytes_with_cntrltype(
+            vid,
+            ssvid,
+            nn,
+            0x01,
+            crate::controller::DEFAULT_MAX_QUEUE_ENTRIES as u16,
+        )
     }
 
     /// **V8a** — builder 化的 Identify Controller，允许 caller 指定
@@ -515,7 +523,13 @@ impl IdentifyController {
     ///
     /// 替代 V7c-fix 在 `controller/admin.rs` 用 byte 111 post-hoc patch 的
     /// 临时方案；wire data 全由 type 构造，更清洁。
-    pub fn build_v2_bytes_with_cntrltype(vid: u16, ssvid: u16, nn: u32, cntrltype: u8) -> Vec<u8> {
+    pub fn build_v2_bytes_with_cntrltype(
+        vid: u16,
+        ssvid: u16,
+        nn: u32,
+        cntrltype: u8,
+        max_outstanding: u16,
+    ) -> Vec<u8> {
         let mut id = SpecIdentifyController::new_zeroed();
         id.vid = vid;
         id.ssvid = ssvid;
@@ -575,7 +589,11 @@ impl IdentifyController {
         // SQES/CQES：NVMe spec 固定 SQE=64B (2^6) / CQE=16B (2^4)。
         id.sqes = nvme_spec::QueueEntrySize::new().with_min(6).with_max(6);
         id.cqes = nvme_spec::QueueEntrySize::new().with_min(4).with_max(4);
-        id.maxcmd = 64;
+        // **2026-06-09** — MAXCMD = Maximum Outstanding Commands。host 把队列深度
+        // clamp 到 min(sqsize, maxcmd)，故须跟随队列深度（caller 传 = MQES+1，
+        // 即 entry 数，clamp 到 u16），否则 --max-queue-entries 抬了 MQES 也被
+        // maxcmd=64 卡住（dmesg "sqsize N > ctrl maxcmd 64, clamping"）。
+        id.maxcmd = max_outstanding;
         id.nn = nn;
         // **V-followup-interop-1** — MNAN = Maximum Number of Allowed Namespaces
         // (spec § 5.17.2.21 byte 524..528)。Linux nvme-tcp `nvme_init_subsystem`
@@ -875,7 +893,7 @@ mod tests {
     /// **V8a** — `build_v2_bytes_with_cntrltype(0x02)` 产 Discovery Controller。
     #[test]
     fn v8a_builder_cntrltype_discovery_explicit() {
-        let buf = IdentifyController::build_v2_bytes_with_cntrltype(0x1414, 0, 0, 0x02);
+        let buf = IdentifyController::build_v2_bytes_with_cntrltype(0x1414, 0, 0, 0x02, 64);
         assert_eq!(
             buf[111], 0x02,
             "explicit CNTRLTYPE = 0x02 (Discovery Controller)"
@@ -986,7 +1004,7 @@ mod tests {
     #[test]
     fn v_interop_1_identify_discovery_controller_fabrics_fields_completeness() {
         use core::mem::offset_of;
-        let buf = IdentifyController::build_v2_bytes_with_cntrltype(0x1414, 0, 0, 0x02);
+        let buf = IdentifyController::build_v2_bytes_with_cntrltype(0x1414, 0, 0, 0x02, 64);
         assert_eq!(
             buf[offset_of!(SpecIdentifyController, cntrltype)],
             0x02,

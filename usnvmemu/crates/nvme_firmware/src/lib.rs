@@ -25,4 +25,6 @@ pub mod regs;
 pub mod sgl;
 
 pub use controller::NvmeController;
-pub use controller::{DEFAULT_MAX_QUEUE_ENTRIES, MAX_MAX_QUEUE_ENTRIES, MIN_MAX_QUEUE_ENTRIES};
+pub use controller::{
+    DEFAULT_MAX_QUEUE_ENTRIES, IO_QUEUE_CAP, MAX_MAX_QUEUE_ENTRIES, MIN_MAX_QUEUE_ENTRIES,
+};

@@ -56,8 +56,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-/// **V5d-fix C-1** — 默认最大并发 conn 数。超出立即 drop。
-const DEFAULT_MAX_CONNECTIONS: usize = 16;
+/// **V5d-fix C-1 + 2026-06-09** — 默认最大并发 conn 数。超出立即 drop。
+///
+/// NVMe-oF TCP **每 queue pair 一条 TCP 连接**：单 host 需 `1(admin) +
+/// min(host_cpu, IO_QUEUE_CAP)` 条。故默认派生自 `IO_QUEUE_CAP`，让任意单 host
+/// 在满队列上限下都能连上（+16 余量给 discovery / 重连瞬时重叠）。以前硬编 16
+/// 是 `IO_QUEUE_CAP=4` 时代的值，现在会拒掉多 CPU host。
+const DEFAULT_MAX_CONNECTIONS: usize = nvme_firmware::IO_QUEUE_CAP as usize + 16;
 /// **V5d-fix L-6** — handshake 阶段 socket read/write timeout。
 /// **V8e-7-4**：bin 切到 AsyncSession 后不再用（KATO timer 接管 idle 防护）；
 /// 保留作 sync `handle_conn` legacy 路径以及 V-followup 参考。
@@ -275,6 +280,24 @@ async fn main() -> Result<()> {
         discovery_mode = cli.discovery_mode,
         "V5d/V7 nvme_of_tcp_target start"
     );
+
+    // **2026-06-09** — NVMe-oF TCP 每 queue pair 一条 TCP 连接：单 host 需
+    // 1(admin) + min(host_cpu, IO_QUEUE_CAP) 条。若 max_connections 不足以容纳
+    // 满队列上限的单 host，提醒（不强制——host CPU 少时小值也够）。
+    let single_host_need = nvme_firmware::IO_QUEUE_CAP as usize + 1;
+    if cli.max_connections < single_host_need {
+        tracing::warn!(
+            max_connections = cli.max_connections,
+            io_queue_cap = nvme_firmware::IO_QUEUE_CAP,
+            single_host_need,
+            "max-connections 偏低：一个请求满 {} 个 IO 队列的 host 需 {} 条连接，\
+             会被拒。host CPU 数 ≤ max_connections-1 时无碍；否则用 --max-connections \
+             {} 或 host 侧 `nvme connect -i N` 限队列数。",
+            nvme_firmware::IO_QUEUE_CAP,
+            single_host_need,
+            single_host_need
+        );
+    }
 
     // **V7 / V8a** — discovery mode 必填 target NQN + addr 多 portal；
     // zip 配对（必须等长且非空）；spawn 时 clone 给每条 conn handler

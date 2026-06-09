@@ -65,7 +65,7 @@ pub(super) const SECTOR_SIZE: u64 = 1 << SECTOR_SHIFT;
 /// 硬上限 256（远超真硬件常见 64，展示并发模型上限）。qid 范围 1..=256；admin = 0。
 /// 存储用 [`DenseMap`]（Vec 直接索引）而非 HashMap：qid 是密集小整数，O(1) 索引 +
 /// cache-friendly，无哈希开销。Create IO Queue 校验 qid ≤ 此值防越界。
-pub(super) const IO_QUEUE_CAP: u16 = 256;
+pub const IO_QUEUE_CAP: u16 = 256;
 
 /// queue id 上界（admin 0 + IO 1..=IO_QUEUE_CAP）→ DenseMap slot 数 = 此 +1。
 pub(super) const MAX_QID: u16 = IO_QUEUE_CAP;

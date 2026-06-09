@@ -167,8 +167,15 @@ impl NvmeController {
                         } else {
                             self.namespaces.len() as u32
                         };
+                        // **2026-06-09** — MAXCMD 跟随队列深度：= MQES+1（entry
+                        // 数），clamp 到 u16 上限，避免 host 把深度 clamp 到旧硬编 64。
+                        let mqes_plus_1 = ((self.cap & 0xffff) + 1).min(u16::MAX as u64) as u16;
                         IdentifyController::build_v2_bytes_with_cntrltype(
-                            self.vid, self.ssvid, nn, cntrltype,
+                            self.vid,
+                            self.ssvid,
+                            nn,
+                            cntrltype,
+                            mqes_plus_1,
                         )
                     }
                     0x02 => {
