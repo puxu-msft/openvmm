@@ -319,6 +319,426 @@ fn pi_write_read_round_trip() {
     );
 }
 
+/// **2026-06-09 纯 4K IO 全链路** — 混合格式 2 NS：NS1 = 512B(LBAF0)、
+/// NS2 = 纯 4K(LBAF2, lbads=12/meta=0/无 PI)。对 NS2 跑 WRITE→READ 全
+/// dispatch_io / on_dma_complete 闭环，覆盖单 PRP(1 LBA=4096)与双 PRP
+/// (2 LBA=8192)两档，断言：
+///   ① 4K 偏移 = lba×4096（**不是** ×512）——在 512-偏移处必为零；
+///   ② READ 经 DMA-write 回吐的字节 == 写入 pattern（往返一致）；
+///   ③ NS1(512B) 同 LBA 写入落在 ×512 偏移，与 NS2 互不串扰。
+#[test]
+fn pure_4k_io_round_trip_mixed_ns() {
+    use pcie_device_core::TransportEvent;
+
+    let dir = std::env::temp_dir();
+    let tid = format!("{:?}", std::thread::current().id());
+    let p1 = dir.join(format!("nvme4k_ns1_{}_{}.img", std::process::id(), tid));
+    let p2 = dir.join(format!("nvme4k_ns2_{}_{}.img", std::process::id(), tid));
+    for p in [&p1, &p2] {
+        let f = std::fs::File::create(p).unwrap();
+        f.set_len(1024 * 1024).unwrap(); // 1 MiB
+        drop(f);
+    }
+    let mut c = NvmeController::open(
+        &[
+            p1.to_str().unwrap().to_string(),
+            p2.to_str().unwrap().to_string(),
+        ],
+        0x1414,
+        0,
+        &[],
+    )
+    .unwrap();
+    // NS2 → 纯 4K（lbads=12, meta=0, 无 PI）。重算 total_lba。
+    {
+        let ns2 = c.namespaces.get_mut(&2).unwrap();
+        ns2.lbads = 12;
+        ns2.meta_size = 0;
+        ns2.pi_type = 0;
+        ns2.pi_first = false;
+        let size = ns2.file.metadata().unwrap().len();
+        ns2.total_lba = size / ns2.block_bytes(); // 4096 → 256 LBA
+        assert_eq!(ns2.block_bytes(), 4096);
+        assert_eq!(ns2.total_lba, 256);
+    }
+    // IO CQ（cq_id=1）——post_cqe 需要 base_gpa。
+    c.cqs.insert(
+        1,
+        crate::regs::CompletionQueue {
+            base_gpa: 0x1_0000,
+            size: 64,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        },
+    );
+    let mut cap = pcie_device_core::CaptureTransport::with_start_token(0x100);
+
+    // 构造 IO SQE 的 helper。
+    let make_sqe = |opc: u8, nsid: u32, slba: u64, nlb: u32, prp1: u64, prp2: u64, cid: u16| {
+        let zero = [0u8; 64];
+        let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+        sqe.cdw0 = (opc as u32) | ((cid as u32) << 16);
+        sqe.nsid = nsid;
+        sqe.cdw10 = slba as u32;
+        sqe.cdw11 = (slba >> 32) as u32;
+        sqe.cdw12 = nlb - 1; // 0-based
+        sqe.prp1 = prp1;
+        sqe.prp2 = prp2;
+        sqe
+    };
+    const WRITE: u8 = 0x01;
+    const READ: u8 = 0x02;
+
+    // 取 [pre..] 中发往 `gpa` 的首条 DmaRead 的 len。WRITE/COMPARE/fused 在
+    // dispatch 阶段按 per-NS 扇区请求 host 数据；断言 len 才能真正锁住
+    // **dispatch 侧**的字节数（completion 侧靠注入数据已被 ①④⑥ 锁住）。
+    fn dma_read_len(cap: &pcie_device_core::CaptureTransport, pre: usize, gpa: u64) -> u32 {
+        cap.events()
+            .iter()
+            .skip(pre)
+            .find_map(|e| match e {
+                TransportEvent::DmaRead { gpa: g, len, .. } if *g == gpa => Some(*len),
+                _ => None,
+            })
+            .expect("应有一条 DmaRead 到该 gpa")
+    }
+
+    // ---- ① 单 PRP WRITE：NS2 LBA 5, 1 LBA (4096B) ----
+    let pat1: Vec<u8> = (0..4096).map(|i| (i * 7 + 1) as u8).collect();
+    let pre1 = cap.events().len();
+    {
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+        let r = c.dispatch_io(
+            &mut ctx,
+            1,
+            make_sqe(WRITE, 2, 5, 1, 0x4000, 0, 0x11),
+            0x11,
+            0,
+            1,
+        );
+        assert!(r.is_none(), "WRITE 走 DMA-read，dispatch 不立即返 cqe");
+        let tok = *c.pending_ios.keys().next().expect("应有一条 pending write");
+        c.on_dma_complete_impl(&mut ctx, tok, true, pat1.clone());
+    }
+    // dispatch 侧必按 ×4096 请求 host 数据（buggy ×512 会在此 fail）。
+    assert_eq!(
+        dma_read_len(&cap, pre1, 0x4000),
+        4096,
+        "纯 4K WRITE dispatch 必须按 ×4096 DMA-read host"
+    );
+    // 断言落盘偏移 = 5×4096 = 20480，且 5×512 = 2560 处仍为零。
+    {
+        let ns2 = c.namespaces.get(&2).unwrap();
+        let mut got = vec![0u8; 4096];
+        ns2.read_at(&mut got, 5 * 4096).unwrap();
+        assert_eq!(got, pat1, "纯 4K WRITE 必须落在 lba×4096 偏移");
+        let mut at512 = vec![0u8; 4096];
+        ns2.read_at(&mut at512, 5 * 512).unwrap();
+        assert!(
+            at512.iter().all(|&b| b == 0),
+            "若错按 ×512 落盘则此处非零 → 数据损坏回归"
+        );
+    }
+
+    // ---- ② 单 PRP READ：NS2 LBA 5 回读，校验 DMA-write 回吐字节 ----
+    {
+        let pre = cap.events().len();
+        {
+            let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+            let r = c.dispatch_io(
+                &mut ctx,
+                1,
+                make_sqe(READ, 2, 5, 1, 0x6000, 0, 0x12),
+                0x12,
+                0,
+                1,
+            );
+            assert!(r.is_none());
+            let tok = *c.pending_ios.keys().next().expect("应有一条 pending read");
+            c.on_dma_complete_impl(&mut ctx, tok, true, Vec::new());
+        }
+        // ctx 已 drop → 安全读 events。dispatch 中已同步 dma_write 到 prp1=0x6000。
+        let dma = cap
+            .events()
+            .iter()
+            .skip(pre)
+            .find_map(|e| match e {
+                TransportEvent::DmaWrite {
+                    gpa: 0x6000, data, ..
+                } => Some(data.clone()),
+                _ => None,
+            })
+            .expect("READ 应 dma_write 一段到 prp1");
+        assert_eq!(dma, pat1, "纯 4K READ 回吐字节必须 == 写入 pattern");
+    }
+
+    // ---- ③ 双 PRP WRITE：NS2 LBA 10, 2 LBA (8192B) ----
+    let pat2: Vec<u8> = (0..8192).map(|i| (i * 3 + 5) as u8).collect();
+    let pre3 = cap.events().len();
+    {
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+        let r = c.dispatch_io(
+            &mut ctx,
+            1,
+            make_sqe(WRITE, 2, 10, 2, 0x4000, 0x5000, 0x13),
+            0x13,
+            0,
+            1,
+        );
+        assert!(r.is_none());
+        // 两段：按 is_prp1 把对应半区喂给正确 token（乱序到达也安全）。
+        let toks: Vec<(u64, bool)> = c
+            .pending_ios
+            .iter()
+            .map(|(t, p)| {
+                let is1 = matches!(p.op, PendingOp::NvmWriteDualPrp { is_prp1: true, .. });
+                (*t, is1)
+            })
+            .collect();
+        assert_eq!(toks.len(), 2, "双 PRP WRITE 应有两条 pending");
+        for (t, is1) in toks {
+            let half = if is1 {
+                pat2[..4096].to_vec()
+            } else {
+                pat2[4096..].to_vec()
+            };
+            c.on_dma_complete_impl(&mut ctx, t, true, half);
+        }
+    }
+    // dispatch 侧两段各按一页（4096）请求；buggy ×512 会让 prp2 段尺寸错。
+    assert_eq!(
+        dma_read_len(&cap, pre3, 0x4000),
+        4096,
+        "双 PRP 段1 = 1 page"
+    );
+    assert_eq!(
+        dma_read_len(&cap, pre3, 0x5000),
+        4096,
+        "双 PRP 段2 = 8192-4096 = 1 page"
+    );
+    {
+        let ns2 = c.namespaces.get(&2).unwrap();
+        let mut got = vec![0u8; 8192];
+        ns2.read_at(&mut got, 10 * 4096).unwrap();
+        assert_eq!(got, pat2, "双 PRP 4K WRITE 落盘 == pattern @ lba×4096");
+    }
+
+    // ---- ④ 双 PRP READ：NS2 LBA 10 回读，拼接两半区校验 ----
+    {
+        let pre = cap.events().len();
+        {
+            let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+            let r = c.dispatch_io(
+                &mut ctx,
+                1,
+                make_sqe(READ, 2, 10, 2, 0x6000, 0x7000, 0x14),
+                0x14,
+                0,
+                1,
+            );
+            assert!(r.is_none());
+            // 清干净 pending（两条 read token）。
+            let toks: Vec<u64> = c.pending_ios.keys().copied().collect();
+            for t in toks {
+                c.on_dma_complete_impl(&mut ctx, t, true, Vec::new());
+            }
+        }
+        let mut merged = Vec::new();
+        for gpa in [0x6000u64, 0x7000] {
+            let d = cap
+                .events()
+                .iter()
+                .skip(pre)
+                .find_map(|e| match e {
+                    TransportEvent::DmaWrite { gpa: g, data, .. } if *g == gpa => {
+                        Some(data.clone())
+                    }
+                    _ => None,
+                })
+                .expect("双 PRP READ 每半区各一 dma_write");
+            merged.extend_from_slice(&d);
+        }
+        assert_eq!(merged, pat2, "双 PRP 4K READ 拼接 == pattern");
+    }
+
+    // ---- ⑤ 跨 NS 隔离：NS1(512B) 同 LBA 5 写入落 ×512 偏移 ----
+    let pat_ns1: Vec<u8> = (0..512).map(|i| (200 - (i & 0x3f)) as u8).collect();
+    {
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+        let r = c.dispatch_io(
+            &mut ctx,
+            1,
+            make_sqe(WRITE, 1, 5, 1, 0x4000, 0, 0x15),
+            0x15,
+            0,
+            1,
+        );
+        assert!(r.is_none());
+        let tok = *c.pending_ios.keys().next().unwrap();
+        c.on_dma_complete_impl(&mut ctx, tok, true, pat_ns1.clone());
+    }
+    {
+        let ns1 = c.namespaces.get(&1).unwrap();
+        let mut got = vec![0u8; 512];
+        ns1.read_at(&mut got, 5 * 512).unwrap();
+        assert_eq!(got, pat_ns1, "NS1 512B WRITE 落在 lba×512");
+    }
+    // NS2 的 LBA 5 数据未被 NS1 操作改动（不同 backing + 不同偏移语义）。
+    {
+        let ns2 = c.namespaces.get(&2).unwrap();
+        let mut got = vec![0u8; 4096];
+        ns2.read_at(&mut got, 5 * 4096).unwrap();
+        assert_eq!(got, pat1, "NS2 LBA5 仍是其 4K pattern，未被 NS1 串扰");
+    }
+
+    // 从 CQ 槽位区间 [lo,hi) 的最后一条 16B DmaWrite 解析 SC（dw3 bits 24:17）。
+    // CQ tail 每 post 递增，故 CQE 落在 base+tail×16，而非固定 base。
+    fn last_cqe_sc(cap: &pcie_device_core::CaptureTransport, pre: usize, lo: u64, hi: u64) -> u8 {
+        let cqe = cap
+            .events()
+            .iter()
+            .skip(pre)
+            .filter_map(|e| match e {
+                TransportEvent::DmaWrite { gpa, data, .. }
+                    if *gpa >= lo && *gpa < hi && data.len() >= 16 =>
+                {
+                    Some(data.clone())
+                }
+                _ => None,
+            })
+            .next_back()
+            .expect("应有一条 CQE 写到 CQ 槽位");
+        let dw3 = u32::from_le_bytes(cqe[12..16].try_into().unwrap());
+        (dw3 >> 17) as u8
+    }
+    const COMPARE: u8 = 0x05;
+    // CQ1 槽位区间：base 0x1_0000, size 64 → [0x1_0000, 0x1_0400)。
+    const CQ1_LO: u64 = 0x1_0000;
+    const CQ1_HI: u64 = 0x1_0000 + 64 * 16;
+
+    // ---- ⑥ COMPARE 单 PRP 4K：host==backing→成功；篡改→COMPARE_FAILURE ----
+    // （NS2 LBA5 当前 == pat1）
+    {
+        let pre = cap.events().len();
+        {
+            let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+            let r = c.dispatch_io(
+                &mut ctx,
+                1,
+                make_sqe(COMPARE, 2, 5, 1, 0x8000, 0, 0x16),
+                0x16,
+                0,
+                1,
+            );
+            assert!(r.is_none());
+            let tok = *c.pending_ios.keys().next().unwrap();
+            c.on_dma_complete_impl(&mut ctx, tok, true, pat1.clone());
+        }
+        assert_eq!(
+            dma_read_len(&cap, pre, 0x8000),
+            4096,
+            "COMPARE dispatch 必须按 ×4096 DMA-read host"
+        );
+        assert_eq!(
+            last_cqe_sc(&cap, pre, CQ1_LO, CQ1_HI),
+            0,
+            "COMPARE 匹配 4K → 成功"
+        );
+    }
+    {
+        let pre = cap.events().len();
+        let mut bad = pat1.clone();
+        bad[100] ^= 0xff;
+        {
+            let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+            let r = c.dispatch_io(
+                &mut ctx,
+                1,
+                make_sqe(COMPARE, 2, 5, 1, 0x8000, 0, 0x17),
+                0x17,
+                0,
+                1,
+            );
+            assert!(r.is_none());
+            let tok = *c.pending_ios.keys().next().unwrap();
+            c.on_dma_complete_impl(&mut ctx, tok, true, bad);
+        }
+        assert_eq!(
+            last_cqe_sc(&cap, pre, CQ1_LO, CQ1_HI),
+            sc::COMPARE_FAILURE,
+            "COMPARE 不匹配 4K → 0x85（证 backing 按 ×4096 读取且长度一致）"
+        );
+    }
+
+    // ---- ⑦ Fused Compare-and-Write 4K（reviewer HIGH-1 回归锁）----
+    // FIRST=Compare(pat1) 与 backing 匹配 → SECOND=Write(newpat) 真落盘。
+    // 修复前 dispatch 按 ×512 DMA-read 仅 512B，与 completion ×4096 长度不一
+    // 致 → Compare 恒 fail、Write 永不执行。此用例证修复后 4K fused 正确。
+    c.sqs.insert(
+        1,
+        crate::regs::SubmissionQueue {
+            base_gpa: 0x2_0000,
+            size: 64,
+            head: 0,
+            tail: 0,
+            cq_id: 1,
+        },
+    );
+    let newpat: Vec<u8> = (0..4096).map(|i| (i * 5 + 9) as u8).collect();
+    let pre7 = cap.events().len();
+    {
+        let mut first = make_sqe(COMPARE, 2, 5, 1, 0x9000, 0, 0x20);
+        first.cdw0 |= 1 << 8; // FUSE_FIRST
+        let mut second = make_sqe(WRITE, 2, 5, 1, 0xA000, 0, 0x21);
+        second.cdw0 |= 2 << 8; // FUSE_SECOND
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+        c.dispatch_sqe(&mut ctx, 1, 0, first); // 缓存 FIRST
+        c.dispatch_sqe(&mut ctx, 1, 0, second); // 触发 fused → Compare DMA-read
+        // 完成 Compare（host==pat1==backing）→ Compare pass → 派发 Write
+        let ctok = c
+            .pending_ios
+            .iter()
+            .find_map(|(t, p)| {
+                matches!(p.op, PendingOp::NvmCompareSinglePrpFused { .. }).then_some(*t)
+            })
+            .expect("fused 应有一条 Compare pending");
+        c.on_dma_complete_impl(&mut ctx, ctok, true, pat1.clone());
+        // Write 已派发为 NvmWriteDmaRead；完成它写 newpat。
+        let wtok = c
+            .pending_ios
+            .iter()
+            .find_map(|(t, p)| matches!(p.op, PendingOp::NvmWriteDmaRead { .. }).then_some(*t))
+            .expect("Compare pass 后应派发 Write");
+        c.on_dma_complete_impl(&mut ctx, wtok, true, newpat.clone());
+    }
+    // **HIGH-1 dispatch 侧锁**：fused Compare 必须按 ×4096 DMA-read host；
+    // 修复前 dispatch 按 ×512 → 此处 len==512 ≠ 4096 直接 fail。
+    assert_eq!(
+        dma_read_len(&cap, pre7, 0x9000),
+        4096,
+        "fused 4K Compare dispatch 必须 ×4096 DMA-read（非 ×512）"
+    );
+    assert_eq!(
+        dma_read_len(&cap, pre7, 0xA000),
+        4096,
+        "fused 派发的 Write 也按 ×4096 DMA-read"
+    );
+    {
+        let ns2 = c.namespaces.get(&2).unwrap();
+        let mut got = vec![0u8; 4096];
+        ns2.read_at(&mut got, 5 * 4096).unwrap();
+        assert_eq!(
+            got, newpat,
+            "Fused C&W 4K：Compare 匹配后 Write 落 newpat @ ×4096"
+        );
+    }
+}
+
 /// Phase L1：ZNS NS 初始化 + zone state 默认值。
 #[test]
 fn zns_namespace_init() {

@@ -2078,23 +2078,47 @@ impl NvmeController {
                     // 限制：教学路径只支持单 PRP Compare（≤ 1 page = 8 LBA at
                     // 512B）。超过此尺寸 → abort 两条 INVALID_FIELD（spec 允许
                     // controller 不支持任意尺寸的 fused）。
-                    let bytes = first_nlb as u64 * SECTOR_SIZE;
-                    if bytes > NVME_PAGE_SIZE {
-                        tracing::warn!(
-                            slba = first_slba,
-                            nlb = first_nlb,
-                            bytes,
-                            "Fused C+W > 1 page not supported"
-                        );
-                        let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
-                        self.post_cqe(
-                            ctx,
-                            cq_id,
-                            Cqe::error(first.cid(), sq_id, first_head, phase, sc::INVALID_FIELD, 0),
-                        );
-                        let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
-                        self.post_cqe(ctx, cq_id, cqe);
-                        return;
+                    // **2026-06-09 纯 4K** — fused Compare 仅支持 plain NS（512B
+                    // LBAF[0] / 纯 4K LBAF[2]，无 meta/PI）且单 PRP（≤ 1 page）。
+                    // 按 per-NS 扇区算字节：4K 时 1 LBA = 4096 = 1 page 仍 OK。
+                    // 非 plain（如 PI 交错格式）或 > 1 page → 两条 INVALID_FIELD
+                    // （spec 允许 controller 不支持任意尺寸/格式的 fused）。
+                    // ns 不存在时不在此拒，交由 dispatch_fused_compare_write 返
+                    // INVALID_NAMESPACE，保持错误码语义。
+                    if let Some((is_plain, sector_bytes)) = self.ns(first_nsid).map(|ns| {
+                        (
+                            ns.meta_size == 0
+                                && !ns.pi_enabled()
+                                && (ns.lbads == 9 || ns.lbads == 12),
+                            1u64 << ns.lbads,
+                        )
+                    }) {
+                        let bytes = first_nlb as u64 * sector_bytes;
+                        if !is_plain || bytes > NVME_PAGE_SIZE {
+                            tracing::warn!(
+                                slba = first_slba,
+                                nlb = first_nlb,
+                                bytes,
+                                is_plain,
+                                "Fused C+W: non-plain NS 或 > 1 page not supported"
+                            );
+                            let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+                            self.post_cqe(
+                                ctx,
+                                cq_id,
+                                Cqe::error(
+                                    first.cid(),
+                                    sq_id,
+                                    first_head,
+                                    phase,
+                                    sc::INVALID_FIELD,
+                                    0,
+                                ),
+                            );
+                            let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                            self.post_cqe(ctx, cq_id, cqe);
+                            return;
+                        }
                     }
                     // Build NvmCompareSinglePrpFused op: 走 Compare 的 DMA-read
                     // 流程，但 PendingOp 变体携 write_sqe 让完成路径区分。
@@ -2192,7 +2216,11 @@ impl NvmeController {
             return;
         }
         // DMA-read host Compare 数据 → NvmCompareSinglePrpFused 完成回调
-        let bytes = nlb as u64 * SECTOR_SIZE;
+        // **2026-06-09 纯 4K** — 按 per-NS 扇区算字节，与 fused completion
+        // (completion.rs NvmCompareSinglePrpFused) 的 sector 对称，避免
+        // 512-vs-4096 长度不一致导致 4K 上 Compare 恒 fail。
+        let sector = self.ns(nsid).map_or(SECTOR_SIZE, |n| 1u64 << n.lbads);
+        let bytes = nlb as u64 * sector;
         let tok = ctx.dma_read(prp1, bytes as u32);
         self.pending_ios.insert(
             tok,
@@ -2384,7 +2412,9 @@ impl NvmeController {
         sq_head: u16,
         cq_id: u16,
     ) -> Cqe {
-        let bytes = num_blocks as u64 * SECTOR_SIZE;
+        // **2026-06-09 纯 4K** — 按 per-NS 扇区算字节/偏移。
+        let sector = 1u64 << self.namespaces.get(&nsid).map_or(9u8, |n| n.lbads);
+        let bytes = num_blocks as u64 * sector;
         let mut host_data = host_prp1;
         if let Some(extra) = host_prp2 {
             host_data.extend_from_slice(&extra);
@@ -2404,7 +2434,7 @@ impl NvmeController {
         );
         // **Phase M2** — read_at 走 mmap 零拷贝（read 路径 immutable，
         // 多个 reader 并发安全）
-        match ns.read_at(&mut backing_buf, lba * SECTOR_SIZE) {
+        match ns.read_at(&mut backing_buf, lba * sector) {
             Ok(()) => {
                 if host_data == backing_buf {
                     self.stat_host_reads += 1;

@@ -479,6 +479,9 @@ impl NvmeController {
                 // PRACT=1 + PI NS = 同 PI K4 path（generate）。PRACT=1 +
                 // 非 PI NS = INVALID_PROTECTION_INFO（spec 要求 PI capable）。
                 let pract = (cdw12 >> 29) & 0x1 != 0;
+                // **2026-06-09**：ns 未取前先按 512B 下界做 MDTS 早退 + 日志；
+                // 真实传输大小（纯 4K = nlb×4096）在取 ns 后用 sector_bytes
+                // 重算并复查 MDTS（见下方 ~814）。512B 下界永不误拒合法请求。
                 let bytes = nlb as u64 * SECTOR_SIZE;
                 tracing::debug!(
                     nsid,
@@ -509,6 +512,11 @@ impl NvmeController {
                 //   - 其它（如 LBAF[1] 多 LBA、Type 2/3）→ INVALID_FIELD
                 //     直到 K4c 多 LBA 路径完整实现
                 let is_pi_path = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
+                // **2026-06-09 纯 4K** — plain 格式 = 无 meta + 无 PI + lbads∈{9,12}
+                // （512B LBAF[0] / 纯 4K LBAF[2]）；数据扇区字节 = 1<<lbads。
+                let is_plain =
+                    ns.meta_size == 0 && !ns.pi_enabled() && (ns.lbads == 9 || ns.lbads == 12);
+                let sector_bytes = 1u64 << ns.lbads;
                 // **Phase Q1 + reviewer 12轮 H-Q1**:
                 // - PRACT=1 + 非 PI NS = INVALID_PROTECTION_INFO（spec § 8.3.1）
                 // - PRACT=0 + PI NS = INVALID_PROTECTION_INFO 因 K4 路径**不支持**
@@ -540,9 +548,10 @@ impl NvmeController {
                         0,
                     ));
                 }
-                if !is_pi_path && (ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled()) {
+                if !is_pi_path && !is_plain {
                     // **Reviewer H5** — 用 INVALID_PROTECTION_INFO 而非 INVALID_FIELD
                     // 让 driver 区分 "PI 格式不受支持" vs "命令字段错误"。
+                    // **2026-06-09**：plain 4K(LBAF[2]) 现走 is_plain 放行，不再误拒。
                     return Some(Cqe::error(
                         cid,
                         sq_id,
@@ -803,10 +812,16 @@ impl NvmeController {
                     );
                     return None;
                 }
+                // **2026-06-09 纯 4K** — plain 路径按 per-NS 扇区字节重算传输大小
+                // + 偏移（512B → 512 / 纯 4K → 4096）；并以真实大小复查 MDTS。
+                let bytes = nlb as u64 * sector_bytes;
+                if bytes > MDTS_MAX_BYTES {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
                 let mut buf = vec![0u8; bytes as usize];
                 let ns_mut = self.ns_mut(nsid).unwrap();
                 // **Phase M2** — read_at 走 mmap 零拷贝
-                if let Err(e) = ns_mut.read_at(&mut buf, slba * SECTOR_SIZE) {
+                if let Err(e) = ns_mut.read_at(&mut buf, slba * sector_bytes) {
                     tracing::warn!(error = %e, nsid, slba, nlb, "READ: backing file read failed");
                     return Some(Cqe::error(
                         cid,
@@ -927,6 +942,8 @@ impl NvmeController {
                 // is_pi_path 检查后处理）。这里只 capture flag，下面与 ns
                 // 一起处理。
                 let pract = (cdw12 >> 29) & 0x1 != 0;
+                // **2026-06-09**：同 READ —— ns 未取前按 512B 下界早退/日志，
+                // 纯 4K 真实大小在取 ns 后用 sector_bytes 重算并复查 MDTS。
                 let bytes = nlb as u64 * SECTOR_SIZE;
                 tracing::debug!(
                     nsid,
@@ -959,6 +976,10 @@ impl NvmeController {
                 // - PRACT=0 + PI NS = INVALID_PROTECTION_INFO（K4 路径不支持
                 //   driver-supplied inline tuple；driver 必须用 PRACT=1）
                 let is_pi_capable = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
+                // **2026-06-09 纯 4K** — plain 格式 = 无 meta + 无 PI + lbads∈{9,12}。
+                let is_plain =
+                    ns.meta_size == 0 && !ns.pi_enabled() && (ns.lbads == 9 || ns.lbads == 12);
+                let sector_bytes = 1u64 << ns.lbads;
                 if pract && !is_pi_capable {
                     tracing::warn!(nsid, "WRITE PRACT=1 on non-PI NS → INVALID_PROTECTION_INFO");
                     return Some(Cqe::error(
@@ -984,7 +1005,7 @@ impl NvmeController {
                         0,
                     ));
                 }
-                if ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled() {
+                if !is_plain {
                     // **Phase K4a** — PI 单 LBA Write 路径
                     let is_pi_path = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
                     if !is_pi_path {
@@ -1194,6 +1215,12 @@ impl NvmeController {
                 if let Some(cqe) = check_zns_write(ns, slba, nlb, cid, sq_id, sq_head, phase) {
                     return Some(cqe);
                 }
+                // **2026-06-09 纯 4K** — plain 路径按 per-NS 扇区字节重算传输大小
+                // + 复查 MDTS（dma_read 拉的数据量、后续 completion 写盘偏移据此）。
+                let bytes = nlb as u64 * sector_bytes;
+                if bytes > MDTS_MAX_BYTES {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
                 // 三档 PRP 分流（同 READ 路径）：≤1page / ≤2page / PRP list。
                 if bytes <= NVME_PAGE_SIZE {
                     let tok = ctx.dma_read(prp1, bytes as u32);
@@ -1394,7 +1421,12 @@ impl NvmeController {
                     return Some(cqe);
                 }
                 let is_pi_path = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
-                if !is_pi_path && (ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled()) {
+                // **2026-06-09**：plain 含 512B(LBAF[0]) 与纯-4K(LBAF[2])，按
+                // 每-LBA sector_bytes = 1<<lbads 计算偏移；is_pi_path 走 PI 分支。
+                let is_plain =
+                    ns.meta_size == 0 && !ns.pi_enabled() && (ns.lbads == 9 || ns.lbads == 12);
+                let sector_bytes = 1u64 << ns.lbads;
+                if !is_pi_path && !is_plain {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
                 let total_lba = ns.total_lba;
@@ -1460,8 +1492,10 @@ impl NvmeController {
                 // 保留 chunked 让 fallback file IO 路径不一次写 32 MiB）。
                 const CHUNK: usize = 4096;
                 let zero_buf = [0u8; CHUNK];
+                // **2026-06-09**：plain 4K 时按 sector_bytes 重算字节数/偏移。
+                let bytes = nlb as u64 * sector_bytes;
                 let mut remaining = bytes as usize;
-                let mut off = slba * SECTOR_SIZE;
+                let mut off = slba * sector_bytes;
                 let ns = self.ns_mut(nsid).unwrap();
                 while remaining > 0 {
                     let n = remaining.min(CHUNK);
@@ -1608,11 +1642,6 @@ impl NvmeController {
                 let nsid = sqe.nsid;
                 let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
                 let nlb = (cdw12 & 0xffff) as u32 + 1;
-                let bytes = nlb as u64 * SECTOR_SIZE;
-                tracing::debug!(nsid, slba, nlb, bytes, "NVM COMPARE");
-                if bytes > MDTS_MAX_BYTES {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
-                }
                 let Some(ns) = self.ns(nsid) else {
                     return Some(Cqe::error(
                         cid,
@@ -1623,10 +1652,20 @@ impl NvmeController {
                         0,
                     ));
                 };
-                if ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled() {
+                // **2026-06-09**：plain 含 512B(LBAF[0]) 与纯-4K(LBAF[2])；DMA
+                // 字节数与 backing 偏移均按 sector_bytes = 1<<lbads 计算。
+                let is_plain =
+                    ns.meta_size == 0 && !ns.pi_enabled() && (ns.lbads == 9 || ns.lbads == 12);
+                if !is_plain {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
+                let sector_bytes = 1u64 << ns.lbads;
                 let total_lba = ns.total_lba;
+                let bytes = nlb as u64 * sector_bytes;
+                tracing::debug!(nsid, slba, nlb, bytes, "NVM COMPARE");
+                if bytes > MDTS_MAX_BYTES {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
                 match slba.checked_add(nlb as u64) {
                     Some(end) if end <= total_lba => {}
                     _ => {
@@ -1780,7 +1819,11 @@ impl NvmeController {
                     ));
                 };
                 let is_pi_path = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
-                if !is_pi_path && (ns.lbads != 9 || ns.meta_size != 0 || ns.pi_enabled()) {
+                // **2026-06-09**：plain 含 512B 与纯-4K(LBAF[2])。plain NS 无 PI
+                // 元数据可校验，VERIFY 直接成功；4K 在此与 512B 同样放行。
+                let is_plain =
+                    ns.meta_size == 0 && !ns.pi_enabled() && (ns.lbads == 9 || ns.lbads == 12);
+                if !is_pi_path && !is_plain {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
                 let total_lba = ns.total_lba;

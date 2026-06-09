@@ -15,7 +15,6 @@ use crate::controller::Namespace;
 use crate::controller::NvmeController;
 use crate::controller::PendingIo;
 use crate::controller::PendingOp;
-use crate::controller::SECTOR_SIZE;
 use crate::controller::SelfTestCompleted;
 use crate::controller::ZoneState;
 use crate::controller::parse_prp_list;
@@ -218,7 +217,10 @@ impl NvmeController {
         if let Some(p) = self.pending_ios.remove(&token) {
             match p.op {
                 PendingOp::NvmWriteDmaRead { lba, num_blocks } => {
-                    let bytes = num_blocks as u64 * SECTOR_SIZE;
+                    // **2026-06-09 纯 4K** — 按 per-NS 扇区字节算（512 或 4096）；
+                    // plain NS 无 meta，扇区 = 1<<lbads。NS 缺失退回 512。
+                    let sector = 1u64 << self.namespaces.get(&p.nsid).map_or(9u8, |n| n.lbads);
+                    let bytes = num_blocks as u64 * sector;
                     let first8 = if data.len() >= 8 {
                         u64::from_le_bytes(data[..8].try_into().unwrap_or([0; 8]))
                     } else {
@@ -243,7 +245,7 @@ impl NvmeController {
                     // 零拷贝 fast path）。Admin DMA-write 是 NvmReadDmaWrite
                     // { num_blocks: 0 } 不走这里。
                     let res = if let Some(ns) = self.namespaces.get_mut(&p.nsid) {
-                        ns.write_at(&data, lba * SECTOR_SIZE)
+                        ns.write_at(&data, lba * sector)
                     } else {
                         Err(std::io::Error::other(format!("unknown NSID {}", p.nsid)))
                     };
@@ -846,7 +848,8 @@ impl NvmeController {
                         dst_total += nlb as u64;
                     }
                     let cqe = if let Some(ns) = self.namespaces.get_mut(&nsid) {
-                        let sector = SECTOR_SIZE;
+                        // **2026-06-09 纯 4K** — 按 per-NS 扇区字节计算偏移。
+                        let sector = 1u64 << ns.lbads;
                         // **Phase S2** — CONFLICTING_ATTRIBUTES (SC 0x80, SCT
                         // Cmd-Spec)：source ranges 互相重叠或与 [sdlba, sdlba+
                         // dst_total) destination 区间重叠时，spec § 3.3.7 (NVM
@@ -1258,7 +1261,11 @@ impl NvmeController {
                         let op = &self.compare_ops[&op_id];
                         (op.sq_id, op.cid, op.sq_head, op.cq_id, op.nsid)
                     };
-                    let total_bytes = num_blocks as u64 * SECTOR_SIZE;
+                    let total_bytes = {
+                        // **2026-06-09 纯 4K** — 按 per-NS 扇区算总字节。
+                        let sector = 1u64 << self.namespaces.get(&nsid).map_or(9u8, |n| n.lbads);
+                        num_blocks as u64 * sector
+                    };
                     for (i, gpa) in list.iter().enumerate() {
                         let page_idx = (i + 1) as u32;
                         let want_bytes = if page_idx == total_pages - 1 {
@@ -1294,7 +1301,9 @@ impl NvmeController {
                     };
                     if done_all {
                         let op = self.compare_ops.remove(&op_id).unwrap();
-                        let total_bytes = op.num_blocks as u64 * SECTOR_SIZE;
+                        // **2026-06-09 纯 4K** — 按 per-NS 扇区算总字节。
+                        let sector = 1u64 << self.namespaces.get(&op.nsid).map_or(9u8, |n| n.lbads);
+                        let total_bytes = op.num_blocks as u64 * sector;
                         let mut full = Vec::with_capacity(total_bytes as usize);
                         for b in op.data_pages.iter().flatten() {
                             full.extend_from_slice(b);
@@ -1334,13 +1343,15 @@ impl NvmeController {
                 PendingOp::NvmCompareSinglePrp { lba, num_blocks } => {
                     // **Phase H3** — host buffer 已 DMA-read 到 `data`；
                     // 读 backing file 对应 LBA 范围 → byte-compare。
-                    let bytes = num_blocks as u64 * SECTOR_SIZE;
+                    // **2026-06-09 纯 4K** — 按 per-NS 扇区算字节/偏移。
+                    let sector = 1u64 << self.namespaces.get(&p.nsid).map_or(9u8, |n| n.lbads);
+                    let bytes = num_blocks as u64 * sector;
                     let mut backing_buf = vec![0u8; bytes as usize];
                     let cq = self.cqs.get(&p.cq_id);
                     let phase = cq.map(|c| c.phase).unwrap_or(1);
                     let cqe = if let Some(ns) = self.namespaces.get_mut(&p.nsid) {
                         // **Phase M2** — read_at 走 mmap 零拷贝
-                        match ns.read_at(&mut backing_buf, lba * SECTOR_SIZE) {
+                        match ns.read_at(&mut backing_buf, lba * sector) {
                             Ok(()) => {
                                 if data == backing_buf {
                                     tracing::debug!(
@@ -1421,14 +1432,15 @@ impl NvmeController {
                     //   pass → 真 dispatch Write (走标准 dispatch_io 路径)
                     //   fail → post COMPARE_FAILURE 给 Compare CID + post 同 SC 给
                     //          Write CID（spec § 6.2：fused 两条都需 individual CQE）
-                    let bytes = num_blocks as u64 * SECTOR_SIZE;
+                    let sector = 1u64 << self.namespaces.get(&p.nsid).map_or(9u8, |n| n.lbads);
+                    let bytes = num_blocks as u64 * sector;
                     let mut backing_buf = vec![0u8; bytes as usize];
                     let phase = self.cqs.get(&p.cq_id).map(|c| c.phase).unwrap_or(1);
                     let write_cid = write_sqe.cid();
                     let (compare_cqe, write_action) = if let Some(ns) =
                         self.namespaces.get_mut(&p.nsid)
                     {
-                        match ns.read_at(&mut backing_buf, lba * SECTOR_SIZE) {
+                        match ns.read_at(&mut backing_buf, lba * sector) {
                             Ok(()) => {
                                 if data == backing_buf {
                                     // Compare success → 计 counter + 真 dispatch Write
@@ -1563,7 +1575,10 @@ impl NvmeController {
                         let accum = self.dual_prp_writes.remove(&op_id).unwrap();
                         let mut full = accum.prp1_data.unwrap();
                         full.extend_from_slice(&accum.prp2_data.unwrap());
-                        let bytes = accum.num_blocks as u64 * SECTOR_SIZE;
+                        // **2026-06-09 纯 4K** — 按 per-NS 扇区字节计算偏移。
+                        let sector =
+                            1u64 << self.namespaces.get(&accum.nsid).map_or(9u8, |n| n.lbads);
+                        let bytes = accum.num_blocks as u64 * sector;
                         tracing::debug!(
                             lba = accum.lba,
                             num_blocks = accum.num_blocks,
@@ -1574,7 +1589,7 @@ impl NvmeController {
                         );
                         let res = if let Some(ns) = self.namespaces.get_mut(&accum.nsid) {
                             // **Phase M2** — write_at 走 mmap 零拷贝
-                            ns.write_at(&full, accum.lba * SECTOR_SIZE)
+                            ns.write_at(&full, accum.lba * sector)
                         } else {
                             Err(std::io::Error::other(format!(
                                 "unknown NSID {}",
@@ -1653,8 +1668,11 @@ impl NvmeController {
                         let page_idx = (i + 1) as u32;
                         let want_bytes = if page_idx == total_pages - 1 {
                             // 末页可能不满 4 KiB
-                            let total_bytes =
-                                self.prp_list_ops[&op_id].num_blocks as u64 * SECTOR_SIZE;
+                            // **2026-06-09 纯 4K** — 按 per-NS 扇区算总字节。
+                            let op = &self.prp_list_ops[&op_id];
+                            let sector =
+                                1u64 << self.namespaces.get(&op.nsid).map_or(9u8, |n| n.lbads);
+                            let total_bytes = op.num_blocks as u64 * sector;
                             let last = total_bytes - (page_idx as u64) * NVME_PAGE_SIZE;
                             last as u32
                         } else {
@@ -1693,7 +1711,9 @@ impl NvmeController {
                     if done_all {
                         let op = self.prp_list_ops.remove(&op_id).unwrap();
                         // 合并 data_pages → 一段连续 buffer
-                        let total_bytes = op.num_blocks as u64 * SECTOR_SIZE;
+                        // **2026-06-09 纯 4K** — 按 per-NS 扇区算总字节/偏移。
+                        let sector = 1u64 << self.namespaces.get(&op.nsid).map_or(9u8, |n| n.lbads);
+                        let total_bytes = op.num_blocks as u64 * sector;
                         let mut full = Vec::with_capacity(total_bytes as usize);
                         for page in op.data_pages.iter() {
                             if let Some(b) = page {
@@ -1712,7 +1732,7 @@ impl NvmeController {
                         );
                         let res = if let Some(ns) = self.namespaces.get_mut(&op.nsid) {
                             // **Phase M2** — write_at 走 mmap 零拷贝
-                            ns.write_at(&full, op.lba * SECTOR_SIZE)
+                            ns.write_at(&full, op.lba * sector)
                         } else {
                             Err(std::io::Error::other(format!("unknown NSID {}", op.nsid)))
                         };
