@@ -45,6 +45,13 @@ NVMe-oF TCP 第 4 条接入。当前架构 ✅ 已对齐：firmware (controller)
 > harness**——Tier-1"三接入各 1 真 host e2e"目标达成。L3 真 Hyper-V guest nvme-driver
 > e2e 仍 defer（须用户+Windows，同 vfio 的 real-guest-boot 档）。另：host-root §0 纯-4K
 > 真 nvme-cli 互通用户实测 PASS（commit bd100f7d）。
+>
+> **下一个 nvme-spec 补全（已 scoped，待实施）** → [admin-prp-data-transfer-completion](/usnvmemu/crates/nvme_firmware/docs/plans/2026-06-10-admin-prp-data-transfer-completion-detailed.md)：
+> `dma_write_then_complete` 把整 buf 连续写 prp1、无视 PRP2/list（7 admin 命令复用）→
+> 4–8 KiB log 在非连续 PRP 的真 host 上 latent silent corruption + > 8 KiB 直接拒。
+> 修=复用 IO read 的 device→host PRP 机件（NvmReadDualPrpSiblingHalf / PrpList*）。
+> silent-corruption-class，须完整严谨循环（含 revert-verify + 用新 OpenHCL harness 测
+> 非连续 PRP）。建议新 context 起手。
 
 > **2026-06-09 自主会话状态分类**（哪些能无人值守做、哪些卡外部）：
 > - **✅ 本会话已完成**：vfio spec-complete track 全部（握手 minor 协商 / max_msg_fds /
