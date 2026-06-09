@@ -22,7 +22,7 @@ uv run python <script>.py
 | `mtls_smoke.py` | V-followup-mtls (强制 client cert) | 加 `--tls-client-ca <bundle>` |
 | `nqn_cert_binding.py` | V-followup-auth-2 (NQN ↔ cert SAN/CN 绑定) | 加 `--tls-bind-nqn-to-cert` |
 | `chap_e2e.py` | V-followup-dhchap-3-wire (simplified 2-msg wire) | `--host-secret <nqn>=<hex>` |
-| `chap4_spec_wire_e2e.py` | **V-followup-dhchap-4 + 4d** (spec § 8.13.5 4-msg wire + multi-descriptor) | `--host-secret <nqn>=<hex>` |
+| `chap4_spec_wire_e2e.py` | **V-followup-dhchap-4 + 4d + wire-conformance** (spec § 8.13.5 4-msg wire + multi-descriptor + 5 错误路径：before-challenge / 截断 / tid-mismatch / SUCCESS2-before-auth / FAILURE2) | `--host-secret <nqn>=<hex>` |
 | `io_write_e2e.py` | V5c (R2T + H2CData write 闭环) | 默认 plaintext |
 | `io_size_sweep.py` | V-followup-prp-list (1..256 LBA byte-equal, 257 reject) | 默认 plaintext |
 | `load_test.py` | V-interop-7 (多 conn 并发 IO) | 默认 plaintext |

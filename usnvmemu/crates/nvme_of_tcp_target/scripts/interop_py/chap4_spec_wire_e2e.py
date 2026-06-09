@@ -7,31 +7,39 @@
   ICReq → Connect → AUTH_SEND(NEGOTIATE) → AUTH_RECV(CHALLENGE wire) →
   AUTH_SEND(REPLY HMAC) → AUTH_RECV(SUCCESS1 wire) → admin cmd 放行
 
-覆盖：
+覆盖（9 scenarios）：
 1. happy path — 完整 4-msg + Identify Controller 通过
 2. NEGOTIATE 无 SHA-256 → FAILURE1 wire + SC=0x83
 3. REPLY 用错 secret → FAILURE1 wire (rescode_exp=FAILED) + SC=0x83
-4. NEGOTIATE napd>1 多 descriptor (V-followup-dhchap-4d) — DH-2048+NULL 第二
-   位匹配应通过
+4. NEGOTIATE napd>1 多 descriptor (V-followup-dhchap-4d) — DH-2048+NULL 第二位匹配
+5. REPLY before CHALLENGE → FAILURE1 INCORRECT_MESSAGE + SC=0x83
+6. REPLY 截断(<48B) → FAILURE1 INCORRECT_PAYLOAD + SC=0x02
+7. REPLY tid != NEGOTIATE tid → FAILURE1 INCORRECT_PAYLOAD + SC=0x83 + tid 回填
+8. SUCCESS2 before auth → FAILURE1 INCORRECT_MESSAGE + SC=0x83
+9. host FAILURE2 → SC=0x83（无 wire failure）
+
+5-9 是 reviewer M-4 的 CHAP wire 错误路径，用差分（断言具体 rescode_exp）证明
+触发了目标路径（§20/§22）。
 
 前置: 启 target with `--host-secret nqn.<host>=<hex>`:
-    cargo run -p nvme_of_tcp_target -- \\
-        --listen-tcp 127.0.0.1:4420 \\
-        --backing /tmp/img \\
+    cargo run --bin nvme_of_tcp_target -- \\
+        --listen 127.0.0.1:4420 \\
+        --backing-file /tmp/img \\
         --host-secret nqn.2014-08.org.nvmexpress:uuid:dhchap4-host=aaaaaa...
 
-跑法 (in scripts/interop_py/):
+跑法 (in scripts/interop_py/，可 NVME_PORT 覆盖端口):
     uv run python chap4_spec_wire_e2e.py
 """
 import binascii
 import hashlib
 import hmac
+import os
 import socket
 import struct
 import sys
 
 HOST = "127.0.0.1"
-PORT = 4420  # 与其他 interop_py 脚本默认 port 对齐；改写后 cross-script 同步换
+PORT = int(os.environ.get("NVME_PORT", "4420"))  # 与其他 interop_py 脚本默认 port 对齐
 HOSTNQN = "nqn.2014-08.org.nvmexpress:uuid:dhchap4-host"
 SUBNQN = "nqn.2014-08.org.nvmexpress:teaching:disk"
 SECRET_HEX = "aa" * 32
@@ -53,15 +61,21 @@ MSG_NEGOTIATE = 0x00
 MSG_CHALLENGE = 0x01
 MSG_REPLY = 0x02
 MSG_SUCCESS1 = 0x03
+MSG_SUCCESS2 = 0x04
+MSG_FAILURE2 = 0xF0
 MSG_FAILURE1 = 0xF1
+
+# spec § 8.13.5 reason-code-explanation（target FAILURE1 第 7 字节）。assert
+# 具体值才能差分证明触发了**目标**错误路径（非泛化 fail）。
+FAIL_EXP_FAILED = 0x01  # secret/HMAC 校验失败
+FAIL_EXP_HASH_UNUSABLE = 0x04  # NEGOTIATE 无可用 hash（如缺 SHA-256）
+FAIL_EXP_INCORRECT_PAYLOAD = 0x06  # 解析失败（截断 / tid 不符）
+FAIL_EXP_INCORRECT_MESSAGE = 0x07  # 消息在错误 state（before-challenge / SUCCESS2-before-auth）
 
 AUTH_DHCHAP = 0x01
 HASH_SHA256 = 0x01
 HASH_SHA384 = 0x02
 DHGROUP_NULL = 0x00
-
-FAIL_EXP_FAILED = 0x01
-FAIL_EXP_HASH_UNUSABLE = 0x04
 
 
 def fail(msg: str) -> None:
@@ -286,7 +300,7 @@ def auth_recv_wire(s: socket.socket, cid: int) -> bytes:
         fail(f"AUTH_RECV 期望 C2HData, pt={pt:#x}")
     pt2, psh, _ = read_pdu(s)
     if pt2 != PDU_RSP or cqe_sc(psh) != 0:
-        fail(f"AUTH_RECV 后 RSP 不对")
+        fail("AUTH_RECV 后 RSP 不对")
     return data
 
 
@@ -378,7 +392,7 @@ def scenario_reply_wrong_secret() -> None:
         fail(f"假 secret SC={sc:#x}")
     if exp != FAIL_EXP_FAILED:
         fail(f"rescode_exp={exp:#x} 期望 FAILED (0x01)")
-    ok(f"FAILURE1 exp=FAILED + RSP SC=0x83")
+    ok("FAILURE1 exp=FAILED + RSP SC=0x83")
     s.close()
 
 
@@ -411,6 +425,117 @@ def scenario_multi_descriptor() -> None:
     s.close()
 
 
+def build_auth_msg(msg_id: int, tid: int) -> bytes:
+    """最小 spec auth 消息（target 对 SUCCESS2/FAILURE2 只看 [0]=auth_type、
+    [1]=msg_id + 当前 state，故 16B header 足够）。"""
+    return bytes([AUTH_TYPE_DHCHAP, msg_id, 0, 0, tid & 0xFF, (tid >> 8) & 0xFF]) + b"\x00" * 10
+
+
+# ── reviewer M-4 的 5 个 CHAP wire 错误路径（spec § 8.13.5）────────────────
+# 每个用**差分**触发：发正确前缀，再改单一字段/跳单一步，断言 target 回的
+# **具体** rescode_exp + SC（不是泛化 fail）——具体值证明触发了目标路径而非别的
+# （§20/§22：别让测试因错误原因通过）。
+
+
+def scenario_reply_before_challenge() -> None:
+    print("\n[5] REPLY 在 CHALLENGE 之前（跳过 AUTH_RECV）→ INCORRECT_MESSAGE + SC=0x83")
+    s = socket.create_connection((HOST, PORT), timeout=5)
+    icreq_and_connect(s)
+    tid = 0x1111
+    _, sc = auth_send(s, 0x02, build_negotiate(tid, [HASH_SHA256], [DHGROUP_NULL]))
+    if sc != 0:
+        fail("NEGOTIATE 失败")
+    # 差分：happy path 此处先 AUTH_RECV 拉 CHALLENGE；本例**跳过** → state 仍
+    # ChallengeNeeded（非 ChallengeSent）→ 单一改动触发 before-challenge 路径。
+    reply = build_reply(tid, b"\x00" * 32)  # 内容无所谓，state 检查先于 verify
+    _, _, exp, sc = auth_send_expect_wire_failure(s, 0x03, reply)
+    if sc != 0x83 or exp != FAIL_EXP_INCORRECT_MESSAGE:
+        fail(f"before-challenge 期望 (exp=0x07, sc=0x83)，实得 (exp={exp:#x}, sc={sc:#x})")
+    ok("FAILURE1 exp=INCORRECT_MESSAGE(0x07) + SC=0x83")
+    s.close()
+
+
+def scenario_reply_truncation() -> None:
+    print("\n[6] REPLY 截断（< 48B）→ INCORRECT_PAYLOAD + SC=0x02")
+    s = socket.create_connection((HOST, PORT), timeout=5)
+    icreq_and_connect(s)
+    tid = 0x2222
+    _, sc = auth_send(s, 0x02, build_negotiate(tid, [HASH_SHA256], [DHGROUP_NULL]))
+    if sc != 0:
+        fail("NEGOTIATE 失败")
+    fw = auth_recv_wire(s, 0x03)
+    _, challenge = parse_challenge(fw)  # 进 ChallengeSent state
+    # 差分：完整 REPLY 是 48B（16 header + 32 HMAC）；截断到 40B → parse_reply 的
+    # 长度检查失败 → INCORRECT_PAYLOAD（区别于 verify-fail 的 FAILED）。
+    full = build_reply(tid, compute_response(SECRET_HEX, challenge, HOSTNQN, SUBNQN))
+    _, _, exp, sc = auth_send_expect_wire_failure(s, 0x04, full[:40])
+    if sc != 0x02 or exp != FAIL_EXP_INCORRECT_PAYLOAD:
+        fail(f"truncation 期望 (exp=0x06, sc=0x02)，实得 (exp={exp:#x}, sc={sc:#x})")
+    ok("FAILURE1 exp=INCORRECT_PAYLOAD(0x06) + SC=0x02")
+    s.close()
+
+
+def scenario_reply_tid_mismatch() -> None:
+    print("\n[7] REPLY tid != NEGOTIATE tid → INCORRECT_PAYLOAD + SC=0x83 + tid 回填")
+    s = socket.create_connection((HOST, PORT), timeout=5)
+    icreq_and_connect(s)
+    tid = 0x3333
+    _, sc = auth_send(s, 0x02, build_negotiate(tid, [HASH_SHA256], [DHGROUP_NULL]))
+    if sc != 0:
+        fail("NEGOTIATE 失败")
+    fw = auth_recv_wire(s, 0x03)
+    _, challenge = parse_challenge(fw)
+    # 差分：HMAC **算对**（真 secret），唯一改动是 tid（翻 1 bit）→ 触发 tid-check
+    # 路径（INCORRECT_PAYLOAD），而非 verify-fail（FAILED 0x01）。
+    good = compute_response(SECRET_HEX, challenge, HOSTNQN, SUBNQN)
+    fail_tid, _rc, exp, sc = auth_send_expect_wire_failure(s, 0x04, build_reply(tid ^ 0x1, good))
+    if sc != 0x83 or exp != FAIL_EXP_INCORRECT_PAYLOAD:
+        fail(f"tid-mismatch 期望 (exp=0x06, sc=0x83)，实得 (exp={exp:#x}, sc={sc:#x})")
+    # target FAILURE1 回填**自己**期望的 tid（NEGOTIATE 的）→ 证它真按 tid 比对
+    if fail_tid != tid:
+        fail(f"FAILURE1 tid={fail_tid:#x} 应回 target 期望 tid={tid:#x}")
+    ok("FAILURE1 exp=INCORRECT_PAYLOAD(0x06) + SC=0x83 + tid 回填正确")
+    s.close()
+
+
+def scenario_success2_before_auth() -> None:
+    print("\n[8] SUCCESS2 在认证完成前 → INCORRECT_MESSAGE + SC=0x83")
+    s = socket.create_connection((HOST, PORT), timeout=5)
+    icreq_and_connect(s)
+    tid = 0x4444
+    _, sc = auth_send(s, 0x02, build_negotiate(tid, [HASH_SHA256], [DHGROUP_NULL]))
+    if sc != 0:
+        fail("NEGOTIATE 失败")
+    # 差分：happy path SUCCESS2 在 REPLY 验过(Authenticated)后才发；本例 NEGOTIATE
+    # 后立即发 → state 未认证 → INCORRECT_MESSAGE。
+    _, _, exp, sc = auth_send_expect_wire_failure(s, 0x03, build_auth_msg(MSG_SUCCESS2, tid))
+    if sc != 0x83 or exp != FAIL_EXP_INCORRECT_MESSAGE:
+        fail(f"SUCCESS2-before-auth 期望 (exp=0x07, sc=0x83)，实得 (exp={exp:#x}, sc={sc:#x})")
+    ok("FAILURE1 exp=INCORRECT_MESSAGE(0x07) + SC=0x83")
+    s.close()
+
+
+def scenario_host_failure2() -> None:
+    print("\n[9] host 发 FAILURE2 → target Failed + SC=0x83（**无** wire failure）")
+    s = socket.create_connection((HOST, PORT), timeout=5)
+    icreq_and_connect(s)
+    tid = 0x5555
+    _, sc = auth_send(s, 0x02, build_negotiate(tid, [HASH_SHA256], [DHGROUP_NULL]))
+    if sc != 0:
+        fail("NEGOTIATE 失败")
+    # host 主动 abort：发 FAILURE2。target 标 Failed + capsule err 0x83，**不**回
+    # wire failure（CapsuleErr 分支）。inline 收 PDU 证第一条就是 RSP（无 C2HData）。
+    write_pdu(s, PDU_CMD, build_fabric_sqe(0x03, FCTYPE_AUTH_SEND), data=build_auth_msg(MSG_FAILURE2, tid), pdo=72)
+    pt, psh, _ = read_pdu(s)
+    if pt != PDU_RSP:
+        fail(f"host FAILURE2 应直接 RSP（无 wire failure），得 pt={pt:#x}")
+    sc = cqe_sc(psh)
+    if sc != 0x83:
+        fail(f"host FAILURE2 期望 SC=0x83，实得 {sc:#x}")
+    ok("FAILURE2 → SC=0x83（无 wire failure，干净标记 Failed）")
+    s.close()
+
+
 def main() -> None:
     print("=== V-interop-8 DH-HMAC-CHAP spec § 8.13.5 4-message wire e2e ===")
     print(f"target {HOST}:{PORT}, host={HOSTNQN}, secret prefix {SECRET_HEX[:8]}...")
@@ -419,6 +544,11 @@ def main() -> None:
         scenario_negotiate_no_sha256()
         scenario_reply_wrong_secret()
         scenario_multi_descriptor()
+        scenario_reply_before_challenge()
+        scenario_reply_truncation()
+        scenario_reply_tid_mismatch()
+        scenario_success2_before_auth()
+        scenario_host_failure2()
     except (ConnectionRefusedError, OSError) as e:
         fail(
             f"无法连 {HOST}:{PORT}: {e}\n"
@@ -427,7 +557,10 @@ def main() -> None:
             f"    --listen-tcp {HOST}:{PORT} --backing /tmp/dhchap4.img \\\n"
             f"    --host-secret {HOSTNQN}={SECRET_HEX}"
         )
-    print("\n✅ V-interop-8 全 4 scenarios 通过 (spec 4-msg wire + multi-descriptor)")
+    print(
+        "\n✅ V-interop-8 全 9 scenarios 通过（spec 4-msg wire + multi-descriptor +"
+        " 5 错误路径：before-challenge / 截断 / tid-mismatch / SUCCESS2-before-auth / FAILURE2）"
+    )
 
 
 if __name__ == "__main__":
