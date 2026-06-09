@@ -95,6 +95,18 @@ const ADMIN_Q_DEPTH: u16 = 8;
 /// guest physical memory 模型大小（flat，GPA [0, SIZE)）。
 const GUEST_MEM_BYTES: usize = 16 << 20;
 
+// ── O3：IO 队列对 + 数据缓冲 GPA（都 4K 对齐，落在 GUEST_MEM_BYTES 内）──
+const IO_SQ_GPA: u64 = 0x4_0000;
+const IO_CQ_GPA: u64 = 0x5_0000;
+const WRITE_BUF_GPA: u64 = 0x6_0000;
+const READ_BUF_GPA: u64 = 0x7_0000;
+const IO_QID: u16 = 1;
+const IO_Q_DEPTH: u16 = 8;
+
+// ── O3b（fused C&W）数据缓冲 GPA ──
+const COMPARE_BUF_GPA: u64 = 0x8_0000;
+const WRITE_BUF2_GPA: u64 = 0x9_0000;
+
 // ═══════════════════════════ 子进程 / 临时文件守卫 ═══════════════════════════
 
 /// 子进程 + 临时文件守卫：Drop 时 kill child + 删 backing/log；测试 panic 时打印
@@ -400,36 +412,154 @@ impl NvmeDriver {
         }
         Err(anyhow!("CC.EN 后 CSTS.RDY 始终未置位"))
     }
+}
 
-    /// 在 admin SQ slot 0 放 SQE，ring SQ0 tail doorbell=1，轮询 ACQ slot 0 的 CQE
-    /// 直到 phase=1。返回 (cid, sc)。
-    async fn submit_admin_and_poll(&self, sqe: Vec<u8>) -> Result<(u16, u8)> {
-        self.write_guest(ASQ_GPA, sqe);
-        self.mmio_write(DOORBELL_BASE, 4, 1); // SQ0 tail = 1
-        for _ in 0..200 {
-            let cqe = self.read_guest(ACQ_GPA, CQE_BYTES).await?;
-            let dw3 = u32::from_le_bytes([cqe[12], cqe[13], cqe[14], cqe[15]]);
-            let phase = (dw3 >> 16) & 1 == 1;
-            if phase {
-                let cid = (dw3 & 0xffff) as u16;
-                let sc = ((dw3 >> 17) & 0xff) as u8;
-                return Ok((cid, sc));
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        Err(anyhow!("CQE phase 始终未翻 1（admin 命令未完成）"))
+// ── doorbell offset（DSTRD=0 → stride 4；SQ=偶 idx，CQ=奇 idx）──
+fn sq_db(qid: u16) -> u64 {
+    DOORBELL_BASE + (2 * qid as u64) * 4
+}
+fn cq_db(qid: u16) -> u64 {
+    DOORBELL_BASE + (2 * qid as u64 + 1) * 4
+}
+
+/// NVMe Submission Queue Entry 构造器（64 字节，常用字段）。
+#[derive(Default)]
+struct Sqe {
+    opcode: u8,
+    /// fuse bits（cdw0[9:8]）：1=FIRST(Compare)，2=SECOND(Write)。
+    fuse: u8,
+    cid: u16,
+    nsid: u32,
+    prp1: u64,
+    prp2: u64,
+    cdw10: u32,
+    cdw11: u32,
+    cdw12: u32,
+}
+
+impl Sqe {
+    fn encode(&self) -> Vec<u8> {
+        let mut b = vec![0u8; SQE_BYTES];
+        let cdw0 = self.opcode as u32 | ((self.fuse as u32 & 0x3) << 8) | ((self.cid as u32) << 16);
+        b[0..4].copy_from_slice(&cdw0.to_le_bytes());
+        b[4..8].copy_from_slice(&self.nsid.to_le_bytes());
+        b[24..32].copy_from_slice(&self.prp1.to_le_bytes());
+        b[32..40].copy_from_slice(&self.prp2.to_le_bytes());
+        b[40..44].copy_from_slice(&self.cdw10.to_le_bytes());
+        b[44..48].copy_from_slice(&self.cdw11.to_le_bytes());
+        b[48..52].copy_from_slice(&self.cdw12.to_le_bytes());
+        b
     }
 }
 
-/// 造 Identify Controller SQE（64 字节）。opcode 0x06，CNS=0x01，PRP1=输出 GPA。
-fn build_identify_controller_sqe(cid: u16, prp1: u64) -> Vec<u8> {
-    let mut sqe = vec![0u8; SQE_BYTES];
-    let cdw0 = 0x06u32 | ((cid as u32) << 16); // opcode Identify + CID
-    sqe[0..4].copy_from_slice(&cdw0.to_le_bytes());
-    // cdw1 nsid = 0（Identify Controller 不针对 NS）。
-    sqe[24..32].copy_from_slice(&prp1.to_le_bytes()); // PRP1
-    sqe[40..44].copy_from_slice(&1u32.to_le_bytes()); // cdw10 CNS=1
-    sqe
+/// CQE 关键字段。
+struct CqeResult {
+    cid: u16,
+    sc: u8,
+    #[allow(dead_code)]
+    dw0: u32,
+}
+
+/// 一对 SQ/CQ 的 driver 侧队列状态：跟踪 SQ tail / CQ head / 期望 phase（处理 wrap），
+/// 让多命令不串槽（reviewer M1：CQ phase-wrap 跟踪）。
+struct QueueState {
+    qid: u16,
+    sq_base: u64,
+    cq_base: u64,
+    depth: u16,
+    sq_tail: u16,
+    cq_head: u16,
+    /// 期望的 CQE phase bit（首轮=1，每 CQ wrap 翻转）。
+    cq_phase: bool,
+}
+
+impl QueueState {
+    fn admin() -> Self {
+        Self {
+            qid: 0,
+            sq_base: ASQ_GPA,
+            cq_base: ACQ_GPA,
+            depth: ADMIN_Q_DEPTH,
+            sq_tail: 0,
+            cq_head: 0,
+            cq_phase: true,
+        }
+    }
+    fn io() -> Self {
+        Self {
+            qid: IO_QID,
+            sq_base: IO_SQ_GPA,
+            cq_base: IO_CQ_GPA,
+            depth: IO_Q_DEPTH,
+            sq_tail: 0,
+            cq_head: 0,
+            cq_phase: true,
+        }
+    }
+
+    /// 放 1 个 SQE 到当前 tail 槽（推进 tail，**不**敲 doorbell）。
+    fn place_sqe(&mut self, drv: &NvmeDriver, sqe: Vec<u8>) {
+        let slot = self.sq_tail;
+        drv.write_guest(self.sq_base + slot as u64 * SQE_BYTES as u64, sqe);
+        self.sq_tail = (self.sq_tail + 1) % self.depth;
+    }
+
+    /// 敲 SQ tail doorbell = 当前 tail（提交已 place 的 SQE）。
+    fn ring_sq(&self, drv: &NvmeDriver) {
+        drv.mmio_write(sq_db(self.qid), 4, self.sq_tail as u64);
+    }
+
+    /// 轮询当前 CQ head 槽到期望 phase → 推进 head（wrap 翻 phase）+ ring CQ head doorbell。
+    async fn poll_cqe(&mut self, drv: &NvmeDriver) -> Result<CqeResult> {
+        for _ in 0..400 {
+            let cqe = drv
+                .read_guest(
+                    self.cq_base + self.cq_head as u64 * CQE_BYTES as u64,
+                    CQE_BYTES,
+                )
+                .await?;
+            let dw3 = u32::from_le_bytes([cqe[12], cqe[13], cqe[14], cqe[15]]);
+            let phase = (dw3 >> 16) & 1 == 1;
+            if phase == self.cq_phase {
+                let res = CqeResult {
+                    cid: (dw3 & 0xffff) as u16,
+                    sc: ((dw3 >> 17) & 0xff) as u8,
+                    dw0: u32::from_le_bytes([cqe[0], cqe[1], cqe[2], cqe[3]]),
+                };
+                self.cq_head = (self.cq_head + 1) % self.depth;
+                if self.cq_head == 0 {
+                    self.cq_phase = !self.cq_phase;
+                }
+                drv.mmio_write(cq_db(self.qid), 4, self.cq_head as u64);
+                return Ok(res);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Err(anyhow!("CQE phase 未达预期（qid={} 命令未完成）", self.qid))
+    }
+
+    /// 提交 1 条 SQE，等其 CQE。
+    async fn submit(&mut self, drv: &NvmeDriver, sqe: Vec<u8>) -> Result<CqeResult> {
+        self.place_sqe(drv, sqe);
+        self.ring_sq(drv);
+        self.poll_cqe(drv).await
+    }
+
+    /// 提交**一对连续 SQE**（fused 用：FIRST+SECOND 必须同 SQ 相邻），1 次 doorbell，
+    /// 收 2 个 CQE。返回 (CQE1, CQE2)，按 CQ 槽顺序（调用方按 CID 区分 Compare/Write）。
+    async fn submit_pair(
+        &mut self,
+        drv: &NvmeDriver,
+        sqe1: Vec<u8>,
+        sqe2: Vec<u8>,
+    ) -> Result<(CqeResult, CqeResult)> {
+        self.place_sqe(drv, sqe1);
+        self.place_sqe(drv, sqe2);
+        self.ring_sq(drv);
+        let c1 = self.poll_cqe(drv).await?;
+        let c2 = self.poll_cqe(drv).await?;
+        Ok((c1, c2))
+    }
 }
 
 // ═══════════════════════════════ 测试 ═══════════════════════════════
@@ -483,16 +613,24 @@ async fn openhcl_admin_identify_controller() -> Result<()> {
         .enable_controller()
         .await
         .context("enable controller")?;
+    let mut admin = QueueState::admin();
 
     // 2) 提交 Identify Controller（CNS=1）→ 4K payload DMA 到 IDENTIFY_GPA。
     let cid = 0x0042u16;
-    let sqe = build_identify_controller_sqe(cid, IDENTIFY_GPA);
-    let (got_cid, sc) = driver
-        .submit_admin_and_poll(sqe)
+    let sqe = Sqe {
+        opcode: 0x06,
+        cid,
+        prp1: IDENTIFY_GPA,
+        cdw10: 1, // CNS=1 Identify Controller
+        ..Default::default()
+    }
+    .encode();
+    let cqe = admin
+        .submit(&driver, sqe)
         .await
         .context("submit Identify")?;
-    assert_eq!(got_cid, cid, "CQE CID 应回显 0x42");
-    assert_eq!(sc, 0, "Identify SC 应=0(成功)，实为 {sc:#x}");
+    assert_eq!(cqe.cid, cid, "CQE CID 应回显 0x42");
+    assert_eq!(cqe.sc, 0, "Identify SC 应=0(成功)，实为 {:#x}", cqe.sc);
 
     // 3) 独立 oracle：读 firmware DMA 进来的 Identify Controller payload，验 VID。
     let id = driver.read_guest(IDENTIFY_GPA, 4096).await?;
@@ -505,6 +643,370 @@ async fn openhcl_admin_identify_controller() -> Result<()> {
         .await
         .context("Identify 完成后应 fire MSI-X")?;
     assert_eq!(msix, 0, "admin CQ 中断应走 vector 0");
+
+    Ok(())
+}
+
+/// 公共 setup：enable controller + 建 IO 队列对（qid 1）+ Format NS1→LBAF[2](纯 4K)。
+/// 返回 (admin, io) 两个 QueueState。O3a / O3b 共用。
+async fn setup_enabled_4k_io(driver: &NvmeDriver) -> Result<(QueueState, QueueState)> {
+    driver.enable_controller().await.context("enable")?;
+    let mut admin = QueueState::admin();
+    let cdw10_q = (IO_QID as u32) | (((IO_Q_DEPTH - 1) as u32) << 16);
+
+    // Create IO CQ（qid 1，PC|IEN，IV=0）。cdw10 = QID | (QSIZE-1)<<16。
+    let cqe = admin
+        .submit(
+            driver,
+            Sqe {
+                opcode: 0x05,
+                cid: 0x10,
+                prp1: IO_CQ_GPA,
+                cdw10: cdw10_q,
+                cdw11: 0b11, // PC(bit0) | IEN(bit1)，IV=0
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Create IO CQ")?;
+    if cqe.sc != 0 {
+        return Err(anyhow!("Create IO CQ sc={:#x}", cqe.sc));
+    }
+
+    // Create IO SQ（qid 1，绑 CQID 1）。cdw11 = PC(bit0) | CQID<<16。
+    let cqe = admin
+        .submit(
+            driver,
+            Sqe {
+                opcode: 0x01,
+                cid: 0x11,
+                prp1: IO_SQ_GPA,
+                cdw10: cdw10_q,
+                cdw11: 1 | ((IO_QID as u32) << 16),
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Create IO SQ")?;
+    if cqe.sc != 0 {
+        return Err(anyhow!("Create IO SQ sc={:#x}", cqe.sc));
+    }
+
+    // Format NS1 → LBAF[2]（纯 4K，no-meta）。cdw10 LBAF(bits3:0)=2。
+    let cqe = admin
+        .submit(
+            driver,
+            Sqe {
+                opcode: 0x80,
+                cid: 0x12,
+                nsid: 1,
+                cdw10: 2,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Format NVM")?;
+    if cqe.sc != 0 {
+        return Err(anyhow!("Format sc={:#x}", cqe.sc));
+    }
+
+    // io() 是刚在 wire 上建好的 IO 队列的 driver 侧本地状态（tail=0/head=0/phase=1），
+    // 与 firmware 侧新建队列初值一致。
+    Ok((admin, QueueState::io()))
+}
+
+/// O3a —— 纯-4K Format + IO round-trip 经 pcie_remote（**parity payoff**）。
+///
+/// 把本会话已在 nvme-of(真 nvme-cli) / vfio(真 QEMU) 上验过的纯-4K 数据路径，第一次经
+/// OpenHCL pcie_remote transport 跑通：建 IO 队列对 → Format NS1→LBAF[2](纯 4K) →
+/// Identify NS 验 in-use=4K → IO Write/Read 4K round-trip → **直读 backing file 独立
+/// oracle**（数据落在 slba\*4096 而非 slba\*512，非 round-trip 自洽）。
+#[tokio::test]
+async fn openhcl_format_4k_and_io_roundtrip() -> Result<()> {
+    let (stream, harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (mut admin, mut io) = setup_enabled_4k_io(&driver).await?;
+
+    // Identify NS1（CNS=0）→ 验 in-use LBAF=2 + LBAF[2] LBADS=12(4096)。
+    let cqe = admin
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x06,
+                cid: 0x13,
+                nsid: 1,
+                prp1: IDENTIFY_GPA,
+                cdw10: 0, // CNS=0 Identify Namespace
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Identify NS")?;
+    assert_eq!(cqe.sc, 0, "Identify NS sc 应=0");
+    let idns = driver.read_guest(IDENTIFY_GPA, 4096).await?;
+    // FLBAS(byte 26) bits3:0 = 当前 LBAF index。
+    assert_eq!(
+        idns[26] & 0xf,
+        2,
+        "Format 后 FLBAS in-use LBAF 应=2(4K)，实={}",
+        idns[26] & 0xf
+    );
+    // LBAF[2] @ byte 128+2*4=136；LBADS(bits 23:16) 在该 4 字节的 byte 2 = 138。
+    assert_eq!(idns[138], 12, "LBAF[2] LBADS 应=12(4096)，实={}", idns[138]);
+
+    // 5) 4K Write @ slba=5（distinct-per-512 pattern，避免 uniform 掩盖偏移错）。
+    let mut pattern = vec![0u8; 4096];
+    for i in 0..8 {
+        pattern[i * 512..(i + 1) * 512].fill(0xC0 + i as u8);
+    }
+    driver.write_guest(WRITE_BUF_GPA, pattern.clone());
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x01, // Write
+                cid: 0x20,
+                nsid: 1,
+                prp1: WRITE_BUF_GPA,
+                cdw10: 5, // slba lo（slba hi=cdw11=0）
+                cdw12: 0, // nlb=0 → 1 block（= 1 个 4K LBA）
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("4K Write")?;
+    assert_eq!(cqe.sc, 0, "4K Write sc 应=0，实={:#x}", cqe.sc);
+
+    // 6) 4K Read @ slba=5 → guest-mem round-trip（READ_BUF 初始全 0，由 firmware DMA 填）。
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02, // Read
+                cid: 0x21,
+                nsid: 1,
+                prp1: READ_BUF_GPA,
+                cdw10: 5,
+                cdw12: 0,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("4K Read")?;
+    assert_eq!(cqe.sc, 0, "4K Read sc 应=0，实={:#x}", cqe.sc);
+    let readback = driver.read_guest(READ_BUF_GPA, 4096).await?;
+    assert_eq!(
+        readback, pattern,
+        "4K round-trip 数据不符（slba=5 经 pcie_remote）"
+    );
+
+    // 7) Flush → **独立 oracle**：直读 backing file 验数据落在 slba*4096 而非 slba*512。
+    //    （round-trip 测不出"读写都用错 ×512"的自洽 bug；backing file 是 firmware 看不到
+    //    harness 在驱动的 ground truth 的另一面——这里是 firmware→file vs harness→file。）
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x00, // Flush
+                cid: 0x22,
+                nsid: 1,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Flush")?;
+    assert_eq!(cqe.sc, 0, "Flush sc 应=0");
+    let file = std::fs::read(&harness.backing).context("读 backing file")?;
+    let at_4k = &file[5 * 4096..5 * 4096 + 4096];
+    assert_eq!(
+        at_4k,
+        &pattern[..],
+        "backing[5*4096] 应=写入 pattern（独立 oracle，非 round-trip 自洽）"
+    );
+    // 5*512=2560 落在 LBA0 区[0,4096)，从未写过 → 应仍是 0（未退化到 ×512 偏移）。
+    assert_ne!(
+        file[5 * 512],
+        0xC0,
+        "backing[5*512] 不应出现 4K 写数据（firmware 未退化用 ×512 偏移）"
+    );
+
+    // 8) CQ phase-wrap 覆盖：连发 10 个 read 让 IO CQ head 越过 depth(8) wrap 一圈，
+    //    真正执行 poll_cqe 的 phase 翻转分支（reviewer LOW：否则该分支从未被跑到）。
+    //    若 phase 翻转逻辑错，wrap 后 poll_cqe 永等不到期望 phase → 此循环会超时 panic。
+    for i in 0..10u16 {
+        let cqe = io
+            .submit(
+                &driver,
+                Sqe {
+                    opcode: 0x02, // Read
+                    cid: 0x40 + i,
+                    nsid: 1,
+                    prp1: READ_BUF_GPA,
+                    cdw10: 5,
+                    ..Default::default()
+                }
+                .encode(),
+            )
+            .await
+            .context("phase-wrap 覆盖 read")?;
+        assert_eq!(cqe.sc, 0, "wrap-cover read[{i}] sc 应=0");
+    }
+
+    Ok(())
+}
+
+/// O3b —— Fused Compare-and-Write 原子 CAS 经 pcie_remote。
+///
+/// fused C&W（spec §6.2）：两条相邻 SQE（Compare FUSE_FIRST + Write FUSE_SECOND）原子执行
+/// ——Compare 命中才应用 Write。验两路：① 匹配→Write 生效；② 不匹配→Write 不生效（原子性
+/// 不变量）。把本会话在 nvme-of fabric 上验过的 fused 真原子 CAS，经 OpenHCL pcie_remote
+/// 跑通（pcie_remote/SDK 走 doorbell→dispatch_sqe→pending_fused 路径）。
+#[tokio::test]
+async fn openhcl_fused_compare_and_write() -> Result<()> {
+    const SLBA: u32 = 10;
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (_admin, mut io) = setup_enabled_4k_io(&driver).await?;
+
+    // 0) seed slba=10 = 全 0xAA（fused Compare 的已知基线）。
+    driver.write_guest(WRITE_BUF_GPA, vec![0xAA; 4096]);
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x01,
+                cid: 0x30,
+                nsid: 1,
+                prp1: WRITE_BUF_GPA,
+                cdw10: SLBA,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("seed write")?;
+    assert_eq!(cqe.sc, 0, "seed write sc 应=0");
+
+    // 1) Fused CAS（**匹配**）：Compare 0xAA(==基线) → Write 0xBB。期望 Write 生效。
+    driver.write_guest(COMPARE_BUF_GPA, vec![0xAA; 4096]); // 与基线一致 → 匹配
+    driver.write_guest(WRITE_BUF2_GPA, vec![0xBB; 4096]); // 新值
+    let cmp = Sqe {
+        opcode: 0x05, // Compare
+        fuse: 1,      // FUSE_FIRST
+        cid: 0x31,
+        nsid: 1,
+        prp1: COMPARE_BUF_GPA,
+        cdw10: SLBA,
+        ..Default::default()
+    }
+    .encode();
+    let wr = Sqe {
+        opcode: 0x01, // Write
+        fuse: 2,      // FUSE_SECOND
+        cid: 0x32,
+        nsid: 1,
+        prp1: WRITE_BUF2_GPA,
+        cdw10: SLBA,
+        ..Default::default()
+    }
+    .encode();
+    let (c1, c2) = io
+        .submit_pair(&driver, cmp, wr)
+        .await
+        .context("fused 匹配")?;
+    for c in [&c1, &c2] {
+        assert_eq!(
+            c.sc, 0,
+            "fused 匹配路 CQE(cid={:#x}) sc 应=0（原子 CAS 应用 Write），实={:#x}",
+            c.cid, c.sc
+        );
+    }
+    // 验 Write 生效：read slba=10 → 0xBB。
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02,
+                cid: 0x33,
+                nsid: 1,
+                prp1: READ_BUF_GPA,
+                cdw10: SLBA,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("read after match")?;
+    assert_eq!(cqe.sc, 0);
+    let rb = driver.read_guest(READ_BUF_GPA, 4096).await?;
+    assert!(
+        rb.iter().all(|&b| b == 0xBB),
+        "fused 匹配后 slba=10 应全 0xBB（Write 生效）"
+    );
+
+    // 2) Fused CAS（**不匹配**）：Compare 0xCC(!=当前 0xBB) → Write 0xDD。期望 Write 不生效。
+    driver.write_guest(COMPARE_BUF_GPA, vec![0xCC; 4096]); // != 当前 0xBB → 不匹配
+    driver.write_guest(WRITE_BUF2_GPA, vec![0xDD; 4096]);
+    let cmp = Sqe {
+        opcode: 0x05,
+        fuse: 1,
+        cid: 0x34,
+        nsid: 1,
+        prp1: COMPARE_BUF_GPA,
+        cdw10: SLBA,
+        ..Default::default()
+    }
+    .encode();
+    let wr = Sqe {
+        opcode: 0x01,
+        fuse: 2,
+        cid: 0x35,
+        nsid: 1,
+        prp1: WRITE_BUF2_GPA,
+        cdw10: SLBA,
+        ..Default::default()
+    }
+    .encode();
+    let (c1, c2) = io
+        .submit_pair(&driver, cmp, wr)
+        .await
+        .context("fused 不匹配")?;
+    // Compare 失败 → Compare CQE sc 非 0（Compare Failure）。按 CID 找 Compare 的那条。
+    let cmp_cqe = if c1.cid == 0x34 { &c1 } else { &c2 };
+    assert_ne!(
+        cmp_cqe.sc, 0,
+        "fused 不匹配 Compare CQE(cid={:#x}) sc 应非 0（Compare Failure）",
+        cmp_cqe.cid
+    );
+    // 原子性不变量：read slba=10 → 仍 0xBB（Write 未生效）。
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02,
+                cid: 0x36,
+                nsid: 1,
+                prp1: READ_BUF_GPA,
+                cdw10: SLBA,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("read after mismatch")?;
+    assert_eq!(cqe.sc, 0);
+    let rb = driver.read_guest(READ_BUF_GPA, 4096).await?;
+    assert!(
+        rb.iter().all(|&b| b == 0xBB),
+        "fused 不匹配后 slba=10 应仍 0xBB（Write 未生效 = 原子性）"
+    );
 
     Ok(())
 }
