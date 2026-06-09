@@ -245,23 +245,22 @@ auth / FAILURE2 from host)，对齐 lib test。
 ### V-followup-fused-cmd (MEDIUM) — controller 侧已 done，gap 在 nvme_of fabric
 
 **纠错（2026-06-09 doc-audit）**：原 What/Why 说"教学 controller 标 Fused detect
-但没真 atomic"是**过时错误**。实际 **nvme_firmware controller 的 Fused
-Compare-and-Write 已完整实现 + 测试**（Phase O2/O3）：`dispatch_sqe` 检测 fuse
-01/10 → `pending_fused: HashMap<SQ→(first SQE)>` → completion 路径 "Compare PASS
-→ dispatching Write" / "Compare FAIL → aborting Write (atomic)"；测试
-`o3_fused_cw_protocol_invariants` / `o3_fused_cw_dispatch_chain_smoke` /
-`identify_controller_advertises_fused_cw` / `fused_on_admin_sq_rejected_by_design`。
+但没真 atomic"是**过时错误**。实际 **nvme_firmware controller 有 Fused
+Compare-and-Write 实现 + 测试**（Phase O2/O3），但**只在 `dispatch_sqe` 路径**
+（doorbell 驱动）：fuse 01/10 检测 → `pending_fused` → "Compare PASS→Write" /
+"Compare FAIL→abort (atomic)"；测试 `o3_fused_cw_*`。
 
-**真正剩余 gap（nvme_of fabric 路径，未做）**：
-- nvme_of 经 doorbell（`mmio_write` BAR0）驱动 controller，理论上 fused 由
-  controller 的 `dispatch_sqe` per-SQ 处理；但 `handle_io_cmd_async` 对 Read/Write
-  做 NLB chunking（`V5_NLB_MAX=16` 拆 sub-SQE）——**fused Write 不可拆**，需先排除
-  fused 命令走 chunking 路径。
-- 需确认 fuse 字段（cdw0 bits 9:8）经 nvme_of IO 路径透传到 in-memory SQ 不被丢。
-- **e2e 确认须真 nvme-cli fused IO**（host-root 阻塞，见状态分类 🔒）。
+**真正剩余 gap（architect review 二次纠错）**：
+- **nvme_of 不走 doorbell→`dispatch_sqe`**，走 `handle_io_cmd_async` →
+  `nvme_io_dispatch` → **`dispatch_io`（io.rs:410），而 `dispatch_io` 完全无 fuse
+  处理**——把 fabric 提交的 fused Compare+Write 当两条独立命令各自执行，**零 atomic
+  CAS**。修复=让 fabric IO 路径走 fuse 配对（复用/共享 controller 已有 pending_fused）。
+- ~~chunking 破坏 fused~~ **已证伪**：chunk 阈值 nlb>16，fused 上限 8 LBA，互斥不可达。
+- **e2e 确认须真 nvme-cli fused IO**（host-root 阻塞）。详
+  [fused-fabric plan](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-09-fused-fabric-and-chap-conformance.md)。
 
-**Acceptance**：fused Compare+Write 两 capsule → 不被 chunk、fuse 透传、controller
-原子处理、双 CQE 回；真 nvme-cli 互通验证。
+**Acceptance**：fused Compare+Write 经 **nvme_of fabric 路径**（dispatch_io，非
+dispatch_sqe）被 controller 原子 CAS 处理、双 CQE 回；真 nvme-cli 互通验证。
 
 ### V-followup-zoned-namespace (LOW, 大块工作)
 

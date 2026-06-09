@@ -28,25 +28,34 @@ cargo run --bin nvme_of_tcp_target -- \
   --host-secret "${HOSTNQN}=${HEXSECRET}"
 ```
 
-**② 生成与 HEXSECRET 同源的 DHHC-1 key**（nvme-cli 要 DHHC-1 格式，不是裸 hex）：
+**② 生成与 HEXSECRET 同源的 DHHC-1 key**（nvme-cli `--dhchap-secret` 要
+`DHHC-1:<hmac>:base64(key‖crc32_le):` 格式——**含 CRC-32 后缀**，不能手写裸 base64；
+用官方 `nvme gen-dhchap-key` 才会带正确 CRC + 长度）：
 ```bash
-# 把 32 字节裸 secret 转 DHHC-1:01:<base64>: （01 = SHA-256）
-RAW_B64=$(echo "$HEXSECRET" | xxd -r -p | base64 -w0)
-echo "DHHC-1:01:${RAW_B64}:"
-# 注：nvme-cli 对 DHHC-1 有 CRC 校验变体；若下面 connect 报 key 格式错，
-# 改用 `nvme gen-dhchap-key --secret <ascii> --hmac 1 --nqn $HOSTNQN` 生成，
-# 并把它**反推**的 raw bytes 用作 target 的 --host-secret hex（贴回让我对齐）。
+# **review 修正（CRITICAL）**：用 --hmac 0（identity，key == 裸 secret），这样
+# nvme-cli 解码去 CRC 后的 key 恰好 == target 的 --host-secret 裸 hex（两端同源）。
+# --secret 是 HEX（不是 ascii）。绝不要手写 `xxd|base64`（缺 CRC，connect 必拒）。
+DHCHAP_KEY=$(nvme gen-dhchap-key --hmac 0 --secret "$HEXSECRET")
+echo "$DHCHAP_KEY"                          # 形如 DHHC-1:00:<base64(secret‖crc32)>:
+nvme check-dhchap-key --key "$DHCHAP_KEY"   # 自验：应打印 key 合法
 ```
+> 为何 `--hmac 0`：`--hmac 1/2/3` 会把 key 变换成 `HMAC(secret, hostnqn‖seed)`，
+> **不可逆**，target 的 `--host-secret` 裸 hex 就对不上了。hmac=0 时 DHHC-1 仅是
+> `base64(裸 secret ‖ CRC)`，解码去 CRC == 裸 secret，两端一致。
+> （CHAP **响应**仍用 SHA-256 HMAC 算 response，与 key 的 hmac_id 是两回事。）
 
 **③ 连接**（另一个终端，**需 sudo**）：
 ```bash
 sudo nvme connect -t tcp -a 127.0.0.1 -s 4420 \
   -n nqn.2026-06.io.openhcl:nvme.userspace \
   --hostnqn "$HOSTNQN" \
-  --dhchap-secret "DHHC-1:01:${RAW_B64}:"
+  --dhchap-secret "$DHCHAP_KEY"
 sudo nvme list
 sudo nvme disconnect -n nqn.2026-06.io.openhcl:nvme.userspace
 ```
+> **secret 卫生**：`--host-secret` / `--dhchap-secret` 出现在命令行会进 `ps aux` +
+> shell history（教学/loopback 可接受）。要避免：命令前置一个空格 +
+> `export HISTCONTROL=ignorespace`；生产应改用 `/etc/nvme/hostkey` 文件或 keyring。
 
 **③ 贴回给我**：
 - target 终端的全部日志（尤其 `RUST_LOG=debug` 时 DHCHAP NEGOTIATE/CHALLENGE/REPLY/SUCCESS 各帧）。

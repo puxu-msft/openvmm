@@ -7,50 +7,52 @@
 
 ## A. V-followup-fused-cmd 的 nvme_of fabric 部分（MEDIUM）
 
-### 现状（已核实，doc-audit）
-- **nvme_firmware controller 的 Fused C&W 已完整 + 测试**（Phase O2/O3）：`dispatch_sqe`
-  检测 fuse 01/10 → `pending_fused: HashMap<SQ→(first SQE, sq_head)>`（mod.rs:762）→
-  completion 路径 "Compare PASS → dispatching Write" / "Compare FAIL → aborting Write
-  (atomic)"（completion.rs:1424/1438）。测试 `o3_fused_cw_protocol_invariants` /
-  `o3_fused_cw_dispatch_chain_smoke` / `identify_controller_advertises_fused_cw` /
-  `fused_on_admin_sq_rejected_by_design`（controller/tests.rs）。
-- nvme_of 经 doorbell（`mmio_write` BAR0，fabric.rs）驱动 controller；IO cmd 走
-  `handle_io_cmd_async`（async_session.rs:1401）。
+### 现状（已核实 + **architect review 二次纠错**）
+- **nvme_firmware controller 有 Fused C&W 实现，但只在 `dispatch_sqe` 路径**（mod.rs:1723，
+  由 doorbell / `on_fetched_sqes` 驱动）：fuse 01/10 检测 → `pending_fused`（mod.rs:762）→
+  completion "Compare PASS → Write" / "Compare FAIL → abort (atomic)"（completion.rs:1424/1438）；
+  fused C+W 硬上限 8 LBA（1 page，mod.rs:1864）。测试 `o3_fused_cw_*`（controller/tests.rs）。
+- **⚠️ 关键纠错**：nvme_of **不走** doorbell→`dispatch_sqe`。它走
+  `handle_io_cmd_async`（async_session.rs:1401）→ `nvme_io_dispatch`（mod.rs:1113）→
+  **`dispatch_io`（controller/io.rs:410）**——而 **`dispatch_io` 完全没有 fuse / pending_fused
+  处理**：`match sqe.opcode()` 把 COMPARE（io.rs:1600）和 Write 各当**独立**命令，fuse
+  bits 9:8 被无视。
 
-### 真正的 gap（需做）
-1. **`handle_io_cmd_async` 对 Read/Write 做 NLB chunking**（`V5_NLB_MAX=16` 拆 sub-SQE，
-   async_session.rs:1437 `handle_io_cmd_chunked_async`）。**Fused 命令不可拆**——一条
-   fused Compare 或 Write 若被 chunk 成多条 sub-SQE，原子语义和 pending_fused 配对全破。
-   → **先在 dispatch 决策里识别 fuse 字段（cdw0 bits 9:8 ≠ 00），fused 命令绕开
-   chunking 路径，整条提交。**
-2. **确认 fuse 字段透传**：`handle_io_cmd_async` 读 `Sqe::read_from_bytes(sqe_bytes)`
-   后到 controller submit 的全链路不丢 cdw0 fuse bits。`Sqe` 有 fuse field（cmd.rs:333）；
-   核 sub_sqe 构造（async_session.rs:1504 `let mut sub_sqe = original_sqe`）chunk 路径会
-   复制 cdw0——但 chunk 本身对 fused 非法，见 gap 1。
-3. **两条 fused capsule 落到同一 in-memory SQ**：controller 的 pending_fused 是 per-SQ
-   的，要求 Compare(fuse=01) 紧接 Write(fuse=10) 进同一 SQ。确认 nvme_of 对同一 IO
-   queue 的两条 capsule 顺序提交到同一 SQ（不并发重排）。
-4. **双 CQE 回**（spec §6.2）：fused 两条都需 individual CQE。controller 已产两个 CQE，
-   确认 nvme_of 的 CQE→C2HData/CapsuleResp 回传两条都送达 host。
+### 真正的 gap（architect 纠错后）
+**经 nvme_of fabric 提交的 fused Compare+Write，被 `dispatch_io` 当两条无关命令各自执行
+——Compare 返结果、Write 无条件写盘，零 atomic CAS 语义。** 这与 chunking 无关（见下）。
+修复方向：让 IO fabric 路径具备 fuse 配对——要么 `dispatch_io` 自身加 fuse 处理（复用
+controller 已有的 pending_fused 机制），要么 session 层维护 fused 状态。两者择一需先定
+（建议：在 controller 加一个 fabric-path 也走的 fuse 配对入口，避免 dispatch_sqe/dispatch_io
+两套 fuse 逻辑分叉——参考 dispatch_sqe 的 pending_fused 实现移到共享层）。
+
+**~~chunking 不是 gap（已证伪）~~**：原以为"fused 被 NLB chunking 拆碎"。实则
+chunking 阈值 `V5_NLB_MAX=16`（session.rs:105），而 controller fused 上限 8 LBA
+（mod.rs:1864，超即 INVALID_FIELD）——**任何合法 fused 命令 nlb ≤ 8 < 16，永不触及
+chunking**。且 Compare opc=0x05 本就不在 `is_rw=(0x01|0x02)` 内，连进 chunk 判断的资格
+都没有。删除原 chunking gap 分析 + 对应 adversarial 测试（场景逻辑不可达）。
 
 ### 步骤
-1. 读 `dispatch_plan.rs::decide_io_nlb_check` + `async_session.rs:1401-1520`，画清 IO
-   cmd → SQ submit → CQE 回传链路。
-2. 在 NLB 决策前加 fuse gate：`if sqe.fuse() != 0 { /* 不 chunk，整条提交 */ }`。
-3. 加 lib test：构造 fused Compare(01)+Write(10) 两 SQE（同 IO SQ），过 nvme_of dispatch
-   → 断言 controller pending_fused 配对 + 双 CQE + Compare-PASS-then-Write 原子。
-4. **adversarial**（§22 教训，必加）：fused Write 的 nlb > V5_NLB_MAX 时**不能**静默
-   chunk——断言要么整条提交要么明确拒（不可拆 fused）。
+1. 读 `controller/io.rs:410 dispatch_io` + `mod.rs:1723 dispatch_sqe`（fuse 逻辑所在），
+   对比两条路径，确定 fuse 配对应抽到哪个共享层（避免分叉）。
+2. 让 fabric IO 路径（dispatch_io / nvme_io_dispatch）走 fuse 配对：Compare(01) 暂存、
+   Write(10) 到达时原子 CAS（Compare PASS→Write / FAIL→abort），双 CQE。
+3. 确认两条 fused capsule 顺序进同一 SQ 上下文、不并发重排。
+4. 加 lib test：fused Compare(01)+Write(10) 过 **nvme_of fabric 路径**（非 dispatch_sqe）
+   → 断言原子 CAS + 双 CQE。**关键**：测试要打 `dispatch_io` 路径，否则测的是已 work 的
+   dispatch_sqe（self-consistent 假阳，§20/§22）。
 5. rust-reviewer。
 
 ### Acceptance
-- fused Compare+Write 不被 chunk、fuse 透传、controller 原子处理、双 CQE 回。
-- lib test 覆盖正常 + adversarial（fused+大 nlb）。
+- fused Compare+Write 经 **nvme_of fabric 路径** 被 controller 原子处理（CAS）、双 CQE 回。
+- lib test 明确走 dispatch_io 路径（不是 dispatch_sqe）。
 - 真 nvme-cli fused IO 互通 = host-root（见 RUNBOOK §1 同款，留 e2e 确认）。
 
-### 陷阱
-- 别假设"chunk 路径复制了 cdw0 所以 fused 也 OK"——**fused 被 chunk 本身就是 bug**
-  （self-consistent 测试数据碰不到）。测试必须用 nlb 触发 chunk 的 fused 命令。
+### 陷阱（§20/§22）
+- **别在 dispatch_sqe 路径测**——那条已 work，测它是 self-consistent 假阳。fabric 的 bug
+  在 dispatch_io，测试必须打这条路径才证明修对了（差分：修前 fabric fused 无原子性、
+  修后有）。
+- 别再押"chunking 破坏 fused"——已证伪（阈值 16 vs 上限 8 互斥）。
 
 ---
 
