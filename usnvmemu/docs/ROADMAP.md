@@ -48,6 +48,16 @@ NVMe-oF TCP 第 4 条接入。当前架构 ✅ 已对齐：firmware (controller)
 > - **🔒 多月架构级（不宜单会话）**：V9 RDMA（6+ 月）/ V10 DMA backend / V-spec-strict /
 >   V-zoned-namespace。
 > - **🔒 卡 Phase X 时机**：pcie_remote_protocol 改名 / 仓库外部化（ADR-008 推迟）。
+>
+> **执行文档（2026-06-09 为新会话/用户产出）**：
+> - 🔒 host-root 项的**精确用户命令** → [RUNBOOK_HOST_ROOT.md](RUNBOOK_HOST_ROOT.md)
+>   （dhchap-4 连接 / tls-psk kmod / discovery / disconnect，贴回输出我据真 oracle 迭代）。
+> - ⏳ 纯代码项 plan → [fused-fabric-and-chap-conformance](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-09-fused-fabric-and-chap-conformance.md)
+>   （nvme_of fused fabric + Python CHAP wire conformance，无人值守可执行）。
+> - 🔒 多月架构级 specs → [multi-month-architecture-specs](plans/2026-06-09-multi-month-architecture-specs.md)
+>   （real-guest-boot / V9 RDMA / V10 DMA backend / spec-strict / ZNS，分阶段）。
+>   **注**：spec-strict 的 S1（CHAP spec-wire transcript）是纯代码且解锁 dhchap-4 真
+>   互通，建议提前单独做。
 
 ### Phase W — pcie_device_sdk 补全 hexagonal 结构 (Tier 2-结构, HIGH 优先, 分 W1-W4)
 
