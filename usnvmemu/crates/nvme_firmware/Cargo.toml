@@ -41,3 +41,13 @@ default = ["openhcl", "vfio-user"]
 openhcl = ["dep:pcie_device_sdk", "dep:pal_async", "dep:guid"]
 # vfio-user transport（QEMU 接管）。
 vfio-user = ["dep:vfio_user_transport"]
+
+# 跨进程 e2e 测试（tests/openhcl_pcie_remote_e2e.rs）：harness 扮 OpenHCL/VTL2 侧，
+# 起真 nvme_firmware bin（--tcp-addr）经 pcie_remote 协议驱动 NVMe。仅 dev 用。
+# 是 nvme-of interop_py / vfio qemu_interop 在 pcie_remote transport 的对位 harness。
+[dev-dependencies]
+pcie_remote_protocol = { path = "../../../vm/devices/pcie_remote_protocol" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
+anyhow = "1"
