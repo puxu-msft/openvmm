@@ -98,6 +98,16 @@ sudo nvme disconnect -n nqn.2014-08.org.nvmexpress:teaching:disk
 ```
 plaintext 通 = 传输/Connect/Identify 栈都好，**只差 host CHAP 这一环卡内核**。
 
+> **✅ 2026-06-09 实测达成**：plaintext connect → 内核 `creating 4 I/O queues` +
+> `new ctrl teaching:disk` + `id-ns` 正确 + `dd`/`nvme read` 真 IO 成功。**NVMe-oF TCP
+> 真 host 全栈 IO 互通达成**（vfio 真 QEMU 之外第 2 条接入）。
+>
+> **坑（实测踩过）**：若 `ls -l /dev/nvme0n1` 显示是**普通文件**（`-rw-r--r--` 而非块
+> 设备 `brw-`），是旧会话 `echo > /dev/nvme0n1` 误重定向留下的垃圾，会挡住真块设备 →
+> `nvme list` 报 `Failed to open ns nvme0n1, errno 22`。修：`sudo rm -f /dev/nvme0n1`
+> 后断开重连。成功判据：`ls -l /dev/nvme0n1` 是 `brw-` 块设备 +
+> `sudo dd if=/dev/nvme0n1 of=/dev/null bs=4k count=8` 成功。
+
 **要真做 host CHAP interop，三选一**：
 1. **重编 WSL2 内核开 `CONFIG_NVME_AUTH=y`**：clone `microsoft/WSL2-Linux-Kernel`
    对应 tag，`make menuconfig` 开 `Device Drivers → NVME Support → NVM Express over
