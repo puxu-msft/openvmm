@@ -830,6 +830,156 @@ fn fused_cas_atomic_compare_and_write() {
     assert_eq!(read_lba(&c), p1, "TOCTOU 拒绝 → backing 不变");
 }
 
+/// **2026-06-09 纯 4K 覆盖** — 把单 NS controller 切到纯 4K（lbads=12）。
+/// reviewer 指 pure_4k_io_round_trip 只覆盖单/dual PRP，未覆盖 WRITE_ZEROES /
+/// COPY 4K——这两条用各自独立的扇区感知偏移代码，补在下面。
+fn make_4k_ctrl(tag: &str) -> NvmeController {
+    let mut c = make_ctrl_with_tmp(tag);
+    let ns = c.namespaces.get_mut(&1).unwrap();
+    ns.lbads = 12;
+    ns.meta_size = 0;
+    ns.pi_type = 0;
+    ns.pi_first = false;
+    let size = ns.file.metadata().unwrap().len();
+    ns.total_lba = size / ns.block_bytes(); // 1 MiB / 4096 = 256
+    assert_eq!(ns.block_bytes(), 4096);
+    c
+}
+
+/// **2026-06-09 纯 4K 覆盖** — WRITE_ZEROES 在 4K NS 按 ×4096 偏移清零。
+/// distinct pattern + ×512 探针证偏移正确（旧 ×512 bug 会清错位置）。
+#[test]
+fn pure_4k_write_zeroes_offset() {
+    let mut c = make_4k_ctrl("wz4k");
+    // 预填 LBA 0..8 全 0xEE（8×4096 = 32 KiB）
+    let pat = vec![0xEEu8; 8 * 4096];
+    c.namespaces.get_mut(&1).unwrap().write_at(&pat, 0).unwrap();
+
+    // WRITE_ZEROES slba=5 nlb=2 → 清 LBA 5,6（bytes [20480, 28672)）
+    let mut b = [0u8; 64];
+    b[0] = nvm_opc::WRITE_ZEROES;
+    b[2..4].copy_from_slice(&0x11u16.to_le_bytes());
+    b[4..8].copy_from_slice(&1u32.to_le_bytes());
+    b[40..44].copy_from_slice(&5u32.to_le_bytes()); // cdw10 slba
+    b[48..52].copy_from_slice(&1u32.to_le_bytes()); // cdw12 nlb-1=1 → 2 LBA
+    let sqe = <Sqe as zerocopy::FromBytes>::read_from_bytes(&b[..]).unwrap();
+    let mut cap = pcie_device_core::CaptureTransport::with_start_token(0x100);
+    let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+    let cqe = c
+        .dispatch_io(&mut ctx, 1, sqe, 0x11, 0, 1)
+        .expect("WRITE_ZEROES 同步返 CQE");
+    assert_eq!((cqe.dw3 >> 17) & 0xff, 0, "WRITE_ZEROES 成功");
+
+    let ns = c.namespaces.get(&1).unwrap();
+    let mut z = vec![0xFFu8; 2 * 4096];
+    ns.read_at(&mut z, 5 * 4096).unwrap();
+    assert!(z.iter().all(|&x| x == 0), "LBA5,6 应清零 @ ×4096");
+    // ×512 探针：5×512=2560 处仍 pattern → 证不是 ×512 清零
+    let mut probe = vec![0u8; 512];
+    ns.read_at(&mut probe, 5 * 512).unwrap();
+    assert!(
+        probe.iter().all(|&x| x == 0xEE),
+        "5×512 处仍 pattern（证 ×4096 非 ×512）"
+    );
+    // LBA 7 (28672) 边界未越界清
+    let mut after = vec![0u8; 4096];
+    ns.read_at(&mut after, 7 * 4096).unwrap();
+    assert!(after.iter().all(|&x| x == 0xEE), "LBA7 未被清（上界正确）");
+}
+
+/// **2026-06-09 纯 4K 覆盖** — Simple Copy 在 4K NS 按 ×4096 偏移 src→dst。
+/// completion 的 `slba*sector` / `dst_off_lba*sector` 是独立扇区感知站点。
+#[test]
+fn pure_4k_copy_offset() {
+    let mut c = make_4k_ctrl("copy4k");
+    // src LBA 10 = 0xAA；dst LBA 20 当前 0。
+    // 另填 LBA 1 = 0xBB：它正好是 ×512-bug 下 source-read 会命中的位置
+    // (src_slba 10 × 512 = 5120 ∈ LBA1[4096,8192))，让 ×512 探针成为**真差分**：
+    // 正确 ×4096 时 dst 的 ×512 区不动(0x00)，×512-bug 时被填 0xBB。
+    c.namespaces
+        .get_mut(&1)
+        .unwrap()
+        .write_at(&vec![0xAAu8; 4096], 10 * 4096)
+        .unwrap();
+    c.namespaces
+        .get_mut(&1)
+        .unwrap()
+        .write_at(&vec![0xBBu8; 4096], 1 * 4096)
+        .unwrap();
+    c.cqs.insert(
+        1,
+        crate::regs::CompletionQueue {
+            base_gpa: 0x1_0000,
+            size: 16,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        },
+    );
+    // COPY: sdlba=20, nr=1, srf=0, prp1=range-list buffer
+    let mut b = [0u8; 64];
+    b[0] = nvm_opc::COPY;
+    b[2..4].copy_from_slice(&0x12u16.to_le_bytes());
+    b[4..8].copy_from_slice(&1u32.to_le_bytes());
+    b[24..32].copy_from_slice(&0x4000u64.to_le_bytes()); // prp1 = range list gpa
+    b[40..44].copy_from_slice(&20u32.to_le_bytes()); // cdw10 sdlba
+    b[48..52].copy_from_slice(&0u32.to_le_bytes()); // cdw12: nr-1=0, srf=0
+    let sqe = <Sqe as zerocopy::FromBytes>::read_from_bytes(&b[..]).unwrap();
+    let mut cap = pcie_device_core::CaptureTransport::with_start_token(0x100);
+    {
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+        let r = c.dispatch_io(&mut ctx, 1, sqe, 0x12, 0, 1);
+        assert!(r.is_none(), "COPY 先 DMA-read range list");
+        // 完成 range-list DMA：1 range × 32 byte（slba@[0:8], nlb-1@[16:18]）
+        let mut rl = vec![0u8; 32];
+        rl[0..8].copy_from_slice(&10u64.to_le_bytes()); // source slba=10
+        rl[16..18].copy_from_slice(&0u16.to_le_bytes()); // nlb-1=0 → 1 LBA
+        let tok = *c
+            .pending_ios
+            .keys()
+            .next()
+            .expect("COPY range-list pending");
+        c.on_dma_complete_impl(&mut ctx, tok, true, rl);
+    }
+    // COPY 完成 → post_cqe 把 16B CQE dma_write 到 CQ1 base 0x1_0000；断言 SC=0。
+    use pcie_device_core::TransportEvent;
+    let cqe = cap
+        .events()
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            TransportEvent::DmaWrite { gpa, data, .. }
+                if *gpa >= 0x1_0000 && *gpa < 0x1_0000 + 16 * 16 && data.len() >= 16 =>
+            {
+                Some(data.clone())
+            }
+            _ => None,
+        })
+        .expect("COPY 应 post 一条 CQE");
+    let sc = (u32::from_le_bytes(cqe[12..16].try_into().unwrap()) >> 17) & 0xff;
+    assert_eq!(sc, 0, "COPY 成功 SC=0");
+
+    let ns = c.namespaces.get(&1).unwrap();
+    let mut got = vec![0u8; 4096];
+    ns.read_at(&mut got, 20 * 4096).unwrap();
+    assert!(
+        got.iter().all(|&x| x == 0xAA),
+        "dst LBA20 @ ×4096 应 = src pattern"
+    );
+    // ×512 真差分探针：dst 的 20×512=10240 区——正确 ×4096 时不动(全 0x00)；
+    // ×512-bug 时 source-read 命中 LBA1(0xBB) 并写到这里 → 全 0x00 即证 ×4096。
+    let mut probe = vec![0xFFu8; 4096];
+    ns.read_at(&mut probe, 20 * 512).unwrap();
+    assert!(
+        probe.iter().all(|&x| x == 0),
+        "20×512 区应全 0（×512-bug 会在此填 0xBB → 证 ×4096 落盘）"
+    );
+}
+
 /// Phase L1：ZNS NS 初始化 + zone state 默认值。
 #[test]
 fn zns_namespace_init() {
