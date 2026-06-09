@@ -289,7 +289,7 @@ pub mod sc {
     /// NS Attachment SEL=1 (Detach) 时 NS 已 detached（对称 0x18）。
     pub const NAMESPACE_NOT_ATTACHED: u8 = 0x19;
     /// **2026-06-09** — Namespace Identifier Unavailable (spec SC 0x16,
-    /// Cmd-Specific)。NS Management Create 时无空闲 NSID（已达 MAX_NAMESPACES）。
+    /// Cmd-Specific)。NS Management Create 时无空闲 NSID（已达 NAMESPACE_SLOT_CAPACITY）。
     pub const NAMESPACE_ID_UNAVAILABLE: u8 = 0x16;
     pub const SGL_DESCRIPTOR_TYPE_INVALID: u8 = 0x15;
     /// **Phase R1** — INVALID_USE_OF_CONTROLLER_MEMORY_BUFFER — SGL Data Block

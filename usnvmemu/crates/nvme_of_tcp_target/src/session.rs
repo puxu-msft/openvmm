@@ -2036,15 +2036,15 @@ mod tests {
         let sc = ((status >> 1) & 0xff) as u8;
         assert_eq!(resp_cid, 0x0011);
         assert_eq!(sc, 0, "Set Features 应 success");
-        // CQE DW0 = granted；IO_QUEUE_CAP=4，请求 NSQR=NCQR=4 应授满 → NSQA-1=3。
-        // **V3-polish (review M-3)** — 之前 `>= 1` 过宽，regression 时不易定位；
-        // 锁死 3 让 IO_QUEUE_CAP 漂移立即被这条断言捕获。
+        // CQE DW0 = granted；请求 NSQR=NCQR=4，运行时 io_queue_pairs 默认 256 ≥ 4，
+        // 故 min(4, 256)=4 全授 → NSQA-1=3。
+        // **V3-polish (review M-3)** — 锁死 3：请求 4 被全授的不变量（与队列上限解耦）。
         let dw0 = u32::from_le_bytes(resp.psh[..4].try_into().unwrap());
         let nsqa_minus_1 = dw0 & 0xffff;
         let ncqa_minus_1 = (dw0 >> 16) & 0xffff;
         assert_eq!(
             nsqa_minus_1, 3,
-            "应授满 IO_QUEUE_CAP=4 个 SQ → NSQA-1=3, dw0={dw0:#x}"
+            "请求 4 个 SQ 应全授（io_queue_pairs 默认 256 ≥ 4）→ NSQA-1=3, dw0={dw0:#x}"
         );
         assert_eq!(nsqa_minus_1, ncqa_minus_1, "NSQA 应等于 NCQA");
         h.join().unwrap().unwrap();

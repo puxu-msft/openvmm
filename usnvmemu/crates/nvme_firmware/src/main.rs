@@ -91,6 +91,12 @@ struct Args {
     /// 设备。∈ [2, 65536]（MQES 0-based 16-bit；spec 不要求 2 的幂）。默认 128。
     #[arg(long = "max-queue-entries", default_value_t = nvme_firmware::DEFAULT_MAX_QUEUE_ENTRIES)]
     max_queue_entries: u32,
+    /// **2026-06-09** — 本次运行模拟的 IO queue 对数上限 ∈ [1, 256]。默认 256。
+    #[arg(long = "io-queue-pairs", default_value_t = nvme_firmware::IO_QUEUE_SLOT_CAPACITY)]
+    io_queue_pairs: u16,
+    /// **2026-06-09** — 本次运行模拟的 namespace 容量上限 ∈ [1, 8]。默认 8。
+    #[arg(long = "max-namespaces", default_value_t = nvme_firmware::NAMESPACE_SLOT_CAPACITY)]
+    max_namespaces: u32,
     /// 仅 TCP 模式：连入此 host:port（非 Windows 测试用）。
     #[arg(long)]
     tcp_addr: Option<String>,
@@ -182,6 +188,8 @@ fn run_vfio_user(args: Args) -> Result<()> {
             NvmeController::open(&args.backing_files, args.vid, args.ssvid, &args.zns_nsids)
                 .map_err(|e| anyhow!("NvmeController::open: {e}"))?;
         c.set_max_queue_entries(args.max_queue_entries)?;
+        c.set_io_queue_pairs(args.io_queue_pairs)?;
+        c.set_max_namespaces(args.max_namespaces)?;
         Ok(c)
     })
 }
@@ -216,6 +224,8 @@ fn run_main(args: Args) -> Result<()> {
             let mut device =
                 NvmeController::open(&args.backing_files, args.vid, args.ssvid, &args.zns_nsids)?;
             device.set_max_queue_entries(args.max_queue_entries)?;
+            device.set_io_queue_pairs(args.io_queue_pairs)?;
+            device.set_max_namespaces(args.max_namespaces)?;
             let opts = RunOptions {
                 // tick 用于：① Sanitize / Self-Test 进度推进 ② AEN 派发
                 // ③ **Phase M1b** Interrupt Coalescing time flush。原 60s

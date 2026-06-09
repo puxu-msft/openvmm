@@ -367,10 +367,10 @@ impl NvmeController {
                 let ien = sqe.cdw11 & 2 != 0;
                 let iv = ((sqe.cdw11 >> 16) & 0xffff) as u16;
                 let prp1 = sqe.prp1;
-                // **2026-06-09** — qid 范围校验：admin(0) 不可重建；> IO_QUEUE_CAP
+                // **2026-06-09** — qid 范围校验：admin(0) 不可重建；> IO_QUEUE_SLOT_CAPACITY
                 // 超授予上限。DenseMap 越界 insert 静默丢弃，必须在此显式拒，否则会
                 // 对未创建的队列误返 success。
-                if qid == 0 || qid > crate::controller::IO_QUEUE_CAP {
+                if qid == 0 || qid > self.io_queue_pairs {
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
                 if !pc {
@@ -408,7 +408,7 @@ impl NvmeController {
                 let cqid = ((sqe.cdw11 >> 16) & 0xffff) as u16;
                 let prp1 = sqe.prp1;
                 // **2026-06-09** — qid 范围校验（同 Create IO CQ；防 DenseMap 越界误 success）。
-                if qid == 0 || qid > crate::controller::IO_QUEUE_CAP {
+                if qid == 0 || qid > self.io_queue_pairs {
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
                 if !pc {
@@ -447,13 +447,13 @@ impl NvmeController {
                 let mut cqe = Cqe::success(cid, 0, sq_head, phase);
                 match fid {
                     cmd::fid::NUMBER_OF_QUEUES => {
-                        // 真实硬件常授 ≤ requested；我们 cap=IO_QUEUE_CAP。
+                        // 真实硬件常授 ≤ requested；我们 cap=IO_QUEUE_SLOT_CAPACITY。
                         // driver 写 cdw11 = (NSQR-1) | ((NCQR-1) << 16) 请
                         // 求 queue 数；controller 在 CQE cdw0 回 (NSQA-1)
                         // | ((NCQA-1) << 16) 表示实际授予（0-based）。
                         let req_nsq = (cdw11 & 0xffff) as u16 + 1;
                         let req_ncq = ((cdw11 >> 16) & 0xffff) as u16 + 1;
-                        let granted = req_nsq.min(req_ncq).min(crate::controller::IO_QUEUE_CAP);
+                        let granted = req_nsq.min(req_ncq).min(self.io_queue_pairs);
                         self.granted_io_queues = granted;
                         let nsqa_minus_1 = (granted - 1) as u32;
                         let ncqa_minus_1 = (granted - 1) as u32;

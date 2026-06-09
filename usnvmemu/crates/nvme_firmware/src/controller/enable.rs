@@ -109,7 +109,7 @@ impl NvmeController {
         // Phase H1：features 跨 reset 不保留（spec § 5.21.1 'Save' bit
         // 默认 0；我们暂不实现 NVM Subsystem persistent）。
         self.features.clear();
-        self.granted_io_queues = IO_QUEUE_CAP;
+        self.granted_io_queues = self.io_queue_pairs;
         // K5: sanitize 跨 reset 撤回（spec § 5.26 'Sanitize Operation
         // Aborts on Reset'），last_status 保留作 history
         self.sanitize = None;

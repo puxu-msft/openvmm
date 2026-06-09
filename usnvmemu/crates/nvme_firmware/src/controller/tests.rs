@@ -160,7 +160,7 @@ fn self_test_log_layout_in_progress_done_and_abort() {
 }
 
 /// Phase H1：features map 存 Set 过的 cdw11，Get 回填；NumberOfQueues
-/// 受 IO_QUEUE_CAP 限；VWC 强制 WCE=1。
+/// 受 IO_QUEUE_SLOT_CAPACITY 限；VWC 强制 WCE=1。
 #[test]
 fn features_set_get_round_trip_and_special_cases() {
     let mut c = make_ctrl_with_tmp("feat");
@@ -170,7 +170,7 @@ fn features_set_get_round_trip_and_special_cases() {
     // 未 Set 过的 fid Get 返 0（admin.rs match _ 默认值）
     assert_eq!(c.features.get(&0xff).copied().unwrap_or(0), 0);
     // NumberOfQueues 实际行为校验：cap 常量非零（绕过 clippy const-assert）
-    let cap: u16 = IO_QUEUE_CAP;
+    let cap: u16 = IO_QUEUE_SLOT_CAPACITY;
     assert!(cap >= 1);
     // VWC 强制 bit0=1（模拟 Set 路径把 driver 写的 cdw11 | 0x1 存入）
     c.features
@@ -1935,7 +1935,7 @@ fn multi_ns_independent_format() {
     assert_eq!(id2[26], 2, "NS2 flbas=2 (纯 4K) — per-NS 独立");
 }
 
-/// Set Features Number-of-Queues 授予封顶到 IO_QUEUE_CAP(256)。
+/// Set Features Number-of-Queues 授予封顶到 IO_QUEUE_SLOT_CAPACITY(256)。
 #[test]
 fn set_features_grants_up_to_256_queues() {
     let mut c = make_ctrl_with_tmp("qgrant");
@@ -1952,7 +1952,7 @@ fn set_features_grants_up_to_256_queues() {
     assert_eq!((cqe.cdw0 >> 16) & 0xffff, 255, "NCQA-1 应为 255");
 }
 
-/// Create IO Queue 拒绝越界 qid（0 / > IO_QUEUE_CAP），防 DenseMap 误 success。
+/// Create IO Queue 拒绝越界 qid（0 / > IO_QUEUE_SLOT_CAPACITY），防 DenseMap 误 success。
 #[test]
 fn create_io_queue_rejects_out_of_range_qid() {
     let mut c = make_ctrl_with_tmp("qid");
@@ -1979,7 +1979,7 @@ fn create_io_queue_rejects_out_of_range_qid() {
     assert_eq!(sc_of(&cqe), 0, "qid=256 应成功");
 }
 
-/// **review H-1 回归** — NS Mgmt Create 的 next-nsid 分配限在 1..=MAX_NAMESPACES：
+/// **review H-1 回归** — NS Mgmt Create 的 next-nsid 分配限在 1..=NAMESPACE_SLOT_CAPACITY：
 /// 8 槽满时 find 返 None（→ 走 NAMESPACE_ID_UNAVAILABLE 错误分支，**不**静默
 /// 分配越界 nsid=9）。锁定 H-1 修复的前提不变量（completion 路径全 e2e 待 DMA mock）。
 #[test]
@@ -1996,6 +1996,116 @@ fn ns_mgmt_create_no_free_nsid_when_8_full() {
     let c = NvmeController::open(&paths, 0x1414, 0, &[]).unwrap();
     assert_eq!(c.namespaces.len(), 8);
     // completion.rs 用同一谓词分配 next nsid；8 满 → None（绝不返 9 越界）。
-    let next = (1..=crate::controller::MAX_NAMESPACES).find(|n| !c.namespaces.contains_key(n));
+    let next =
+        (1..=crate::controller::NAMESPACE_SLOT_CAPACITY).find(|n| !c.namespaces.contains_key(n));
     assert_eq!(next, None, "8 NS 满时不得有空闲 nsid（防越界静默分配）");
+}
+
+/// **2026-06-09** — 运行时 io_queue_pairs 上限：set 低值 → Set Features 授予封顶到它。
+#[test]
+fn set_io_queue_pairs_caps_grant() {
+    let mut c = make_ctrl_with_tmp("iqp");
+    c.set_io_queue_pairs(8).unwrap(); // 模拟 8-queue 设备（≤256 槽位）
+    let mut cap = pcie_device_core::CaptureTransport::new();
+    let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+    let zero = [0u8; 64];
+    let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+    sqe.cdw0 = (crate::cmd::admin_opc::SET_FEATURES as u32) | (0x11 << 16);
+    sqe.cdw10 = crate::cmd::fid::NUMBER_OF_QUEUES as u32;
+    sqe.cdw11 = 99 | (99 << 16); // 请求 100 对
+    let cqe = c.dispatch_admin(&mut ctx, sqe, 0x11, 0, 0).unwrap();
+    assert_eq!(
+        cqe.cdw0 & 0xffff,
+        7,
+        "授予封顶到 io_queue_pairs=8 → NSQA-1=7"
+    );
+    // 校验：超槽位容量 / 0 → 拒
+    assert!(c.set_io_queue_pairs(300).is_err());
+    assert!(c.set_io_queue_pairs(0).is_err());
+    assert!(c.set_io_queue_pairs(256).is_ok()); // 恰好槽位容量
+}
+
+/// **2026-06-09** — qid gate 用运行时 io_queue_pairs：set 4 后 Create IO Queue
+/// qid=5（≤256 槽位但 > 运行时上限）应拒。
+#[test]
+fn create_io_queue_gate_uses_runtime_io_queue_pairs() {
+    let mut c = make_ctrl_with_tmp("iqpgate");
+    c.set_io_queue_pairs(4).unwrap();
+    let mut cap = pcie_device_core::CaptureTransport::new();
+    let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+    let sc_of = |cqe: &Cqe| (cqe.dw3 >> 17) as u8;
+    let mk_cq = |qid: u16| {
+        let zero = [0u8; 64];
+        let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+        sqe.cdw0 = (crate::cmd::admin_opc::CREATE_IO_CQ as u32) | (0x11 << 16);
+        sqe.cdw10 = (qid as u32) | (63 << 16);
+        sqe.cdw11 = 1;
+        sqe.prp1 = 0x1_0000;
+        sqe
+    };
+    let cqe = c.dispatch_admin(&mut ctx, mk_cq(5), 0x11, 0, 0).unwrap();
+    assert_eq!(
+        sc_of(&cqe),
+        crate::cmd::sc::INVALID_FIELD,
+        "qid=5 > io_queue_pairs=4 应拒"
+    );
+    let cqe = c.dispatch_admin(&mut ctx, mk_cq(4), 0x11, 0, 0).unwrap();
+    assert_eq!(sc_of(&cqe), 0, "qid=4 = io_queue_pairs 上限内应成功");
+}
+
+/// **2026-06-09** — 运行时 max_namespaces 校验：≤槽位容量 + ≥ 已加载数。
+#[test]
+fn set_max_namespaces_validates() {
+    let mut c = make_ctrl_with_tmp("mns"); // 1 NS 加载
+    assert!(c.set_max_namespaces(1).is_ok(), "1 NS 加载，模拟上限 1 OK");
+    assert!(c.set_max_namespaces(8).is_ok());
+    assert!(c.set_max_namespaces(0).is_err(), "0 非法");
+    assert!(c.set_max_namespaces(9).is_err(), "超槽位容量 8 非法");
+    // 加载 1 个 NS 时设上限 0 不可能（已被 0 拒）；用 2-NS 验"上限 < 已加载"
+    let dir = std::env::temp_dir();
+    let paths: Vec<String> = (0..2)
+        .map(|i| {
+            let p = dir.join(format!("nvme_mnsv_{}_{i}.img", std::process::id()));
+            let f = std::fs::File::create(&p).unwrap();
+            f.set_len(1 << 20).unwrap();
+            p.to_str().unwrap().to_string()
+        })
+        .collect();
+    let mut c2 = NvmeController::open(&paths, 0x1414, 0, &[]).unwrap();
+    assert!(
+        c2.set_max_namespaces(1).is_err(),
+        "已加载 2 NS，模拟上限 1 应拒"
+    );
+    assert!(c2.set_max_namespaces(2).is_ok());
+}
+
+/// **review M-1 回归** — NS Mgmt Create 的 nsid 分配用**运行时 max_namespaces**
+/// 而非编译期槽位容量：`--max-namespaces 2` 真挡住第 3 个 NS 的动态创建。
+#[test]
+fn ns_create_gate_uses_runtime_max_namespaces() {
+    let dir = std::env::temp_dir();
+    let paths: Vec<String> = (0..2)
+        .map(|i| {
+            let p = dir.join(format!("nvme_m1_{}_{i}.img", std::process::id()));
+            let f = std::fs::File::create(&p).unwrap();
+            f.set_len(1 << 20).unwrap();
+            p.to_str().unwrap().to_string()
+        })
+        .collect();
+    let mut c = NvmeController::open(&paths, 0x1414, 0, &[]).unwrap();
+    // 模拟上限 4（< 槽位容量 8）：还有空位（nsid 3）→ Create 可成功。
+    c.set_max_namespaces(4).unwrap();
+    let next = (1..=c.max_namespaces).find(|n| !c.namespaces.contains_key(n));
+    assert_eq!(
+        next,
+        Some(3),
+        "max_namespaces=4、2 已加载 → 下一 nsid=3 可创建"
+    );
+    // 收紧到 2（= 已加载数）：无空位 → Create 应被 NAMESPACE_ID_UNAVAILABLE 拒。
+    c.set_max_namespaces(2).unwrap();
+    let next = (1..=c.max_namespaces).find(|n| !c.namespaces.contains_key(n));
+    assert_eq!(
+        next, None,
+        "max_namespaces=2、2 已加载 → 无空位，动态 Create 被运行时上限挡"
+    );
 }

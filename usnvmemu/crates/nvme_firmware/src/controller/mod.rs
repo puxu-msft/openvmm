@@ -18,7 +18,7 @@
 //!
 //! ## Phase M3 — Multi-queue 并发模型
 //!
-//! Phase H2 暴露了 4 个 IO queue (IO_QUEUE_CAP)；当前 dispatch 模型是
+//! Phase H2 暴露了 4 个 IO queue (IO_QUEUE_SLOT_CAPACITY)；当前 dispatch 模型是
 //! **per-controller 单 worker 线程**串行处理所有 SQE：
 //! - SDK 的 `run` loop 单线程 select transport / tick
 //! - 每个 SQyTDBL 写入触发独立的 DMA-read，多 queue 的 fetches 可
@@ -61,23 +61,28 @@ use zerocopy::IntoBytes;
 pub(super) const SECTOR_SHIFT: u32 = 9;
 pub(super) const SECTOR_SIZE: u64 = 1 << SECTOR_SHIFT;
 
-/// **Phase H2 + 2026-06-09** — controller 最多授予 driver 的 IO queue 对数（SQ+CQ）。
-/// 硬上限 256（远超真硬件常见 64，展示并发模型上限）。qid 范围 1..=256；admin = 0。
-/// 存储用 [`DenseMap`]（Vec 直接索引）而非 HashMap：qid 是密集小整数，O(1) 索引 +
-/// cache-friendly，无哈希开销。Create IO Queue 校验 qid ≤ 此值防越界。
-pub const IO_QUEUE_CAP: u16 = 256;
+// ───── 编译期槽位上限（预留存储容量，DenseMap Vec 大小；非运行时广告值）─────
 
-/// queue id 上界（admin 0 + IO 1..=IO_QUEUE_CAP）→ DenseMap slot 数 = 此 +1。
-pub(super) const MAX_QID: u16 = IO_QUEUE_CAP;
+/// **预留 IO queue 槽位容量**（编译期）。`sqs`/`cqs` 的 [`DenseMap`] 各预留
+/// `此值 + 1`（admin qid 0 + IO 1..=此值）个槽。这是**存储上限**，不是本次运行
+/// 广告/授予的队列数——后者是运行时的 [`io_queue_pairs`](NvmeController::io_queue_pairs)
+/// （≤ 本上限）。256 远超真硬件常见 64，给运行时模拟留足空间。
+pub const IO_QUEUE_SLOT_CAPACITY: u16 = 256;
 
-/// **2026-06-09** — namespace 硬上限。多 `--backing-file` → nsid 1..=8；超出在
-/// `open()` 拒绝。nsid 同样密集小整数，namespaces 也用 [`DenseMap`] 索引。
-pub(super) const MAX_NAMESPACES: u32 = 8;
+/// queue id 上界（admin 0 + IO 1..=IO_QUEUE_SLOT_CAPACITY）→ DenseMap slot 数 = 此 +1。
+pub(super) const MAX_QID: u16 = IO_QUEUE_SLOT_CAPACITY;
 
-/// **2026-06-09** — 队列深度（MQES = 单 SQ/CQ 最大 entry 数）的默认 / 范围。
-/// 运行时可经 [`NvmeController::set_max_queue_entries`] 调（CLI flag），模拟不同
-/// 档位的设备。MQES 是 CAP 的 **0-based 16-bit** 字段（存 N-1，≤ 0xFFFF），故
-/// entry 数 ∈ [1, 65536]；spec **不要求** 2 的幂，任意值皆可。
+/// **预留 namespace 槽位容量**（编译期）。namespaces 的 [`DenseMap`] 预留
+/// `此值 + 1` 个槽（nsid 1..=此值）。这是**存储上限**；本次运行模拟的 NS 容量是
+/// 运行时的 [`mnan`](NvmeController::mnan)（≤ 本上限，广告为 Identify Controller MNAN）。
+pub const NAMESPACE_SLOT_CAPACITY: u32 = 8;
+
+// ───── 运行时模拟上限（spec 名；≤ 上述编译期槽位容量；CLI 可配）─────
+
+/// **2026-06-09** — 队列深度（MQES = Maximum Queue Entries Supported，单 SQ/CQ 最大
+/// entry 数）的默认 / 范围。运行时经 [`NvmeController::set_max_queue_entries`] 调
+/// （CLI flag）模拟不同档位设备。MQES 是 CAP 的 **0-based 16-bit** 字段（存 N-1，
+/// ≤ 0xFFFF），故 entry 数 ∈ [1, 65536]；spec **不要求** 2 的幂。
 pub const DEFAULT_MAX_QUEUE_ENTRIES: u32 = 128;
 /// 队列深度可配下限（2 = 最小有意义深度）。
 pub const MIN_MAX_QUEUE_ENTRIES: u32 = 2;
@@ -96,7 +101,7 @@ pub const MAX_MAX_QUEUE_ENTRIES: u32 = 65536;
 /// `iter`/`iter_mut` 返 owned 键（slot 下标反推）。
 ///
 /// 容量在 `new(max_key)` 固定（slot 数 = max_key+1）；`insert` 越界静默忽略
-/// （caller 须先 bound-check，如 Create IO Queue 校验 qid ≤ IO_QUEUE_CAP）。
+/// （caller 须先 bound-check，如 Create IO Queue 校验 qid ≤ IO_QUEUE_SLOT_CAPACITY）。
 pub(super) struct DenseMap<K: SlotKey, V> {
     slots: Vec<Option<V>>,
     _k: core::marker::PhantomData<K>,
@@ -870,7 +875,7 @@ pub struct NvmeController {
     state: CtrlState,
 
     // ----- Queues -----
-    /// SQ ID → queue。Admin = ID 0；IO = ID 1..=IO_QUEUE_CAP。Vec 直接索引。
+    /// SQ ID → queue。Admin = ID 0；IO = ID 1..=IO_QUEUE_SLOT_CAPACITY。Vec 直接索引。
     sqs: DenseMap<u16, SubmissionQueue>,
     /// CQ ID → queue。
     cqs: DenseMap<u16, CompletionQueue>,
@@ -954,9 +959,17 @@ pub struct NvmeController {
     /// 所以 reset 时清掉）。
     pub(super) features: std::collections::HashMap<u8, u32>,
     /// **Phase H2** — Driver 通过 Set Features 0x07 请求的 IO queue 数；
-    /// controller 在 enable() 时实际授予 max(requested, IO_QUEUE_CAP) 个 SQ/CQ。
-    /// 默认 4 SQ + 4 CQ，体现多 queue 并发模型。请求大于 cap 被限制到 cap。
+    /// controller 在 enable() 时实际授予 `min(requested, io_queue_pairs)` 个 SQ/CQ。
+    /// 默认 = 运行时上限 [`Self::io_queue_pairs`]；请求大于上限被限制到上限。
     pub(super) granted_io_queues: u16,
+    /// **2026-06-09 运行时模拟上限** — 本次运行愿意授予的 IO queue 对数上限
+    /// （Set Features Number of Queues grant 封顶；Create IO Queue qid gate）。
+    /// ∈ [1, [`IO_QUEUE_SLOT_CAPACITY`]]，默认 = 上限。模拟"N-queue 设备"。
+    pub(super) io_queue_pairs: u16,
+    /// **2026-06-09 运行时模拟上限** — 本次运行模拟的 namespace 容量上限
+    /// （≤ [`NAMESPACE_SLOT_CAPACITY`]）。加载 NS 数（= NN = MNAN，Linux 要求
+    /// MNAN≤NN）不得超过它。模拟"N-NS 设备"。
+    pub(super) max_namespaces: u32,
     /// **Phase G** — 上次 AEN 触发时观测到的 stat_num_err_log_entries
     /// 快照；tick 中比较新值 → 自动 fire AEN type 0x00 Error。
     pub(super) aen_last_err_count: u64,
@@ -1590,6 +1603,42 @@ impl NvmeController {
         Ok(())
     }
 
+    /// **2026-06-09** — 运行时设置本次模拟的 **IO queue 对数上限**（Set Features
+    /// Number of Queues 授予封顶 + Create IO Queue qid gate）。`pairs` ∈
+    /// `[1, IO_QUEUE_SLOT_CAPACITY]`（不得超编译期槽位容量）。`open()` 后调。
+    pub fn set_io_queue_pairs(&mut self, pairs: u16) -> anyhow::Result<()> {
+        if pairs == 0 || pairs > IO_QUEUE_SLOT_CAPACITY {
+            return Err(anyhow::anyhow!(
+                "io_queue_pairs {pairs} 非法：须 ∈ [1, {IO_QUEUE_SLOT_CAPACITY}]（槽位容量）"
+            ));
+        }
+        self.io_queue_pairs = pairs;
+        // 重置默认授予数为新上限（host 仍按 Set Features 协商实际值）。
+        self.granted_io_queues = pairs;
+        tracing::info!(io_queue_pairs = pairs, "IO queue 对数上限设置");
+        Ok(())
+    }
+
+    /// **2026-06-09** — 运行时设置本次模拟的 **namespace 容量上限**（≤
+    /// `NAMESPACE_SLOT_CAPACITY`）。当前已加载 NS 数不得超过它（否则报错）。
+    /// MNAN/NN 仍 = 实际加载数（Linux 要求 MNAN≤NN），本值只作模拟上限约束。
+    pub fn set_max_namespaces(&mut self, max_ns: u32) -> anyhow::Result<()> {
+        if max_ns == 0 || max_ns > NAMESPACE_SLOT_CAPACITY {
+            return Err(anyhow::anyhow!(
+                "max_namespaces {max_ns} 非法：须 ∈ [1, {NAMESPACE_SLOT_CAPACITY}]（槽位容量）"
+            ));
+        }
+        let loaded = self.namespaces.len() as u32;
+        if loaded > max_ns {
+            return Err(anyhow::anyhow!(
+                "已加载 {loaded} 个 namespace，超过模拟上限 max_namespaces {max_ns}"
+            ));
+        }
+        self.max_namespaces = max_ns;
+        tracing::info!(max_namespaces = max_ns, "namespace 容量上限设置");
+        Ok(())
+    }
+
     /// `backing_files`：每个文件成为一个 namespace（NSID 1, 2, ...）。
     /// 文件大小决定该 NS 容量（÷ 512 round down 到 LBA 数）。
     /// Phase H4：之前接受单 path string；现在 slice，至少 1 个。
@@ -1602,15 +1651,16 @@ impl NvmeController {
         if backing_files.is_empty() {
             return Err(anyhow::anyhow!("at least one --backing-file required"));
         }
-        // **2026-06-09** — namespace 硬上限 MAX_NAMESPACES（nsid 1..=8）。
-        if backing_files.len() > MAX_NAMESPACES as usize {
+        // **2026-06-09** — namespace 硬上限 NAMESPACE_SLOT_CAPACITY（nsid 1..=8）。
+        if backing_files.len() > NAMESPACE_SLOT_CAPACITY as usize {
             return Err(anyhow::anyhow!(
                 "too many --backing-file ({}): namespace 硬上限 {}",
                 backing_files.len(),
-                MAX_NAMESPACES
+                NAMESPACE_SLOT_CAPACITY
             ));
         }
-        let mut namespaces: DenseMap<u32, Namespace> = DenseMap::new(MAX_NAMESPACES as usize);
+        let mut namespaces: DenseMap<u32, Namespace> =
+            DenseMap::new(NAMESPACE_SLOT_CAPACITY as usize);
         for (idx, path) in backing_files.iter().enumerate() {
             let file = std::fs::OpenOptions::new()
                 .read(true)
@@ -1744,7 +1794,10 @@ impl NvmeController {
             discovery_portals: Vec::new(),
             discovery_gen_ctr: 0,
             features: std::collections::HashMap::new(),
-            granted_io_queues: IO_QUEUE_CAP,
+            granted_io_queues: IO_QUEUE_SLOT_CAPACITY,
+            // 运行时模拟上限默认 = 编译期槽位容量（即"不额外限制"）；CLI 可调低。
+            io_queue_pairs: IO_QUEUE_SLOT_CAPACITY,
+            max_namespaces: NAMESPACE_SLOT_CAPACITY,
             aen_last_err_count: 0,
             self_test_in_progress: None,
             self_test_last: None,

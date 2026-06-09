@@ -1114,14 +1114,15 @@ impl NvmeController {
                         } else {
                             let new_lbads = if flbas == 0 { 9u8 } else { 12u8 };
                             let new_meta_size = if flbas == 0 { 0u8 } else { 8u8 };
-                            // 分配新 NSID（next available，**限 MAX_NAMESPACES**）+
-                            // 创 temp file backing。
-                            // **review H-1（CRITICAL 对称修复）**：必须把 find 限在
-                            // 1..=MAX_NAMESPACES。否则 8 槽满时 find 返 nsid=9，
-                            // DenseMap 越界 insert 静默丢弃，却返 success+cdw0=9 →
-                            // driver 见"刚建的 NS 立刻消失" + temp 文件泄漏。与 Create
-                            // IO Queue 的 qid gate 同类（两处越界 insert 须各自 gate）。
-                            let new_nsid = (1..=crate::controller::MAX_NAMESPACES)
+                            // 分配新 NSID（next available）+ 创 temp file backing。
+                            // **review H-1（CRITICAL 越界）+ M-1（运行时上限生效）**：
+                            // find 限在 1..=**运行时 max_namespaces**（≤ 编译期
+                            // NAMESPACE_SLOT_CAPACITY 槽位容量）。① 防 DenseMap 越界
+                            // 静默丢弃 + temp 文件泄漏（H-1）；② 真正 enforce
+                            // `--max-namespaces N` 的模拟上限——满时返
+                            // NAMESPACE_ID_UNAVAILABLE 而非继续创到槽位容量（M-1）。
+                            let ns_limit = self.max_namespaces;
+                            let new_nsid = (1..=ns_limit)
                                 .find(|n| !self.namespaces.contains_key(n))
                                 .unwrap_or(0);
                             if new_nsid == 0 {
