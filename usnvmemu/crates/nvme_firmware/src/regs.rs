@@ -83,9 +83,12 @@ pub mod csts {
 }
 
 /// CAP (Controller Capabilities) — 64 位 RO，启动期一次构造。
-pub fn build_cap(max_qe: u16) -> u64 {
-    // Queue size minus 1 (MQES) bits 15:0 — 最大 SQ/CQ 大小，单位 entry。
-    // 这里 max_qe 已是 "max entry count"，存储用 max_qe-1。
+///
+/// `max_qe` = 队列深度（单 SQ/CQ 最大 entry 数），∈ [1, 65536]。MQES 字段是
+/// **0-based**（存 `max_qe - 1`，≤ 0xFFFF），spec **不要求** 2 的幂。
+pub fn build_cap(max_qe: u32) -> u64 {
+    debug_assert!((1..=65536).contains(&max_qe), "max_qe 须 ∈ [1, 65536]");
+    // Queue size minus 1 (MQES) bits 15:0 — 0-based，最大 65535（= 65536 entries）。
     let mqes_minus_1 = (max_qe - 1) as u64;
     // bit 16 = CQR (Contiguous Queues Required); 强制 1 让 driver 只用
     // 一段连续物理内存（也就是 PRP1 指 entry[0]），简化 host 实现。

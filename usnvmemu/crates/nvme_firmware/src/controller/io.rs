@@ -1322,7 +1322,7 @@ impl NvmeController {
                 // § 6.7）；具体 NSID 仅 flush 该 NS。
                 let nsid = sqe.nsid;
                 let targets: Vec<u32> = if nsid == 0xFFFF_FFFF {
-                    self.namespaces.keys().copied().collect()
+                    self.namespaces.keys().collect()
                 } else if self.namespaces.contains_key(&nsid) {
                     vec![nsid]
                 } else {

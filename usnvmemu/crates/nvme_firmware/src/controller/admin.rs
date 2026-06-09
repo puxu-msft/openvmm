@@ -175,7 +175,7 @@ impl NvmeController {
                         // Active NSID list — 列所有已注册 NSID（spec § 5.15.1）。
                         // Phase H4：动态枚举 self.namespaces；按 NSID 升序。
                         let mut buf = vec![0u8; 4096];
-                        let mut nsids: Vec<u32> = self.namespaces.keys().copied().collect();
+                        let mut nsids: Vec<u32> = self.namespaces.keys().collect();
                         nsids.sort();
                         for (i, n) in nsids.iter().enumerate() {
                             let off = i * 4;
@@ -360,6 +360,12 @@ impl NvmeController {
                 let ien = sqe.cdw11 & 2 != 0;
                 let iv = ((sqe.cdw11 >> 16) & 0xffff) as u16;
                 let prp1 = sqe.prp1;
+                // **2026-06-09** — qid 范围校验：admin(0) 不可重建；> IO_QUEUE_CAP
+                // 超授予上限。DenseMap 越界 insert 静默丢弃，必须在此显式拒，否则会
+                // 对未创建的队列误返 success。
+                if qid == 0 || qid > crate::controller::IO_QUEUE_CAP {
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
                 if !pc {
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
@@ -394,6 +400,10 @@ impl NvmeController {
                 // CDW11 bits 31:16 = CQID
                 let cqid = ((sqe.cdw11 >> 16) & 0xffff) as u16;
                 let prp1 = sqe.prp1;
+                // **2026-06-09** — qid 范围校验（同 Create IO CQ；防 DenseMap 越界误 success）。
+                if qid == 0 || qid > crate::controller::IO_QUEUE_CAP {
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
                 if !pc {
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
@@ -846,24 +856,28 @@ impl NvmeController {
                 let pil = ((sqe.cdw10 >> 8) & 0x1) as u8;
                 let ses = ((sqe.cdw10 >> 9) & 0x7) as u8;
                 tracing::info!(lbafl, mset, pi, pil, ses, "Format NVM");
-                if lbafl > 1 || pi > 1 || mset != 0 {
-                    // **Phase K1** — 真支持 LBAF[0] (512B no-meta) +
-                    // LBAF[1] (4096B+8B meta) + PI Type 0/1。mset=1
-                    // (separate metadata buffer) 需 MPTR 二级 DMA，未实现；
+                if lbafl > 2 || pi > 1 || mset != 0 {
+                    // **Phase K1 + 2026-06-09** — 真支持 LBAF[0]=512B/no-meta、
+                    // LBAF[1]=4K+8B-meta(PI)、LBAF[2]=纯 4K/no-meta + PI Type 0/1。
+                    // mset=1（separate metadata buffer）需 MPTR 二级 DMA，未实现；
                     // driver 用 mset=0 把 meta 与 data inline 存。其余拒绝。
                     tracing::warn!(
                         lbafl,
                         pi,
                         mset,
-                        "Format rejected: only LBAF[0/1] + PI Type 0/1 supported"
+                        "Format rejected: only LBAF[0/1/2] + PI Type 0/1 supported"
                     );
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
-                // **Phase K1** 计算新 LBAF + PI 配置
-                let new_lbads: u8 = if lbafl == 0 { 9 } else { 12 };
-                let new_meta_size: u8 = if lbafl == 0 { 0 } else { 8 };
+                // **Phase K1 + 2026-06-09** 计算新 LBAF + PI 配置。
+                // LBAF: 0→(512B,no-meta) / 1→(4K,8B-meta) / 2→(4K,no-meta)。
+                let (new_lbads, new_meta_size): (u8, u8) = match lbafl {
+                    0 => (9, 0),
+                    1 => (12, 8),
+                    _ => (12, 0), // lbafl == 2（已被上面 gate 限制 ≤2）
+                };
                 if pi != 0 && new_meta_size == 0 {
-                    // PI 需要 metadata 空间承载 8-byte tuple
+                    // PI 需要 metadata 空间承载 8-byte tuple（纯 4K LBAF[2] 不能开 PI）。
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
                 let new_pi_type = pi;
@@ -927,7 +941,7 @@ impl NvmeController {
                     // 所有 NS；具体 NSID 仅 format 该 NS。
                     let nsid = sqe.nsid;
                     let targets: Vec<u32> = if nsid == 0xFFFF_FFFF {
-                        self.namespaces.keys().copied().collect()
+                        self.namespaces.keys().collect()
                     } else if self.namespaces.contains_key(&nsid) {
                         vec![nsid]
                     } else {
@@ -937,7 +951,9 @@ impl NvmeController {
                     // 必须拒绝 (NVMe 2.0 § 8.19 + cmd::fid::NS_WRITE_PROTECTION)。
                     // broadcast 时只要 *任意* target NS protected 即整批失败。
                     for target_nsid in &targets {
-                        let ns = &self.namespaces[target_nsid];
+                        let Some(ns) = self.namespaces.get(target_nsid) else {
+                            continue;
+                        };
                         if ns.nswp != 0 {
                             tracing::debug!(
                                 target_nsid,
@@ -1011,7 +1027,7 @@ impl NvmeController {
                     // SES=0 — 只切换 LBAF/PI 而不擦盘（spec § 5.14 允许）
                     let nsid = sqe.nsid;
                     let targets: Vec<u32> = if nsid == 0xFFFF_FFFF {
-                        self.namespaces.keys().copied().collect()
+                        self.namespaces.keys().collect()
                     } else if self.namespaces.contains_key(&nsid) {
                         vec![nsid]
                     } else {
@@ -1021,7 +1037,9 @@ impl NvmeController {
                     // 必须拒绝 (NVMe 2.0 § 8.19 + cmd::fid::NS_WRITE_PROTECTION)。
                     // broadcast 时只要 *任意* target NS protected 即整批失败。
                     for target_nsid in &targets {
-                        let ns = &self.namespaces[target_nsid];
+                        let Some(ns) = self.namespaces.get(target_nsid) else {
+                            continue;
+                        };
                         if ns.nswp != 0 {
                             tracing::debug!(
                                 target_nsid,
@@ -1457,7 +1475,7 @@ impl NvmeController {
                 }
                 // **Phase S1 H1** — Sanitize 抹整盘，命中任何 protected NS 都
                 // 拒（NVMe 2.0 § 8.19）。Sanitize 是 controller 范围，遍历所有 NS。
-                for (target_nsid, ns) in &self.namespaces {
+                for (target_nsid, ns) in self.namespaces.iter() {
                     if ns.nswp != 0 {
                         tracing::debug!(
                             target_nsid,

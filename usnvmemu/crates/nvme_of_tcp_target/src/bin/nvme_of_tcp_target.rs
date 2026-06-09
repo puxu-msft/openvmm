@@ -92,6 +92,10 @@ struct Cli {
     /// 把指定 NSID 标记为 ZNS（Zoned Namespace）。可重复。
     #[arg(long = "zns-nsid")]
     zns_nsids: Vec<u32>,
+    /// **2026-06-09** — 队列深度（MQES = 单 SQ/CQ 最大 entry 数），模拟不同档位
+    /// 设备。∈ [2, 65536]（MQES 0-based 16-bit；spec 不要求 2 的幂）。默认 128。
+    #[arg(long = "max-queue-entries", default_value_t = nvme_firmware::DEFAULT_MAX_QUEUE_ENTRIES)]
+    max_queue_entries: u32,
     /// 最大并发 connection 数（**V5d-fix C-1** 防 thread/fd 耗尽）。
     #[arg(long, default_value_t = DEFAULT_MAX_CONNECTIONS)]
     max_connections: usize,
@@ -331,6 +335,9 @@ async fn main() -> Result<()> {
     let mut shared_ctrl_inner =
         NvmeController::open(&backing_strs, cli.vid, cli.ssvid, &cli.zns_nsids)
             .context("NvmeController::open (startup, V8b shared)")?;
+    shared_ctrl_inner
+        .set_max_queue_entries(cli.max_queue_entries)
+        .context("--max-queue-entries 非法")?;
     // **V7 / V8a** — discovery_portals 在 controller share 时 startup 注入一次。
     if !discovery_portals.is_empty() {
         shared_ctrl_inner.nvme_set_discovery_target(discovery_portals);

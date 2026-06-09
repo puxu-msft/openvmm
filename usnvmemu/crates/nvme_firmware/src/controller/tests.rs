@@ -1831,3 +1831,171 @@ fn ana_state_change_triggers_aen() {
     );
     assert_eq!(log[16 + 16], 0x02, "ANA state = 0x02 Non-Optimized");
 }
+
+// ───────── 2026-06-09: 硬上限 + Vec 存储 + 4K + 运行时队列深度 ─────────
+
+/// DenseMap 基础语义：get/insert/remove/contains/keys 升序/iter。
+#[test]
+fn dense_map_basic_semantics() {
+    let mut m: crate::controller::DenseMap<u16, &'static str> = crate::controller::DenseMap::new(8);
+    assert!(m.get(&3).is_none());
+    assert_eq!(m.insert(3, "a"), None);
+    assert_eq!(m.insert(1, "b"), None);
+    assert_eq!(m.insert(3, "c"), Some("a")); // 替换返旧值
+    assert_eq!(*m.get(&3).unwrap(), "c");
+    assert!(m.contains_key(&1) && !m.contains_key(&2));
+    // keys 按 slot 下标升序
+    assert_eq!(m.keys().collect::<Vec<u16>>(), vec![1, 3]);
+    assert_eq!(m.remove(&1), Some("b"));
+    assert!(!m.contains_key(&1));
+    // 越界 insert：release 静默丢弃 / debug 命中 debug_assert（M-1 tripwire）。
+    // 故此处不测越界路径——bound-check 由 caller 负责（见 qid / NS cap 测试）。
+}
+
+/// namespace 硬上限 8：第 9 个 --backing-file 拒绝。
+#[test]
+fn namespace_cap_rejects_more_than_8() {
+    let dir = std::env::temp_dir();
+    let paths: Vec<String> = (0..9)
+        .map(|i| {
+            let p = dir.join(format!("nvme_nscap_{}_{}_{i}.img", std::process::id(), i));
+            let f = std::fs::File::create(&p).unwrap();
+            f.set_len(1 << 20).unwrap();
+            p.to_str().unwrap().to_string()
+        })
+        .collect();
+    let err = NvmeController::open(&paths, 0x1414, 0, &[]).err().unwrap();
+    assert!(
+        err.to_string().contains("namespace 硬上限"),
+        "9 个 backing 应被 namespace 上限拒：{err}"
+    );
+    // 恰好 8 个应成功
+    assert!(NvmeController::open(&paths[..8], 0x1414, 0, &[]).is_ok());
+}
+
+/// 运行时队列深度 setter：合法值设置 CAP.MQES；非法值拒。
+#[test]
+fn set_max_queue_entries_validates_and_writes_mqes() {
+    let mut c = make_ctrl_with_tmp("qdepth");
+    // 合法：128 / 2 / 65536（非 2 的幂如 100 也合法）
+    for &n in &[2u32, 100, 128, 4096, 65536] {
+        c.set_max_queue_entries(n).unwrap();
+        let mqes_plus_1 = (c.cap & 0xffff) + 1;
+        assert_eq!(mqes_plus_1, n as u64, "CAP.MQES 应反映 {n} entries");
+    }
+    // 非法：0 / 1 / 65537
+    for &n in &[0u32, 1, 65537, 100000] {
+        assert!(c.set_max_queue_entries(n).is_err(), "{n} 应被拒");
+    }
+}
+
+/// Identify NS 广告纯 4K LBAF[2]（lbads=12, ms=0）+ flbas 双因素映射。
+#[test]
+fn identify_ns_advertises_pure_4k_lbaf() {
+    // 512B NS → flbas=0
+    let b512 = IdentifyNamespace::build_v2_bytes(2048, 9, 0, 0, false);
+    assert_eq!(b512[26], 0, "512B → flbas=0");
+    // 4K+meta NS → flbas=1
+    let b4km = IdentifyNamespace::build_v2_bytes(2048, 12, 8, 0, false);
+    assert_eq!(b4km[26], 1, "4K+meta → flbas=1");
+    // 纯 4K NS → flbas=2
+    let b4k = IdentifyNamespace::build_v2_bytes(2048, 12, 0, 0, false);
+    assert_eq!(b4k[26], 2, "纯 4K → flbas=2");
+    assert_eq!(b4k[25], 2, "nlbaf=2（3 个格式）");
+    // LBAF[2] @ 128+8：ms(bytes 0:1)=0, lbads(byte 2)=12
+    assert_eq!(b4k[136], 0, "LBAF[2] ms 低字节=0");
+    assert_eq!(b4k[137], 0, "LBAF[2] ms 高字节=0");
+    assert_eq!(b4k[138], 12, "LBAF[2] lbads=12（4K）");
+}
+
+/// 多-NS 各自独立 format：NS1 512B / NS2 纯 4K，Identify 各反映自己的。
+#[test]
+fn multi_ns_independent_format() {
+    let dir = std::env::temp_dir();
+    let paths: Vec<String> = (0..2)
+        .map(|i| {
+            let p = dir.join(format!("nvme_mns_{}_{i}.img", std::process::id()));
+            let f = std::fs::File::create(&p).unwrap();
+            f.set_len(1 << 20).unwrap();
+            p.to_str().unwrap().to_string()
+        })
+        .collect();
+    let mut c = NvmeController::open(&paths, 0x1414, 0, &[]).unwrap();
+    assert_eq!(c.namespaces.len(), 2);
+    // 模拟把 NS2 format 成纯 4K（per-NS 状态独立）
+    let ns2 = c.namespaces.get_mut(&2).unwrap();
+    ns2.lbads = 12;
+    ns2.meta_size = 0;
+    // NS1 仍 512B（flbas=0），NS2 纯 4K（flbas=2）
+    let n1 = c.namespaces.get(&1).unwrap();
+    let n2 = c.namespaces.get(&2).unwrap();
+    let id1 = IdentifyNamespace::build_v2_bytes(n1.total_lba, n1.lbads, n1.meta_size, 0, false);
+    let id2 = IdentifyNamespace::build_v2_bytes(n2.total_lba, n2.lbads, n2.meta_size, 0, false);
+    assert_eq!(id1[26], 0, "NS1 flbas=0 (512B)");
+    assert_eq!(id2[26], 2, "NS2 flbas=2 (纯 4K) — per-NS 独立");
+}
+
+/// Set Features Number-of-Queues 授予封顶到 IO_QUEUE_CAP(256)。
+#[test]
+fn set_features_grants_up_to_256_queues() {
+    let mut c = make_ctrl_with_tmp("qgrant");
+    let mut cap = pcie_device_core::CaptureTransport::new();
+    let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+    let zero = [0u8; 64];
+    let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+    sqe.cdw0 = (crate::cmd::admin_opc::SET_FEATURES as u32) | (0x11 << 16);
+    sqe.cdw10 = crate::cmd::fid::NUMBER_OF_QUEUES as u32;
+    sqe.cdw11 = 999 | (999 << 16); // 请求 1000 对（NSQR-1=999）
+    let cqe = c.dispatch_admin(&mut ctx, sqe, 0x11, 0, 0).unwrap();
+    // granted = min(1000, 256) = 256 → NSQA-1 = 255
+    assert_eq!(cqe.cdw0 & 0xffff, 255, "NSQA-1 应为 255（授 256）");
+    assert_eq!((cqe.cdw0 >> 16) & 0xffff, 255, "NCQA-1 应为 255");
+}
+
+/// Create IO Queue 拒绝越界 qid（0 / > IO_QUEUE_CAP），防 DenseMap 误 success。
+#[test]
+fn create_io_queue_rejects_out_of_range_qid() {
+    let mut c = make_ctrl_with_tmp("qid");
+    let mut cap = pcie_device_core::CaptureTransport::new();
+    let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+    let sc_of = |cqe: &Cqe| (cqe.dw3 >> 17) as u8;
+    let mk_cq = |qid: u16| {
+        let zero = [0u8; 64];
+        let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+        sqe.cdw0 = (crate::cmd::admin_opc::CREATE_IO_CQ as u32) | (0x11 << 16);
+        sqe.cdw10 = (qid as u32) | (63 << 16); // qsize-1=63
+        sqe.cdw11 = 1; // PC=1
+        sqe.prp1 = 0x1_0000;
+        sqe
+    };
+    // qid=0（admin）→ 拒
+    let cqe = c.dispatch_admin(&mut ctx, mk_cq(0), 0x11, 0, 0).unwrap();
+    assert_eq!(sc_of(&cqe), crate::cmd::sc::INVALID_FIELD, "qid=0 应拒");
+    // qid=257（> 256）→ 拒
+    let cqe = c.dispatch_admin(&mut ctx, mk_cq(257), 0x11, 0, 0).unwrap();
+    assert_eq!(sc_of(&cqe), crate::cmd::sc::INVALID_FIELD, "qid=257 应拒");
+    // qid=256（边界内）→ 成功
+    let cqe = c.dispatch_admin(&mut ctx, mk_cq(256), 0x11, 0, 0).unwrap();
+    assert_eq!(sc_of(&cqe), 0, "qid=256 应成功");
+}
+
+/// **review H-1 回归** — NS Mgmt Create 的 next-nsid 分配限在 1..=MAX_NAMESPACES：
+/// 8 槽满时 find 返 None（→ 走 NAMESPACE_ID_UNAVAILABLE 错误分支，**不**静默
+/// 分配越界 nsid=9）。锁定 H-1 修复的前提不变量（completion 路径全 e2e 待 DMA mock）。
+#[test]
+fn ns_mgmt_create_no_free_nsid_when_8_full() {
+    let dir = std::env::temp_dir();
+    let paths: Vec<String> = (0..8)
+        .map(|i| {
+            let p = dir.join(format!("nvme_full_{}_{i}.img", std::process::id()));
+            let f = std::fs::File::create(&p).unwrap();
+            f.set_len(1 << 20).unwrap();
+            p.to_str().unwrap().to_string()
+        })
+        .collect();
+    let c = NvmeController::open(&paths, 0x1414, 0, &[]).unwrap();
+    assert_eq!(c.namespaces.len(), 8);
+    // completion.rs 用同一谓词分配 next nsid；8 满 → None（绝不返 9 越界）。
+    let next = (1..=crate::controller::MAX_NAMESPACES).find(|n| !c.namespaces.contains_key(n));
+    assert_eq!(next, None, "8 NS 满时不得有空闲 nsid（防越界静默分配）");
+}

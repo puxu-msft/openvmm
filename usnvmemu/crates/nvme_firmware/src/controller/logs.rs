@@ -210,7 +210,7 @@ pub(super) fn build_predictable_latency_event(_c: &NvmeController, bytes: usize)
 /// 16 byte header + per-ANA group descriptor。我们 1 controller，1 ANA group
 /// containing 所有 NS，state = Optimized (0x01)。
 pub(super) fn build_ana_log(c: &NvmeController, bytes: usize) -> Vec<u8> {
-    let mut nsids: Vec<u32> = c.namespaces.keys().copied().collect();
+    let mut nsids: Vec<u32> = c.namespaces.keys().collect();
     nsids.sort();
     let n_nsid = nsids.len() as u32;
     let total = 16 + 32 + 4 * (n_nsid as usize);

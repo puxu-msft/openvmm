@@ -1114,12 +1114,27 @@ impl NvmeController {
                         } else {
                             let new_lbads = if flbas == 0 { 9u8 } else { 12u8 };
                             let new_meta_size = if flbas == 0 { 0u8 } else { 8u8 };
-                            // 分配新 NSID（next available）+ 创 temp file backing
-                            let new_nsid = (1..=u32::MAX)
+                            // 分配新 NSID（next available，**限 MAX_NAMESPACES**）+
+                            // 创 temp file backing。
+                            // **review H-1（CRITICAL 对称修复）**：必须把 find 限在
+                            // 1..=MAX_NAMESPACES。否则 8 槽满时 find 返 nsid=9，
+                            // DenseMap 越界 insert 静默丢弃，却返 success+cdw0=9 →
+                            // driver 见"刚建的 NS 立刻消失" + temp 文件泄漏。与 Create
+                            // IO Queue 的 qid gate 同类（两处越界 insert 须各自 gate）。
+                            let new_nsid = (1..=crate::controller::MAX_NAMESPACES)
                                 .find(|n| !self.namespaces.contains_key(n))
                                 .unwrap_or(0);
                             if new_nsid == 0 {
-                                Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INTERNAL_ERROR, 0)
+                                // 无空闲 NSID（已达硬上限）→ Namespace Identifier
+                                // Unavailable。在创 temp 文件**之前**返回，无泄漏。
+                                Cqe::error(
+                                    p.cid,
+                                    p.sq_id,
+                                    p.sq_head,
+                                    phase,
+                                    sc::NAMESPACE_ID_UNAVAILABLE,
+                                    sc::SCT_COMMAND_SPECIFIC,
+                                )
                             } else {
                                 let dir = std::env::temp_dir();
                                 let path = dir.join(format!(

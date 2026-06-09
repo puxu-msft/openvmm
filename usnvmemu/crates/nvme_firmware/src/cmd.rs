@@ -288,6 +288,9 @@ pub mod sc {
     /// **Phase S2** — NAMESPACE_NOT_ATTACHED (spec SC 0x19, Cmd-Specific)。
     /// NS Attachment SEL=1 (Detach) 时 NS 已 detached（对称 0x18）。
     pub const NAMESPACE_NOT_ATTACHED: u8 = 0x19;
+    /// **2026-06-09** — Namespace Identifier Unavailable (spec SC 0x16,
+    /// Cmd-Specific)。NS Management Create 时无空闲 NSID（已达 MAX_NAMESPACES）。
+    pub const NAMESPACE_ID_UNAVAILABLE: u8 = 0x16;
     pub const SGL_DESCRIPTOR_TYPE_INVALID: u8 = 0x15;
     /// **Phase R1** — INVALID_USE_OF_CONTROLLER_MEMORY_BUFFER — SGL Data Block
     /// 指向无效 GPA / CMB 但 CMB 未启用时返。
@@ -749,17 +752,29 @@ impl IdentifyNamespace {
         ns.ncap = total_lba;
         ns.nuse = 0;
         ns.nsfeat = 0x01.into(); // THINP
-        // FLBAS bits 3:0 = current LBAF index (0 or 1)；bit 4 = metadata
-        // inline with data (我们 mset=0 → 0)
-        let lbaf_idx = if lbads == 9 { 0u8 } else { 1u8 };
+        // FLBAS bits 3:0 = current LBAF index；bit 4 = metadata inline (mset=0 → 0)。
+        // **2026-06-09** — 3 个 LBAF：0=512B/no-meta、1=4K+8B-meta(PI)、2=纯 4K/no-meta。
+        // flbas 需用 (lbads, meta_size) 双因素区分 index 1 vs 2（都 lbads=12）。
+        let lbaf_idx: u8 = match (lbads, meta_size) {
+            (9, _) => 0,
+            (12, 0) => 2, // 纯 4K
+            (12, _) => 1, // 4K + metadata
+            _ => 0,
+        };
         ns.flbas = lbaf_idx.into();
-        ns.nlbaf = 1; // 2 LBAF slots
+        ns.nlbaf = 2; // 3 LBAF slots（0-based：nlbaf = 格式数 - 1）
         ns.lbaf[0] = nvme_spec::nvm::Lbaf::new()
             .with_ms(0)
             .with_lbads(9)
             .with_rp(0);
         ns.lbaf[1] = nvme_spec::nvm::Lbaf::new()
             .with_ms(8)
+            .with_lbads(12)
+            .with_rp(0);
+        // **2026-06-09** — LBAF 2：纯 4K（lbads=12, ms=0），给不要元数据/PI 的
+        // 标准 4K 块用（多数普通 host 用法）。`nvme format -l 2` 切到它。
+        ns.lbaf[2] = nvme_spec::nvm::Lbaf::new()
+            .with_ms(0)
             .with_lbads(12)
             .with_rp(0);
         // RESCAP — Phase H6 reservation capabilities

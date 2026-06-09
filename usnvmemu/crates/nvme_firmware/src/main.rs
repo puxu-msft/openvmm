@@ -87,6 +87,10 @@ struct Args {
     /// PCI Subsystem Vendor ID
     #[arg(long, default_value_t = 0)]
     ssvid: u16,
+    /// **2026-06-09** — 队列深度（MQES = 单 SQ/CQ 最大 entry 数），模拟不同档位
+    /// 设备。∈ [2, 65536]（MQES 0-based 16-bit；spec 不要求 2 的幂）。默认 128。
+    #[arg(long = "max-queue-entries", default_value_t = nvme_firmware::DEFAULT_MAX_QUEUE_ENTRIES)]
+    max_queue_entries: u32,
     /// 仅 TCP 模式：连入此 host:port（非 Windows 测试用）。
     #[arg(long)]
     tcp_addr: Option<String>,
@@ -174,8 +178,11 @@ fn run_vfio_user(args: Args) -> Result<()> {
         "vfio-user NVMe server starting"
     );
     vfio_user_transport::serve_unix(&sock, || {
-        NvmeController::open(&args.backing_files, args.vid, args.ssvid, &args.zns_nsids)
-            .map_err(|e| anyhow!("NvmeController::open: {e}"))
+        let mut c =
+            NvmeController::open(&args.backing_files, args.vid, args.ssvid, &args.zns_nsids)
+                .map_err(|e| anyhow!("NvmeController::open: {e}"))?;
+        c.set_max_queue_entries(args.max_queue_entries)?;
+        Ok(c)
     })
 }
 
@@ -206,8 +213,9 @@ fn run_main(args: Args) -> Result<()> {
             tracing::info!("connected; spawning NvmeController");
 
             // 每次重连重新 open file（让 hot-reconnect 也能切换 backing）
-            let device =
+            let mut device =
                 NvmeController::open(&args.backing_files, args.vid, args.ssvid, &args.zns_nsids)?;
+            device.set_max_queue_entries(args.max_queue_entries)?;
             let opts = RunOptions {
                 // tick 用于：① Sanitize / Self-Test 进度推进 ② AEN 派发
                 // ③ **Phase M1b** Interrupt Coalescing time flush。原 60s

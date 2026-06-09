@@ -61,13 +61,153 @@ use zerocopy::IntoBytes;
 pub(super) const SECTOR_SHIFT: u32 = 9;
 pub(super) const SECTOR_SIZE: u64 = 1 << SECTOR_SHIFT;
 
-/// **Phase H2** — controller 最多授予 driver 的 IO queue 对数（SQ+CQ）。
-/// 真硬件常 8-128；教学 4 足够展示并发模型，每队列独立 dispatch。
-pub(super) const IO_QUEUE_CAP: u16 = 4;
+/// **Phase H2 + 2026-06-09** — controller 最多授予 driver 的 IO queue 对数（SQ+CQ）。
+/// 硬上限 256（远超真硬件常见 64，展示并发模型上限）。qid 范围 1..=256；admin = 0。
+/// 存储用 [`DenseMap`]（Vec 直接索引）而非 HashMap：qid 是密集小整数，O(1) 索引 +
+/// cache-friendly，无哈希开销。Create IO Queue 校验 qid ≤ 此值防越界。
+pub(super) const IO_QUEUE_CAP: u16 = 256;
+
+/// queue id 上界（admin 0 + IO 1..=IO_QUEUE_CAP）→ DenseMap slot 数 = 此 +1。
+pub(super) const MAX_QID: u16 = IO_QUEUE_CAP;
+
+/// **2026-06-09** — namespace 硬上限。多 `--backing-file` → nsid 1..=8；超出在
+/// `open()` 拒绝。nsid 同样密集小整数，namespaces 也用 [`DenseMap`] 索引。
+pub(super) const MAX_NAMESPACES: u32 = 8;
+
+/// **2026-06-09** — 队列深度（MQES = 单 SQ/CQ 最大 entry 数）的默认 / 范围。
+/// 运行时可经 [`NvmeController::set_max_queue_entries`] 调（CLI flag），模拟不同
+/// 档位的设备。MQES 是 CAP 的 **0-based 16-bit** 字段（存 N-1，≤ 0xFFFF），故
+/// entry 数 ∈ [1, 65536]；spec **不要求** 2 的幂，任意值皆可。
+pub const DEFAULT_MAX_QUEUE_ENTRIES: u32 = 128;
+/// 队列深度可配下限（2 = 最小有意义深度）。
+pub const MIN_MAX_QUEUE_ENTRIES: u32 = 2;
+/// 队列深度可配上限 = MQES 字段满值（0xFFFF + 1 = 65536 entries）。
+pub const MAX_MAX_QUEUE_ENTRIES: u32 = 65536;
 
 // 注：本实现用 SDK 分配的 raw DMA token 直接作 HashMap key 路由完成回调；
 // 不再做 token 高位 tagging（早期设计想用 tag 标 op 类别，实测 raw token
 // 已唯一，多此一举）。
+
+/// **2026-06-09** — 密集小整数键的稀疏映射，用 `Vec<Option<V>>` 直接索引。
+///
+/// 用于 SQ/CQ（u16 qid 0..=256）与 namespace（u32 nsid 1..=8）：键是密集小整数，
+/// 直接索引 O(1) + cache-friendly，无 HashMap 哈希开销。API 镜像 `HashMap` 的常用
+/// 子集（`get/get_mut/insert/remove/contains_key/clear`），故调用点零改动；`keys`/
+/// `iter`/`iter_mut` 返 owned 键（slot 下标反推）。
+///
+/// 容量在 `new(max_key)` 固定（slot 数 = max_key+1）；`insert` 越界静默忽略
+/// （caller 须先 bound-check，如 Create IO Queue 校验 qid ≤ IO_QUEUE_CAP）。
+pub(super) struct DenseMap<K: SlotKey, V> {
+    slots: Vec<Option<V>>,
+    _k: core::marker::PhantomData<K>,
+}
+
+/// `DenseMap` 的键：可与 `usize` slot 下标互转的密集小整数。
+pub(super) trait SlotKey: Copy {
+    fn to_index(self) -> usize;
+    fn from_index(i: usize) -> Self;
+}
+impl SlotKey for u16 {
+    fn to_index(self) -> usize {
+        self as usize
+    }
+    fn from_index(i: usize) -> Self {
+        i as u16
+    }
+}
+impl SlotKey for u32 {
+    fn to_index(self) -> usize {
+        self as usize
+    }
+    fn from_index(i: usize) -> Self {
+        i as u32
+    }
+}
+
+impl<K: SlotKey, V> DenseMap<K, V> {
+    /// 建容量 = `max_key + 1` 的空映射（slot 0..=max_key）。
+    pub(super) fn new(max_key: usize) -> Self {
+        let mut slots = Vec::with_capacity(max_key + 1);
+        slots.resize_with(max_key + 1, || None);
+        Self {
+            slots,
+            _k: core::marker::PhantomData,
+        }
+    }
+    pub(super) fn get(&self, k: &K) -> Option<&V> {
+        self.slots.get(k.to_index()).and_then(|o| o.as_ref())
+    }
+    pub(super) fn get_mut(&mut self, k: &K) -> Option<&mut V> {
+        self.slots.get_mut(k.to_index()).and_then(|o| o.as_mut())
+    }
+    /// 镜像 `HashMap::insert`：返回被替换的旧值（若有）。越界（caller 未 bound-check）
+    /// 静默忽略并返 `None` —— 生产校验在 caller（Create IO Queue qid gate）。
+    pub(super) fn insert(&mut self, k: K, v: V) -> Option<V> {
+        match self.slots.get_mut(k.to_index()) {
+            Some(slot) => slot.replace(v),
+            None => {
+                // **review M-1** — 越界 insert 是 caller 漏 bound-check 的信号。
+                // release 静默（不 panic 在线上），debug/test 立即命中 root cause，
+                // 避免变成"success + 幽灵 entry"的远端症状（见 H-1）。
+                debug_assert!(
+                    false,
+                    "DenseMap::insert 越界 key idx={}（caller 须先 bound-check）",
+                    k.to_index()
+                );
+                None
+            }
+        }
+    }
+    pub(super) fn remove(&mut self, k: &K) -> Option<V> {
+        self.slots.get_mut(k.to_index()).and_then(|o| o.take())
+    }
+    pub(super) fn contains_key(&self, k: &K) -> bool {
+        self.get(k).is_some()
+    }
+    pub(super) fn clear(&mut self) {
+        for s in &mut self.slots {
+            *s = None;
+        }
+    }
+    /// 已占用 slot 的键（升序，因 Vec 按下标）。返 owned 键（非 HashMap 的 `&K`）。
+    pub(super) fn keys(&self) -> impl Iterator<Item = K> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| o.as_ref().map(|_| K::from_index(i)))
+    }
+    /// (key, &mut V) 升序迭代。返 owned 键。
+    pub(super) fn iter_mut(&mut self) -> impl Iterator<Item = (K, &mut V)> + '_ {
+        self.slots
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, o)| o.as_mut().map(|v| (K::from_index(i), v)))
+    }
+    /// 已占用 slot 数。
+    pub(super) fn len(&self) -> usize {
+        self.slots.iter().filter(|o| o.is_some()).count()
+    }
+    /// (key, &V) 升序迭代。返 owned 键。
+    pub(super) fn iter(&self) -> impl Iterator<Item = (K, &V)> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| o.as_ref().map(|v| (K::from_index(i), v)))
+    }
+}
+
+// 镜像 `HashMap` 的 `Index<&K>`：键不存在 panic（与 HashMap 行为一致）。
+impl<K: SlotKey, V> core::ops::Index<&K> for DenseMap<K, V> {
+    type Output = V;
+    fn index(&self, k: &K) -> &V {
+        self.get(k).expect("no entry found for key in DenseMap")
+    }
+}
+impl<K: SlotKey, V> core::ops::IndexMut<&K> for DenseMap<K, V> {
+    fn index_mut(&mut self, k: &K) -> &mut V {
+        self.get_mut(k).expect("no entry found for key in DenseMap")
+    }
+}
 
 /// **Phase S6** — Reservation Notification Log entry (NVMe spec § 5.16.1.20)。
 ///
@@ -706,7 +846,7 @@ pub struct NvmeController {
     /// NSID → Namespace。spec § 1.6：NSID 0 reserved (controller broadcast)，
     /// NSID 1..N 数据 namespace，NSID 0xFFFF_FFFF = broadcast。本实现单
     /// controller，NS 从 1 起编号。Phase H4 之前只支持 NSID=1。
-    pub(super) namespaces: HashMap<u32, Namespace>,
+    pub(super) namespaces: DenseMap<u32, Namespace>,
 
     // ----- Controller registers -----
     cap: u64,
@@ -730,10 +870,10 @@ pub struct NvmeController {
     state: CtrlState,
 
     // ----- Queues -----
-    /// SQ ID → queue。Admin = ID 0；IO = ID 1..
-    sqs: HashMap<u16, SubmissionQueue>,
+    /// SQ ID → queue。Admin = ID 0；IO = ID 1..=IO_QUEUE_CAP。Vec 直接索引。
+    sqs: DenseMap<u16, SubmissionQueue>,
     /// CQ ID → queue。
-    cqs: HashMap<u16, CompletionQueue>,
+    cqs: DenseMap<u16, CompletionQueue>,
 
     // ----- DMA tracking -----
     /// fetch_sqe token → SQ id + slot index（host 侧已确认这批 entries 要 fetch）。
@@ -1340,14 +1480,14 @@ impl NvmeController {
     /// **Phase V8d** — 列出所有 IO SQ id（qid ≥ 1，过滤掉 admin 0）。
     /// session Drop sweep 用以拿到要清的 qid 列表，避免漏。
     pub fn nvme_list_io_sqs(&self) -> Vec<u16> {
-        let mut v: Vec<u16> = self.sqs.keys().copied().filter(|&q| q != 0).collect();
+        let mut v: Vec<u16> = self.sqs.keys().filter(|&q| q != 0).collect();
         v.sort_unstable();
         v
     }
 
     /// **Phase V8d** — 同 [`Self::nvme_list_io_sqs`] 但列 CQ。
     pub fn nvme_list_io_cqs(&self) -> Vec<u16> {
-        let mut v: Vec<u16> = self.cqs.keys().copied().filter(|&q| q != 0).collect();
+        let mut v: Vec<u16> = self.cqs.keys().filter(|&q| q != 0).collect();
         v.sort_unstable();
         v
     }
@@ -1436,6 +1576,20 @@ impl NvmeController {
 }
 
 impl NvmeController {
+    /// **2026-06-09** — 运行时设置队列深度（MQES = 单 SQ/CQ 最大 entry 数），
+    /// 模拟不同档位设备。须在 controller enable（host 读 CAP）前调，通常 `open()`
+    /// 之后立即调（CLI flag）。`entries` ∈ [2, 65536]；spec 不要求 2 的幂。
+    pub fn set_max_queue_entries(&mut self, entries: u32) -> anyhow::Result<()> {
+        if !(MIN_MAX_QUEUE_ENTRIES..=MAX_MAX_QUEUE_ENTRIES).contains(&entries) {
+            return Err(anyhow::anyhow!(
+                "max_queue_entries {entries} 非法：须 ∈ [{MIN_MAX_QUEUE_ENTRIES}, {MAX_MAX_QUEUE_ENTRIES}]（MQES 0-based 16-bit）"
+            ));
+        }
+        self.cap = crate::regs::build_cap(entries);
+        tracing::info!(mqes_entries = entries, "queue depth (MQES) 设置");
+        Ok(())
+    }
+
     /// `backing_files`：每个文件成为一个 namespace（NSID 1, 2, ...）。
     /// 文件大小决定该 NS 容量（÷ 512 round down 到 LBA 数）。
     /// Phase H4：之前接受单 path string；现在 slice，至少 1 个。
@@ -1448,7 +1602,15 @@ impl NvmeController {
         if backing_files.is_empty() {
             return Err(anyhow::anyhow!("at least one --backing-file required"));
         }
-        let mut namespaces: HashMap<u32, Namespace> = HashMap::new();
+        // **2026-06-09** — namespace 硬上限 MAX_NAMESPACES（nsid 1..=8）。
+        if backing_files.len() > MAX_NAMESPACES as usize {
+            return Err(anyhow::anyhow!(
+                "too many --backing-file ({}): namespace 硬上限 {}",
+                backing_files.len(),
+                MAX_NAMESPACES
+            ));
+        }
+        let mut namespaces: DenseMap<u32, Namespace> = DenseMap::new(MAX_NAMESPACES as usize);
         for (idx, path) in backing_files.iter().enumerate() {
             let file = std::fs::OpenOptions::new()
                 .read(true)
@@ -1544,7 +1706,10 @@ impl NvmeController {
         }
         Ok(Self {
             namespaces,
-            cap: build_cap(64),
+            // 默认 MQES = 128 entries；运行时可经 set_max_queue_entries 调
+            // （CLI flag）。SQ/CQ 是 host 分配的内存，逐条 dispatch，深度无本地
+            // 数组限制；128 也消掉 Linux "queue_size 128 > sqsize 64 clamping" 警告。
+            cap: build_cap(DEFAULT_MAX_QUEUE_ENTRIES),
             vs: VS_NVME_1_4,
             intms: 0,
             intmc: 0,
@@ -1556,8 +1721,8 @@ impl NvmeController {
             bprsel: 0,
             bpmbl: 0,
             state: CtrlState::Disabled,
-            sqs: HashMap::new(),
-            cqs: HashMap::new(),
+            sqs: DenseMap::new(MAX_QID as usize),
+            cqs: DenseMap::new(MAX_QID as usize),
             pending_fetches: HashMap::new(),
             pending_ios: HashMap::new(),
             dual_prp_writes: HashMap::new(),
@@ -2447,7 +2612,7 @@ impl PcieDevice for NvmeController {
             let now = std::time::Instant::now();
             // 先收集 (cq_id, iv) 避免 borrow 冲突
             let mut to_fire: Vec<(u16, u16)> = Vec::new();
-            for (&cq_id, cq) in self.cqs.iter_mut() {
+            for (cq_id, cq) in self.cqs.iter_mut() {
                 if cq_id == 0 || !cq.interrupt_enabled || cq.pending_completions == 0 {
                     continue;
                 }
