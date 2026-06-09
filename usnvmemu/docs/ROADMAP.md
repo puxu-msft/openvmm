@@ -38,8 +38,10 @@ NVMe-oF TCP 第 4 条接入。当前架构 ✅ 已对齐：firmware (controller)
 > - **✅ 本会话已完成**：vfio spec-complete track 全部（握手 minor 协商 / max_msg_fds /
 >   bulk REGION_WRITE / REGION 上限 max_data_xfer_size / describe 缓存 / mmap 零拷贝 DMA）
 >   + 真 QEMU 11 e2e harness + HOW_TO_ADD_TRANSPORT.md。
-> - **⏳ 可无人值守做（纯代码/文档，未做）**：V-followup-fused-cmd（Fused C&W 真原子）/
->   V-followup-py-harness-spec-wire-conformance（CHAP wire 错误路径 Python）。
+> - **✅ 2026-06-09 自主会话已完成**：V-followup-fused-cmd（Fused C&W 真原子，
+>   commit 79daadc1）+ V-followup-py-harness-spec-wire-conformance（CHAP wire
+>   5 错误路径，commit 57d12a7b）。**⏳ 纯代码自主可做项已清空**——剩余全卡
+>   host-root / 上游 / 多月架构（见下）。
 > - **🔒 卡 host-root / sudo / kmod（须用户授权，无法无人值守）**：
 >   dhchap-4-real-host-interop（`sudo nvme connect --dhchap-secret`）/
 >   tls-psk-kernel-vector（写+装 ~50 LOC kmod dump kernel TLS PSK）/
@@ -214,14 +216,14 @@ portal；多 portal 走 [[nvme-of-tcp-real-linux-interop-milestone]] 验过。
 **Acceptance**：起 target with `--discovery-target-addr A:p1 -p A:p2 -p A:p3`，
 `nvme discover -t tcp -a A -s 4420` 输出 3 个 entry，每个 NQN/IP/Port 正确。
 
-### V-followup-py-harness-spec-wire-conformance (Tier 2, MEDIUM, 预计半 day)
+### ✅ V-followup-py-harness-spec-wire-conformance (2026-06-09 SHIPPED — commit `57d12a7b`)
 
-**What**：把 `chap4_spec_wire_e2e.py` 扩到覆盖 reviewer M-4 那 5 个 case
-(REPLY before challenge / REPLY truncation / tid mismatch / SUCCESS2 before
-auth / FAILURE2 from host)，对齐 lib test。
-
-**Why**：lib test 覆盖了，但 Python harness 缺；跨进程实证 wire 错误路径才能
-保 Linux nvme-cli 拿到正确 FAILURE1 diagnostic。
+**✅ 已做**：`chap4_spec_wire_e2e.py` 扩到 9 scenarios，覆盖 reviewer M-4 的 5 个
+CHAP wire 错误路径（REPLY before challenge / 截断 / tid mismatch / SUCCESS2
+before auth / FAILURE2 from host），跨进程真触发 + 断言 target 回的**具体**
+rescode_exp + SC（§20/§22 差分：[7] HMAC 算对只翻 tid 1 bit 证 tid-check 先于
+verify；两 INCORRECT_PAYLOAD 兄弟靠 SC 区分）。python-reviewer 验证全 5
+path-specific 无 false-pass。对真 target 通过。
 
 ### ✅ V-followup-firmware-rename (Tier 2, 2026-06-08 已 SHIPPED — crate 改名部分)
 
