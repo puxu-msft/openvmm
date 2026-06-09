@@ -24,9 +24,11 @@ HOSTNQN='nqn.2014-08.org.nvmexpress:uuid:test-host'
 HEXSECRET=$(head -c 32 /dev/urandom | xxd -p -c 64)
 echo "HEXSECRET=$HEXSECRET"   # 记下，要和下面 DHHC-1 同源
 cargo run --bin nvme_of_tcp_target -- \
-  --addr 127.0.0.1:4420 --backing-file /tmp/ns1.img \
+  --listen 127.0.0.1:4420 --backing-file /tmp/ns1.img \
   --host-secret "${HOSTNQN}=${HEXSECRET}"
 ```
+> flag 是 `--listen`（不是 `--addr`）；`--host-secret` 的 HEX 解码后须 ≥ 32 字节
+> （上面 32 字节裸 secret = 64 hex 字符，正好）。加 `RUST_LOG=debug` 前缀看 CHAP 帧。
 
 **② 生成与 HEXSECRET 同源的 DHHC-1 key**（nvme-cli `--dhchap-secret` 要
 `DHHC-1:<hmac>:base64(key‖crc32_le):` 格式——**含 CRC-32 后缀**，不能手写裸 base64；
@@ -103,9 +105,10 @@ response 不匹配，是这里的 transcript 串法差异，我会对齐 spec wi
 
 **代码状态**：V7c-fix 改了 CNTRLTYPE，但只测过单 portal。
 
-**① 启动多 portal target**：
+**① 启动多 portal target**（`--discovery-mode` 让主 `--listen` 端口服务 discovery）：
 ```bash
-cargo run --bin nvme_of_tcp_target -- --backing-file /tmp/ns1.img --discovery-listen \
+cargo run --bin nvme_of_tcp_target -- \
+  --listen 127.0.0.1:4420 --backing-file /tmp/ns1.img --discovery-mode \
   --discovery-target-nqn nqn.test:p1 --discovery-target-addr 127.0.0.1:4421 \
   --discovery-target-nqn nqn.test:p2 --discovery-target-addr 127.0.0.1:4422 \
   --discovery-target-nqn nqn.test:p3 --discovery-target-addr 127.0.0.1:4423
