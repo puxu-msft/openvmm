@@ -280,7 +280,19 @@ auth / FAILURE2 from host)，对齐 lib test。
 
 **Blocker**：rustls upstream（详 [tls-psk-survey](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v-followup-tls-psk-survey.md)）。
 
-### V-followup-fused-cmd (MEDIUM) — controller 侧已 done，gap 在 nvme_of fabric
+### ✅ V-followup-fused-cmd (2026-06-09 SHIPPED — fabric fused C&W 真原子)
+
+**✅ 已做**（commit `79daadc1`）：nvme_of fabric 路径接入 fused Compare-and-Write
+真原子 CAS。**hoisted 设计**（2 轮 reviewer）：session 独占 fuse 配对
+（`pending_fused: Option<(Sqe,u16)>`），SECOND 到达先经 R2T 把 Compare/Write 两
+host buffer 各按自己 cccid 取齐，再单次调 controller 新增无状态原子入口
+`nvme_fused_cas`（**单 &mut self 内** read-compare-write，无 await/锁释放 → 与
+doorbell 同级原子）。firmware 单元 `fused_cas_atomic_compare_and_write`（FAIL→
+backing 不变 原子性不变量）+ 真 wire e2e `scripts/interop_py/fused_cw_e2e.py`
+（CAS + 状态机对抗：SECOND-无-FIRST / 不匹配 / 两-FIRST 打断）。详 LESSONS §24。
+**e2e 真 nvme-cli fused IO**（host-root）仍留 RUNBOOK。
+
+<details><summary>历史 gap 分析（已解决）</summary>
 
 **纠错（2026-06-09 doc-audit）**：原 What/Why 说"教学 controller 标 Fused detect
 但没真 atomic"是**过时错误**。实际 **nvme_firmware controller 有 Fused
@@ -296,6 +308,7 @@ Compare-and-Write 实现 + 测试**（Phase O2/O3），但**只在 `dispatch_sqe
 - ~~chunking 破坏 fused~~ **已证伪**：chunk 阈值 nlb>16，fused 上限 8 LBA，互斥不可达。
 - **e2e 确认须真 nvme-cli fused IO**（host-root 阻塞）。详
   [fused-fabric plan](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-09-fused-fabric-and-chap-conformance.md)。
+</details>
 
 **Acceptance**：fused Compare+Write 经 **nvme_of fabric 路径**（dispatch_io，非
 dispatch_sqe）被 controller 原子 CAS 处理、双 CQE 回；真 nvme-cli 互通验证。

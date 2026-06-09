@@ -536,3 +536,39 @@ LBA、`io_write_e2e`）都用 period-256 uniform pattern（每 LBA 同字节）�
    是 chunked 偏移逻辑的独立判据；同路径 round-trip 再 distinct 也只证「不撕裂」，
    证不了「绝对位置对」。挑 oracle 时问：判据来自**另一条**代码路径，还是同一条
    自己印证自己？（同 [[lesson §22]] unsafe oracle、[[lesson §20]] wire flag 判据）。
+
+## 24. review BLOCK 的对抗-case bug，常是"换更简单的设计"而非"补复杂设计" (HIGH)
+
+**坑**: fused C&W over fabric 首版用 capture-based 设计——给 Compare/Write 数据各
+设不同 PRP sentinel，靠 captured dma_read 的 gpa 反推该数据属于哪条命令（→R2T
+cccid），session 与 controller **双状态**（session `pending_fused_compare: Option<u16>`
++ controller `pending_fused`）。happy path 全绿、e2e 过、revert-verify 也过。但
+rust-reviewer 对抗审出 **HIGH-1**：连续两 FIRST 时双状态失步（controller abort A+
+stash B，session 据"有无 CQE"启发式误清 pending）→ 后续 Write 的 Compare 数据
+R2T 发**错 cccid** → 比错 buffer → **静默 CAS corruption**。还有 HIGH-2 锁在 CAS
+中途因 wire I/O 释放（非原子）、HIGH-3 多 conn 共享 controller `pending_fused` 串对。
+
+**修法不是补 capture-based 的洞，是换 hoisted 设计**：session **独占** fuse 状态
+（存整条 Compare SQE），SECOND 到达**先经 R2T 把两 host buffer 各按自己 cccid 取齐**，
+再单次调 controller 无状态 `nvme_fused_cas`（单 `&mut self` 内 read-compare-write）。
+一举消三 HIGH 且**代码更短**（删 sentinel、删多轮捕获驱动、删双状态）。
+
+**三条根本教训**:
+1. **review 抓到复杂设计在对抗 case 下的洞，先问"是不是设计本身太绕"**，而非逐个补
+   洞。capture-based 的 gpa→CID 推断 + 双状态是洞之源；hoisted 把"取数据"与"原子
+   操作"分离，对抗 case 自然消失。简单设计的对抗面更小。
+2. **跨 fabric/wire 的原子性 = 所有外部数据先取齐，再进单锁同步临界区（无 await
+   跨锁）**。只要临界区中途因 wire I/O 释放锁，别的 conn 就能插队 → 非原子。
+   parking_lot 锁 + `#![deny(clippy::await_holding_lock)]` 本就逼你这么分。
+3. **buffer/路由隔离要靠 wire 级协议字段，不靠自家推断**（同 [[lesson §20]]）。
+   hoisted 下 H2CData 落对 buffer 靠 reassembler 按 `(cccid,ttag)` 拒错配（协议
+   语义），不是靠 gpa→CID 猜。这也是 HIGH-1 消失的 linchpin。
+4. **happy-path 全绿 + 自家 revert-verify 都不够**：对抗输入（两 FIRST / SECOND-
+   无-FIRST / 不匹配 / 并发）是 data-integrity 路径的必测面。mandatory review 第
+   N 次抓到我会 ship 的 silent-corruption（[[lesson §22]] 同模式：我自信、reviewer
+   adversarial 一问即破）。data-integrity 代码，对抗 case 测试 + review 不可省。
+
+**来源**: fused C&W over fabric（commit `79daadc1`，2 轮 rust-reviewer：首版
+capture-based BLOCK HIGH-1/2/3 → hoisted 重设计 APPROVE）；firmware 单元
+`fused_cas_atomic_compare_and_write`（FAIL→backing 不变 原子性不变量）+ wire e2e
+`fused_cw_e2e.py` 9 检查含对抗状态机。
