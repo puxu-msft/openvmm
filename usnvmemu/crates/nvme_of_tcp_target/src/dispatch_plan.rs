@@ -23,6 +23,9 @@
 use crate::aer::{ADMIN_OPC_AER, MAX_PENDING_AERS};
 use nvme_firmware::cmd::Sqe;
 
+/// NVMe PRP 页大小（教学固定 4 KiB；MPSMIN=0）。纯-4K 扇区感知按此算页边界。
+pub const NVME_PRP_PAGE_BYTES: u32 = 4096;
+
 /// 一条 capsule cmd PDU 的粗分类（fabric / admin / IO / 非法长度）。
 ///
 /// 取代 sync `dispatch_capsule_cmd` 入口的 `if opc == NVME_OPC_FABRIC { ... }
@@ -155,14 +158,18 @@ pub fn decide_admin_discovery_whitelist(
 
 /// **V5e-1-fix (review H-1)** — 改 NS 形状的 admin opc 黑名单。
 ///
-/// V5 教学版 `V5_NLB_MAX` 单 PRP1 假设直接挂钩 `LBADS=9 + pi_type=0`：一旦
-/// host `nvme format --lbaf=1 --pi=1`，controller dual-PRP path 走 prp2=0
-/// sentinel → dma_read 静默到非法 gpa → wire 破 / 数据 corruption。V8+ 真支
-/// 持多 PRP 后解封。
+/// 历史原因：V5 教学版 session 合成 PRP 写死 `LBADS=9`（单 PRP1 ≤ 4 KiB /
+/// dual-PRP ≤ 8 KiB 的页边界按 512B 算）。一旦 host `nvme format` 改 lbads，
+/// session 的 prp2 sentinel 阈值与 chunk 大小就与真实扇区不符 → 撕裂
+/// dual-PRP 边界 → 数据 corruption，故默认 block 0x80/0x0D。
 ///
-/// 黑名单：
-/// - 0x80 FORMAT_NVM            — 改 lbads / pi_type
-/// - 0x0D NAMESPACE_MANAGEMENT — 创建/删除 NS
+/// **2026-06-09 纯 4K** — session 现已**扇区感知**（[`dual_prp_max_lbas`] /
+/// [`prp2_sentinel_for_nlb`] 按 `ns_lbads` 算），Format 改 lbads 后下条 IO
+/// 即读到新扇区。故 **0x80 FORMAT_NVM 可经 `--allow-format` 显式 opt-in 放行**
+/// （firmware Format handler 自身 gate in-flight IO + lbafl≤2）。
+///
+/// 0x0D NAMESPACE_MANAGEMENT 仍恒 block：创建 NS 会引入 session 未追踪的
+/// 新 NS，且教学 target NS 集合固定，无放行需求。
 ///
 /// (0x15 NS_ATTACHMENT 在 sync 注释里提过保守 block，但 sync 实现实际只 block
 /// 0x80/0x0D；本决策表与 sync 行为一致以避免漂移。)
@@ -174,13 +181,14 @@ pub enum AdminBlockedOpcDecision {
     Blocked,
 }
 
-/// 决策：admin opc 是否触犯 NS 形状黑名单。
-pub fn decide_admin_blocked_opc(sqe: &[u8]) -> AdminBlockedOpcDecision {
+/// 决策：admin opc 是否触犯 NS 形状黑名单。`allow_format=true` 时显式放行
+/// 0x80 FORMAT_NVM（用户经 CLI `--allow-format` opt-in）；0x0D 恒 block。
+pub fn decide_admin_blocked_opc(sqe: &[u8], allow_format: bool) -> AdminBlockedOpcDecision {
     let opc = crate::aer::peek_admin_opc(sqe);
-    if matches!(opc, 0x80 | 0x0D) {
-        AdminBlockedOpcDecision::Blocked
-    } else {
-        AdminBlockedOpcDecision::Allowed
+    match opc {
+        0x80 if allow_format => AdminBlockedOpcDecision::Allowed,
+        0x80 | 0x0D => AdminBlockedOpcDecision::Blocked,
+        _ => AdminBlockedOpcDecision::Allowed,
     }
 }
 
@@ -209,27 +217,50 @@ pub enum IoNlbDecision {
     },
 }
 
-/// 决策：IO SQE 的 NLB 是否在 `V5_NLB_MAX` 上限内。
-pub fn decide_io_nlb_check(sqe: &Sqe) -> IoNlbDecision {
+/// 决策：IO SQE 的 NLB 是否在单次 dispatch（dual-PRP）能覆盖的上限内。
+/// **2026-06-09 纯 4K** — 上限按 per-NS 扇区算 = [`dual_prp_max_lbas`]
+/// （512B→16、4K→2），而非旧的固定 `V5_NLB_MAX`。
+pub fn decide_io_nlb_check(sqe: &Sqe, lbads: u8) -> IoNlbDecision {
     let opc = (sqe.cdw0 & 0xff) as u8;
     if !matches!(opc, 0x01 | 0x02) {
         return IoNlbDecision::NotReadWrite;
     }
     let nlb_real = (sqe.cdw12 & 0xffff) + 1;
-    if nlb_real > crate::V5_NLB_MAX {
+    if nlb_real > dual_prp_max_lbas(lbads) {
         IoNlbDecision::OverMax { nlb_real }
     } else {
         IoNlbDecision::Ok { nlb_real }
     }
 }
 
+/// **2026-06-09 纯 4K** — 一个 4 KiB PRP 页能装多少 LBA（512B→8、4K→1）。
+/// 仅支持 lbads∈{9,12}；`.max(1)` 防御性兜底（lbads≥12 时至少 1）。
+pub fn page_lbas(lbads: u8) -> u32 {
+    (NVME_PRP_PAGE_BYTES >> lbads).max(1)
+}
+
+/// 单次 dispatch（controller dual-PRP path，≤ 2 页 = 8 KiB）能覆盖的最大
+/// LBA 数：512B→16、4K→2。同时是 session chunking 的 chunk 大小与触发阈值。
+pub fn dual_prp_max_lbas(lbads: u8) -> u32 {
+    (2 * NVME_PRP_PAGE_BYTES) >> lbads
+}
+
+/// host 单条 IO 的 MDTS LBA 上限（按字节预算 = `V_HOST_IO_NLB_MAX`×512B =
+/// 128 KiB，再 ÷ 扇区）：512B→256、4K→32。超出 → 拒 SC=0x18。
+pub fn host_io_max_lbas(lbads: u8) -> u32 {
+    (crate::V_HOST_IO_NLB_MAX * 512) >> lbads
+}
+
 /// **V5e-2** — IO Read/Write 的 prp2 sentinel 决策。
 ///
-/// - nlb ≤ 8 (单 PRP1 ≤ 4 KiB)：prp2 = 0（controller 走单 PRP1 path）
-/// - 8 < nlb ≤ 16 (双 PRP ≤ 8 KiB)：prp2 = `PRP2_SENTINEL`，controller 走
-///   dual-PRP path 产 2 个 dma_read/dma_write，session 累计处理
-pub fn prp2_sentinel_for_nlb(nlb_real: u32) -> u64 {
-    if nlb_real > 8 {
+/// **2026-06-09 纯 4K** — 阈值按 per-NS 页边界（[`page_lbas`]）：
+/// - nlb ≤ page_lbas（≤ 1 页）：prp2 = 0（controller 走单 PRP1 path）
+/// - page_lbas < nlb ≤ 2×page_lbas（≤ 2 页）：prp2 = `PRP2_SENTINEL`，
+///   controller 走 dual-PRP path 产 2 个 dma_read/dma_write
+///
+/// 512B：page_lbas=8 → nlb>8 才 dual；4K：page_lbas=1 → nlb≥2 即 dual。
+pub fn prp2_sentinel_for_nlb(nlb_real: u32, lbads: u8) -> u64 {
+    if nlb_real > page_lbas(lbads) {
         crate::session::PRP2_SENTINEL
     } else {
         0
@@ -345,17 +376,28 @@ mod tests {
     #[test]
     fn v8e7_1_decide_admin_blocked_opc_format_nvm() {
         let sqe = admin_sqe_with_opc(0x80);
+        // 默认（allow_format=false）→ block
         assert_eq!(
-            decide_admin_blocked_opc(&sqe),
+            decide_admin_blocked_opc(&sqe, false),
             AdminBlockedOpcDecision::Blocked
+        );
+        // **2026-06-09 纯 4K** — opt-in 后放行 Format
+        assert_eq!(
+            decide_admin_blocked_opc(&sqe, true),
+            AdminBlockedOpcDecision::Allowed
         );
     }
 
     #[test]
     fn v8e7_1_decide_admin_blocked_opc_ns_management() {
         let sqe = admin_sqe_with_opc(0x0D);
+        // NS Management 恒 block，即便 allow_format=true
         assert_eq!(
-            decide_admin_blocked_opc(&sqe),
+            decide_admin_blocked_opc(&sqe, false),
+            AdminBlockedOpcDecision::Blocked
+        );
+        assert_eq!(
+            decide_admin_blocked_opc(&sqe, true),
             AdminBlockedOpcDecision::Blocked
         );
     }
@@ -365,7 +407,7 @@ mod tests {
         for opc in [0x06u8, 0x02, 0x09, 0x18, 0x0C, 0x05, 0x01] {
             let sqe = admin_sqe_with_opc(opc);
             assert_eq!(
-                decide_admin_blocked_opc(&sqe),
+                decide_admin_blocked_opc(&sqe, false),
                 AdminBlockedOpcDecision::Allowed,
                 "opc={opc:#x} 不应在黑名单",
             );
@@ -383,14 +425,14 @@ mod tests {
     #[test]
     fn v8e7_1_decide_io_nlb_not_read_write() {
         let sqe = io_sqe(0x05, 100); // Create IO CQ
-        assert_eq!(decide_io_nlb_check(&sqe), IoNlbDecision::NotReadWrite);
+        assert_eq!(decide_io_nlb_check(&sqe, 9), IoNlbDecision::NotReadWrite);
     }
 
     #[test]
     fn v8e7_1_decide_io_nlb_ok_at_max() {
-        let sqe = io_sqe(0x02, crate::V5_NLB_MAX - 1); // nlb_real = MAX
+        let sqe = io_sqe(0x02, crate::V5_NLB_MAX - 1); // nlb_real = MAX (512B)
         assert_eq!(
-            decide_io_nlb_check(&sqe),
+            decide_io_nlb_check(&sqe, 9),
             IoNlbDecision::Ok {
                 nlb_real: crate::V5_NLB_MAX
             }
@@ -399,24 +441,58 @@ mod tests {
 
     #[test]
     fn v8e7_1_decide_io_nlb_over_max() {
-        let sqe = io_sqe(0x01, crate::V5_NLB_MAX); // nlb_real = MAX+1
+        let sqe = io_sqe(0x01, crate::V5_NLB_MAX); // nlb_real = MAX+1 (512B)
         assert_eq!(
-            decide_io_nlb_check(&sqe),
+            decide_io_nlb_check(&sqe, 9),
             IoNlbDecision::OverMax {
                 nlb_real: crate::V5_NLB_MAX + 1
             }
         );
     }
 
+    /// **2026-06-09 纯 4K** — 4K NS（lbads=12）单次 dispatch 上限 = 2 LBA。
+    #[test]
+    fn pure_4k_decide_io_nlb_cap_is_2() {
+        assert_eq!(dual_prp_max_lbas(12), 2);
+        assert_eq!(dual_prp_max_lbas(9), 16);
+        let ok = io_sqe(0x02, 1); // nlb_real = 2
+        assert_eq!(
+            decide_io_nlb_check(&ok, 12),
+            IoNlbDecision::Ok { nlb_real: 2 }
+        );
+        let over = io_sqe(0x01, 2); // nlb_real = 3 > 2
+        assert_eq!(
+            decide_io_nlb_check(&over, 12),
+            IoNlbDecision::OverMax { nlb_real: 3 }
+        );
+    }
+
     #[test]
     fn v8e7_1_prp2_sentinel_single_prp_when_nlb_le_8() {
-        assert_eq!(prp2_sentinel_for_nlb(1), 0);
-        assert_eq!(prp2_sentinel_for_nlb(8), 0);
+        // 512B：≤ 8 LBA = ≤ 1 页 → 单 PRP
+        assert_eq!(prp2_sentinel_for_nlb(1, 9), 0);
+        assert_eq!(prp2_sentinel_for_nlb(8, 9), 0);
     }
 
     #[test]
     fn v8e7_1_prp2_sentinel_dual_prp_when_nlb_over_8() {
-        assert_eq!(prp2_sentinel_for_nlb(9), crate::session::PRP2_SENTINEL);
-        assert_eq!(prp2_sentinel_for_nlb(16), crate::session::PRP2_SENTINEL);
+        // 512B：> 8 LBA = > 1 页 → dual PRP
+        assert_eq!(prp2_sentinel_for_nlb(9, 9), crate::session::PRP2_SENTINEL);
+        assert_eq!(prp2_sentinel_for_nlb(16, 9), crate::session::PRP2_SENTINEL);
+    }
+
+    /// **2026-06-09 纯 4K** — 4K NS：1 LBA = 1 页 → 单 PRP；2 LBA = 2 页 → dual。
+    #[test]
+    fn pure_4k_prp2_sentinel_threshold_is_1_lba() {
+        assert_eq!(page_lbas(12), 1);
+        assert_eq!(page_lbas(9), 8);
+        assert_eq!(prp2_sentinel_for_nlb(1, 12), 0); // 1 页 → 单 PRP
+        assert_eq!(
+            prp2_sentinel_for_nlb(2, 12),
+            crate::session::PRP2_SENTINEL // 2 页 → dual
+        );
+        // MDTS host 上限：4K → 32 LBA (128 KiB)，512B → 256。
+        assert_eq!(host_io_max_lbas(12), 32);
+        assert_eq!(host_io_max_lbas(9), 256);
     }
 }

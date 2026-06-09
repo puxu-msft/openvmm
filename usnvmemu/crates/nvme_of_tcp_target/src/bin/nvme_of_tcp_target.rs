@@ -200,6 +200,13 @@ struct Cli {
     /// (V-followup-tls-3+) 防 challenge 明文泄漏。
     #[arg(long = "host-secret", value_parser = parse_host_secret)]
     host_secrets: Vec<(String, Vec<u8>)>,
+    /// **2026-06-09 纯 4K** — 放行 host 的 Format NVM (opc 0x80)，允许
+    /// `nvme format -l 2` 把 NS 切到纯-4K LBAF（或切回 512B）。默认 false
+    /// （保守 block，防误改 NS 形状）。session 已扇区感知，Format 改 lbads
+    /// 后续 IO 自动按新扇区合成 PRP；firmware Format handler 自身 gate
+    /// in-flight IO + lbafl≤2。**不影响** 0x0D NS Management（恒 block）。
+    #[arg(long = "allow-format", default_value_t = false)]
+    allow_format: bool,
 }
 
 fn parse_host_secret(s: &str) -> Result<(String, Vec<u8>), String> {
@@ -500,6 +507,12 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind {parsed_listen}"))?;
     tracing::info!("listening on {}", listener.local_addr()?);
+    if cli.allow_format {
+        tracing::warn!(
+            "⚠️  --allow-format 启用：host 可经 Format NVM 改 NS LBAF（如切纯-4K）。\
+             session 已扇区感知，但请确认这是你想要的（默认 block）"
+        );
+    }
 
     // **V-followup-tls-3 (plan R-4/R-5)** — CLI 校验 + acceptor build。
     // 双 explicit consent 模型：`--tls-listen` 必须配 `--tls-cert + --tls-key
@@ -637,6 +650,7 @@ async fn main() -> Result<()> {
                 "discovery",
                 host_nqn_allowlist.clone(),
                 chap_store.clone(),
+                false, // discovery 子系统不开放 IO/Format
             )))
         } else {
             drop(shutdown_rx_disc);
@@ -667,6 +681,7 @@ async fn main() -> Result<()> {
                 host_nqn_allowlist.clone(),
                 bind_nqn_to_cert,
                 chap_store.clone(),
+                cli.allow_format,
             )))
         } else {
             drop(shutdown_rx_tls);
@@ -684,6 +699,7 @@ async fn main() -> Result<()> {
         "main",
         host_nqn_allowlist.clone(),
         chap_store.clone(),
+        cli.allow_format,
     )
     .await;
     let _ = shutdown_tx.send(true);
@@ -735,6 +751,7 @@ async fn run_accept_loop(
     label: &'static str,
     host_nqn_allowlist: Option<std::sync::Arc<std::collections::HashSet<String>>>,
     chap_store: Option<std::sync::Arc<nvme_of_tcp_target::dhchap::ChapSecretStore>>,
+    allow_format: bool,
 ) -> Result<()> {
     let mut accept_backoff_ms: u64 = 0;
     loop {
@@ -807,6 +824,7 @@ async fn run_accept_loop(
                 shutdown_rx,
                 allowlist,
                 chap,
+                allow_format,
             ));
             let r = futures::FutureExt::catch_unwind(fut).await;
             match r {
@@ -850,6 +868,7 @@ async fn handle_conn_async(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     host_nqn_allowlist: Option<std::sync::Arc<std::collections::HashSet<String>>>,
     chap_store: Option<std::sync::Arc<nvme_of_tcp_target::dhchap::ChapSecretStore>>,
+    allow_format: bool,
 ) -> Result<()> {
     let mut sess = if let Some(allow) = host_nqn_allowlist {
         nvme_of_tcp_target::accept_and_handshake_async_with_auth(stream, shared_ctrl, allow)
@@ -860,6 +879,7 @@ async fn handle_conn_async(
             .await
             .context("V8e-7-4 AsyncSession handshake")?
     };
+    sess.set_allow_format(allow_format);
     if let Some(store) = chap_store {
         sess.enable_chap(store);
     }
@@ -916,6 +936,7 @@ async fn run_accept_loop_tls(
     host_nqn_allowlist: Option<std::sync::Arc<std::collections::HashSet<String>>>,
     bind_nqn_to_cert: bool,
     chap_store: Option<std::sync::Arc<nvme_of_tcp_target::dhchap::ChapSecretStore>>,
+    allow_format: bool,
 ) -> Result<()> {
     let label = "tls";
     let mut accept_backoff_ms: u64 = 0;
@@ -1000,6 +1021,7 @@ async fn run_accept_loop_tls(
                 allowlist,
                 bind_nqn_to_cert,
                 chap,
+                allow_format,
             ));
             let r = futures::FutureExt::catch_unwind(fut).await;
             match r {
@@ -1039,6 +1061,7 @@ async fn handle_conn_async_tls(
     host_nqn_allowlist: Option<std::sync::Arc<std::collections::HashSet<String>>>,
     bind_nqn_to_cert: bool,
     chap_store: Option<std::sync::Arc<nvme_of_tcp_target::dhchap::ChapSecretStore>>,
+    allow_format: bool,
 ) -> Result<()> {
     // **V-followup-auth-2** — 在交给 AsyncSession 前抽 leaf cert SAN/CN
     // identities（仅当 bind_nqn_to_cert + mTLS 拿到 peer certs 时）
@@ -1088,6 +1111,7 @@ async fn handle_conn_async_tls(
     if let Some(ids) = bound_ids {
         sess.bind_host_identities(ids);
     }
+    sess.set_allow_format(allow_format);
     if let Some(store) = chap_store {
         sess.enable_chap(store);
     }

@@ -132,6 +132,11 @@ pub struct AsyncSession<S: AsyncSessionStream = TokioStream> {
     /// `chap_secret_store` 是否 Some 决定是否 init；非 None 时 admin/IO cmd 入口
     /// 必须 `stage.is_authenticated()` 才放行。
     pub chap: Option<crate::dhchap::ChapNegotiation>,
+    /// **2026-06-09 纯 4K** — 是否放行 host 的 Format NVM (opc 0x80)。默认
+    /// `false`（保守 block 防误改 NS 形状）；bin 经 CLI `--allow-format` 显式
+    /// opt-in。session 已扇区感知，Format 改 lbads 后下条 IO 即按新扇区合成
+    /// PRP。0x0D NS Management 不受此开关影响，恒 block。
+    pub allow_format: bool,
 }
 
 /// **V8e-3** — async 版 ICReq/ICResp handshake。语义与 sync
@@ -236,6 +241,7 @@ where
         bound_host_identities: None,
         chap_secret_store: None,
         chap: None,
+        allow_format: false,
     })
 }
 
@@ -278,6 +284,12 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
     /// `Disabled` / `ChallengeNeeded` 路径。
     pub fn enable_chap(&mut self, store: std::sync::Arc<crate::dhchap::ChapSecretStore>) {
         self.chap_secret_store = Some(store);
+    }
+
+    /// **2026-06-09 纯 4K** — opt-in 放行 host Format NVM (opc 0x80)。bin 端按
+    /// CLI `--allow-format` 调用。默认 false 时 Format 仍被 block。
+    pub fn set_allow_format(&mut self, allow: bool) {
+        self.allow_format = allow;
     }
 
     /// **V8e-3 / V8e-4 / V8e-5** — async 主循环单次 tick。
@@ -1285,9 +1297,9 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             AdminAerDecision::NotAer => {}
         }
 
-        // V5e-1-fix NS-shape 黑名单
+        // V5e-1-fix NS-shape 黑名单（allow_format opt-in 放行 Format）
         if matches!(
-            decide_admin_blocked_opc(sqe_bytes),
+            decide_admin_blocked_opc(sqe_bytes, self.allow_format),
             AdminBlockedOpcDecision::Blocked
         ) {
             tracing::warn!(
@@ -1421,40 +1433,72 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         let nlb_real = (sqe.cdw12 & 0xffff) + 1;
         let is_rw = matches!(opc, 0x01 | 0x02);
 
-        // **V-followup-prp-list session chunking** — host nlb > V5_NLB_MAX 时
-        // 拆 sub-cmd 并对 V_HOST_IO_NLB_MAX (= MDTS) 真值上限校验
-        if is_rw && nlb_real > crate::V5_NLB_MAX {
-            if nlb_real > crate::V_HOST_IO_NLB_MAX {
+        // **2026-06-09 纯 4K** — 查目标 NS 的 lbads，让页边界 / nlb 上限 /
+        // chunk 大小按 per-NS 扇区算（512B 假设会在 4K NS 上撕裂 dual-PRP
+        // 边界 → corruption）。NSID 不存在时退回 9（controller 随后会以
+        // INVALID_NAMESPACE 拒）。
+        let lbads = {
+            let c = self.controller.controller.lock();
+            c.ns_lbads(sqe.nsid).unwrap_or(9)
+        };
+
+        // **V-followup-prp-list session chunking** — host nlb 超单次 dispatch
+        // (dual-PRP) 上限时拆 sub-cmd 并对 host_io_max_lbas (= MDTS) 真值上限校验
+        if is_rw && nlb_real > crate::dispatch_plan::dual_prp_max_lbas(lbads) {
+            if nlb_real > crate::dispatch_plan::host_io_max_lbas(lbads) {
                 tracing::warn!(
                     opc,
                     nlb_real,
-                    cap = crate::V_HOST_IO_NLB_MAX,
+                    lbads,
+                    cap = crate::dispatch_plan::host_io_max_lbas(lbads),
                     "V-followup-prp-list: nlb > MDTS cap, reject SC=0x18"
                 );
                 return self.send_capsule_resp_err_async(cid, 0x18).await;
             }
             return self
-                .handle_io_cmd_chunked_async(cid, sqe, sq_id, cq_id, opc, nlb_real)
+                .handle_io_cmd_chunked_async(cid, sqe, sq_id, cq_id, opc, nlb_real, lbads)
                 .await;
         }
 
-        // NLB + dual-PRP sentinel 决策 (≤ V5_NLB_MAX 单 dispatch)
-        match decide_io_nlb_check(&sqe) {
-            IoNlbDecision::OverMax { .. } => unreachable!("已上面分流"),
-            IoNlbDecision::Ok { nlb_real } => {
-                sqe.prp2 = prp2_sentinel_for_nlb(nlb_real);
-            }
-            IoNlbDecision::NotReadWrite => {
-                sqe.prp2 = 0;
-            }
-        }
+        // 分类 rw vs 非 rw（用早读 lbads 做路由足够）；prp2 的**最终**值
+        // 与 ≤2 页守卫放到 dispatch 同一锁内用**复读** lbads 定，防 TOCTOU。
+        let is_rw_single = matches!(decide_io_nlb_check(&sqe, lbads), IoNlbDecision::Ok { .. });
 
         let mut tcp_t =
             crate::tcp_transport::TcpAdminTransport::new_with_token_base(self.next_token);
-        let immediate_cqe = {
+        // **2026-06-09 纯 4K TOCTOU 防护** — 多 conn 共享一个 controller 时，
+        // 另一条 conn 的 Format 可能在「早读 lbads」与「本 dispatch」之间改
+        // lbads。controller 在 dispatch 时按**当时**的 ns.lbads 算 bytes；若与
+        // session 据早读 lbads 定的 prp2 不一致，会让 controller 误入 PRP-list
+        // path（合成-PRP 无法表达）→ wire 撕裂 / corruption。故在 dispatch 同
+        // 一锁内复读 lbads：① 用它算 prp2；② 守 transfer ≤ 2 页（controller
+        // 合成-PRP 上限）。扇区变大致超 2 页 → 中止让 host 重试（retryable）。
+        let dispatch_result: Option<Option<_>> = {
             let mut c = self.controller.controller.lock();
-            let mut ctx = pcie_device_core::DeviceCtx::new(&mut tcp_t);
-            c.nvme_io_dispatch(&mut ctx, sq_id, sqe, cid, cq_id)
+            if is_rw_single {
+                let lbads_now = c.ns_lbads(sqe.nsid).unwrap_or(9);
+                if ((nlb_real as u64) << lbads_now)
+                    > (2 * crate::dispatch_plan::NVME_PRP_PAGE_BYTES) as u64
+                {
+                    None // TOCTOU：扇区已变大，本 dispatch 会超 2 页 → 中止
+                } else {
+                    sqe.prp2 = prp2_sentinel_for_nlb(nlb_real, lbads_now);
+                    let mut ctx = pcie_device_core::DeviceCtx::new(&mut tcp_t);
+                    Some(c.nvme_io_dispatch(&mut ctx, sq_id, sqe, cid, cq_id))
+                }
+            } else {
+                sqe.prp2 = 0;
+                let mut ctx = pcie_device_core::DeviceCtx::new(&mut tcp_t);
+                Some(c.nvme_io_dispatch(&mut ctx, sq_id, sqe, cid, cq_id))
+            }
+        };
+        let Some(immediate_cqe) = dispatch_result else {
+            tracing::warn!(
+                cid,
+                nlb_real,
+                "纯 4K TOCTOU: lbads 在决策后被 Format 改大，本 dispatch 超 2 页，中止让 host 重试"
+            );
+            return self.send_capsule_resp_err_async(cid, 0x18).await;
         };
         self.run_post_dispatch_async(cid, immediate_cqe, tcp_t)
             .await
@@ -1471,6 +1515,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
     ///
     /// 这避开了控制器 PRP-list path (mixed read/write capture 复杂度)，但
     /// 单 host IO 拆 N 次 dispatch — IOPS 降 N 倍。教学版可接受。
+    #[allow(clippy::too_many_arguments)]
     async fn handle_io_cmd_chunked_async(
         &mut self,
         cid: u16,
@@ -1479,9 +1524,13 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         cq_id: u16,
         opc: u8,
         nlb_real: u32,
+        lbads: u8,
     ) -> anyhow::Result<()> {
         use crate::dispatch_plan::prp2_sentinel_for_nlb;
-        let chunk_max = crate::V5_NLB_MAX;
+        // **2026-06-09 纯 4K** — chunk 大小 = 单次 dual-PRP 能覆盖的 LBA 数，
+        // 按扇区算（512B→16、4K→2）。固定 16 会让 4K chunk = 64 KiB = 16 页
+        // 撞穿 controller dual-PRP（≤ 2 页）→ corruption。
+        let chunk_max = crate::dispatch_plan::dual_prp_max_lbas(lbads);
         let num_chunks = nlb_real.div_ceil(chunk_max);
         let slba = original_sqe.cdw10 as u64 | ((original_sqe.cdw11 as u64) << 32);
 
@@ -1505,14 +1554,32 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             sub_sqe.cdw10 = (chunk_slba & 0xffff_ffff) as u32;
             sub_sqe.cdw11 = ((chunk_slba >> 32) & 0xffff_ffff) as u32;
             sub_sqe.cdw12 = (sub_sqe.cdw12 & !0xffff) | (chunk_nlb - 1); // 0-based
-            sub_sqe.prp2 = prp2_sentinel_for_nlb(chunk_nlb);
+            // prp2 + ≤2 页守卫在 dispatch 同锁内用复读 lbads 定（防多 conn Format
+            // 在分片中途改 lbads → 本片超 controller dual-PRP 上限 → wire 撕裂）。
 
             let mut tcp_t =
                 crate::tcp_transport::TcpAdminTransport::new_with_token_base(self.next_token);
-            let immediate_cqe = {
+            let dispatch_result: Option<Option<_>> = {
                 let mut c = self.controller.controller.lock();
-                let mut ctx = pcie_device_core::DeviceCtx::new(&mut tcp_t);
-                c.nvme_io_dispatch(&mut ctx, sq_id, sub_sqe, cid, cq_id)
+                let lbads_now = c.ns_lbads(sub_sqe.nsid).unwrap_or(9);
+                if ((chunk_nlb as u64) << lbads_now)
+                    > (2 * crate::dispatch_plan::NVME_PRP_PAGE_BYTES) as u64
+                {
+                    None // TOCTOU：扇区中途变大，本片超 2 页 → 中止整条 host IO
+                } else {
+                    sub_sqe.prp2 = prp2_sentinel_for_nlb(chunk_nlb, lbads_now);
+                    let mut ctx = pcie_device_core::DeviceCtx::new(&mut tcp_t);
+                    Some(c.nvme_io_dispatch(&mut ctx, sq_id, sub_sqe, cid, cq_id))
+                }
+            };
+            let Some(immediate_cqe) = dispatch_result else {
+                tracing::warn!(
+                    cid,
+                    chunk_idx,
+                    chunk_nlb,
+                    "纯 4K TOCTOU: 分片 IO 中途 lbads 被 Format 改大，中止让 host 重试"
+                );
+                return self.send_capsule_resp_err_async(cid, 0x18).await;
             };
 
             // 复用 V8e-7-3 R2T 三段式 + data emit。**关键**: 不让最终 CQE 反给

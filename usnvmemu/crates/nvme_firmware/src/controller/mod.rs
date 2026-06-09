@@ -1274,6 +1274,16 @@ impl NvmeController {
         self.dispatch_io(ctx, sq_id, sqe, cid, /*sq_head*/ 0, cq_id)
     }
 
+    /// **2026-06-09 纯 4K** — 查指定 NSID 当前激活 LBA Format 的 `lbads`
+    /// （扇区字节 = `1 << lbads`：9 = 512B、12 = 4 KiB）。`None` 表示 NSID
+    /// 不存在。NVMe-oF TCP session 用它把合成 PRP 的页边界 / nlb 上限 /
+    /// chunk 大小改成 per-NS 扇区感知（否则 512B 假设会在 4K NS 上撕裂
+    /// dual-PRP 边界 → 数据 corruption）。Format 改 lbads 后下条 IO 即读到
+    /// 新值（controller Format handler 已更新 ns.lbads）。
+    pub fn ns_lbads(&self, nsid: u32) -> Option<u8> {
+        self.namespaces.get(&nsid).map(|n| n.lbads)
+    }
+
     /// **Phase V3** — 让 controller 处理一条 DMA 完成事件（caller 通常
     /// 是 V2Session 在 captured dma_write 全部 emit 完 C2HData 后，回调
     /// 一次 ok=true 触发 controller post_cqe）。

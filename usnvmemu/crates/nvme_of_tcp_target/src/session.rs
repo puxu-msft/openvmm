@@ -498,24 +498,27 @@ impl V2Session {
             ),
         };
 
-        // **V5b/V5c/V5e-1/V5e-2 (R-4)** — IO Read/Write nlb 上限 = [`V5_NLB_MAX`]=16。
-        // - LBADS=9：单 PRP1 (≤4 KiB) → nlb ≤ 8；双 PRP (≤8 KiB) → nlb ≤ 16
-        // - prp2 sentinel 仅 IO Read/Write 设；其他 opc 走默认（多数 admin
-        //   只用 prp1）。session block FORMAT_NVM / NS_MANAGEMENT 防 lbads 漂变。
-        // - 超出 → 拒 SC=0x18 SGL_DATA_LENGTH_INVALID 让 driver 拆分。
+        // **V5b/V5c/V5e-1/V5e-2 (R-4)** — IO Read/Write nlb 单次 dispatch 上限。
+        // **2026-06-09 纯 4K** — 上限/页边界按 per-NS 扇区算（512B→8/16、
+        // 4K→1/2），见 dispatch_plan::{dual_prp_max_lbas, prp2_sentinel_for_nlb}。
+        // sync V2Session 是 legacy/test 路径，不像 async 那样 chunk；超上限直接
+        // 拒 SC=0x18 让 driver 拆分。
         if matches!(opc, 0x01 /* WRITE */ | 0x02 /* READ */) {
             let nlb_real = (sqe.cdw12 & 0xffff) + 1;
-            if nlb_real > V5_NLB_MAX {
+            let lbads = self.with_controller(|c| c.ns_lbads(sqe.nsid).unwrap_or(9));
+            let cap = crate::dispatch_plan::dual_prp_max_lbas(lbads);
+            if nlb_real > cap {
                 tracing::warn!(
                     opc,
                     nlb_real,
-                    max = V5_NLB_MAX,
-                    "V5e-2 IO nlb>MAX 双 PRP 上限，回 SC=0x18 让 driver 拆"
+                    max = cap,
+                    lbads,
+                    "V5e-2 IO nlb>单次 dual-PRP 上限，回 SC=0x18 让 driver 拆"
                 );
                 return self.send_capsule_resp_err(cid, /*SGL_DATA_LENGTH_INVALID=*/ 0x18);
             }
-            // 设 prp2 sentinel 让 controller 走 dual-PRP path
-            sqe.prp2 = if nlb_real > 8 { PRP2_SENTINEL } else { 0 };
+            // 设 prp2 sentinel 让 controller 走 dual-PRP path（≥ 2 页时）
+            sqe.prp2 = crate::dispatch_plan::prp2_sentinel_for_nlb(nlb_real, lbads);
         } else {
             sqe.prp2 = 0;
         }
@@ -3064,6 +3067,72 @@ mod tests {
         assert_eq!(resp.header.pdu_type, pdu_type::RSP);
         let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
         assert_eq!(sc, 0, "nlb=8 IO Read 应 success");
+        h.join().unwrap().unwrap();
+    }
+
+    /// **2026-06-09 纯 4K over fabric（端到端集成）** — 把 NS1 经 controller
+    /// admin API 直接 Format 到 lbafl=2（纯 4K，lbads=12），再经真 fabric
+    /// session 跑 IO，验证 session 的扇区感知合成-PRP 路径：
+    ///   ① ns_lbads 查询返回新扇区 12；
+    ///   ② IO Read nlb=1 → 单 PRP，C2HData = 4096B（1 LBA @ 4K）；
+    ///   ③ IO Read nlb=3 → SC=0x18（4K 单次 dispatch 上限 = 2 LBA；旧 512B
+    ///      硬编码 session 会误收 nlb=3 → controller 入 PRP-list path → 撕裂，
+    ///      故本断言锁住 session 按**新**扇区算 cap）。
+    /// session 端 wire-level Format block 不影响本测试——setup 阶段直接调
+    /// controller admin dispatch 改 lbads，绕过 wire 黑名单。
+    /// sess_pumps = 4 setup（Connect/CQ/SQ/ConnectIO）+ 2 IO = 6。
+    #[test]
+    fn pure_4k_over_fabric_format_then_io_sector_aware() {
+        let (mut controller, _backing) = make_test_controller_with_pattern(0xC4);
+        // ── setup：直接 Format NS1 → lbafl=2（纯 4K）────────────────────
+        {
+            let mut cap = pcie_device_core::CaptureTransport::with_start_token(0x9000);
+            let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+            let mut bytes = [0u8; 64];
+            bytes[0] = 0x80; // FORMAT_NVM opcode
+            bytes[2..4].copy_from_slice(&0x0001u16.to_le_bytes()); // cid
+            bytes[4..8].copy_from_slice(&1u32.to_le_bytes()); // nsid=1
+            bytes[40..44].copy_from_slice(&2u32.to_le_bytes()); // cdw10 lbafl=2
+            let sqe = <nvme_firmware::cmd::Sqe as zerocopy::FromBytes>::read_from_bytes(&bytes[..])
+                .unwrap();
+            let cqe = controller.nvme_admin_dispatch(&mut ctx, sqe, 0x0001, 0);
+            assert!(cqe.is_some(), "Format NVM 应同步返 CQE");
+            assert_eq!(
+                controller.ns_lbads(1),
+                Some(12),
+                "Format lbafl=2 后 NS1 必须是纯 4K (lbads=12)"
+            );
+        }
+        // ── 经真 fabric session 跑 IO（6 pumps：4 setup + 2 IO）──────────
+        let (mut client, h) = setup_qid1_with_controller(controller, 6);
+
+        // ② nlb=1 → 单 PRP，C2HData = 4096B（1 LBA @ 4K）
+        send_io_read(&mut client, 0x0C41, 1, 0, 1);
+        let p = read_pdu(&mut client).unwrap();
+        assert_eq!(p.header.pdu_type, pdu_type::C2H_DATA);
+        assert_eq!(
+            p.data.len(),
+            4096,
+            "纯 4K：1 LBA = 4096B C2HData（证 session 按新扇区合成单 PRP）"
+        );
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(resp.header.pdu_type, pdu_type::RSP);
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(sc, 0, "nlb=1 @ 4K 应 success");
+
+        // ③ nlb=3 → SC=0x18（4K 单次 dispatch 上限 = 2 LBA）
+        send_io_read(&mut client, 0x0C43, 1, 0, 3);
+        let resp = read_pdu(&mut client).unwrap();
+        assert_eq!(
+            resp.header.pdu_type,
+            pdu_type::RSP,
+            "nlb=3 @ 4K 超单次 dual-PRP 上限(2)，应直接 reject 不发 C2HData"
+        );
+        let sc = ((u16::from_le_bytes(resp.psh[14..16].try_into().unwrap()) >> 1) & 0xff) as u8;
+        assert_eq!(
+            sc, 0x18,
+            "纯 4K cap=2：nlb=3 必回 SC=0x18（证 session 按新扇区算 cap，非旧 512B 的 16）"
+        );
         h.join().unwrap().unwrap();
     }
 
