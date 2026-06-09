@@ -192,6 +192,13 @@ Format 接受，IO guard 直接拒（advertise-only）。
   `--allow-format` opt-in 解封 Format(0x80)，0x0D NS-Mgmt 恒 block。e2e
   `pure_4k_over_fabric_format_then_io_sector_aware`（revert-verified）。2 轮 reviewer
   （抓多 conn TOCTOU HIGH）。
+- **✅ 真 wire 互通 + 捞出多 chunk corruption**（commit `aae0eb7f`）：独立 Python
+  harness `scripts/interop_py/pure_4k_e2e.py`（需 `--allow-format`）对真 target 跑
+  Format→4K + 单/dual PRP + chunking + MDTS cap，distinct-per-LBA pattern + 单-LBA
+  独立 oracle。**捞出 pre-existing 多 chunk fabric IO 偏移 corruption**（R2T/C2HData
+  偏移 chunk-relative 而非 host-buffer 累计，被 uniform pattern 长期掩盖）→ 修
+  `host_buf_offset` 累计 + DATA_LAST 末 chunk only；`io_size_sweep.py` pattern 改
+  distinct 当回归守卫。reviewer APPROVE（offset 归纳证明）。详见 LESSONS §23 教训 4/5。
 
 **Why**：[PROJECT_VISION](PROJECT_VISION.md) 教学=spec-complete 非玩具。LBAF 是
 NVMe 基础能力，4K 是真实硬件主流扇区；混合 NS 让"模拟不同设备"真正可用。

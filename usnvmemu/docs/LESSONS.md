@@ -514,3 +514,25 @@ TCP fabric（commit `73429e28`，2 轮 reviewer 抓多 conn TOCTOU HIGH）；e2e
 `pure_4k_over_fabric_format_then_io_sector_aware` revert-verified；测试 harness
 `setup_qid1_with_controller(_, sess_pumps)` 的 sess_pumps 必 = setup PDU(4) + IO 操作数，
 多了 server 线程 join 挂死（独立调试坑）。
+
+**后续实证（commit `aae0eb7f`）—— uniform pattern 掩盖真 corruption bug，独立
+oracle 用不同代码路径才有牙**: 为验纯-4K fabric，写独立 Python wire 测试。最初
+用 `(b+const)&0xFF` pattern——`period-256 + 4096%256==0 → 每 LBA 字节全同`，测过；
+但**把 pattern 换成 per-LBA distinct marker 后立刻 FAIL**：捞出一个**pre-existing
+多 chunk fabric IO 偏移 corruption**——session 拆 chunk 后每 chunk 的 R2T 偏移(写)/
+C2HData DATAO(读) 重置为 0（chunk-relative）而非 host-buffer 累计，第 N>0 片数据被
+host 当第 0 片发/落 → 多 chunk 读写数据错位。所有既有测试（`io_size_sweep` 1..256
+LBA、`io_write_e2e`）都用 period-256 uniform pattern（每 LBA 同字节），**chunk 错位
+被 byte-equal 静默掩盖了 V-followup-prp-list 以来若干 phase**。
+
+两条加强教训：
+4. **round-trip byte-equal 的判据强度 = pattern 的位置唯一性**。write/read 走同一
+   代码路径时，symmetric 偏移 bug + period-N pattern（N | LBA_size）会 round-trip
+   静默通过。pattern 必须 **per-LBA 位置唯一**（marker = LBA 序号），整-LBA 错位才
+   可见。这是 [[lesson §20]]「self-consistent 数据测不出 self-consistent bug」在
+   **测试数据生成**层的具体化。
+5. **独立 oracle = 不同代码路径的交叉验证**。chunked write 后用 **单-LBA(非
+   chunked) 读**逐个验落对绝对 LBA：单-LBA 走 controller 直接 `slba*sector` 偏移，
+   是 chunked 偏移逻辑的独立判据；同路径 round-trip 再 distinct 也只证「不撕裂」，
+   证不了「绝对位置对」。挑 oracle 时问：判据来自**另一条**代码路径，还是同一条
+   自己印证自己？（同 [[lesson §22]] unsafe oracle、[[lesson §20]] wire flag 判据）。
