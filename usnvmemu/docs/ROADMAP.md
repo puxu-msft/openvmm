@@ -34,6 +34,18 @@ NVMe-oF TCP 第 4 条接入。当前架构 ✅ 已对齐：firmware (controller)
 > - **Tier 2**: firmware crate 命名重构 (下季)
 > - **Tier 3**: Phase X 仓库拆分 (半年)
 
+> **2026-06-10 自主会话**：**OpenHCL pcie_remote transport 拉回 parity**（修 [[transport-maturity-imbalance]]
+> 三 transport 不均衡）。此前该 transport 只有 noop 设备烟雾测试，从未驱动真 NVMe
+> firmware。新增 `nvme_firmware/tests/openhcl_pcie_remote_e2e.rs` 跨进程 harness（扮
+> OpenHCL/VTL2 侧，起真 `nvme_firmware --tcp-addr` bin，Linux 可测无需 Windows）：
+> O1 握手+身份 / O2 admin queue 全路径(enable+Identify+MSI-X) / O3 纯-4K Format+IO
+> round-trip + backing-file 独立 oracle + fused C&W 原子 CAS + CQ phase-wrap 覆盖。
+> commits 94c5b741→99ca1cf2，4 tests + 4 轮 rust-reviewer(0 C/H/M)。**至此 3 transport
+> (nvme-of / vfio / OpenHCL) 对 firmware 核心数据路径均有跨进程真-firmware e2e
+> harness**——Tier-1"三接入各 1 真 host e2e"目标达成。L3 真 Hyper-V guest nvme-driver
+> e2e 仍 defer（须用户+Windows，同 vfio 的 real-guest-boot 档）。另：host-root §0 纯-4K
+> 真 nvme-cli 互通用户实测 PASS（commit bd100f7d）。
+
 > **2026-06-09 自主会话状态分类**（哪些能无人值守做、哪些卡外部）：
 > - **✅ 本会话已完成**：vfio spec-complete track 全部（握手 minor 协商 / max_msg_fds /
 >   bulk REGION_WRITE / REGION 上限 max_data_xfer_size / describe 缓存 / mmap 零拷贝 DMA）
