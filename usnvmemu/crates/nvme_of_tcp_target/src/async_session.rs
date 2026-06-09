@@ -1544,6 +1544,11 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         );
 
         let mut _last_sc: u8 = 0;
+        // **2026-06-09 纯 4K / chunked** — 累计 host-buffer 字节偏移，让每 chunk 的
+        // R2T / C2HData 偏移是 host-buffer-relative（见 run_post_dispatch_chunked
+        // _async base_offset）。sector 用 IO 起始 lbads（TOCTOU 改 lbads 会中止）。
+        let sector_bytes: u32 = 1u32 << lbads;
+        let mut host_buf_offset: u32 = 0;
         for chunk_idx in 0..num_chunks {
             let chunk_lba_off = chunk_idx * chunk_max;
             let chunk_nlb = chunk_max.min(nlb_real - chunk_lba_off);
@@ -1593,6 +1598,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
                     immediate_cqe,
                     tcp_t,
                     /*emit_capsule_resp*/ chunk_idx == num_chunks - 1,
+                    host_buf_offset,
                 )
                 .await?;
             if chunk_sc != 0 {
@@ -1607,6 +1613,8 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
                 );
                 return Ok(());
             }
+            // 本 chunk 成功 → 推进 host-buffer 偏移（chunk_nlb LBA × sector）。
+            host_buf_offset = host_buf_offset.saturating_add(chunk_nlb * sector_bytes);
         }
         tracing::debug!(cid, num_chunks, "V-prp-list chunked done");
         Ok(())
@@ -1624,6 +1632,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         immediate_cqe: Option<nvme_firmware::cmd::Cqe>,
         mut tcp_t: crate::tcp_transport::TcpAdminTransport,
         emit_capsule_resp: bool,
+        base_offset: u32,
     ) -> anyhow::Result<u8> {
         // 走 run_post_dispatch_async 大部分逻辑，但 phase 5 emit 时按 flag 决定
         let dispatch_data_writes = tcp_t
@@ -1642,7 +1651,10 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         let had_pending_reads = dispatch_pending_reads > 0;
 
         // Phase 2: dma_read 闭环走 R2T 三段式
-        let mut cmd_cumulative_offset: u32 = 0;
+        // **2026-06-09 纯 4K / chunked** — 从 base_offset（前序 chunk 的累计 host
+        // 字节）起，让本 chunk 的 R2T 偏移是 **host-buffer-relative**；否则每 chunk
+        // 从 0 起 → host 把第 N 片数据当第 0 片发 → 多片 WRITE 数据 corruption。
+        let mut cmd_cumulative_offset: u32 = base_offset;
         while let Some(read_req) = tcp_t.pop_read() {
             let bytes = self
                 .dma_read_via_r2t_async(cid, cmd_cumulative_offset, read_req.len)
@@ -1720,8 +1732,12 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
 
         // Phase 5: emit C2HData (本 chunk 的 data 必须发) +
         // (按 flag 决定是否 emit CapsuleResp)
+        // **2026-06-09** — C2HData 带 base_offset（host-buffer-relative），让
+        // spec-compliant host 按 DATAO 把每片落对位（否则多片 READ corruption）。
+        // DATA_LAST 仅打在末 chunk（= emit_capsule_resp 同条件）。
         if !data_payload.is_empty() {
-            self.send_c2h_data_async(cid, &data_payload).await?;
+            self.send_c2h_data_at_async(cid, &data_payload, base_offset, emit_capsule_resp)
+                .await?;
         }
         if emit_capsule_resp {
             self.write_capsule_resp_bytes_async(&cqe_bytes).await?;
@@ -1895,11 +1911,35 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             })
     }
 
-    /// **V8e-7-3** — 发 C2HData PDU（一次性 + DATA_LAST）。
+    /// **V8e-7-3** — 发 C2HData PDU（一次性 + DATA_LAST），data_offset=0。
+    /// 适用单次 transfer（admin / 非 chunked IO）：单 PDU 即末片，LAST=1。
     async fn send_c2h_data_async(&mut self, cid: u16, data: &[u8]) -> anyhow::Result<()> {
+        self.send_c2h_data_at_async(cid, data, 0, /*is_last*/ true)
+            .await
+    }
+
+    /// **2026-06-09 纯 4K / chunked** — 带 host-buffer `data_offset` + `is_last`
+    /// 的 C2HData。chunked READ 每片 C2HData 必须带**累计** host 偏移（spec
+    /// TP-8000 host 按 DATAO 落位）；否则 spec-compliant host（如 Linux kernel）
+    /// 把每片都写到 buffer[0] → 多片读数据 corruption。
+    /// `is_last`：DATA_LAST 仅打在**整条命令最后一片** C2HData（chunked 多片时
+    /// 非末片 LAST=0），spec-strict host 据此判命令 data 传输结束；非 chunked
+    /// 单片 = 末片 = LAST=1。
+    async fn send_c2h_data_at_async(
+        &mut self,
+        cid: u16,
+        data: &[u8],
+        data_offset: u32,
+        is_last: bool,
+    ) -> anyhow::Result<()> {
+        let flags = if is_last {
+            crate::pdu::flags::DATA_LAST
+        } else {
+            0
+        };
         let hdr = CommonHdr {
             pdu_type: pdu_type::C2H_DATA,
-            flags: crate::pdu::flags::DATA_LAST,
+            flags,
             hlen: 24,
             pdo: 24,
             plen: 24 + data.len() as u32,
@@ -1907,7 +1947,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         let psh = crate::pdu::DataPsh {
             cccid: cid,
             ttag_or_rsvd: 0,
-            data_offset: 0,
+            data_offset,
             data_length: data.len() as u32,
             rsvd: [0u8; 4],
         };

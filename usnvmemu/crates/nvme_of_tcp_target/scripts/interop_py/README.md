@@ -26,6 +26,7 @@ uv run python <script>.py
 | `io_write_e2e.py` | V5c (R2T + H2CData write 闭环) | 默认 plaintext |
 | `io_size_sweep.py` | V-followup-prp-list (1..256 LBA byte-equal, 257 reject) | 默认 plaintext |
 | `load_test.py` | V-interop-7 (多 conn 并发 IO) | 默认 plaintext |
+| `pure_4k_e2e.py` | **纯-4K over fabric** (Format NS→4K + 扇区感知单/dual PRP + chunking + MDTS cap=32) | 加 `--allow-format` |
 
 ## 加新 script
 

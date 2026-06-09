@@ -10,9 +10,10 @@
 import socket
 import struct
 import sys
+import os
 
 HOST = "127.0.0.1"
-PORT = 4420
+PORT = int(os.environ.get("NVME_PORT", "4420"))
 HOSTNQN = "nqn.2014-08.org.nvmexpress:uuid:sweep-host"
 SUBNQN = "nqn.2014-08.org.nvmexpress:teaching:disk"
 
@@ -195,7 +196,10 @@ def main():
     print("-" * 50)
     for nlb in test_nlbs:
         cid += 1
-        payload = bytes(((b * 7 + nlb) & 0xFF) for b in range(nlb * 512))
+        # **2026-06-09** — 每 LBA 内容 +1 区分（`b//512` 项），让整-LBA 错位
+        # 可见；旧 `(b*7+nlb)&0xFF` period-256 + 512%256==0 → 每 LBA 同字节，
+        # 多 chunk WRITE 偏移 bug 被静默 byte-equal 掩盖（R2T 偏移修复回归守卫）。
+        payload = bytes(((b + b // 512) & 0xFF) for b in range(nlb * 512))
         w_sc = io_write(io, cid, base_slba + nlb * 20, payload)
         cid += 1
         if w_sc == 0:
