@@ -15,6 +15,19 @@
 **代码状态**：DHCHAP 4-message spec §8.13.5 wire + simplified wire 两路都过 lib test
 + Python harness（自家算法对自家算法）。**缺的就是真 nvme-cli 这一第三方 oracle**。
 
+> **⛔ 内核前置（2026-06-09 实测发现，硬阻塞）**：host 侧 DH-HMAC-CHAP connect 需要
+> 内核编了 **`CONFIG_NVME_AUTH`**。先查：
+> ```bash
+> (zcat /proc/config.gz 2>/dev/null || cat /boot/config-$(uname -r)) | grep NVME_AUTH
+> ```
+> - `CONFIG_NVME_AUTH=y`（或 `=m`）→ 可继续 §1。
+> - `# CONFIG_NVME_AUTH is not set` → **本内核做不了 host CHAP connect**（nvme-cli 报
+>   `option "dhchap_secret" ignored` + `/dev/nvme-fabrics: Invalid argument`）。
+>   **当前 WSL2 内核 6.6.114.1-microsoft 正是这种**（只编了 NVME_TCP/FABRICS，没 NVME_AUTH）。
+>   真修路径见本节末"内核阻塞的出路"。注意：之前以为"WSL2 已开 nvme-auth"——那指的是
+>   **target 侧** `nvme_auth_derive_tls_psk` 的 EXPORT_SYMBOL（nvme-core），与 **host 侧
+>   connect auth**（CONFIG_NVME_AUTH）是两回事，别混。
+
 **① 启动 target**（普通用户，无需 sudo）：
 ```bash
 cd usnvmemu/crates/nvme_of_tcp_target
@@ -69,6 +82,35 @@ wire format（dhchap.rs:75 注释）；真 nvme-cli 走 spec §8.13.5 4-message 
 response 不匹配，是这里的 transcript 串法差异，我会对齐 spec wire。
 
 **目标 NQN**：`nqn.2026-06.io.openhcl:nvme.userspace`（fabric.rs:303，固定）。
+
+### 内核阻塞的出路（CONFIG_NVME_AUTH 缺失时）
+
+**先验证其余栈正常（plaintext，不需 CONFIG_NVME_AUTH）**——target **不带** `--host-secret`
+重启，再普通 connect：
+```bash
+# target 终端：去掉 --host-secret
+cargo run --bin nvme_of_tcp_target -- --listen 127.0.0.1:4420 --backing-file /tmp/ns1.img
+# host 终端（sudo）：
+sudo nvme connect -t tcp -a 127.0.0.1 -s 4420 -n nqn.2026-06.io.openhcl:nvme.userspace \
+  --hostnqn nqn.2014-08.org.nvmexpress:uuid:test-host
+sudo nvme list        # 应见 /dev/nvmeXn1
+sudo nvme disconnect -n nqn.2026-06.io.openhcl:nvme.userspace
+```
+plaintext 通 = 传输/Connect/Identify 栈都好，**只差 host CHAP 这一环卡内核**。
+
+**要真做 host CHAP interop，三选一**：
+1. **重编 WSL2 内核开 `CONFIG_NVME_AUTH=y`**：clone `microsoft/WSL2-Linux-Kernel`
+   对应 tag，`make menuconfig` 开 `Device Drivers → NVME Support → NVM Express over
+   Fabrics In-Band Authentication`，编出 `bzImage` → `.wslconfig` 的 `kernel=` 指过去
+   → `wsl --shutdown` 重启。（半天工作；最彻底。）
+2. **用一台带 CONFIG_NVME_AUTH 的发行版内核**（多数主线 distro kernel 默认开）的真机/VM
+   跑 host 侧 connect，target 仍在这。
+3. **暂用 Python CHAP harness 作 oracle**（`scripts/interop_py/chap4_spec_wire_e2e.py`，
+   已跨进程实证 §8.13.5 wire）——非真 nvme-cli，但比 lib test 独立。真 nvme-cli 留到
+   有 CONFIG_NVME_AUTH 内核时。
+
+**贴回**（任一路径）：plaintext connect 结果 + 若走路径 1/2 的 CHAP connect 输出 +
+target CHAP 帧日志。
 
 ---
 

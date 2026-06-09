@@ -96,8 +96,15 @@ V-followup-vfio-user-qemu-harness。
 - 之后 `nvme list` 看得见 namespace
 
 **Blockers**：
+- **⛔ 内核 `CONFIG_NVME_AUTH` 缺失（2026-06-09 实测）**：WSL2 kernel 6.6.114.1 只编了
+  NVME_TCP/FABRICS，**没 NVME_AUTH** → host 侧 `nvme connect --dhchap-secret` 报
+  `option "dhchap_secret" ignored` + `/dev/nvme-fabrics: Invalid argument`。出路见
+  [RUNBOOK §1 内核阻塞的出路](/usnvmemu/docs/RUNBOOK_HOST_ROOT.md)（重编 WSL2 kernel 开
+  CONFIG_NVME_AUTH / 用 distro kernel VM / 暂用 Python harness）。plaintext connect
+  不受影响，可先验其余栈。
 - Linux 6.6 WSL2 默认 kernel.modules 路径，nvme-cli 用户态 + nvme-tcp.ko 模块版本兼容
-- DHHC-1 base64 key 格式 (kernel 用 ":sha256:" / ":sha384:" suffix)，文档化
+- DHHC-1 base64 key 格式：`DHHC-1:<hmac>:base64(key‖crc32_le):`（含 CRC，用
+  `nvme gen-dhchap-key --hmac 0` 生成，见 RUNBOOK §1 ②）。
 
 **Links**：commit `714029df`, plans/2026-06-05-phase-v4-detailed.md §9 (entrypoint hint)。
 
@@ -117,7 +124,9 @@ V-followup-vfio-user-qemu-harness。
 
 **Blockers**：
 - 需要 host root + 写小 kmod (~ 50 LOC)，用户须授权或代提
-- WSL2 kernel 已开 `nvme-tcp` / `nvme-auth` 内置；EXPORT_SYMBOL_GPL OK
+- WSL2 kernel 有 `nvme-tcp` + nvme-core 的 `nvme_auth_derive_tls_psk`（target 侧
+  EXPORT_SYMBOL_GPL，本项要 dump 的就是它）；**注意**：这≠host 侧 `CONFIG_NVME_AUTH`
+  （后者 WSL2 没编，见 dhchap-4 Blockers）——两者别混。
 
 ### ✅ V-followup-vfio-user-cross-process-harness (Tier 1, 2026-06-09 SHIPPED — 含真 QEMU 11 e2e)
 
