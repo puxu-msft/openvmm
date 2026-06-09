@@ -174,6 +174,28 @@ realize 成功。教训记 [LESSONS.md](LESSONS.md) §21（"版本不带≠协�
 真 QEMU 11 e2e 把 vfio-user 从"自家 client 验自家 server"推到"第三方独立实现
 （真 QEMU）驱动协议全握手"——Tier 1"真 host e2e harness"目标达成。
 
+### ✅ 纯-4K LBAF 数据路径 (Tier 1, 2026-06-09 SHIPPED — firmware + fabric 实测)
+
+混合 512B + 纯-4K(LBAF[2], lbads=12) 多 NS 真数据路径。之前 4K 只 advertise +
+Format 接受，IO guard 直接拒（advertise-only）。
+
+- **✅ firmware**（commit `3668b36a`）：READ/WRITE/COMPARE/VERIFY/WRITE_ZEROES/
+  COPY + 全 PRP 档（单/双/list）+ compare_finalize + fused C&W，LBA↔byte 换算从
+  硬编码 512 改 per-NS `1<<lbads`；`is_plain = meta==0 && !pi && lbads∈{9,12}`。
+  测试 `pure_4k_io_round_trip_mixed_ns`（含 DmaRead len 断言锁 dispatch 侧）。
+  OpenHCL vsock / vfio-user（host 自建真 PRP）即刻支持。2 轮 reviewer（抓 fused
+  C&W dispatch-vs-completion 512-vs-4096 不一致 HIGH）。
+- **✅ NVMe-oF TCP fabric**（commit `73429e28`）：session 合成假 PRP 原写死 512B；
+  新增 `ns_lbads(nsid)` + dispatch_plan `page_lbas/dual_prp_max_lbas/host_io_max_lbas
+  (lbads)`，async+sync session 每 IO 查扇区。**多 conn Format/IO TOCTOU 防护**：
+  dispatch 同锁内复读 lbads 算 prp2 + 守 ≤2 页，超则中止 retryable 0x18。
+  `--allow-format` opt-in 解封 Format(0x80)，0x0D NS-Mgmt 恒 block。e2e
+  `pure_4k_over_fabric_format_then_io_sector_aware`（revert-verified）。2 轮 reviewer
+  （抓多 conn TOCTOU HIGH）。
+
+**Why**：[PROJECT_VISION](PROJECT_VISION.md) 教学=spec-complete 非玩具。LBAF 是
+NVMe 基础能力，4K 是真实硬件主流扇区；混合 NS 让"模拟不同设备"真正可用。
+
 ### V-followup-discovery-multi-portal-real (Tier 2, MEDIUM, 预计 1 day)
 
 **What**：实测 V7 / V8a `--discovery-target-addr` 重复指定多 portal，nvme-cli

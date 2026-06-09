@@ -476,3 +476,41 @@ backing / TOCTOU shrink 残留依赖（生产须 `F_SEAL_SHRINK`）/ u8 并发�
 
 **来源**: vfio-user mmap DMA 的 rust-reviewer 2 轮（首轮 BLOCK CRITICAL C-1），
 commit dfa9fefb；回归测试 `dma_map_fd_smaller_than_declared_size_falls_back_no_sigbus`。
+
+## 23. 改对称代码要 sweep 所有 reachable sibling；自写两端的测试必 revert-verify (HIGH)
+
+**坑**: 纯-4K 把 LBA↔byte 换算从硬编码 512 改 per-NS `1<<lbads`。我系统改了
+READ/WRITE/COMPARE/VERIFY/WRITE_ZEROES/COPY 的 dispatch + completion 全 PRP 档，
+自测 `pure_4k_io_round_trip_mixed_ns` 全绿。reviewer 却抓到 **Fused Compare-and-Write
+的 dispatch 仍写死 512**——它的 completion 我改了（扇区感知），dispatch 没改，
+4K 上 Compare 恒 fail（512-len data vs 4096-len backing）。fused 是 COMPARE 的
+**reachable sibling**，sweep 漏了。
+
+**根本**: ① 改一类语义（扇区换算）时，grep 出**所有**触发点不够——还要找**语义同族
+但代码路径独立**的 sibling（fused 是 compare 的变体，走单独 dispatch helper）。
+dispatch/completion 任一侧改了另一侧没改 = 长度不对称 = 数据 corruption 的经典形。
+② 我的 e2e 测试一开始注入 4096B 数据，**无论 dispatch 请求 512 还是 4096 都过**——
+测试碰不到 bug。reviewer 指出后改为断言 captured `DmaRead.len == 4096`（锁
+dispatch 侧请求字节），并**revert-verify**：把 dispatch 改回 512 确认测试 FAIL，
+才算真锁住。
+
+**第二个 sibling 类坑（同 commit，fabric 侧）**: session 合成假 PRP 的 prp2 阈值 /
+nlb cap / chunk 大小三处都按 512B。改对了**单 dispatch** 的扇区感知，reviewer 抓到
+**多 conn Format/IO TOCTOU**：另一 conn 的 Format 在「session 读 lbads」与
+「controller dispatch」之间改 lbads（锁释放窗口），合成的 prp2 与 controller 实际
+byte-routing 不符 → 撕裂。修=dispatch 同锁内复读 lbads + 守 ≤2 页中止。
+
+**三条根本教训**:
+1. **改对称/同族语义，列 sibling 清单**：grep 触发点 + 问"还有哪条独立代码路径走
+   同一语义？"（fused vs 普通 compare、单 dispatch vs chunked、dispatch vs completion）。
+2. **自写两端的测试必须能 catch bug 才算数**：注入数据要让正确/错误实现产生**不同**
+   wire 可观测量（DmaRead.len / SC / C2HData.len），并 revert-verify 注入 bug 后测试
+   真 FAIL（[[lesson §20]] 同源：self-consistent 数据测不出 self-consistent bug）。
+3. **跨锁读的值 = TOCTOU 隐患**：在锁 A 读、锁 B 用，两锁间状态可被改。判据值（这里
+   lbads）必须在**最终用它的那把锁内复读**，否则共享状态的并发修改会让决策过期。
+
+**来源**: 纯-4K firmware（commit `3668b36a`，2 轮 reviewer 抓 fused HIGH）+ NVMe-oF
+TCP fabric（commit `73429e28`，2 轮 reviewer 抓多 conn TOCTOU HIGH）；e2e
+`pure_4k_over_fabric_format_then_io_sector_aware` revert-verified；测试 harness
+`setup_qid1_with_controller(_, sess_pumps)` 的 sess_pumps 必 = setup PDU(4) + IO 操作数，
+多了 server 线程 join 挂死（独立调试坑）。
