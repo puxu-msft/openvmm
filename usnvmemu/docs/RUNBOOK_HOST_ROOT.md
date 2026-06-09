@@ -5,8 +5,8 @@
 > ② 你要跑的精确命令 ③ 把什么贴回来**，我据此在下个会话诊断/迭代（真互通通常要
 > 迭代几轮修 wire 不匹配——这正是做真互通的意义）。
 >
-> WSL2 前置：`nvme-cli` + `nvme-tcp` / `nvme-auth` 内核模块（[[nvme-of-tcp-real-linux-interop-milestone]]
-> 验过 WSL2 kernel 6.6 已内置）。
+> WSL2 前置：`nvme-cli` + `nvme-tcp` 内核模块（已内置）。**host 侧 CHAP（§1）另需
+> `CONFIG_NVME_AUTH`——WSL2 默认内核没编**，见 §1 内核前置。
 
 ---
 
@@ -62,11 +62,11 @@ nvme check-dhchap-key --key "$DHCHAP_KEY"   # 自验：应打印 key 合法
 **③ 连接**（另一个终端，**需 sudo**）：
 ```bash
 sudo nvme connect -t tcp -a 127.0.0.1 -s 4420 \
-  -n nqn.2026-06.io.openhcl:nvme.userspace \
+  -n nqn.2014-08.org.nvmexpress:teaching:disk \
   --hostnqn "$HOSTNQN" \
   --dhchap-secret "$DHCHAP_KEY"
 sudo nvme list
-sudo nvme disconnect -n nqn.2026-06.io.openhcl:nvme.userspace
+sudo nvme disconnect -n nqn.2014-08.org.nvmexpress:teaching:disk
 ```
 > **secret 卫生**：`--host-secret` / `--dhchap-secret` 出现在命令行会进 `ps aux` +
 > shell history（教学/loopback 可接受）。要避免：命令前置一个空格 +
@@ -81,7 +81,7 @@ sudo nvme disconnect -n nqn.2026-06.io.openhcl:nvme.userspace
 wire format（dhchap.rs:75 注释）；真 nvme-cli 走 spec §8.13.5 4-message wire——若
 response 不匹配，是这里的 transcript 串法差异，我会对齐 spec wire。
 
-**目标 NQN**：`nqn.2026-06.io.openhcl:nvme.userspace`（fabric.rs:303，固定）。
+**目标 NQN**：`nqn.2014-08.org.nvmexpress:teaching:disk`（cmd.rs:674 Identify Controller SUBNQN，固定；内核日志确认）。
 
 ### 内核阻塞的出路（CONFIG_NVME_AUTH 缺失时）
 
@@ -91,10 +91,10 @@ response 不匹配，是这里的 transcript 串法差异，我会对齐 spec wi
 # target 终端：去掉 --host-secret
 cargo run --bin nvme_of_tcp_target -- --listen 127.0.0.1:4420 --backing-file /tmp/ns1.img
 # host 终端（sudo）：
-sudo nvme connect -t tcp -a 127.0.0.1 -s 4420 -n nqn.2026-06.io.openhcl:nvme.userspace \
+sudo nvme connect -t tcp -a 127.0.0.1 -s 4420 -n nqn.2014-08.org.nvmexpress:teaching:disk \
   --hostnqn nqn.2014-08.org.nvmexpress:uuid:test-host
 sudo nvme list        # 应见 /dev/nvmeXn1
-sudo nvme disconnect -n nqn.2026-06.io.openhcl:nvme.userspace
+sudo nvme disconnect -n nqn.2014-08.org.nvmexpress:teaching:disk
 ```
 plaintext 通 = 传输/Connect/Identify 栈都好，**只差 host CHAP 这一环卡内核**。
 
@@ -163,7 +163,7 @@ cargo run --bin nvme_of_tcp_target -- \
 ## 4. fabric-disconnect-real-interop（Tier 2 MEDIUM）
 
 **代码状态**：V8c Disconnect 只测过 Python e2e。
-**步骤**：跑 §1 的 connect 后 `sudo nvme disconnect -n nqn.2026-06.io.openhcl:nvme.userspace`，
+**步骤**：跑 §1 的 connect 后 `sudo nvme disconnect -n nqn.2014-08.org.nvmexpress:teaching:disk`，
 贴回 target 日志（应见 Disconnect capsule 处理 + 连接干净关闭）+ `nvme list`（设备消失）。
 
 ---
