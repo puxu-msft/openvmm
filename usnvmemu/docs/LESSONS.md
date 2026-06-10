@@ -604,3 +604,38 @@ progress 完成包以 SC 0x12 = Invalid Use of CMB 发出，真 driver 误解。
 
 **来源**: SGL R2d（commit `2babf32a`）；anchored 测试 `sgl_status_codes_match_nvme_spec`；
 reviewer 2 轮（HIGH 0x12 collision + live Sanitize bug → 校正 + 扩 anchor）。
+
+## 26. in-process / 小内存 harness 看不见 >4 GiB 地址截断 —— 真 host e2e 不冗余 (HIGH)
+
+**症状**: 真 Hyper-V OpenHCL guest（4 GiB RAM）起不来 NVMe 盘。controller log：guest
+以单条 8-byte（qword）写 `ASQ=0x1_02eb_0000`，controller 却存成 `0x02eb_0000`（高 32
+位丢），随后 SQE fetch 从截断后的错 GPA 读，首条 admin 命令读成全 0 → `opc=0x0` 被当
+`Delete IO SQ` → guest 初始化挂。**间歇性**：admin 队列碰巧落在 4 GiB 以下时不触发。
+
+**根因**: `controller/mmio.rs::mmio_write_impl` 对 8-byte 寄存器（ASQ 0x28 / ACQ 0x30 /
+BPMBL 0x48）只按 `offset` 匹配、无视 `size`，一律 `value & 0xffff_ffff`——把单条 qword
+写截断成 32 位。读侧本来就 size-aware（`(0x28,8)=>self.asq`），**只有写侧漏了 → 不对称**。
+
+**为什么长期没暴露**: 三个对 firmware 的 harness——L1 跨进程 TCP（`tests/openhcl_
+pcie_remote_e2e.rs` 用 flat 16 MiB guest-mem `Vec`）、vfio `qemu_interop`、`#[cfg(test)]`
+单测——的 GPA **全部 < 4 GiB**。flat 小内存模型**结构上生不出 4 GiB 以上地址**，于是
+「64-bit 地址高半被截断」这一整类 bug 对它们**不可见**。只有真 guest + 真实 RAM
+（Windows nvme.sys 把 admin 队列放 4 GiB 以上）才触发。三 transport 单测全绿 ≠ 安全。
+
+**根治**: 写侧改 size-aware（`size==8` 存全 64 位；否则低半合并）；ASQ/ACQ/BPMBL 三处
+统一。单测 `asq_acq_qword_write_above_4gib_not_truncated` 锚 `0x1_02eb_0000` round-trip
+（写 + `mmio_read_impl` 回读）+ revert-verify（重新引入截断 → 测试红 `0x02eb0000 ≠
+0x102eb0000`）。真 host harness `scripts/hyperv_interop/` 双 oracle 复验。
+
+**三条**:
+1. **真 host e2e 不是 in-process e2e 的冗余**——它覆盖**结构性不可见的 bug 类**：地址
+   宽度（>4 GiB）、对齐、真硬件/真 driver 的访问尺寸（nvme.sys 单条 qword 写 ASQ）、
+   真时序。小内存 mock 的「全绿」是假安心（同 [[lesson §22]]：自洽 ≠ 正确）。
+2. **任何 64-bit 寄存器 / GPA 的 MMIO 写必须 size-aware**（4-byte low/high vs 8-byte
+   qword）；只按 offset 分支迟早截断。读写两侧要对称——本仓正是写侧漏了读侧对的。
+3. **自写 harness 的 guest-memory 模型要敢上真实尺寸（≥4 GiB）或显式把队列/PRP 放高
+   地址**，否则等于把高地址路径排除在测试外，制造结构性盲区。
+
+**来源**: 真 Hyper-V guest e2e harness `scripts/hyperv_interop/` 首次跑当前 binary 即
+抓到；fix `controller/mmio.rs`（ASQ/ACQ/BPMBL size-aware）+ 单测 + revert-verify；
+rust-reviewer 确认无 sibling 截断点（PRP/IO 队列 base 走 SQE 的 u64，非 MMIO）。

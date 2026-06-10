@@ -15,7 +15,11 @@
 
 set -e
 CRATE="${1:-ohcldiag-dev}"
-ROOT="$(realpath "$(dirname "${BASH_SOURCE[0]}")/../../..")"
+# 本脚本在 usnvmemu/scripts/（仓库根下 2 层）→ 仓库根 = dirname/../..。
+# （2026-06-10 修：crate 2026-06-08 从 docs/superpowers/scripts/ 搬来后，旧
+#  的 ../../.. 会解析到仓库根上一层，导致 `realpath build_support/windows_cross`
+#  找不到——自改名以来此脚本一直没成功跑过。）
+ROOT="$(realpath "$(dirname "${BASH_SOURCE[0]}")/../..")"
 cd "$ROOT"
 
 # 让 cross_tool.py 能找到 reg.exe / vswhere.exe / rust-lld
