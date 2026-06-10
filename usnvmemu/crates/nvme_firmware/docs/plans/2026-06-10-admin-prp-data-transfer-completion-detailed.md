@@ -1,6 +1,7 @@
 # Plan — Admin 数据 DMA 的完整 PRP 处理（教学简化 → spec-complete）
 
-> 状态：📋 SCOPED（2026-06-10 调研 + scoped，待实施）
+> 状态：**P1 ✅ SHIPPED**（commit `5a87cf08`，2026-06-10，含 revert-verify + rust-reviewer
+> 0 C/H/M）/ **P2 📋 待续**（>2 page PRP list，去 Get Log Page 8KiB 上限）。
 > 类型：silent-corruption-class firmware core 手术 —— 必须走完整严谨循环
 > （设计 → 实施 → unit + harness 测试 → **revert-verify** → rust-reviewer → commit）。
 
@@ -46,15 +47,22 @@ sq_head, cq_id)`，IO read 的 device→host 写与 admin 都调它（DRY），�
 
 ## 子阶段
 
-- **P1（≤2 页，sync）**：`dma_write_then_complete` 增 `prp2` 参数；`buf.len()` ≤1 页走
-  原单写；2 页拆 `prp1[0..4096]` + `prp2[4096..]` 两 DMA-write，双 token 追踪（沿用
-  `NvmReadDualPrpSiblingHalf` 模式或新 `AdminWriteDualPrp`），两半都完成才 post CQE。
-  改 7 个 call site 传 `sqe.prp2`。**这步就修掉 4–8 KiB 的 latent corruption。**
-- **P2（> 2 页，async，PRP list）**：`buf.len()` > 8 KiB 时，PRP2 是 list 指针：DMA-read
-  list 页 → `parse_prp_list` → page 0 写 prp1、pages 1.. 写 list entries、per-page DMA-write
-  → 全到齐 post CQE。删 `admin.rs:755` 的 `> 8192 → INVALID_FIELD` 上限。
-- **P3（清理）**：审 7 个 call site 各自的 buf 是否真会 > 4 KiB（Get Log Page 会；Identify
-  恒 4 KiB；Get Features 小）—— 只有会超的才真正受影响，但 helper 统一正确。
+- **P1（≤2 页，sync）✅ SHIPPED `5a87cf08`**：`dma_write_then_complete` 加 `prp2` 参数 +
+  按 buf size 分流：≤1 页单 PRP1（字节级不变）/ 2 页 page0→PRP1(`NvmReadDualPrpSiblingHalf`)
+  + page1→PRP2(`NvmReadDmaWrite` completer)。**实施中发现 helper 非 admin-only**——io.rs 的
+  Zone Report / Reservation Report 也用它且可 > 8 KiB，故 **> 2 页加了回退分支**（PRP2 是
+  list 指针时回退旧连续写，留 P2），8 个 call site（6 admin + 2 io）全传 `sqe.prp2`。harness
+  test `openhcl_get_log_page_noncontiguous_prp`（非连续 PRP + sentinel）revert-verified。
+- **P2（> 2 页，async，PRP list）📋 待续**：把 P1 的 > 2 页**回退分支**换成真 list 处理。
+  **复用路径已确认**：io.rs read > 2 页（`io.rs:880-918`）的 device→host list 写机件
+  `PrpListOp{is_write:false, data_pages}` + `alloc_op_id` + `prp_list_ops` + 完成 arm
+  `NvmReadPrpListFetch`/`NvmReadPrpListData`（completion.rs:1779/1852）可直接套——在
+  `dma_write_then_complete` 的 > 2 页分支里：split buf 成 data_pages → insert PrpListOp
+  (num_blocks:0, nsid:0) → `dma_read(prp2, PAGE)` 取 list 页。**起手须核**完成 arm 是否对
+  num_blocks=0 跳过 SMART 计数（NvmReadDmaWrite 有 `if num_blocks>0` 守卫，list arm 须同样）。
+  删 `admin.rs` 的 `bytes_req > 8192 → INVALID_FIELD` 上限。测试：> 8 KiB Get Log Page +
+  guest-mem 放真 PRP list 页 + 非连续 entry，断言跨 list 正确落地 + revert-verify。
+- **P3（清理）**：审 caller buf 上界；README "未实现" 删该条 / ROADMAP 记 SHIPPED。
 
 ## 测试计划（**用本会话新建的 OpenHCL harness** + 单元）
 
