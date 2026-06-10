@@ -46,11 +46,19 @@ impl NvmeController {
     /// CSTS.SHST = complete。normal(01) 与 abrupt(10) 都 flush（教学上一律持久化更安全；
     /// spec 允许 abrupt 跳过以求快）。flush 失败仅 warn —— shutdown 不应卡死 driver。
     ///
-    /// **教学边界（deliberate omission，reviewer M-2/M-3）**：
-    /// - 不 quiesce：完成后不拦截新命令的 doorbell（`on_sq_tail_doorbell` 不 gate
-    ///   SHST/RDY）。教学 driver 协作、shutdown 后不再敲门，故不建模。
-    /// - flush 失败仍报 complete：spec 无 "shutdown failed" 状态；production controller
-    ///   会在此置 `csts::CFS`（fatal）让 driver 知数据可能丢，教学版仅 warn。
+    /// **完成后 quiesce（reviewer M-2，2026-06-10 实现）**：`on_sq_tail_doorbell` gate
+    /// 在 CSTS.SHST=complete → 关机后下发的命令被忽略（SQ 仍在但不处理）；re-enable
+    /// 清 SHST 后恢复。
+    ///
+    /// **教学边界（deliberate omission）**：
+    /// - flush 失败仍报 complete（reviewer M-3）—— spec 无 "shutdown failed" 状态；
+    ///   production controller 会置 `csts::CFS`（fatal）让 driver 知数据可能丢，教学版仅 warn。
+    /// - 只 quiesce **新命令**（`on_sq_tail_doorbell` gate SHST=complete），不停 async
+    ///   AEN 源（reviewer M-1）：shutdown-complete 到下次 CC.EN=0 之间，in-flight 的
+    ///   self-test / sanitize / error AEN + IRQ-coalesce flush 仍可能 fire。cooperative
+    ///   driver 先停自己提交侧故可接受；CC.EN=0(disable) 才真正拆掉这些。
+    /// - 不 drain in-flight DMA（reviewer LOW-2）：CC.SHN 时正在飞的 write，其完成若落在
+    ///   flush 之后才写 backing，那一笔不会被再 flush（同上 flush 边界，教学可接受）。
     fn process_shutdown(&mut self, shn_field: u32) {
         tracing::info!(
             shn = shn_field,

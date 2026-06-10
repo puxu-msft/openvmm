@@ -1997,6 +1997,20 @@ impl NvmeController {
     /// SQyTDBL 写入：driver 通告新 SQE。host 立即 DMA-read 新 entries。
     /// 支持 wrap：[old_tail..size) + [0..new_tail) 拆两段独立 DMA fetch。
     fn on_sq_tail_doorbell(&mut self, ctx: &mut DeviceCtx<'_>, sq_id: u16, new_tail: u32) {
+        // **Quiesce（spec § 3.1.4.5）**：controller 未 operational 时不处理新命令——
+        // 关机完成（CSTS.SHST=complete）或未 enable（CSTS.RDY=0）时忽略 SQ tail doorbell。
+        // disable 路径已清 SQ，故 RDY 这条是 belt-and-suspenders；真正修的是 **shutdown
+        // 后 SQ 仍在却不该再处理**（shutdown 不清队列，只置 SHST）。
+        let shut_down = (self.csts & csts::SHST_MASK) == csts::SHST_COMPLETE;
+        if self.csts & csts::RDY == 0 || shut_down {
+            tracing::warn!(
+                sq_id,
+                new_tail,
+                shut_down,
+                "SQ doorbell while controller not operational (disabled / shut down) → ignored"
+            );
+            return;
+        }
         // 先校验：spec 要求 0 ≤ new_tail < size；越界视为 driver bug，
         // 设 CSTS.CFS 让 driver 见到 fatal 状态。在写 sq.tail 前校验，
         // 否则脏 state 已经在 SQ 中持久化。

@@ -1225,3 +1225,59 @@ async fn openhcl_shutdown_sequence() -> Result<()> {
 
     Ok(())
 }
+
+/// 关机后 quiesce —— controller shut down 后下发的命令不被处理（reviewer M-2）。
+///
+/// shutdown 不清队列（只置 SHST），故 SQ 仍在。spec § 3.1.4.5：关机后 controller 不应
+/// 再处理新命令。`on_sq_tail_doorbell` gate 在 CSTS.SHST=complete → 忽略 doorbell。
+///
+/// **negative oracle + revert-verify**：关机后放一条 Identify SQE + ring doorbell，验
+/// Identify payload **未写入**（VID 仍 0 = 命令没处理）。去掉 gate → 命令被处理 →
+/// payload=0x1414 → FAIL（已实测确认）。
+#[tokio::test]
+async fn openhcl_no_command_processing_after_shutdown() -> Result<()> {
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    driver.enable_controller().await.context("enable")?;
+
+    // 立即关机（admin SQ/CQ 都还在 slot 0，无命令历史）。
+    let cc = 1u64 | (6 << 16) | (4 << 20) | (0b01 << 14);
+    driver.mmio_write(REG_CC, 4, cc);
+    let mut done = false;
+    for _ in 0..100 {
+        let csts = driver.mmio_read(REG_CSTS, 4).await?;
+        if (csts >> 2) & 0x3 == 0b10 {
+            done = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(done, "shutdown 应 complete");
+
+    // 关机后下发 admin Identify：放 SQE 到 ASQ slot 0，ring SQ0 tail=1。
+    let sqe = Sqe {
+        opcode: 0x06,
+        cid: 0x70,
+        prp1: IDENTIFY_GPA,
+        cdw10: 1, // CNS=1 Identify Controller
+        ..Default::default()
+    }
+    .encode();
+    driver.write_guest(ASQ_GPA, sqe);
+    driver.mmio_write(DOORBELL_BASE, 4, 1);
+
+    // 给足时间（命令若会处理，早处理完了）。
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 验命令**未被处理**：Identify Controller 的 payload(VID) 未写入 IDENTIFY_GPA（仍 0）。
+    // Identify payload 是可靠 oracle：命令处理 ⟺ payload 写入；比 CQE-slot 稳（实测：无 gate
+    // 时命令处理 → vid=0x1414，但 CQE 不一定落在手算 slot，CQE-slot oracle 会假阴）。
+    let id = driver.read_guest(IDENTIFY_GPA, 4).await?;
+    let vid = u16::from_le_bytes([id[0], id[1]]);
+    assert_eq!(
+        vid, 0,
+        "关机后下发的命令不应被处理（Identify payload 不应写入）—— quiesce，实 vid={vid:#06x}"
+    );
+
+    Ok(())
+}
