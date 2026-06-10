@@ -904,7 +904,7 @@ fn pure_4k_copy_offset() {
     c.namespaces
         .get_mut(&1)
         .unwrap()
-        .write_at(&vec![0xBBu8; 4096], 1 * 4096)
+        .write_at(&vec![0xBBu8; 4096], 4096)
         .unwrap();
     c.cqs.insert(
         1,

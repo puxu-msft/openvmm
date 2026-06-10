@@ -1789,6 +1789,11 @@ impl NvmeController {
                         self.prp_list_ops.get_mut(&op_id).map(|op| {
                             // M2 修复：parse_prp_list 现在不再 0 终止；用
                             // total_pages-1 精确截 list 长度。
+                            // **P2 注（2026-06-10）**：单 list 页恰好装满（total_pages=513，
+                            // 512 entry）时全部 entry 当数据、**不**留末位作 chain pointer——
+                            // 已对 NVMe spec + 真 OpenVMM host driver `make_prp`（密集写满、
+                            // 不留 chain slot）双验 byte-compat。未来若加 list chaining，须在
+                            // 此区分"满页=继续链"。caller 已把 > 513 页挡在 dma_write_then_complete。
                             let take = (op.total_pages - 1) as usize;
                             let list: Vec<u64> = entries.into_iter().take(take).collect();
                             // Take 全部页（含 PRP1 = idx 0）；data_pages 移空

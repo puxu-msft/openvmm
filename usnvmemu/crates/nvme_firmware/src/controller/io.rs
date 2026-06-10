@@ -2034,6 +2034,12 @@ impl NvmeController {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 };
                 let bytes = numd as usize * 4;
+                // **review M-1（2026-06-10）** — host 控的 NUMD→bytes 无上限会让 build_*
+                // 分配巨量内存（最坏 ~16 GiB DoS）。比照 Get Log Page 卡 2 MiB（单 PRP-list
+                // 页可服务范围）；超过 INVALID_FIELD 让 driver 分块。
+                if bytes > 2 * 1024 * 1024 {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
                 let zra = (sqe.cdw13 & 0xff) as u8;
                 let Some(ns) = self.ns(nsid) else {
                     return Some(Cqe::error(
@@ -2342,6 +2348,12 @@ impl NvmeController {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
                 }
                 let bytes = numd as usize * 4;
+                // **review M-1（2026-06-10）** — host 控的 NUMD→bytes 无上限会让 build_*
+                // 分配巨量内存（最坏 ~16 GiB DoS）。比照 Get Log Page 卡 2 MiB（单 PRP-list
+                // 页可服务范围）；超过 INVALID_FIELD 让 driver 分块。
+                if bytes > 2 * 1024 * 1024 {
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                }
                 let Some(ns) = self.ns(nsid) else {
                     return Some(Cqe::error(
                         cid,
