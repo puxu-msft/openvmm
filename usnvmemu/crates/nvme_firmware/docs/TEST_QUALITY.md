@@ -20,7 +20,7 @@
   每个**复制 nvme_spec 的常量**（sc / admin_opc / nvm_opc / fid / regs::Reg / pi SC byte）编译/测试期锚到
   canonical `nvme_spec`，drift 即红。**一加上就抓出真 bug**（`GET_LBA_STATUS=0x1e` 应 0x86）。
   *新增任何 spec 常量 → 顺手 anchor。*
-- **M2 布局锚定** *(SMART Figure 207 + error-log Figure 205 已锚；ZNS-Id/resv-report 待)* — log/report 字节布局用 `#[repr(C)]` struct + `offset_of!`
+- **M2 布局锚定** *(SMART/error-log/ZNS-Id 已锚（3/4）；resv-report 待)* — log/report 字节布局用 `#[repr(C)]` struct + `offset_of!`
   锚到 spec figure（替代"test 照抄 builder"的自洽假锚）。
 - **M3 proptest** — `pt_*`：纯/近纯函数随机输入 + **独立 oracle** 不变量（copy-conflict 的 u128 brute /
   CRC 的 crc crate / SGL parser no-panic / ZNS 矩阵 / parse_prp_list 恒等 / PI 往返）。
@@ -60,9 +60,7 @@ rustup component add llvm-tools-preview   # llvm-cov 需要
 
 ## Follow-up（按 LESSONS §30：清理 ≠ 删 scaffolding；不 speculative wire）
 
-- **M2 布局 struct**（SMART+error-log 已做，ZNS-Id+resv 待）：ZNS Identify / reservation report 写成
-  `#[repr(C)]` + `offset_of!` 锚 spec figure +（有真设备时）golden wire 字节。当前这些是手填 offset +
-  自洽测试（test 照抄 builder，测不出 spec-vs-impl 偏移）。
+- **M2 reservation report 布局**（SMART/error-log/ZNS-Id 已锚）：reservation report 写成 repr(C) + offset_of! 锚 NVM CS figure；audit 发现 builder 漏 ptpls，补 ptpls 属特性修（按 §30 留真做时）。+（有真设备时）golden wire 字节替代自洽测试。
 - **剩余无牙测试上牙**：`o3_fused_cw_dispatch_chain_smoke`（断言 events 空=啥也没测）、
   `aen_queue_fifo_order`（测 stdlib VecDeque）、`fw_download_cap`（断言 64MiB≥8MiB 重言）、
   `k4c_list_accum`（构造 struct 再断言自己）—— 给牙或并入 M4 矩阵。

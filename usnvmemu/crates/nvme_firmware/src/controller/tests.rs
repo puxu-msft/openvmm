@@ -314,6 +314,52 @@ fn error_log_entry_offsets_anchored_to_spec_figure() {
     );
 }
 
+/// **M2 布局锚定（Wave 7）** — ZNS I/O CS Identify Namespace 锚到 **ZNS CS 1.1
+/// § 3.1.6**。重点钉死 `LBAFE[0].ZSZE @ 2816` 这个最吓人的 magic offset（driver
+/// 据它算整个 zone 几何，错一位静默 corrupt 所有 zone 寻址）。
+#[test]
+fn zns_identify_offsets_anchored_to_spec_figure() {
+    use crate::controller::admin::__test_build_zns_ns_identify;
+    use std::mem::offset_of;
+    #[repr(C, packed)]
+    struct ZnsIdentifyLayout {
+        zoc: u16,            // 0
+        ozcs: u16,           // 2
+        mar: u32,            // 4  Max Active Resources
+        mor: u32,            // 8  Max Open Resources
+        rrl: u32,            // 12
+        frl: u32,            // 16
+        _rsvd20: [u8; 2796], // 20..2816
+        lbafe0_zsze: u64,    // 2816 LBAFE[0] Zone Size
+        lbafe0_zdes: u8,     // 2824 LBAFE[0] Zone Descriptor Ext Size
+    }
+    assert_eq!(offset_of!(ZnsIdentifyLayout, mar), 4);
+    assert_eq!(offset_of!(ZnsIdentifyLayout, mor), 8);
+    assert_eq!(offset_of!(ZnsIdentifyLayout, lbafe0_zsze), 2816);
+    assert_eq!(offset_of!(ZnsIdentifyLayout, lbafe0_zdes), 2824);
+
+    let zns = ZnsState {
+        zone_size: 2048,
+        zone_capacity: 2048,
+        max_open: 7,
+        max_active: 14,
+        zones: vec![],
+    };
+    let buf = __test_build_zns_ns_identify(&zns);
+    let rd32 = |off: usize| u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+    // MAR/MOR 0's-based：14→13, 7→6。
+    assert_eq!(rd32(offset_of!(ZnsIdentifyLayout, mar)), 13);
+    assert_eq!(rd32(offset_of!(ZnsIdentifyLayout, mor)), 6);
+    assert_eq!(
+        u64::from_le_bytes(
+            buf[offset_of!(ZnsIdentifyLayout, lbafe0_zsze)..][..8]
+                .try_into()
+                .unwrap()
+        ),
+        2048
+    );
+}
+
 /// Phase E (M2 修复后)：parse_prp_list 不再 0 终止 — 返回所有 entry，
 /// caller 用 total_pages 自行截断。GPA = 0 是合法地址，不能视作终止。
 #[test]
