@@ -883,6 +883,90 @@ fn reservation_preempt_spec_semantics() {
     }
 }
 
+/// **B6a（Format MSET 极性 + FLBAS.inband_metadata，spec § 5.14）差分 oracle** —
+/// 修正此前反置的 MSET 极性。NVMe / nvme_spec `Flbas.inband_metadata`：bit4=1 =
+/// metadata 内联（extended LBA），bit4=0 = 独立 buffer。本 firmware 内联存储 →
+///   ① LBAF[1](4K+meta) + MSET=1(内联) → 接受，且 Identify NS FLBAS bit4=1；
+///   ② LBAF[1] + MSET=0(独立 buffer) → INVALID_FIELD（B6b 未实现）；
+///   ③ LBAF[2](纯 4K no-meta) + MSET=0 → 接受（无 meta，MSET 被忽略），FLBAS bit4=0。
+///
+/// 独立 oracle：FLBAS 字节取自 Identify NS builder（spec 布局 byte 26），非读
+/// 自家 ns 字段。revert-verify：把 FLBAS 锚回旧版恒 0 → 案例①的 bit4=1 转红。
+#[test]
+fn format_mset_flbas_polarity() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx};
+    // Format SQE: cdw10 = LBAFL | MSET<<4 | PI<<5 | PIL<<8 | SES<<9
+    fn fmt_sqe(nsid: u32, lbafl: u8, mset: u8, pi: u8) -> Sqe {
+        let zero = [0u8; 64];
+        let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+        sqe.cdw0 = (crate::cmd::admin_opc::FORMAT_NVM as u32) | (0x33u32 << 16); // cid 0x33
+        sqe.nsid = nsid;
+        sqe.cdw10 = (lbafl as u32) | ((mset as u32) << 4) | ((pi as u32) << 5);
+        sqe
+    }
+    fn flbas(ns: &Namespace) -> u8 {
+        crate::cmd::IdentifyNamespace::build_v2_bytes(
+            ns.total_lba,
+            ns.lbads,
+            ns.meta_size,
+            ns.pi_type,
+            ns.pi_first,
+        )[26]
+    }
+    let mut cap = CaptureTransport::with_start_token(0x100);
+
+    // ① LBAF[1] + MSET=1（extended/inline）+ PI Type 1 → 接受 + FLBAS bit4=1。
+    {
+        let mut c = make_ctrl_with_tmp("fmt_inline");
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let cqe = c
+            .dispatch_admin(&mut ctx, fmt_sqe(1, 1, 1, 1), 0x33, 0, 0)
+            .expect("Format 同步返 CQE");
+        assert_eq!(cqe_status(&cqe), 0, "LBAF[1] MSET=1（内联）应接受");
+        let ns = &c.namespaces[&1];
+        assert_eq!(
+            (ns.lbads, ns.meta_size, ns.pi_type),
+            (12, 8, 1),
+            "格式已应用"
+        );
+        assert_eq!(
+            flbas(ns) & 0x10,
+            0x10,
+            "metadata 格式 FLBAS.inband_metadata=1"
+        );
+        assert_eq!(flbas(ns) & 0x0f, 1, "FLBAS index = LBAF[1]");
+    }
+
+    // ② LBAF[1] + MSET=0（独立 buffer）→ INVALID_FIELD（B6b 未实现）。
+    {
+        let mut c = make_ctrl_with_tmp("fmt_separate");
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let cqe = c
+            .dispatch_admin(&mut ctx, fmt_sqe(1, 1, 0, 1), 0x33, 0, 0)
+            .expect("Format 同步返 CQE");
+        assert_eq!(
+            cqe_status(&cqe),
+            crate::cmd::sc::INVALID_FIELD,
+            "MSET=0 独立 metadata buffer 未实现 → INVALID_FIELD"
+        );
+    }
+
+    // ③ LBAF[2]（纯 4K no-meta）+ MSET=0 → 接受（无 meta，MSET 被忽略），FLBAS bit4=0。
+    {
+        let mut c = make_ctrl_with_tmp("fmt_plain4k");
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let cqe = c
+            .dispatch_admin(&mut ctx, fmt_sqe(1, 2, 0, 0), 0x33, 0, 0)
+            .expect("Format 同步返 CQE");
+        assert_eq!(cqe_status(&cqe), 0, "无 meta 格式 MSET 被忽略 → 接受");
+        assert_eq!(
+            flbas(&c.namespaces[&1]) & 0x10,
+            0,
+            "no-meta 格式 FLBAS.inband_metadata=0"
+        );
+    }
+}
+
 ///
 /// 单 LBA 4 KiB data + 8 byte T10 DIF tuple inline。verify 必须通过。
 #[test]
@@ -3578,13 +3662,17 @@ fn set_max_queue_entries_validates_and_writes_mqes() {
 /// Identify NS 广告纯 4K LBAF[2]（lbads=12, ms=0）+ flbas 双因素映射。
 #[test]
 fn identify_ns_advertises_pure_4k_lbaf() {
-    // 512B NS → flbas=0
+    // 512B NS → flbas=0（no meta，inband bit=0）
     let b512 = IdentifyNamespace::build_v2_bytes(2048, 9, 0, 0, false);
     assert_eq!(b512[26], 0, "512B → flbas=0");
-    // 4K+meta NS → flbas=1
+    // 4K+meta NS → flbas index=1 + inband_metadata bit4=1（内联，B6a 极性修正：
+    // 旧版恒 0 错报 separate buffer；spec/nvme_spec Flbas.inband_metadata=1=内联）
     let b4km = IdentifyNamespace::build_v2_bytes(2048, 12, 8, 0, false);
-    assert_eq!(b4km[26], 1, "4K+meta → flbas=1");
-    // 纯 4K NS → flbas=2
+    assert_eq!(
+        b4km[26], 0x11,
+        "4K+meta → flbas index=1 + inband_metadata(bit4)=1"
+    );
+    // 纯 4K NS → flbas=2（no meta，inband bit=0）
     let b4k = IdentifyNamespace::build_v2_bytes(2048, 12, 0, 0, false);
     assert_eq!(b4k[26], 2, "纯 4K → flbas=2");
     assert_eq!(b4k[25], 2, "nlbaf=2（3 个格式）");

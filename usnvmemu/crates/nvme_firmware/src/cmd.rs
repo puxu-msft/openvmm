@@ -794,7 +794,11 @@ impl IdentifyNamespace {
         ns.ncap = total_lba;
         ns.nuse = 0;
         ns.nsfeat = 0x01.into(); // THINP
-        // FLBAS bits 3:0 = current LBAF index；bit 4 = metadata inline (mset=0 → 0)。
+        // FLBAS bits 3:0 = current LBAF index；bit 4 (inband_metadata) = 1 当
+        // metadata 内联（extended LBA）。**B6a 极性修正**：本 firmware 的 metadata
+        // 格式(LBAF[1])一律内联存储，故 meta_size>0 时 bit4=1（spec FLBAS /
+        // nvme_spec Flbas.inband_metadata：1=in-band/extended）。旧版恒置 0，错报
+        // "separate buffer" 而实际内联 → 真 driver 会按 separate 给 MPTR、布局失配。
         // **2026-06-09** — 3 个 LBAF：0=512B/no-meta、1=4K+8B-meta(PI)、2=纯 4K/no-meta。
         // flbas 需用 (lbads, meta_size) 双因素区分 index 1 vs 2（都 lbads=12）。
         let lbaf_idx: u8 = match (lbads, meta_size) {
@@ -803,7 +807,8 @@ impl IdentifyNamespace {
             (12, _) => 1, // 4K + metadata
             _ => 0,
         };
-        ns.flbas = lbaf_idx.into();
+        let inband_bit: u8 = if meta_size > 0 { 0x10 } else { 0 };
+        ns.flbas = (lbaf_idx | inband_bit).into();
         ns.nlbaf = 2; // 3 LBAF slots（0-based：nlbaf = 格式数 - 1）
         ns.lbaf[0] = nvme_spec::nvm::Lbaf::new()
             .with_ms(0)
@@ -839,8 +844,6 @@ impl IdentifyNamespace {
         ns.npwa = 0;
         ns.npdg = 0;
         ns.npda = 0;
-        // 静默 unused warning（meta_size 通过 lbaf[1].ms 暴露）
-        let _ = meta_size;
         ns.as_bytes().to_vec()
     }
 }

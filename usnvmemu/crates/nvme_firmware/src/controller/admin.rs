@@ -842,16 +842,27 @@ impl NvmeController {
                 let pil = ((sqe.cdw10 >> 8) & 0x1) as u8;
                 let ses = ((sqe.cdw10 >> 9) & 0x7) as u8;
                 tracing::info!(lbafl, mset, pi, pil, ses, "Format NVM");
-                if lbafl > 2 || pi > 1 || mset != 0 {
+                if lbafl > 2 || pi > 1 {
                     // **Phase K1 + 2026-06-09** — 真支持 LBAF[0]=512B/no-meta、
                     // LBAF[1]=4K+8B-meta(PI)、LBAF[2]=纯 4K/no-meta + PI Type 0/1。
-                    // mset=1（separate metadata buffer）需 MPTR 二级 DMA，未实现；
-                    // driver 用 mset=0 把 meta 与 data inline 存。其余拒绝。
                     tracing::warn!(
                         lbafl,
                         pi,
-                        mset,
                         "Format rejected: only LBAF[0/1/2] + PI Type 0/1 supported"
+                    );
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
+                }
+                // **B6a — MSET 极性修正（spec § 5.14 Format MSET / FLBAS
+                // inband_metadata）**：mset=1 = metadata 作 extended LBA 内联（本
+                // firmware 支持）；mset=0 = metadata 走独立 MPTR buffer（B6b，尚未
+                // 实现）。仅当所选 LBAF 含 metadata（LBAF[1]，MS=8）时 mset 有意义；
+                // 无 meta（LBAF[0/2]，MS=0）时 mset 被忽略。旧版极性反置（拒内联的
+                // mset=1、收 mset=0 当内联=实为 separate）与 spec / 真 driver 不兼容。
+                let lbaf_has_meta = lbafl == 1;
+                if lbaf_has_meta && mset == 0 {
+                    tracing::warn!(
+                        lbafl,
+                        "Format rejected: separate metadata buffer (MSET=0) 未实现，仅支持 MSET=1 extended LBA"
                     );
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
