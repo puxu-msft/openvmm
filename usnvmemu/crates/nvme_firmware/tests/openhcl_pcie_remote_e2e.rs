@@ -120,6 +120,23 @@ const EVENTIDX_GPA: u64 = 0xB_0000;
 /// Doorbell Buffer Config admin opcode（spec § 5.7；= firmware cmd::DOORBELL_BUFFER_CONFIG）。
 const DOORBELL_BUFFER_CONFIG: u8 = 0x7c;
 
+// ── O5（第二 IO 队列）队列对 + 数据缓冲 GPA（都 4K 对齐，远在 GUEST_MEM_BYTES(16 MiB) 内）──
+//
+// 现有 GPA 布局用到 0xB_0000（EVENTIDX_GPA）；从 0xC_0000 起的空间是空的。第二 IO 队列
+// 用 qid=2，其 CQ 的 **interrupt vector 故意设 1**（≠ qid 1 的 vec 0），以在跨进程真 wire
+// 上行使 controller 的**逐-CQ IV 路由**（`post_cqe` 读 `cq.interrupt_vector` 再 fire）。
+// firmware 默认广告 msix_count=4（admin vec0 + IO vec1 + 2 spare），故 vec 1 合法可路由。
+// shadow doorbell slot 与 qid 1 自动分到不同槽（SQ tail 在 `qid*8`、CQ head 在 `qid*8+4`，
+// qid 1 → 偏移 8/12，qid 2 → 偏移 16/20），无需新 shadow 页——同一 SHADOW_DB_GPA 页够用。
+const IO_QID2: u16 = 2;
+const IO_SQ2_GPA: u64 = 0xC_0000;
+const IO_CQ2_GPA: u64 = 0xD_0000;
+/// qid 2 的 CQ interrupt vector（**非 0**：证 controller 按 CQ 的 IV 路由，非硬编码 0）。
+const IO_MSIX_VEC2: u16 = 1;
+/// 第二 IO 队列用的数据缓冲（与 qid 1 的 WRITE/READ_BUF 区分开，证无跨队列数据污染）。
+const WRITE_BUF2Q_GPA: u64 = 0xE_0000;
+const READ_BUF2Q_GPA: u64 = 0xF_0000;
+
 // ═══════════════════════════ 子进程 / 临时文件守卫 ═══════════════════════════
 
 /// 子进程 + 临时文件守卫：Drop 时 kill child + 删 backing/log；测试 panic 时打印
@@ -405,6 +422,17 @@ impl NvmeDriver {
             .context("int channel 已关闭")
     }
 
+    /// **O5（多 IO 队列路由）** — 非阻塞排空已到的中断（返回排掉的 vector 列表）。
+    /// TEST 1 在每队列提交**之前**调它清干净 int channel，使随后 `wait_interrupt` 拿到的
+    /// vector 必属当前队列的完成——让"vector ↔ 队列"对应关系无歧义（非依赖巧合排序）。
+    fn drain_interrupts(&mut self) -> Vec<u32> {
+        let mut drained = Vec::new();
+        while let Ok(v) = self.int_rx.try_recv() {
+            drained.push(v);
+        }
+        drained
+    }
+
     /// CC.EN=1 + AQA/ASQ/ACQ，轮询 CSTS.RDY=1。
     async fn enable_controller(&self) -> Result<()> {
         // AQA：admin SQ/CQ size（0-based）。
@@ -615,6 +643,20 @@ impl QueueState {
             qid: IO_QID,
             sq_base: IO_SQ_GPA,
             cq_base: IO_CQ_GPA,
+            depth: IO_Q_DEPTH,
+            sq_tail: 0,
+            cq_head: 0,
+            cq_phase: true,
+        }
+    }
+
+    /// **O5（第二 IO 队列）** — qid 2 的 driver 侧本地队列状态（独立 SQ/CQ GPA + tail/head/
+    /// phase）。与 `io()`（qid 1）完全独立，让两队列在同一 controller 上并行驱动而不串槽。
+    fn io2() -> Self {
+        Self {
+            qid: IO_QID2,
+            sq_base: IO_SQ2_GPA,
+            cq_base: IO_CQ2_GPA,
             depth: IO_Q_DEPTH,
             sq_tail: 0,
             cq_head: 0,
@@ -881,6 +923,119 @@ async fn setup_enabled_4k_io(driver: &NvmeDriver) -> Result<(QueueState, QueueSt
     // io() 是刚在 wire 上建好的 IO 队列的 driver 侧本地状态（tail=0/head=0/phase=1），
     // 与 firmware 侧新建队列初值一致。
     Ok((admin, QueueState::io()))
+}
+
+/// **O5（第二 IO 队列）公共 setup** — enable 一次 + Format NS1 一次 + 建**两对** IO 队列：
+/// CQ1(IV=0)+SQ1(qid 1) 与 CQ2(**IV=1**)+SQ2(qid 2 绑 CQID 2)。返回 (admin, io1, io2)。
+///
+/// 与 `setup_enabled_4k_io` 同构，仅多建第二队列对。**关键差异**：第二 CQ 的 cdw11 IV 字段
+/// = `IO_MSIX_VEC2 << 16`（≠ 0），让两队列的完成走**不同** MSI-X vector——这是 TEST 1 的
+/// 路由 oracle 之根（vec 1 到达 ⇒ controller 按 CQ 的 IV 路由，非硬编码 0）。
+async fn setup_enabled_4k_io_dual(
+    driver: &NvmeDriver,
+) -> Result<(QueueState, QueueState, QueueState)> {
+    driver.enable_controller().await.context("enable")?;
+    let mut admin = QueueState::admin();
+    let cdw10_q = (IO_QID as u32) | (((IO_Q_DEPTH - 1) as u32) << 16);
+    let cdw10_q2 = (IO_QID2 as u32) | (((IO_Q_DEPTH - 1) as u32) << 16);
+
+    // ── 队列对 1：CQ1（qid 1，PC|IEN，IV=0）+ SQ1（qid 1 绑 CQID 1）──
+    let cqe = admin
+        .submit(
+            driver,
+            Sqe {
+                opcode: 0x05,
+                cid: 0x10,
+                prp1: IO_CQ_GPA,
+                cdw10: cdw10_q,
+                cdw11: 0b11, // PC(bit0) | IEN(bit1)，IV=0
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Create IO CQ1")?;
+    if cqe.sc != 0 {
+        return Err(anyhow!("Create IO CQ1 sc={:#x}", cqe.sc));
+    }
+    let cqe = admin
+        .submit(
+            driver,
+            Sqe {
+                opcode: 0x01,
+                cid: 0x11,
+                prp1: IO_SQ_GPA,
+                cdw10: cdw10_q,
+                cdw11: 1 | ((IO_QID as u32) << 16),
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Create IO SQ1")?;
+    if cqe.sc != 0 {
+        return Err(anyhow!("Create IO SQ1 sc={:#x}", cqe.sc));
+    }
+
+    // ── 队列对 2：CQ2（qid 2，PC|IEN，**IV=1**）+ SQ2（qid 2 绑 CQID 2）──
+    // cdw11 = IV<<16 | IEN<<1 | PC = (IO_MSIX_VEC2<<16) | 0b11。
+    let cqe = admin
+        .submit(
+            driver,
+            Sqe {
+                opcode: 0x05,
+                cid: 0x14,
+                prp1: IO_CQ2_GPA,
+                cdw10: cdw10_q2,
+                cdw11: 0b11 | ((IO_MSIX_VEC2 as u32) << 16), // PC | IEN | IV=1
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Create IO CQ2")?;
+    if cqe.sc != 0 {
+        return Err(anyhow!("Create IO CQ2 sc={:#x}", cqe.sc));
+    }
+    let cqe = admin
+        .submit(
+            driver,
+            Sqe {
+                opcode: 0x01,
+                cid: 0x15,
+                prp1: IO_SQ2_GPA,
+                cdw10: cdw10_q2,
+                cdw11: 1 | ((IO_QID2 as u32) << 16), // PC | CQID=2
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Create IO SQ2")?;
+    if cqe.sc != 0 {
+        return Err(anyhow!("Create IO SQ2 sc={:#x}", cqe.sc));
+    }
+
+    // Format NS1 → LBAF[2]（纯 4K，no-meta）一次。cdw10 LBAF(bits3:0)=2。
+    let cqe = admin
+        .submit(
+            driver,
+            Sqe {
+                opcode: 0x80,
+                cid: 0x12,
+                nsid: 1,
+                cdw10: 2,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Format NVM")?;
+    if cqe.sc != 0 {
+        return Err(anyhow!("Format sc={:#x}", cqe.sc));
+    }
+
+    Ok((admin, QueueState::io(), QueueState::io2()))
 }
 
 /// O3a —— 纯-4K Format + IO round-trip 经 pcie_remote（**parity payoff**）。
@@ -2393,6 +2548,379 @@ async fn openhcl_dbbuf_burst_skipped_rings_caught_promptly() -> Result<()> {
         (rings_sent as u16) < N,
         "rings_sent({rings_sent}) 应 < N({N})：证 driver 经 need_event 跳过了部分真 ring，\
          由 controller shadow-poll 捕获（DBBUF 真行使）。若恒等于 N 应收紧 pipeline 而非弱化断言",
+    );
+
+    Ok(())
+}
+
+/// **O5（多 IO 队列）TEST 1** — MSI-X **非零 vector 路由**（逐-CQ IV 路由，DBBUF 无关，纯 MMIO）。
+///
+/// 此前本 e2e harness 只存在**单** IO 队列（qid 1）+ **单** vector（0）——admin/IO CQ 的
+/// 中断都落 vector 0，故"firmware 按 CQ 的 interrupt vector 路由"这条语义从未在跨进程真
+/// wire 上被行使（一个把所有中断硬编码到 vector 0 的 controller 也能让旧测试全绿）。本测试
+/// 建**两个** IO 队列，其 CQ 的 IV 分别为 **0(qid 1)** 与 **1(qid 2)**，在各自队列上提交
+/// IO Write 并断言 fire 的 MSI-X vector == 该队列 CQ 的 IV。
+///
+/// **独立 oracle（逐-CQ IV 路由）**：firmware fire 的 vector 由 driver 在 Create IO CQ 时
+/// 写进 cdw11 IV 字段、controller 存进 `cq.interrupt_vector`、`post_cqe` fire 时读出的那个
+/// 值决定。**vector 1 为 qid 2 到达，就证明 controller 按 CQ 的 IV 路由，而非硬编码 0**——
+/// 这是**独立**的，因为判据（到达的 vector index）来自 firmware 经真 wire 发的 `InterruptFire`
+/// 帧，与 harness 自身记账无关；一个把中断全发 vector 0 的路由 bug 会让 `== 1` 断言 FAIL。
+///
+/// 两队列**顺序**驱动（提交前 `drain_interrupts` 清干净 int channel）→ 每个中断干净对应其
+/// 队列，无歧义。CQE 也各落**自己**的 CQ（`QueueState` 跟踪逐队列 cq_head/phase，`poll_cqe`
+/// 自动读对 CQ），断言 sc==0 + CID 回显，证完成路径与中断路径都对上号。
+///
+/// **revert-verify（已实测）**：把 `controller/mod.rs` `post_cqe` 的 fire 由
+/// `ctx.fire_interrupt(iv as u32)` 改成 `ctx.fire_interrupt(0)`（忽略 CQ 的 IV，恒发
+/// vector 0）→ qid 2 的中断到达 vector 0 而非 1 → 本测试 `== IO_MSIX_VEC2(1)` 断言 FAIL。
+#[tokio::test]
+async fn openhcl_multi_io_queue_msix_vector_routing() -> Result<()> {
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (mut driver, _dev) = NvmeDriver::start(stream).await?;
+    let (_admin, mut io1, mut io2) = setup_enabled_4k_io_dual(&driver).await?;
+
+    // distinct-per-512 pattern（避免 uniform 掩盖偏移错；本测试焦点是中断路由，数据正确性
+    // 作辅助信号）。两队列写**不同** LBA + 不同 buffer，互不污染。
+    let mut pat1 = vec![0u8; 4096];
+    for i in 0..8 {
+        pat1[i * 512..(i + 1) * 512].fill(0xA0 + i as u8);
+    }
+    let mut pat2 = vec![0u8; 4096];
+    for i in 0..8 {
+        pat2[i * 512..(i + 1) * 512].fill(0xB0 + i as u8);
+    }
+
+    // ── qid 1（CQ IV=0）：提交 Write → 等中断，断言 vector == 0 ──
+    // 提交前**排空** int channel：setup 期间 5 条 admin 命令（CQ1/SQ1/CQ2/SQ2/Format）各 fire
+    // 一个 admin 完成中断（vec 0）堆在 channel 里且无人消费。先丢弃这些 stale 中断，使随后
+    // wait_interrupt 拿到的必是本次 qid 1 IO 完成新 fire 的中断——让"vector ↔ 队列"无歧义。
+    let pre1 = driver.drain_interrupts();
+    assert!(
+        pre1.iter().all(|&v| v == 0),
+        "qid 1 提交前残留的应全是 admin(vec 0) 中断，实 {pre1:?}"
+    );
+    driver.write_guest(WRITE_BUF_GPA, pat1.clone());
+    let cqe = io1
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x01, // Write
+                cid: 0x20,
+                nsid: 1,
+                prp1: WRITE_BUF_GPA,
+                cdw10: 5, // slba=5
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("qid 1 Write")?;
+    assert_eq!(cqe.sc, 0, "qid 1 Write sc 应=0，实={:#x}", cqe.sc);
+    assert_eq!(cqe.cid, 0x20, "qid 1 CQE CID 应回显 0x20");
+    let v1 = driver
+        .wait_interrupt(Duration::from_secs(3))
+        .await
+        .context("qid 1 Write 完成后应 fire MSI-X")?;
+    assert_eq!(
+        v1, 0,
+        "qid 1 的 CQ IV=0 → 中断应走 vector 0，实={v1}（路由 bug 会让所有中断挤到固定 vector）"
+    );
+
+    // ── qid 2（CQ IV=1）：提交 Write → 等中断，断言 vector == 1（**核心 oracle**）──
+    // 再次排空：丢弃 qid 1 残留的任何 vec-0 中断（含 setup stragglers）。**断言排掉的全 < vec 1**
+    // ——qid 2 尚未提交，故此刻 channel 里**不可能**有 vec 1；这把"vec 1 只能来自 qid 2 的 IO
+    // 完成"钉死（否则若 vec 1 提前出现，说明路由把别的队列也发到了 vec 1，oracle 失真）。
+    let pre2 = driver.drain_interrupts();
+    assert!(
+        pre2.iter().all(|&v| v != IO_MSIX_VEC2 as u32),
+        "qid 2 提交前 channel 不应有 vec {}（qid 2 还没提交，vec {} 只应来自其 IO 完成），实残留 {pre2:?}",
+        IO_MSIX_VEC2,
+        IO_MSIX_VEC2
+    );
+    driver.write_guest(WRITE_BUF2Q_GPA, pat2.clone());
+    let cqe = io2
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x01, // Write
+                cid: 0x24,
+                nsid: 1,
+                prp1: WRITE_BUF2Q_GPA,
+                cdw10: 6, // slba=6（与 qid 1 的 slba=5 不同 LBA）
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("qid 2 Write")?;
+    assert_eq!(cqe.sc, 0, "qid 2 Write sc 应=0，实={:#x}", cqe.sc);
+    assert_eq!(cqe.cid, 0x24, "qid 2 CQE CID 应回显 0x24");
+    let v2 = driver
+        .wait_interrupt(Duration::from_secs(3))
+        .await
+        .context("qid 2 Write 完成后应 fire MSI-X")?;
+    assert_eq!(
+        v2, IO_MSIX_VEC2 as u32,
+        "qid 2 的 CQ IV={} → 中断应走 vector {}（**独立 oracle**：vector {} 到达证 controller \
+         按 CQ 的 interrupt_vector 路由，非硬编码 0；恒发 0 的路由 bug 会让此断言 FAIL），实={v2}",
+        IO_MSIX_VEC2, IO_MSIX_VEC2, IO_MSIX_VEC2
+    );
+
+    // ── 辅助：数据回读各落对自己队列的 pattern（证无跨队列数据污染）──
+    // qid 1 读回 slba=5 → pat1；qid 2 读回 slba=6 → pat2（各用 distinct READ buffer）。
+    driver.write_guest(READ_BUF_GPA, vec![0u8; 4096]);
+    let cqe = io1
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02, // Read
+                cid: 0x21,
+                nsid: 1,
+                prp1: READ_BUF_GPA,
+                cdw10: 5,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("qid 1 Read")?;
+    assert_eq!(cqe.sc, 0, "qid 1 Read sc 应=0");
+    let rb1 = driver.read_guest(READ_BUF_GPA, 4096).await?;
+    assert_eq!(rb1, pat1, "qid 1 回读 slba=5 应=pat1（数据路径正确）");
+
+    driver.write_guest(READ_BUF2Q_GPA, vec![0u8; 4096]);
+    let cqe = io2
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02, // Read
+                cid: 0x25,
+                nsid: 1,
+                prp1: READ_BUF2Q_GPA,
+                cdw10: 6,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("qid 2 Read")?;
+    assert_eq!(cqe.sc, 0, "qid 2 Read sc 应=0");
+    let rb2 = driver.read_guest(READ_BUF2Q_GPA, 4096).await?;
+    assert_eq!(rb2, pat2, "qid 2 回读 slba=6 应=pat2（无跨队列数据污染）");
+
+    Ok(())
+}
+
+/// **O5（多 IO 队列）TEST 2** — DBBUF 逐队列 `(qid)` shadow keying（确定性）。
+///
+/// 此前 DBBUF e2e（`openhcl_dbbuf_*`）只在**单** IO 队列上行使过 shadow doorbell，故
+/// "controller 用 **正确 qid** 的 shadow slot（SQ tail 在 `qid*8`、CQ head 在 `qid*8+4`）"
+/// 这条逐队列 keying 语义从未被跨队列区分——一个把所有队列的 shadow 读成**固定 qid** slot
+/// 的 keying bug 也能让单队列 DBBUF 测试全绿。本测试在**两个** IO 队列上放**不同条数**的
+/// Write（qid 1 放 2 条、qid 2 放 3 条），各自的 shadow tail（2 vs 3）落在**不同** slot
+/// （qid 1 → 偏移 8、qid 2 → 偏移 16），断言每队列**精确**完成它自己那么多条。
+///
+/// 复用 `openhcl_dbbuf_shadow_ahead_of_mmio_doorbell` 的"shadow 领先于 stale MMIO"确定性
+/// 手法（shadow 写真 tail、MMIO doorbell 只敲 1 模拟 driver 跳过真 ring）——但**关键扭转**是
+/// 两队列携带**不同** shadow tail 在**不同** slot，逼 controller 必须按 qid 取对 slot。
+///
+/// **独立 oracle ①（逐队列 keying）**：若 controller mis-key 了 shadow slot（如从 qid 1 的
+/// slot 读 qid 2 的 tail、或用固定 qid），逐队列计数会**发散**——qid 1 会试图处理 3 条（只
+/// 有 2）或 qid 2 会停在 2 条。每队列**恰好**处理自己 distinct 的 shadow tail（2 vs 3）来自
+/// 自己的 slot，就证明 `(qid)` keying 正确。这是**独立**的：判据是"每队列 CQE 计数 == 它写进
+/// **自己** shadow slot 的 tail"，来自 controller 对 per-qid shadow slot 的真实 DMA 行为，与
+/// harness 记账无关。keying bug 会让某队列计数偏离 → 对应 `poll_cqe` 超时 / 计数断言 FAIL。
+///
+/// **独立 oracle ②（数据回读，防跨队列污染）**：从**每个** namespace 区回读一个 LBA，断言
+/// 逐队列 pattern（LBA 11 → 0xA2、LBA 22 → 0xB3）。这进一步证两队列的 Write 各落对自己的
+/// 数据路径，无 shadow mis-key 导致的 SQE 串取 / 数据交叉。
+///
+/// **revert-verify（已实测）**：把 `controller/mod.rs` `issue_shadow_read` 的 SQ 读偏移由
+/// `let off = qid as u64 * 8 + if is_cq { 4 } else { 0 };` 改成固定 qid 1 的 SQ slot
+/// （`let off = 8 + if is_cq { 4 } else { 0 };`）→ 任何 qid 的 SQ shadow-poll 都去读 qid 1
+/// 的 slot（值 2）→ qid 2 的链把它的 SQ 只推进到 tail=2（漏掉第 3 条）→ qid 2 第 3 个 CQE
+/// 永不到 → `poll_cqe` 超时 → 本测试 FAIL。
+#[tokio::test]
+async fn openhcl_dbbuf_per_queue_shadow_keying() -> Result<()> {
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (mut admin, mut io1, mut io2) = setup_enabled_4k_io_dual(&driver).await?;
+    driver
+        .activate_dbbuf(&mut admin)
+        .await
+        .context("activate DBBUF")?;
+
+    // ── qid 1：2 条 Write（LBA 10/11，pattern 0xA1/0xA2，各 distinct buffer）──
+    // qid 2：3 条 Write（LBA 20/21/22，pattern 0xB1/0xB2/0xB3，各 distinct buffer）──
+    // 用 distinct LBA + distinct buffer 让两队列的数据路径完全分离（oracle ② 据此回读验）。
+    let q1_lbas: [u32; 2] = [10, 11];
+    let q1_cids: [u16; 2] = [0xA1, 0xA2];
+    let q1_bufs: [u64; 2] = [WRITE_BUF_GPA, WRITE_BUF2_GPA];
+    let q1_pats: [u8; 2] = [0xA1, 0xA2];
+    let q2_lbas: [u32; 3] = [20, 21, 22];
+    let q2_cids: [u16; 3] = [0xB1, 0xB2, 0xB3];
+    let q2_bufs: [u64; 3] = [COMPARE_BUF_GPA, WRITE_BUF2Q_GPA, READ_BUF2Q_GPA];
+    let q2_pats: [u8; 3] = [0xB1, 0xB2, 0xB3];
+
+    // place 两队列的 SQE（各自推进自己的 tail，**不**敲 doorbell）。
+    for i in 0..2 {
+        driver.write_guest(q1_bufs[i], vec![q1_pats[i]; 4096]);
+        io1.place_sqe(
+            &driver,
+            Sqe {
+                opcode: 0x01, // Write
+                cid: q1_cids[i],
+                nsid: 1,
+                prp1: q1_bufs[i],
+                cdw10: q1_lbas[i],
+                ..Default::default()
+            }
+            .encode(),
+        );
+    }
+    for i in 0..3 {
+        driver.write_guest(q2_bufs[i], vec![q2_pats[i]; 4096]);
+        io2.place_sqe(
+            &driver,
+            Sqe {
+                opcode: 0x01, // Write
+                cid: q2_cids[i],
+                nsid: 1,
+                prp1: q2_bufs[i],
+                cdw10: q2_lbas[i],
+                ..Default::default()
+            }
+            .encode(),
+        );
+    }
+    assert_eq!(io1.sq_tail, 2, "qid 1 place 2 条后 sq_tail 应=2");
+    assert_eq!(io2.sq_tail, 3, "qid 2 place 3 条后 sq_tail 应=3");
+
+    // ★ 关键扭转：两队列写**不同** shadow tail 到**不同** slot（qid 1→偏移 8 写 2、
+    //   qid 2→偏移 16 写 3），MMIO doorbell 都**故意**只敲 1（stale，模拟 driver 跳过真
+    //   ring）。次序：shadow 写在 ring 之前（都走有序 cmd channel → controller 起 shadow-poll
+    //   链读 shadow 时必见各自真 tail）。逐队列 keying 正确 ⇒ qid 1 链读偏移 8 得 2、qid 2 链
+    //   读偏移 16 得 3；mis-key（固定 slot / 错 qid）⇒ 某队列读到错值 → 计数发散。
+    driver.write_sq_shadow(IO_QID, 2);
+    driver.write_sq_shadow(IO_QID2, 3);
+    driver.mmio_write(sq_db(IO_QID), 4, 1);
+    driver.mmio_write(sq_db(IO_QID2), 4, 1);
+
+    // ★ oracle ①（逐队列 keying）：qid 1 **恰好** 2 条 CQE、qid 2 **恰好** 3 条 CQE。
+    //   各队列 poll 自己的 CQ（QueueState 跟踪逐队列 cq_head/phase）；全部 sc==0 + CID 命中
+    //   提交的集合。若 controller mis-key shadow slot，某队列会停滞（CQE 不齐 → poll_cqe
+    //   超时）或越界处理（错 CID）。每队列处理**恰好**它自己 distinct 的 tail 证 (qid) keying。
+    let mut seen1 = std::collections::HashSet::new();
+    for _ in 0..2 {
+        let cqe = io1.poll_cqe_dbbuf(&driver).await.context(
+            "qid 1 期望 2 条 CQE；若超时 = controller mis-key shadow slot（读错 qid 的 tail）",
+        )?;
+        assert_eq!(
+            cqe.sc, 0,
+            "qid 1 shadow-submit Write sc 应=0，实={:#x}",
+            cqe.sc
+        );
+        assert!(seen1.insert(cqe.cid), "qid 1 CQE CID {:#x} 应唯一", cqe.cid);
+    }
+    for c in q1_cids {
+        assert!(seen1.contains(&c), "qid 1 应收到 cid={c:#x} 的 CQE");
+    }
+
+    let mut seen2 = std::collections::HashSet::new();
+    for _ in 0..3 {
+        let cqe = io2.poll_cqe_dbbuf(&driver).await.context(
+            "qid 2 期望 3 条 CQE；若超时 = controller mis-key shadow slot（如固定读 qid 1 的 slot=2，\
+             qid 2 只推进到 2 漏第 3 条）",
+        )?;
+        assert_eq!(
+            cqe.sc, 0,
+            "qid 2 shadow-submit Write sc 应=0，实={:#x}",
+            cqe.sc
+        );
+        assert!(seen2.insert(cqe.cid), "qid 2 CQE CID {:#x} 应唯一", cqe.cid);
+    }
+    for c in q2_cids {
+        assert!(seen2.contains(&c), "qid 2 应收到 cid={c:#x} 的 CQE");
+    }
+
+    // ★ oracle ①续：controller 经各自 shadow slot 把 SQ event_idx 写回到它 caught 的真 tail
+    //   （qid 1→2、qid 2→3）。两值**不同**再钉一层逐队列 keying：写回也分到对的 slot。
+    //   event_idx 写是与 CQE 独立的 DMA，可能稍晚落地 → 短轮询消除 race（仍断言精确值）。
+    //   注意：下方 oracle ② 的回读 Read 会推进队列 tail/event_idx，故此断言必须在回读**之前**。
+    let mut ei1 = 0u16;
+    for _ in 0..100 {
+        ei1 = driver.read_sq_eventidx(IO_QID).await?;
+        if ei1 == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        ei1, 2,
+        "qid 1 SQ event_idx 应写回=2（它经 shadow caught 的真 tail），实={ei1}"
+    );
+    let mut ei2 = 0u16;
+    for _ in 0..100 {
+        ei2 = driver.read_sq_eventidx(IO_QID2).await?;
+        if ei2 == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        ei2, 3,
+        "qid 2 SQ event_idx 应写回=3（distinct slot，不同值），实={ei2}"
+    );
+
+    // ★ oracle ②（数据回读，防跨队列污染）：从**每个** namespace 区回读一个 LBA，断言逐队列
+    //   pattern。LBA 11 → 0xA2（qid 1 第 2 条）、LBA 22 → 0xB3（qid 2 第 3 条）。证两队列的
+    //   Write 各落对自己的数据路径，无 shadow mis-key 导致的 SQE 串取 / 数据交叉。DBBUF active
+    //   后回读也必须经 shadow 协议提交（submit_dbbuf）。
+    driver.write_guest(READ_BUF_GPA, vec![0u8; 4096]);
+    let cqe = io1
+        .submit_dbbuf(
+            &driver,
+            Sqe {
+                opcode: 0x02, // Read
+                cid: 0xAF,
+                nsid: 1,
+                prp1: READ_BUF_GPA,
+                cdw10: 11, // 读回 qid 1 第 2 条写的 LBA=11
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("qid 1 回读 LBA=11")?;
+    assert_eq!(cqe.sc, 0, "qid 1 回读 sc 应=0");
+    let rb1 = driver.read_guest(READ_BUF_GPA, 4096).await?;
+    assert!(
+        rb1.iter().all(|&b| b == 0xA2),
+        "LBA=11 回读应全 0xA2（qid 1 第 2 条 Write 落盘，无跨队列污染）"
+    );
+
+    driver.write_guest(READ_BUF2Q_GPA, vec![0u8; 4096]);
+    let cqe = io2
+        .submit_dbbuf(
+            &driver,
+            Sqe {
+                opcode: 0x02, // Read
+                cid: 0xBF,
+                nsid: 1,
+                prp1: READ_BUF2Q_GPA,
+                cdw10: 22, // 读回 qid 2 第 3 条写的 LBA=22
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("qid 2 回读 LBA=22")?;
+    assert_eq!(cqe.sc, 0, "qid 2 回读 sc 应=0");
+    let rb2 = driver.read_guest(READ_BUF2Q_GPA, 4096).await?;
+    assert!(
+        rb2.iter().all(|&b| b == 0xB3),
+        "LBA=22 回读应全 0xB3（qid 2 第 3 条 Write 落盘，逐队列 keying + 无数据交叉）"
     );
 
     Ok(())
