@@ -814,9 +814,16 @@ impl NvmeController {
                 Some(Cqe::success(cid, 0, sq_head, phase))
             }
             admin_opc::ABORT => {
-                tracing::debug!(cid, "Abort (no-op success)");
+                // **A1（spec § 5.1 Abort）** — cdw10 bits15:0=SQID，bits31:16=CID
+                // 命名要中止的命令。真定位 in-flight 异步命令并中止；dw0 bit0 报
+                // 结果（0=已中止 / 1=Could Not Abort）。此前是 no-op（恒返 dw0=1）。
+                // ACL=3（最多 4 条并发 Abort）已在 Identify Controller 广告。
+                let target_sqid = (sqe.cdw10 & 0xffff) as u16;
+                let target_cid = ((sqe.cdw10 >> 16) & 0xffff) as u16;
+                let aborted = self.try_abort_inflight(ctx, target_sqid, target_cid);
+                tracing::debug!(target_sqid, target_cid, aborted, "Abort");
                 let mut cqe = Cqe::success(cid, 0, sq_head, phase);
-                cqe.cdw0 = 1; // bit 0 = "Could Not Abort" — driver 不报错
+                cqe.cdw0 = u32::from(!aborted); // bit0: 0=Aborted, 1=Could Not Abort
                 Some(cqe)
             }
             admin_opc::FORMAT_NVM => {

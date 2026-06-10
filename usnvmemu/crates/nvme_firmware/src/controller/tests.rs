@@ -40,6 +40,130 @@ fn io_sqe(opc: u8, nsid: u32, slba: u64, nlb: u32, prp1: u64, pract: bool, cid: 
     sqe
 }
 
+/// **A1（Abort, spec § 5.1）差分 oracle** — 真把一条 IO Write 驱进 in-flight
+/// 异步态（`pending_ios`，等 host DMA-read），再发 Abort 命中它，断言：
+///   ① `pending_ios` 真被移除（命令被取消）；
+///   ② 给被中止命令 post 了一条 COMMAND_ABORT_REQUESTED CQE（cid=目标 cid）；
+///   ③ Abort 自身 CQE 的 dw0 bit0 = 0（已中止）；
+///   ④ 随后到达的 stale DMA completion 不产生第二条 CQE（unknown-token 静默忽略）；
+///   ⑤ 负例：Abort 一个不存在的 (sqid,cid) → dw0 bit0 = 1（Could Not Abort）。
+///
+/// 独立 oracle：被中止命令的 CQE 由 firmware DMA-write 到 CQ GPA，从 capture 的
+/// DmaWrite 解析（非读自家变量）。revert-verify：把 `try_abort_inflight` 改成恒
+/// 返 false（不移除/不 post）→ ①②③ 全红。
+#[test]
+fn abort_inflight_command_real_cancel() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    let mut c = make_ctrl_with_tmp("abort_a1");
+    // IO CQ1（post_cqe 需要 base_gpa）。
+    c.cqs.insert(
+        1,
+        crate::regs::CompletionQueue {
+            base_gpa: 0x1_0000,
+            size: 64,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        },
+    );
+    let mut cap = pcie_device_core::CaptureTransport::with_start_token(0x100);
+
+    const SQID: u16 = 1;
+    const TARGET_CID: u16 = 0x20;
+    const CQ1_LO: u64 = 0x1_0000;
+    const CQ1_HI: u64 = 0x1_0000 + 64 * 16;
+
+    // 取 [pre..] 内写到 CQ1 区间的最后一条 CQE 的 (cid, status)。
+    fn last_cqe(cap: &CaptureTransport, pre: usize) -> Option<(u16, u16)> {
+        cap.events()
+            .iter()
+            .skip(pre)
+            .filter_map(|e| match e {
+                TransportEvent::DmaWrite { gpa, data, .. }
+                    if *gpa >= CQ1_LO && *gpa < CQ1_HI && data.len() >= 16 =>
+                {
+                    Some(data.clone())
+                }
+                _ => None,
+            })
+            .next_back()
+            .map(|d| {
+                let dw3 = u32::from_le_bytes(d[12..16].try_into().unwrap());
+                let cid = (dw3 & 0xffff) as u16;
+                let status = (((dw3 >> 17) & 0xff) | (((dw3 >> 25) & 0x7) << 8)) as u16;
+                (cid, status)
+            })
+    }
+
+    // 1) 驱一条 Write 进 pending_ios（dispatch_io 走 DMA-read，返 None）。
+    {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let r = c.dispatch_io(
+            &mut ctx,
+            SQID,
+            io_sqe(0x01, 1, 5, 1, 0x4000, false, TARGET_CID),
+            TARGET_CID,
+            0,
+            1,
+        );
+        assert!(r.is_none(), "WRITE 走 DMA-read，应 pend 不立即完成");
+    }
+    assert_eq!(c.pending_ios.len(), 1, "应有 1 条 in-flight write");
+    let tok = *c.pending_ios.keys().next().unwrap();
+
+    // 2) Abort 命中它（cdw10 = SQID | CID<<16）。
+    let mut abort_hit = io_sqe(0x08, 0, 0, 1, 0, false, 0x99);
+    abort_hit.cdw10 = (SQID as u32) | ((TARGET_CID as u32) << 16);
+    let pre1 = cap.events().len();
+    let abort_cqe = {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        c.dispatch_admin(&mut ctx, abort_hit, 0x99, 0, 0)
+            .expect("Abort 同步返 CQE")
+    };
+    // ③ Abort 自身 dw0 bit0 = 0（已中止）。
+    assert_eq!(abort_cqe.cdw0 & 1, 0, "命中 → dw0 bit0=0（Aborted）");
+    // ① 被中止命令从 pending_ios 移除。
+    assert!(c.pending_ios.is_empty(), "被中止命令应从 pending_ios 移除");
+    // ② COMMAND_ABORT_REQUESTED CQE posted 到 CQ1（cid=目标 cid）。
+    let (cid, status) = last_cqe(&cap, pre1).expect("应 post 被中止命令 CQE");
+    assert_eq!(cid, TARGET_CID, "被中止 CQE 的 cid = 目标 cid");
+    assert_eq!(
+        status,
+        sc::COMMAND_ABORT_REQUESTED,
+        "被中止 CQE status = COMMAND_ABORT_REQUESTED"
+    );
+
+    // ④ stale DMA completion 到达 → unknown-token，不产生第二条 CQE。
+    let pre2 = cap.events().len();
+    {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        c.on_dma_complete_impl(&mut ctx, tok, true, vec![0xAB; 4096]);
+    }
+    assert!(
+        last_cqe(&cap, pre2).is_none(),
+        "stale completion 不应产生第二条 CQE（杜绝重复完成）"
+    );
+    assert!(c.pending_ios.is_empty());
+
+    // ⑤ 负例：Abort 不存在的 (sqid, cid) → dw0 bit0 = 1。
+    let mut abort_miss = io_sqe(0x08, 0, 0, 1, 0, false, 0x9a);
+    abort_miss.cdw10 = (SQID as u32) | (0xBEEFu32 << 16);
+    let miss_cqe = {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        c.dispatch_admin(&mut ctx, abort_miss, 0x9a, 0, 0)
+            .expect("Abort 同步返 CQE")
+    };
+    assert_eq!(
+        miss_cqe.cdw0 & 1,
+        1,
+        "未命中 → dw0 bit0=1（Could Not Abort）"
+    );
+}
+
 /// **M4 driven 错误码矩阵（Wave 2）** — 真正把 controller 驱动进各错误路径，断言
 /// emit 的**完整 16-bit status（含 SCT）**。这次结构性 SC bug
 /// （`INVALID_PROTECTION_INFO` 曾当 Generic 发→driver 误读 Capacity Exceeded、
@@ -2444,6 +2568,10 @@ fn sc_constants_match_nvme_spec() {
     assert_eq!(sc::INVALID_FIELD, Status::INVALID_FIELD_IN_COMMAND.0);
     assert_eq!(sc::DATA_TRANSFER_ERROR, Status::DATA_TRANSFER_ERROR.0);
     assert_eq!(sc::INTERNAL_ERROR, Status::INTERNAL_ERROR.0);
+    assert_eq!(
+        sc::COMMAND_ABORT_REQUESTED,
+        Status::COMMAND_ABORT_REQUESTED.0
+    );
     assert_eq!(sc::INVALID_NAMESPACE, Status::INVALID_NAMESPACE_OR_FORMAT.0);
     assert_eq!(sc::SANITIZE_IN_PROGRESS, Status::SANITIZE_IN_PROGRESS.0);
     assert_eq!(sc::LBA_OUT_OF_RANGE, Status::LBA_OUT_OF_RANGE.0);

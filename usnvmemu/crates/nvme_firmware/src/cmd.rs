@@ -248,6 +248,9 @@ pub mod sc {
     pub const INVALID_FIELD: u16 = 0x0002;
     pub const DATA_TRANSFER_ERROR: u16 = 0x0004;
     pub const INTERNAL_ERROR: u16 = 0x0006;
+    /// Command Abort Requested（Generic 0x07）—— host 发 Abort 命中本命令，
+    /// 给被中止命令的 CQE 填这个 status（A1）。
+    pub const COMMAND_ABORT_REQUESTED: u16 = 0x0007;
     /// Invalid Namespace or Format — IO 命令带未注册 NSID。
     pub const INVALID_NAMESPACE: u16 = 0x000b;
     /// Sanitize In Progress（Generic 0x1d；R1 误填 0x12=Invalid Use of CMB）。

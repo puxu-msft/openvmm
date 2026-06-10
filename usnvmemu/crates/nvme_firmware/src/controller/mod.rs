@@ -647,6 +647,58 @@ pub(super) struct SglPlanFrag {
     pub(super) length: u32,
 }
 
+// ═══════════════════════ A1（Abort, spec § 5.1）═══════════════════════
+//
+// Abort 命令按 (SQID, CID) 定位一条 in-flight 命令并中止。本 controller 的
+// in-flight 异步命令分散在 7 张 DMA-pending 累积器表里（都在等 host DMA 完成），
+// 每张表的累积器都带 (sq_id, cid)（定位键）+ (cq_id, sq_head)（构造被中止
+// 命令 CQE 所需）。下面的 trait + 泛型扫描把这 7 张表统一处理；fused FIRST
+// 等 SECOND（pending_fused，keyed by sq_id，cid 在 Sqe 内）形状不同，单独处理。
+
+/// async-pending 累积器的 Abort 定位能力（A1）。
+trait AbortableOp {
+    /// (sq_id, cid) —— 与 Abort cdw10 的 SQID|CID 匹配。
+    fn abort_match(&self) -> (u16, u16);
+    /// (cq_id, sq_head) —— 给被中止命令 post COMMAND_ABORT_REQUESTED 用。
+    fn abort_target(&self) -> (u16, u16);
+}
+
+/// 7 张累积器的字段名一致（sq_id/cid/cq_id/sq_head），用 macro 消除重复 impl。
+macro_rules! impl_abortable_op {
+    ($t:ty) => {
+        impl AbortableOp for $t {
+            fn abort_match(&self) -> (u16, u16) {
+                (self.sq_id, self.cid)
+            }
+            fn abort_target(&self) -> (u16, u16) {
+                (self.cq_id, self.sq_head)
+            }
+        }
+    };
+}
+impl_abortable_op!(PendingIo);
+impl_abortable_op!(WriteAccum);
+impl_abortable_op!(CompareAccum);
+impl_abortable_op!(PiWriteAccum);
+impl_abortable_op!(PiReadAccum);
+impl_abortable_op!(PrpListOp);
+impl_abortable_op!(SglOp);
+
+/// 在一张 DMA-pending 表里找 (sqid, cid) 匹配的累积器，命中则移除并返其
+/// (cq_id, sq_head)。移除后该 op 在飞的 DMA completion 会走 unknown-token
+/// 静默忽略（与 `disable()` 清表同一机制），不会重复完成。
+fn abort_scan<T: AbortableOp>(
+    map: &mut HashMap<u64, T>,
+    sqid: u16,
+    cid: u16,
+) -> Option<(u16, u16)> {
+    let tok = map
+        .iter()
+        .find(|(_, e)| e.abort_match() == (sqid, cid))
+        .map(|(&t, _)| t)?;
+    Some(map.remove(&tok).unwrap().abort_target())
+}
+
 /// **Phase H4 + K1** — 单个 namespace 状态。
 /// 每 NS 有独立 backing file + 容量 + LBA 格式 + Protection Information
 /// 配置。spec § 1.6 "An NSID maps to one namespace"。
@@ -3287,6 +3339,50 @@ impl NvmeController {
     /// 若 driver Set Features 0x08 时 thr=0 + time=0 → 退化为
     /// "fire-on-every-CQE"（原行为）。Admin CQ (cq_id=0) 不参与
     /// coalescing — spec 要求 admin 延迟最小。
+    /// **A1（Abort, spec § 5.1）** — 尝试中止 (sqid, cid) 命名的 in-flight 命令。
+    /// 扫 7 张 DMA-pending 累积器表 + fused-first-pending；命中则移除累积器
+    /// （后续到达的 DMA completion 走 unknown-token 静默忽略，同 `disable()`，
+    /// 杜绝重复完成）并给被中止命令 post 一条 COMMAND_ABORT_REQUESTED CQE。
+    /// 返回 true=已中止 / false=未找到（已完成 / 从未提交 / 已同步执行完）。
+    ///
+    /// **教学边界**：只中止真正"在飞"的异步命令（等 host DMA）。已 fetch 但还在
+    /// sqe_inbox 待同步 dispatch 的命令转瞬即完，不在此中止——spec § 5.1 允许对
+    /// 已开始执行的命令返 dw0 bit0=1（Could Not Abort）。
+    pub(super) fn try_abort_inflight(
+        &mut self,
+        ctx: &mut DeviceCtx<'_>,
+        sqid: u16,
+        cid: u16,
+    ) -> bool {
+        let target = abort_scan(&mut self.pending_ios, sqid, cid)
+            .or_else(|| abort_scan(&mut self.dual_prp_writes, sqid, cid))
+            .or_else(|| abort_scan(&mut self.compare_ops, sqid, cid))
+            .or_else(|| abort_scan(&mut self.pi_writes, sqid, cid))
+            .or_else(|| abort_scan(&mut self.pi_reads, sqid, cid))
+            .or_else(|| abort_scan(&mut self.prp_list_ops, sqid, cid))
+            .or_else(|| abort_scan(&mut self.sgl_ops, sqid, cid))
+            .or_else(|| {
+                // fused FIRST 等 SECOND：keyed by sq_id，cid 在缓存的 Sqe 内。
+                let hit = self
+                    .pending_fused
+                    .get(&sqid)
+                    .is_some_and(|(fsqe, _)| fsqe.cid() == cid);
+                if !hit {
+                    return None;
+                }
+                let (_, sq_head) = self.pending_fused.remove(&sqid).unwrap();
+                let cq_id = self.sqs.get(&sqid).map(|s| s.cq_id)?;
+                Some((cq_id, sq_head))
+            });
+        let Some((cq_id, sq_head)) = target else {
+            return false;
+        };
+        let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+        let cqe = Cqe::error(cid, sqid, sq_head, phase, sc::COMMAND_ABORT_REQUESTED);
+        self.post_cqe(ctx, cq_id, cqe);
+        true
+    }
+
     fn post_cqe(&mut self, ctx: &mut DeviceCtx<'_>, cq_id: u16, cqe: Cqe) {
         let aggr_thr = self.irq_aggr_threshold;
         let aggr_time_100us = self.irq_aggr_time;
