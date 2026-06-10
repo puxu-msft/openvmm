@@ -87,15 +87,29 @@ impl NvmeController {
             0x10 => self.intms &= !(value as u32), // mask clear (INTMC sets bits to clear)
             0x14 => self.write_cc(value as u32),
             0x24 => self.aqa = value as u32,
+            // ASQ/ACQ 是 8-byte 寄存器：spec 允许按 4-byte（low/high dword 各一条）
+            // 或单条 8-byte（qword）访问。**Bug fix 2026-06-10**：原代码只按 offset
+            // 匹配、无视 size，对 0x28/0x30 一律 `value & 0xffff_ffff`。于是 Windows
+            // nvme.sys 的单条 8-byte ASQ 写在 admin 队列落在 4 GiB 以上时高 32 位被
+            // 截断 → SQE fetch 读错 GPA → 首条 admin 命令读成全 0（opc=0x0 被当
+            // Delete IO SQ）→ guest 初始化挂。真 Hyper-V guest e2e 发现（小内存
+            // in-process harness 的 GPA 永远 < 4 GiB，命不到此截断）。
             0x28 => {
-                // ASQ low 32
-                self.asq = (self.asq & !0xffff_ffff) | (value & 0xffff_ffff);
+                if size == 8 {
+                    self.asq = value;
+                } else {
+                    self.asq = (self.asq & !0xffff_ffff) | (value & 0xffff_ffff);
+                }
             }
             0x2c => {
                 self.asq = (self.asq & 0xffff_ffff) | (value << 32);
             }
             0x30 => {
-                self.acq = (self.acq & !0xffff_ffff) | (value & 0xffff_ffff);
+                if size == 8 {
+                    self.acq = value;
+                } else {
+                    self.acq = (self.acq & !0xffff_ffff) | (value & 0xffff_ffff);
+                }
             }
             0x34 => {
                 self.acq = (self.acq & 0xffff_ffff) | (value << 32);
@@ -110,8 +124,12 @@ impl NvmeController {
                 tracing::debug!(value, "BPRSEL set (boot partition no-op)");
             }
             0x48 => {
-                // BPMBL low 32
-                self.bpmbl = (self.bpmbl & !0xffff_ffff) | (value & 0xffff_ffff);
+                // BPMBL 同为 8-byte 寄存器，同样 size-aware（见上 ASQ 注释）。
+                if size == 8 {
+                    self.bpmbl = value;
+                } else {
+                    self.bpmbl = (self.bpmbl & !0xffff_ffff) | (value & 0xffff_ffff);
+                }
             }
             0x4c => {
                 self.bpmbl = (self.bpmbl & 0xffff_ffff) | (value << 32);
@@ -142,5 +160,59 @@ impl NvmeController {
         for (sq_id, head, sqe) in inbox {
             self.dispatch_sqe(ctx, sq_id, head, sqe);
         }
+    }
+}
+
+#[cfg(test)]
+mod addr_reg_tests {
+    use super::*;
+
+    /// 构造最小 NvmeController（1 MiB 临时 backing），只用来测寄存器存储逻辑。
+    fn mk() -> NvmeController {
+        let path = std::env::temp_dir().join(format!(
+            "nvme_mmio_test_{}_{:?}.img",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(1024 * 1024).unwrap();
+        drop(f);
+        NvmeController::open(&[path.to_str().unwrap().to_string()], 0x1414, 0, &[]).unwrap()
+    }
+
+    /// **Bug fix 2026-06-10 回归**：单条 8-byte（qword）写 ASQ/ACQ 到 4 GiB
+    /// 以上时高 32 位必须保留。原代码 `value & 0xffff_ffff` 会截断 → guest
+    /// admin 队列落在 4 GiB 以上时 SQE fetch 读错 GPA → 首条命令读成全 0。
+    /// 真 Hyper-V guest e2e（4 GiB RAM）发现；小内存 in-process harness 命不到。
+    #[test]
+    fn asq_acq_qword_write_above_4gib_not_truncated() {
+        let mut c = mk();
+        let mut cap = pcie_device_core::CaptureTransport::with_start_token(0x100);
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+        c.mmio_write_impl(&mut ctx, 0, 0x28, 8, 0x1_02eb_0000);
+        assert_eq!(c.asq, 0x1_02eb_0000, "ASQ 8-byte 写被截断（4 GiB 以上）");
+        // read 侧 size-aware round-trip（mmio_read_impl 是这个 bug 的镜像半边）
+        assert_eq!(c.mmio_read_impl(0, 0x28, 8), 0x1_02eb_0000, "ASQ qword 回读不全");
+        assert_eq!(c.mmio_read_impl(0, 0x28, 4), 0x02eb_0000, "ASQ low dword 回读错");
+        assert_eq!(c.mmio_read_impl(0, 0x2c, 4), 0x1, "ASQ high dword 回读错");
+        c.mmio_write_impl(&mut ctx, 0, 0x30, 8, 0x2_aaaa_5000);
+        assert_eq!(c.acq, 0x2_aaaa_5000, "ACQ 8-byte 写被截断（4 GiB 以上）");
+        // BPMBL 同 8-byte 寄存器
+        c.mmio_write_impl(&mut ctx, 0, 0x48, 8, 0x3_1234_0000);
+        assert_eq!(c.bpmbl, 0x3_1234_0000, "BPMBL 8-byte 写被截断");
+    }
+
+    /// 4-byte 分两次写（low @0x28/0x30, high @0x2c/0x34）仍正确组装 64 位。
+    #[test]
+    fn asq_acq_split_dword_write_still_works() {
+        let mut c = mk();
+        let mut cap = pcie_device_core::CaptureTransport::with_start_token(0x100);
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+        c.mmio_write_impl(&mut ctx, 0, 0x28, 4, 0xbbbb_0000); // low dword
+        c.mmio_write_impl(&mut ctx, 0, 0x2c, 4, 0x1); // high dword
+        assert_eq!(c.asq, 0x1_bbbb_0000);
+        c.mmio_write_impl(&mut ctx, 0, 0x30, 4, 0xcccc_0000);
+        c.mmio_write_impl(&mut ctx, 0, 0x34, 4, 0x2);
+        assert_eq!(c.acq, 0x2_cccc_0000);
     }
 }
