@@ -2052,8 +2052,17 @@ impl NvmeController {
     /// CAP.DSTRD=0 → stride=4 bytes。
     /// 序列：SQ0TDBL, CQ0HDBL, SQ1TDBL, CQ1HDBL, ...
     /// offset = 0x1000 + (2*qid + (0 if SQ else 1)) * 4
+    ///
+    /// **LOW-1（2026-06-10 reviewer）** — doorbell 区上界 = [`MSIX_TABLE_BAR0_OFFSET`]
+    /// (0x2000)。doorbell 数组 [0x1000, 0x2000) 与其后的 MSI-X table 区
+    /// [0x2000, 0x3000) 在同一 BAR0 内相邻。当前最大 doorbell（~0x1804，对应 256 队列档 = IO_QUEUE_SLOT_CAPACITY 上限）
+    /// 远不及 0x2000，但若将来队列数上调致 doorbell 数组撑到 0x2000，无上界的
+    /// `>= 0x1000` 会把落在 MSI-X table 区的访问误判成 doorbell。显式 gate 到
+    /// `< MSIX_TABLE_BAR0_OFFSET`，让该别名永不发生（越界返 `None`）。
     fn parse_doorbell(offset: u64) -> Option<(bool, u16)> {
-        if offset < 0x1000 {
+        // doorbell 合法区 = [0x1000, MSIX_TABLE_BAR0_OFFSET)；区外（含 MSI-X
+        // table/PBA 区）一律非 doorbell。
+        if !(0x1000..MSIX_TABLE_BAR0_OFFSET).contains(&offset) {
             return None;
         }
         let idx = (offset - 0x1000) / 4;
@@ -2926,6 +2935,46 @@ impl NvmeController {
             }
         }
     }
+
+    /// **真 QEMU 11 vfio-user guest e2e（2026-06-10）** — 合成标准 PCI MSI-X
+    /// capability body（cap_id + next_ptr 之后的 10 字节，由 adapter 拼链表指针）。
+    ///
+    /// 布局（PCI 3.0 spec § 6.8.2 MSI-X Capability）：
+    /// - Message Control（u16）：bit[10:0] = Table Size = N-1（N = `msix_count`）；
+    ///   bit15 MSI-X Enable / bit14 Function Mask 由 QEMU/guest 经 cfg 写控制，
+    ///   初值 0。
+    /// - Table Offset/BIR（u32）：bit[2:0] = BIR（=0 → BAR0）；bit[31:3] = table
+    ///   在该 BAR 内的 8 字节对齐 offset（= [`MSIX_TABLE_BAR0_OFFSET`]）。
+    /// - PBA Offset/BIR（u32）：同上，offset = [`MSIX_PBA_BAR0_OFFSET`]。
+    ///
+    /// QEMU 自行 overlay MSI-X table 内存区（server 不服务 table 读写），仅把 PBA
+    /// 读 forward 给 server（controller mmio_read 对该区返 0 = 无 pending）。
+    fn msix_capability(&self) -> Capability {
+        debug_assert!(self.msix_count >= 1, "MSI-X table size 须 ≥ 1");
+        // Table Size 字段 = N-1（spec 编码）。msix_count 受 u16 约束、远小于 2048，
+        // 故 N-1 必落在 bit[10:0]（最大 2047）。`saturating_sub` 防御 msix_count==0
+        // 的 underflow（调用点已 gate msix_count>0，此处仅双保险）。
+        let table_size_field = self.msix_count.saturating_sub(1) & 0x07FF;
+        let message_control: u16 = table_size_field; // EN=0 / Mask=0 初值
+        // BIR=0（BAR0），低 3 位即 BIR；offset 已 8 字节对齐故低 3 位本就为 0，
+        // 直接用 offset 值即 `offset | BIR(0)`。
+        debug_assert_eq!(
+            MSIX_TABLE_BAR0_OFFSET & 0x7,
+            0,
+            "table offset 须 8 字节对齐"
+        );
+        debug_assert_eq!(MSIX_PBA_BAR0_OFFSET & 0x7, 0, "PBA offset 须 8 字节对齐");
+        let table_off_bir: u32 = MSIX_TABLE_BAR0_OFFSET as u32; // BIR=0
+        let pba_off_bir: u32 = MSIX_PBA_BAR0_OFFSET as u32; // BIR=0
+        let mut raw = Vec::with_capacity(10);
+        raw.extend_from_slice(&message_control.to_le_bytes());
+        raw.extend_from_slice(&table_off_bir.to_le_bytes());
+        raw.extend_from_slice(&pba_off_bir.to_le_bytes());
+        Capability {
+            cap_id: MSIX_CAP_ID,
+            raw,
+        }
+    }
 }
 
 impl PcieDevice for NvmeController {
@@ -2948,7 +2997,20 @@ impl PcieDevice for NvmeController {
                 prefetchable: false,
             }],
             msix_count: self.msix_count as u32,
-            capabilities: vec![],
+            // **真 QEMU 11 vfio-user guest e2e 修复（2026-06-10）** — 必须在 config
+            // space 暴露 MSI-X capability，否则 QEMU `vfio_pci_add_capabilities` 找不到
+            // MSI-X cap → `vdev->msix=NULL` → guest nvme 驱动 `pci_alloc_irq_vectors`
+            // 拿不到向量 → `nvme_probe` 返 -EINVAL（-22），设备永不 enumerate。
+            // 仅广告 `msix_count`（vfio-user `GET_IRQ_INFO` 接口）**不够**——cfg-space
+            // cap 链表才是 QEMU 解析 table/PBA 布局的来源。OpenHCL 路径由 VTL2 shim
+            // 据 `msix_count` 自行合成此 cap，故那条路径不需要本字段；vfio-user 无
+            // shim，QEMU 直读我们合成的 cfg space，故这里必须补上。
+            // msix_count==0（无 MSI-X 设备）则不合成该 cap（合规：无向量不应广告 cap）。
+            capabilities: if self.msix_count > 0 {
+                vec![self.msix_capability()]
+            } else {
+                vec![]
+            },
             cfg_write_side_effect_offsets: vec![],
         }
     }

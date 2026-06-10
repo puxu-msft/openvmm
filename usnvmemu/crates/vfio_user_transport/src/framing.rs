@@ -159,6 +159,30 @@ pub fn read_message(stream: &mut UnixStream) -> anyhow::Result<Message> {
         }
         got += n;
     }
+    // **wire 诊断**（对称 TX）：每条**收到**的完整帧 header 全字段 + payload 头
+    // 32 字节 hex。与 write_message 的 TX trace 配对可在 server 侧重建 wire 流水。
+    // packed 字段先 copy 到局部，避免 unaligned ref（E0793）。
+    {
+        let (m_id, m_cmd, m_size, m_flags, m_err) = (
+            header.msg_id,
+            header.cmd,
+            header.msg_size,
+            header.flags,
+            header.error_no,
+        );
+        tracing::trace!(
+            dir = "RX",
+            msg_id = m_id,
+            cmd = m_cmd,
+            msg_size = m_size,
+            flags = format_args!("{m_flags:#x}"),
+            error_no = m_err,
+            payload_len = payload.len(),
+            fd_count = fds.len(),
+            head32 = %hex_head(&payload),
+            "vfio-user wire recv",
+        );
+    }
     Ok(Message {
         header,
         payload,
@@ -182,6 +206,31 @@ pub fn write_message(
 ) -> anyhow::Result<()> {
     use zerocopy::IntoBytes;
     let hdr_bytes = header.as_bytes();
+    // **wire 诊断**（RUST_LOG=…=trace 才启用）：每条**发出**消息的 header 全字段
+    // + payload 头 32 字节 hex。配合 read_message 的对称 trace，可定位 wire 上
+    // 第一条与对端期望分歧的帧（msg_size 错 / msg_id 错 / 该回 reply 却发 command 等）。
+    // packed struct 字段须先 copy 到局部，避免 unaligned ref（E0793）。
+    {
+        let (m_id, m_cmd, m_size, m_flags, m_err) = (
+            header.msg_id,
+            header.cmd,
+            header.msg_size,
+            header.flags,
+            header.error_no,
+        );
+        tracing::trace!(
+            dir = "TX",
+            msg_id = m_id,
+            cmd = m_cmd,
+            msg_size = m_size,
+            flags = format_args!("{m_flags:#x}"),
+            error_no = m_err,
+            payload_len = payload.len(),
+            fd_count = fds.len(),
+            head32 = %hex_head(payload),
+            "vfio-user wire send",
+        );
+    }
     debug_assert_eq!(
         hdr_bytes.len() + payload.len(),
         header.msg_size as usize,
@@ -215,6 +264,19 @@ pub fn write_message(
         }
     }
     Ok(())
+}
+
+/// **wire 诊断 helper** — payload 头 ≤32 字节的小写 hex（无分隔），供 TX/RX
+/// trace 用。空 payload 返回空串。仅诊断用途，热路径在 `trace` 关闭时不调用
+/// （`tracing::trace!` 的字段惰性求值，level 未启用则不构造）。
+fn hex_head(buf: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let n = buf.len().min(32);
+    let mut s = String::with_capacity(n * 2);
+    for b in &buf[..n] {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// 把 `nix::recvmsg` `ScmRights` 解到的 RawFd 包成 [`OwnedFd`]。

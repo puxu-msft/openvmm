@@ -9,6 +9,7 @@
 //! NVMe regs spec layout 集中可读。
 
 use super::*;
+use crate::regs::MSIX_TABLE_BAR0_OFFSET;
 
 impl NvmeController {
     pub(super) fn mmio_read_impl(&mut self, bar: u32, offset: u64, size: u32) -> u64 {
@@ -50,7 +51,9 @@ impl NvmeController {
             (0xe00, _) => 0,                 // PMRCAP — Q6 (PMR) 仍 0
             (0xe04, _) => 0,                 // PMRCTL
             (0xe08, _) => 0,                 // PMRSTS
-            (o, _) if o >= 0x1000 => 0,      // doorbell reads return 0 (write-only)
+            // doorbell 区 [0x1000, MSIX_TABLE) 读返回 0（write-only）。上界排除其后
+            // 的 MSI-X table/PBA 区（见 parse_doorbell 的 LOW-1 注释）。
+            (o, _) if (0x1000..MSIX_TABLE_BAR0_OFFSET).contains(&o) => 0,
             _ => {
                 tracing::debug!(offset, size, "MMIO read: unknown offset");
                 0
@@ -134,9 +137,11 @@ impl NvmeController {
             0x4c => {
                 self.bpmbl = (self.bpmbl & 0xffff_ffff) | (value << 32);
             }
-            o if o >= 0x1000 => {
+            o if (0x1000..MSIX_TABLE_BAR0_OFFSET).contains(&o) => {
                 // doorbell 写**必须** 4 字节 access；其它尺寸视为 driver bug
-                // 直接忽略（不应该按 8/2/1 字节写 doorbell）。
+                // 直接忽略（不应该按 8/2/1 字节写 doorbell）。上界排除其后的 MSI-X
+                // table/PBA 区（落该区的写交由下方 default 静默忽略 —— server 不服务
+                // MSI-X table；QEMU overlay / OpenHCL emulator 处理之）。
                 if size != 4 {
                     tracing::warn!(
                         offset = format_args!("{:#x}", o),
@@ -178,6 +183,73 @@ mod addr_reg_tests {
         f.set_len(1024 * 1024).unwrap();
         drop(f);
         NvmeController::open(&[path.to_str().unwrap().to_string()], 0x1414, 0, &[]).unwrap()
+    }
+
+    /// **真 QEMU 11 vfio-user guest e2e 修复（2026-06-10）回归** — `describe()` 必须
+    /// 在 config space 暴露一条**合法 MSI-X capability**（cap_id 0x11 + 正确 table
+    /// size / table BIR+offset / PBA BIR+offset），否则 QEMU 找不到 MSI-X →
+    /// `pci_alloc_irq_vectors` 失败 → guest nvme `probe -EINVAL`。同时校验合成的
+    /// PCI config space 里 Status.CapList 置位、CapPtr 指向该 cap。
+    #[test]
+    fn describe_exposes_valid_msix_capability() {
+        use crate::regs::{MSIX_CAP_ID, MSIX_PBA_BAR0_OFFSET, MSIX_TABLE_BAR0_OFFSET};
+        use pcie_device_core::PcieDevice as _;
+        use pcie_device_core::describe::cfg_offset as o;
+
+        let c = mk();
+        let d = c.describe();
+        // 1) capabilities 含一条 MSI-X cap，body 恰 10 字节（MC(2)+table(4)+pba(4)）。
+        assert_eq!(d.capabilities.len(), 1, "应恰有 1 条 cap（MSI-X）");
+        let cap = &d.capabilities[0];
+        assert_eq!(cap.cap_id, MSIX_CAP_ID);
+        assert_eq!(
+            cap.raw.len(),
+            10,
+            "MSI-X cap body = MC+TableOff+PbaOff = 10B"
+        );
+        // Message Control: bit[10:0] = table size = msix_count-1。
+        let mc = u16::from_le_bytes([cap.raw[0], cap.raw[1]]);
+        assert_eq!(
+            mc & 0x07FF,
+            (d.msix_count as u16) - 1,
+            "MSI-X table size = N-1"
+        );
+        // Table Offset/BIR + PBA Offset/BIR（BIR=0 → BAR0，offset 8 字节对齐）。
+        let table = u32::from_le_bytes([cap.raw[2], cap.raw[3], cap.raw[4], cap.raw[5]]);
+        let pba = u32::from_le_bytes([cap.raw[6], cap.raw[7], cap.raw[8], cap.raw[9]]);
+        assert_eq!(table & 0x7, 0, "table BIR = 0 (BAR0)");
+        assert_eq!(table & !0x7, MSIX_TABLE_BAR0_OFFSET as u32);
+        assert_eq!(pba & 0x7, 0, "PBA BIR = 0 (BAR0)");
+        assert_eq!(pba & !0x7, MSIX_PBA_BAR0_OFFSET as u32);
+
+        // 2) 合成 config space：Status.CapList 置位 + CapPtr 指向 MSI-X cap。
+        let cfg = d.config_space();
+        let status = u16::from_le_bytes([cfg[o::STATUS], cfg[o::STATUS + 1]]);
+        assert_ne!(status & o::STATUS_CAP_LIST, 0, "Status.CapList 应置位");
+        let cap_ptr = cfg[o::CAP_PTR] as usize;
+        assert_ne!(cap_ptr, 0, "CapPtr 应非 0");
+        assert_eq!(cfg[cap_ptr], MSIX_CAP_ID, "CapPtr 指向 MSI-X cap_id");
+    }
+
+    /// **真 QEMU 11 vfio-user guest e2e 修复（2026-06-10）回归** — controller **不**
+    /// 广告 OACS Doorbell Buffer Config（bit 8）。我们只存 shadow GPA 却从不 poll，
+    /// 广告会让 Linux nvme 启用 shadow doorbell → 对部分提交跳过真 MMIO doorbell →
+    /// 命令永不 fetch → IO 30s timeout。OACS bit8 必须为 0。
+    #[test]
+    fn identify_controller_does_not_advertise_dbbuf() {
+        use crate::cmd::IdentifyController;
+        let c = mk();
+        // 真实 enumeration 走 build_v2_bytes_with_cntrltype（admin.rs 用它）；OACS
+        // 在 Identify Controller 数据结构 offset 256（u16, little-endian）。
+        let bytes = IdentifyController::build_v2_bytes_with_cntrltype(c.vid, c.ssvid, 1, 0x01, 0);
+        let oacs = u16::from_le_bytes([bytes[256], bytes[257]]);
+        assert_eq!(
+            oacs & (1 << 8),
+            0,
+            "OACS bit8 (Doorbell Buffer Config) 必须为 0（shadow doorbell 未实现轮询）"
+        );
+        // 其它 OACS 能力仍在（非全清）——controller 仍广告 Format/FW/Self-test 等。
+        assert_ne!(oacs, 0, "OACS 不应全 0（只清 DBBUF，保留其它能力）");
     }
 
     /// **通用机制（回归 "64-bit 寄存器写/读无视 size 而截断" 这一整类 bug，由
@@ -237,5 +309,49 @@ mod addr_reg_tests {
                 "{name}: split dword 未拼回 64 位"
             );
         }
+    }
+
+    /// **LOW-1（2026-06-10 reviewer）** — doorbell 区上界 = `MSIX_TABLE_BAR0_OFFSET`：
+    /// `parse_doorbell` 必须把落在 MSI-X table/PBA 区（≥ 0x2000）的 offset 判为
+    /// **非 doorbell**（返 `None`），杜绝未来队列数上调致 doorbell 数组撑进 MSI-X
+    /// 区时的别名。区内合法 offset 仍正常解析。
+    #[test]
+    fn parse_doorbell_bounded_below_msix_table() {
+        use crate::regs::{MSIX_PBA_BAR0_OFFSET, MSIX_TABLE_BAR0_OFFSET};
+        // 区内：0x1000 = SQ0 tail；0x1004 = CQ0 head；0x1008 = SQ1 tail。
+        assert_eq!(NvmeController::parse_doorbell(0x1000), Some((true, 0)));
+        assert_eq!(NvmeController::parse_doorbell(0x1004), Some((false, 0)));
+        assert_eq!(NvmeController::parse_doorbell(0x1008), Some((true, 1)));
+        // 区内最后一个合法 4-byte slot（< 0x2000）。
+        assert!(NvmeController::parse_doorbell(MSIX_TABLE_BAR0_OFFSET - 4).is_some());
+        // 边界与越界：MSI-X table 起点及其后一律 None（不再被当 doorbell）。
+        assert_eq!(NvmeController::parse_doorbell(MSIX_TABLE_BAR0_OFFSET), None);
+        assert_eq!(
+            NvmeController::parse_doorbell(MSIX_TABLE_BAR0_OFFSET + 4),
+            None
+        );
+        assert_eq!(NvmeController::parse_doorbell(MSIX_PBA_BAR0_OFFSET), None);
+        // 区前：< 0x1000 仍 None。
+        assert_eq!(NvmeController::parse_doorbell(0x0FFC), None);
+    }
+
+    /// LOW-1 镜像半边 —— MMIO 写分发：落在 MSI-X table/PBA 区的写**不**被当
+    /// doorbell（不触发 SQ/CQ doorbell 副作用），交由 default 静默忽略。
+    #[test]
+    fn mmio_write_msix_region_not_treated_as_doorbell() {
+        use crate::regs::{MSIX_PBA_BAR0_OFFSET, MSIX_TABLE_BAR0_OFFSET};
+        let mut c = mk();
+        let mut cap = pcie_device_core::CaptureTransport::with_start_token(0x100);
+        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+        // 先 enable controller，否则 SQ doorbell 本就因 not-operational 被丢，
+        // 测不出"区分 doorbell 与 MSI-X 区"这件事。这里只需 RDY 路径不 panic；
+        // 写 MSI-X table 区一个 4-byte 值，断言不产生任何 outbound（doorbell 会
+        // 触发 DMA fetch 等 outbound）。
+        c.mmio_write_impl(&mut ctx, 0, MSIX_TABLE_BAR0_OFFSET, 4, 0xdead_beef);
+        c.mmio_write_impl(&mut ctx, 0, MSIX_PBA_BAR0_OFFSET, 4, 0x1234_5678);
+        assert!(
+            cap.events().is_empty(),
+            "MSI-X 区写不应触发 doorbell 副作用（无 outbound）"
+        );
     }
 }

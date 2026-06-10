@@ -14,8 +14,29 @@
 #![allow(dead_code)]
 
 /// BAR0 总大小：必须够装 controller regs (0..0x1000) + doorbell strip
-/// （0x1000..），8 KiB 是最小合规且 round 上 PCIe BAR power-of-2 边界值。
-pub const BAR0_SIZE: u64 = 8 * 1024;
+/// （0x1000..0x2000）+ MSI-X table (0x2000..) + MSI-X PBA (0x3000..)。
+///
+/// **真 QEMU 11 vfio-user guest e2e 修复（2026-06-10）**：guest 的 nvme 驱动要求
+/// 至少一个 MSI-X 向量；MSI-X capability 的 table/PBA 必须落在某个 BAR 内（QEMU
+/// `vfio_setup_msix` 从 config-space MSI-X cap 解析 table BIR+offset / PBA
+/// BIR+offset，并在该 BAR 上**自行 overlay** MSI-X table 内存区——server 不服务
+/// table 访问，仅 PBA 读被 forward 给 server）。把 table 放 BAR0 0x2000（独立页，
+/// 不与 doorbell strip 0x1000 重叠）、PBA 放 0x3000，故 BAR0 升到 16 KiB（仍是
+/// 2 的幂，PCIe BAR 合规）。
+pub const BAR0_SIZE: u64 = 16 * 1024;
+
+/// MSI-X table 在 BAR0 内的 byte offset（独立 4 KiB 页，避开 reg/doorbell）。
+/// 8 字节对齐（spec 要求）；QEMU overlay 自己的 table region 于此，controller
+/// 不服务该区读写。
+pub const MSIX_TABLE_BAR0_OFFSET: u64 = 0x2000;
+
+/// MSI-X PBA 在 BAR0 内的 byte offset（再独立一页）。8 字节对齐。QEMU 把 PBA
+/// 读 forward 给 server（写丢弃）；controller 的 mmio_read 对 ≥0x1000 的非
+/// doorbell 区返 0 = 无 pending（我们直接经 eventfd fire 中断，不靠 PBA 轮询）。
+pub const MSIX_PBA_BAR0_OFFSET: u64 = 0x3000;
+
+/// MSI-X capability ID（PCI spec / `PCI_CAP_ID_MSIX`）。
+pub const MSIX_CAP_ID: u8 = 0x11;
 
 /// CC.MPS=0 → memory page size = 4 KiB（NVMe 默认）。
 pub const NVME_PAGE_SHIFT: u32 = 12;

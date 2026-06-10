@@ -45,7 +45,10 @@ impl IrqVectors {
                 // eventfd 写 8 byte，永远不会 short-write；任何 IO err 都视
                 // 为致命（kernel eventfd 行为）。
                 match write_eventfd(fd, &one.to_ne_bytes()) {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        tracing::trace!(index, "MSI-X fire: eventfd write OK");
+                        true
+                    }
                     Err(e) => {
                         tracing::warn!(
                             index,
@@ -101,16 +104,17 @@ pub fn handle_set_irqs(
     vectors: &mut IrqVectors,
     msg_id: u16,
     msg: &mut Message,
+    no_reply: bool,
 ) -> anyhow::Result<()> {
     let want = core::mem::size_of::<IrqSetPayload>();
     if msg.payload.len() < want {
-        send_err(stream, msg_id, libc::EINVAL as u32)?;
+        send_err(stream, msg_id, libc::EINVAL as u32, no_reply)?;
         return Ok(());
     }
     let pl: IrqSetPayload = match decode_payload(&msg.payload[..want]) {
         Ok(p) => p,
         Err(_) => {
-            send_err(stream, msg_id, libc::EINVAL as u32)?;
+            send_err(stream, msg_id, libc::EINVAL as u32, no_reply)?;
             return Ok(());
         }
     };
@@ -129,8 +133,7 @@ pub fn handle_set_irqs(
     // 我们当前只 wire MSI-X (idx=2)；其它 idx 接受但 no-op。
     if idx != crate::proto::pci_irq::MSIX {
         tracing::debug!(idx, "SET_IRQS for non-MSIX idx: no-op (best-effort OK)");
-        let hdr = Header::reply_ok(msg_id, Command::DeviceSetIrqs, 0);
-        return write_message(stream, &hdr, &[], &[]).context("write SET_IRQS reply (no-op)");
+        return reply_ok(stream, msg_id, no_reply, "no-op");
     }
     // DATA_NONE + ACTION_TRIGGER + count=0 → disable all (清整个数组)。
     let is_data_none = flags & irq_set::DATA_NONE != 0;
@@ -139,45 +142,96 @@ pub fn handle_set_irqs(
     if is_data_none && count == 0 && is_trigger {
         vectors.vectors.clear();
         tracing::info!("SET_IRQS: cleared all MSI-X vectors");
-        let hdr = Header::reply_ok(msg_id, Command::DeviceSetIrqs, 0);
-        return write_message(stream, &hdr, &[], &[]).context("write SET_IRQS reply (clear)");
+        return reply_ok(stream, msg_id, no_reply, "clear");
     }
     if is_data_eventfd && is_trigger {
         let need = count as usize;
-        // **review M2** — fd 数必须 == count。少了静默 None 会让中断丢失。
-        if msg.fds.len() != need {
-            send_err(stream, msg_id, libc::EINVAL as u32)?;
-            return Ok(());
-        }
         let upto = (start as usize) + need;
         if vectors.vectors.len() < upto {
             vectors.vectors.resize_with(upto, || None);
         }
-        // **review M2** — 从 msg.fds 取走 fd（drain，OwnedFd 移交不被 Message drop close）。
-        let mut fd_iter = msg.fds.drain(..);
-        for i in 0..need {
-            let slot = (start as usize) + i;
-            vectors.vectors[slot] = fd_iter.next();
+        // **真 QEMU 11 vfio-user guest e2e 修复（2026-06-10）** — DATA_EVENTFD 的
+        // fd 数**未必** == count。VFIO spec：data 数组里 `-1` 表示"de-assign 已配置
+        // 的中断 / 跳过未配置项"；vfio-user 把 `-1` 编码为**不经 SCM_RIGHTS 传**该
+        // 槽位 fd。QEMU client（`vfio_user_device_io_set_irqs`）按 chunk 发送，且
+        // "一条消息要么全是有效 fd、要么全是 -1"（`arg_fds = fds[0]!=-1 ? .. : NULL`）。
+        // 合法情形只有两种：
+        //   - `fd_cnt == count`：每个 fd 赋给 [start, start+count) 槽位（assign）；
+        //   - `fd_cnt == 0`：[start, start+count) 全部 **de-assign**（清 None / 掩码）。
+        // 之前误用 `fds.len() != count → EINVAL`，把 QEMU 掩码向量（count=1 / fd_cnt=0）
+        // 当非法拒了 → QEMU `vfio_enable_vectors` 收 EINVAL → "failed to enable MSI-X,
+        // Invalid argument" → guest IO 中断永不路由 → IO 命令 30s timeout。仅
+        // `0 < fd_cnt < count`（部分 fd，QEMU 从不这么发）才视作非法。
+        if need > 0 && msg.fds.len() == need {
+            // assign：从 msg.fds drain 取走（OwnedFd 移交，不被 Message drop close）。
+            let mut fd_iter = msg.fds.drain(..);
+            for i in 0..need {
+                let slot = (start as usize) + i;
+                vectors.vectors[slot] = fd_iter.next();
+            }
+            tracing::info!(
+                start,
+                count,
+                total = vectors.vectors.len(),
+                "SET_IRQS: MSI-X trigger eventfds assigned"
+            );
+            return reply_ok(stream, msg_id, no_reply, "assign");
         }
-        tracing::info!(
-            start,
-            count,
-            total = vectors.vectors.len(),
-            "SET_IRQS: MSI-X trigger eventfds assigned"
+        if msg.fds.is_empty() {
+            // de-assign（所有 -1 / 掩码）：清 [start, start+count) 槽位为 None。
+            for i in 0..need {
+                let slot = (start as usize) + i;
+                vectors.vectors[slot] = None;
+            }
+            tracing::info!(
+                start,
+                count,
+                total = vectors.vectors.len(),
+                "SET_IRQS: MSI-X trigger eventfds de-assigned (all -1 / masked)"
+            );
+            return reply_ok(stream, msg_id, no_reply, "deassign");
+        }
+        // 0 < fd_cnt < count：部分 fd，QEMU 不会这么发；拒以暴露非预期 client 行为。
+        tracing::warn!(
+            need,
+            fd_cnt = msg.fds.len(),
+            "SET_IRQS DATA_EVENTFD: 部分 fd（0<fd_cnt<count），非法"
         );
-        let hdr = Header::reply_ok(msg_id, Command::DeviceSetIrqs, 0);
-        return write_message(stream, &hdr, &[], &[]).context("write SET_IRQS reply (assign)");
+        send_err(stream, msg_id, libc::EINVAL as u32, no_reply)?;
+        return Ok(());
     }
     // 其它 MASK/UNMASK 等不处理；spec 允许 server 选择不实现。
     tracing::debug!(
         flags = format_args!("{flags:#x}"),
         "SET_IRQS: unsupported flag combo — best-effort OK reply"
     );
-    let hdr = Header::reply_ok(msg_id, Command::DeviceSetIrqs, 0);
-    write_message(stream, &hdr, &[], &[]).context("write SET_IRQS reply (best-effort)")
+    reply_ok(stream, msg_id, no_reply, "best-effort")
 }
 
-fn send_err(stream: &mut UnixStream, msg_id: u16, errno: u32) -> anyhow::Result<()> {
+/// **NO_REPLY 修复** — SET_IRQS 成功 reply 统一出口；posted（`no_reply`）时不发。
+/// `what` 仅用于 `.context()` 标注哪条成功分支。
+fn reply_ok(
+    stream: &mut UnixStream,
+    msg_id: u16,
+    no_reply: bool,
+    what: &'static str,
+) -> anyhow::Result<()> {
+    if no_reply {
+        return Ok(());
+    }
+    let hdr = Header::reply_ok(msg_id, Command::DeviceSetIrqs, 0);
+    write_message(stream, &hdr, &[], &[]).with_context(|| format!("write SET_IRQS reply ({what})"))
+}
+
+fn send_err(
+    stream: &mut UnixStream,
+    msg_id: u16,
+    errno: u32,
+    no_reply: bool,
+) -> anyhow::Result<()> {
+    if no_reply {
+        return Ok(());
+    }
     let hdr = Header {
         msg_id,
         cmd: Command::DeviceSetIrqs as u16,
@@ -231,7 +285,13 @@ mod tests {
         let h = thread::spawn(move || -> anyhow::Result<IrqVectors> {
             let mut vectors = IrqVectors::default();
             let mut msg = read_message(&mut server)?;
-            handle_set_irqs(&mut server, &mut vectors, msg.header.msg_id, &mut msg)?;
+            handle_set_irqs(
+                &mut server,
+                &mut vectors,
+                msg.header.msg_id,
+                &mut msg,
+                false,
+            )?;
             Ok(vectors)
         });
 
@@ -277,7 +337,13 @@ mod tests {
 
         let h = thread::spawn(move || -> anyhow::Result<IrqVectors> {
             let mut msg = read_message(&mut server)?;
-            handle_set_irqs(&mut server, &mut vectors, msg.header.msg_id, &mut msg)?;
+            handle_set_irqs(
+                &mut server,
+                &mut vectors,
+                msg.header.msg_id,
+                &mut msg,
+                false,
+            )?;
             Ok(vectors)
         });
         let pl = IrqSetPayload {
@@ -294,14 +360,105 @@ mod tests {
         assert!(vectors.is_empty());
     }
 
-    /// **review M2** — fd 数 < count → EINVAL，不静默 None 覆盖。
+    /// **真 QEMU 11 vfio-user guest e2e 修复（2026-06-10）** — DATA_EVENTFD + TRIGGER
+    /// 且 `fd_cnt == 0`（所有 `-1` / 掩码）是合法的 **de-assign**，不再误判 EINVAL。
+    /// 这是 QEMU `vfio_enable_vectors` 对掩码向量的编码；之前误拒导致 "failed to
+    /// enable MSI-X, Invalid argument" + guest IO 30s timeout。
     #[test]
-    fn set_irqs_fd_count_mismatch_returns_einval() {
+    fn set_irqs_eventfd_zero_fds_deassigns_not_einval() {
+        use nix::sys::eventfd::EfdFlags;
+        use nix::sys::eventfd::EventFd;
+        let (mut server, mut client) = pair();
+        let mut vectors = IrqVectors::default();
+        // 先给 vector 0 装一个真 eventfd，稍后用 fd_cnt=0 的 SET_IRQS 把它清掉。
+        let f = EventFd::from_value_and_flags(0, EfdFlags::empty()).unwrap();
+        vectors.vectors.push(Some(f.into()));
+        assert_eq!(vectors.len(), 1);
+        let h = thread::spawn(move || -> anyhow::Result<IrqVectors> {
+            let mut msg = read_message(&mut server)?;
+            handle_set_irqs(
+                &mut server,
+                &mut vectors,
+                msg.header.msg_id,
+                &mut msg,
+                false,
+            )?;
+            Ok(vectors)
+        });
+        let pl = IrqSetPayload {
+            argsz: 20,
+            flags: irq_set::DATA_EVENTFD | irq_set::ACTION_TRIGGER,
+            index: pci_irq::MSIX,
+            start: 0,
+            count: 1, // 1 个向量，但发 0 个 fd（= -1，de-assign）
+        };
+        let hdr = Header::command(11, Command::DeviceSetIrqs, pl.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, pl.as_bytes(), &[]).unwrap(); // 0 个 fd
+        let reply = read_message(&mut client).unwrap();
+        assert!(
+            !reply.header.flags().is_error(),
+            "fd_cnt=0 应 de-assign（OK），非 EINVAL"
+        );
+        let mut vectors = h.join().unwrap().unwrap();
+        // vector 0 被清为 None → fire 返 false。
+        assert!(!vectors.fire(0), "de-assign 后 vector 0 应无 eventfd");
+    }
+
+    /// **NO_REPLY 修复** — posted（NO_REPLY）SET_IRQS：执行副作用但**不发** reply。
+    #[test]
+    fn set_irqs_no_reply_suppresses_reply() {
         let (mut server, mut client) = pair();
         let mut vectors = IrqVectors::default();
         let h = thread::spawn(move || -> anyhow::Result<()> {
             let mut msg = read_message(&mut server)?;
-            handle_set_irqs(&mut server, &mut vectors, msg.header.msg_id, &mut msg)?;
+            handle_set_irqs(&mut server, &mut vectors, msg.header.msg_id, &mut msg, true)?;
+            Ok(())
+        });
+        // DATA_NONE+TRIGGER+count=0 = clear all（副作用），但带 NO_REPLY。
+        let pl = IrqSetPayload {
+            argsz: 20,
+            flags: irq_set::DATA_NONE | irq_set::ACTION_TRIGGER,
+            index: pci_irq::MSIX,
+            start: 0,
+            count: 0,
+        };
+        let hdr = Header {
+            msg_id: 7,
+            cmd: Command::DeviceSetIrqs as u16,
+            msg_size: crate::proto::HEADER_LEN as u32 + pl.as_bytes().len() as u32,
+            flags: HeaderFlags::command().with_no_reply().0,
+            error_no: 0,
+        };
+        fw_write(&mut client, &hdr, pl.as_bytes(), &[]).unwrap();
+        h.join().unwrap().unwrap();
+        // server 不应发任何 reply：drop server 端后 client read 应得 EOF。
+        drop(client.try_clone().unwrap()); // no-op，仅示意
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(150)))
+            .unwrap();
+        let r = read_message(&mut client);
+        assert!(r.is_err(), "NO_REPLY SET_IRQS 不应有任何 reply 回到 client");
+    }
+
+    /// **review M2 + NO_REPLY 修复后** — 部分 fd（`0 < fd_cnt < count`）仍 → EINVAL。
+    /// QEMU 从不这么发（chunk 要么全有效 fd 要么全 -1），故部分 fd 是非预期。
+    #[test]
+    fn set_irqs_partial_fds_returns_einval() {
+        use nix::sys::eventfd::EfdFlags;
+        use nix::sys::eventfd::EventFd;
+        let (mut server, mut client) = pair();
+        let mut vectors = IrqVectors::default();
+        let efd = EventFd::from_value_and_flags(0, EfdFlags::empty()).unwrap();
+        let raw = efd.as_raw_fd();
+        let h = thread::spawn(move || -> anyhow::Result<()> {
+            let mut msg = read_message(&mut server)?;
+            handle_set_irqs(
+                &mut server,
+                &mut vectors,
+                msg.header.msg_id,
+                &mut msg,
+                false,
+            )?;
             Ok(())
         });
         let pl = IrqSetPayload {
@@ -309,10 +466,10 @@ mod tests {
             flags: irq_set::DATA_EVENTFD | irq_set::ACTION_TRIGGER,
             index: pci_irq::MSIX,
             start: 0,
-            count: 3, // 故意要 3 个 fd
+            count: 3, // 要 3 个向量
         };
         let hdr = Header::command(11, Command::DeviceSetIrqs, pl.as_bytes().len() as u32);
-        fw_write(&mut client, &hdr, pl.as_bytes(), &[]).unwrap(); // 只发 0 个 fd
+        fw_write(&mut client, &hdr, pl.as_bytes(), &[raw]).unwrap(); // 只发 1 个 fd（部分）
         let reply = read_message(&mut client).unwrap();
         assert!(reply.header.flags().is_error());
         let err = reply.header.error_no;
@@ -327,7 +484,13 @@ mod tests {
         let mut vectors = IrqVectors::default();
         let h = thread::spawn(move || -> anyhow::Result<()> {
             let mut msg = read_message(&mut server)?;
-            handle_set_irqs(&mut server, &mut vectors, msg.header.msg_id, &mut msg)?;
+            handle_set_irqs(
+                &mut server,
+                &mut vectors,
+                msg.header.msg_id,
+                &mut msg,
+                false,
+            )?;
             Ok(())
         });
         let pl = IrqSetPayload {
@@ -351,7 +514,13 @@ mod tests {
         let mut vectors = IrqVectors::default();
         let h = thread::spawn(move || -> anyhow::Result<()> {
             let mut msg = read_message(&mut server)?;
-            handle_set_irqs(&mut server, &mut vectors, msg.header.msg_id, &mut msg)?;
+            handle_set_irqs(
+                &mut server,
+                &mut vectors,
+                msg.header.msg_id,
+                &mut msg,
+                false,
+            )?;
             Ok(())
         });
         let hdr = Header::command(4, Command::DeviceSetIrqs, 4);

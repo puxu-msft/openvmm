@@ -179,15 +179,28 @@ impl VfioUserSession {
     ) -> anyhow::Result<bool> {
         let msg_id = msg.header.msg_id;
         let cmd_u = msg.header.cmd;
+        // **vfio-spec NO_REPLY（真 QEMU 11 guest e2e 修复）** — client 可把 COMMAND 标
+        // `VFIO_USER_NO_REPLY`（flags bit4=0x10）做 *posted*（fire-and-forget）请求；
+        // QEMU 对 MMIO 写（REGION_WRITE）正是这么发的——把消息直接 recycle，**不**入
+        // `proxy->pending` 队列。此时 server 若仍回 reply，QEMU 在 `vfio_user_recv_one`
+        // 里按 msg_id 找不到 pending 项 → `unexpected reply` → 它把我们 reply 的字节
+        // 当下一帧 header 解析 → `bad header size` → wire 彻底失步 → guest 挂。
+        // 故：NO_REPLY 命令只执行副作用（如真正写 CC 寄存器），**绝不**发任何 reply
+        // （成功或 error 都不发——QEMU 没在听）。realize-only 测试用 `-S` 暂停 CPU，
+        // 从不发 MMIO 写，所以漏掉了这条 posted-write 路径。
+        let no_reply = msg.header.flags().no_reply();
         let cmd = match Command::try_from(cmd_u) {
             Ok(c) => c,
             Err(_) => {
-                // 未知 cmd 是 wire 层硬错：close。
-                self.send_err(msg_id, Command::Version, libc::EINVAL as u32);
+                // 未知 cmd 是 wire 层硬错：close。NO_REPLY 时不回 error（QEMU 没在听），
+                // 但仍当协议硬错返回 Err 让 caller close socket。
+                if !no_reply {
+                    self.send_err(msg_id, Command::Version, libc::EINVAL as u32);
+                }
                 return Err(anyhow::anyhow!("unknown command {cmd_u}"));
             }
         };
-        self.dispatch(cmd, msg, device)?;
+        self.dispatch(cmd, msg, device, no_reply)?;
         // **review H1** — dispatch 完后 drain DMA 完成事件投给 device。
         // 设备 mmio_write handler 内调 ctx.dma_read() 时本 transport 同步
         // 完成 wire，把 (token, ok, data) 推 pending_completions；现在
@@ -212,42 +225,67 @@ impl VfioUserSession {
     }
 
     /// 内部 dispatch — 按 [`Command`] 路由到对应处理函数。
+    ///
+    /// `no_reply` = 入站 COMMAND 带 `VFIO_USER_NO_REPLY`（posted 请求）。各 handler
+    /// 必须执行副作用但在 `no_reply` 时**跳过**所有 reply（成功 / error 都不发），
+    /// 否则 QEMU 收到非预期 reply 会 wire 失步（见 `dispatch_one` 注释）。
     fn dispatch<D: PcieDevice>(
         &mut self,
         cmd: Command,
         msg: Message,
         device: &mut D,
+        no_reply: bool,
     ) -> anyhow::Result<()> {
         let id = msg.header.msg_id;
         match cmd {
-            Command::DeviceGetInfo => self.handle_get_info(id, &msg, device),
-            Command::DeviceGetRegionInfo => self.handle_get_region_info(id, &msg, device),
-            Command::DeviceGetIrqInfo => self.handle_get_irq_info(id, &msg, device),
-            Command::RegionRead => self.handle_region_read(id, &msg, device),
-            Command::RegionWrite => self.handle_region_write(id, &msg, device),
-            Command::DeviceReset => self.handle_reset(id, &msg, device),
+            Command::DeviceGetInfo => self.handle_get_info(id, &msg, device, no_reply),
+            Command::DeviceGetRegionInfo => self.handle_get_region_info(id, &msg, device, no_reply),
+            Command::DeviceGetIrqInfo => self.handle_get_irq_info(id, &msg, device, no_reply),
+            Command::RegionRead => self.handle_region_read(id, &msg, device, no_reply),
+            Command::RegionWrite => self.handle_region_write(id, &msg, device, no_reply),
+            Command::DeviceReset => self.handle_reset(id, &msg, device, no_reply),
             // **Phase U4 / W mmap** — DMA 表已接（DMA_MAP 取 fd 做零拷贝 mmap）：
             Command::DmaMap => {
                 let mut msg = msg;
-                crate::dma::handle_dma_map(&mut self.stream, &mut self.dma_table, id, &mut msg)
+                crate::dma::handle_dma_map(
+                    &mut self.stream,
+                    &mut self.dma_table,
+                    id,
+                    &mut msg,
+                    no_reply,
+                )
             }
-            Command::DmaUnmap => {
-                crate::dma::handle_dma_unmap(&mut self.stream, &mut self.dma_table, id, &msg)
-            }
+            Command::DmaUnmap => crate::dma::handle_dma_unmap(
+                &mut self.stream,
+                &mut self.dma_table,
+                id,
+                &msg,
+                no_reply,
+            ),
             // U5 实现：
             Command::DeviceSetIrqs => {
                 let mut msg = msg;
-                crate::irq::handle_set_irqs(&mut self.stream, &mut self.irq_vectors, id, &mut msg)
+                crate::irq::handle_set_irqs(
+                    &mut self.stream,
+                    &mut self.irq_vectors,
+                    id,
+                    &mut msg,
+                    no_reply,
+                )
             }
-            // 我们不实现 — 礼貌地回 ENOTSUP。
+            // 我们不实现 — 礼貌地回 ENOTSUP（除非 posted）。
             Command::DeviceGetRegionIoFds => {
-                self.send_err(id, cmd, libc::ENOTSUP as u32);
+                if !no_reply {
+                    self.send_err(id, cmd, libc::ENOTSUP as u32);
+                }
                 Ok(())
             }
             // server-initiated 类型不该作为入站 cmd 出现
             Command::Version | Command::DmaRead | Command::DmaWrite => {
                 tracing::warn!(?cmd, "unexpected inbound command (server-initiated kind)");
-                self.send_err(id, cmd, libc::EPROTO as u32);
+                if !no_reply {
+                    self.send_err(id, cmd, libc::EPROTO as u32);
+                }
                 Ok(())
             }
         }
@@ -258,6 +296,7 @@ impl VfioUserSession {
         id: u16,
         _msg: &Message,
         _device: &D,
+        no_reply: bool,
     ) -> anyhow::Result<()> {
         let pl = DeviceInfoPayload {
             argsz: core::mem::size_of::<DeviceInfoPayload>() as u32,
@@ -266,7 +305,8 @@ impl VfioUserSession {
             num_irqs: pci_irq::NUM_IRQS,
         };
         let hdr = Header::reply_ok(id, Command::DeviceGetInfo, pl.as_bytes().len() as u32);
-        write_message(&mut self.stream, &hdr, pl.as_bytes(), &[]).context("write GET_INFO reply")
+        self.reply(no_reply, &hdr, pl.as_bytes())
+            .context("write GET_INFO reply")
     }
 
     fn handle_get_region_info<D: PcieDevice>(
@@ -274,18 +314,29 @@ impl VfioUserSession {
         id: u16,
         msg: &Message,
         device: &D,
+        no_reply: bool,
     ) -> anyhow::Result<()> {
         // **review H2 + M1** — payload 长度校验在前；参数错走 send_err + Ok(())
         // 保持 session 不被 driver 探测 BAR1..5 等行为关闭。
         let want = core::mem::size_of::<RegionInfoPayload>();
         if msg.payload.len() != want {
-            self.send_err(id, Command::DeviceGetRegionInfo, libc::EINVAL as u32);
+            self.send_err_unless(
+                no_reply,
+                id,
+                Command::DeviceGetRegionInfo,
+                libc::EINVAL as u32,
+            );
             return Ok(());
         }
         let req: RegionInfoPayload = match decode_payload(&msg.payload) {
             Ok(r) => r,
             Err(_) => {
-                self.send_err(id, Command::DeviceGetRegionInfo, libc::EINVAL as u32);
+                self.send_err_unless(
+                    no_reply,
+                    id,
+                    Command::DeviceGetRegionInfo,
+                    libc::EINVAL as u32,
+                );
                 return Ok(());
             }
         };
@@ -314,7 +365,12 @@ impl VfioUserSession {
             // BAR1..5 / ROM / VGA — 教学版无支持，size=0+flags=0。
             _ if idx < pci_region::NUM_REGIONS => (0u32, 0u64),
             _ => {
-                self.send_err(id, Command::DeviceGetRegionInfo, libc::EINVAL as u32);
+                self.send_err_unless(
+                    no_reply,
+                    id,
+                    Command::DeviceGetRegionInfo,
+                    libc::EINVAL as u32,
+                );
                 return Ok(());
             }
         };
@@ -327,7 +383,7 @@ impl VfioUserSession {
             offset: 0,
         };
         let hdr = Header::reply_ok(id, Command::DeviceGetRegionInfo, pl.as_bytes().len() as u32);
-        write_message(&mut self.stream, &hdr, pl.as_bytes(), &[])
+        self.reply(no_reply, &hdr, pl.as_bytes())
             .context("write GET_REGION_INFO reply")
     }
 
@@ -336,16 +392,17 @@ impl VfioUserSession {
         id: u16,
         msg: &Message,
         device: &D,
+        no_reply: bool,
     ) -> anyhow::Result<()> {
         let want = core::mem::size_of::<IrqInfoPayload>();
         if msg.payload.len() != want {
-            self.send_err(id, Command::DeviceGetIrqInfo, libc::EINVAL as u32);
+            self.send_err_unless(no_reply, id, Command::DeviceGetIrqInfo, libc::EINVAL as u32);
             return Ok(());
         }
         let req: IrqInfoPayload = match decode_payload(&msg.payload) {
             Ok(r) => r,
             Err(_) => {
-                self.send_err(id, Command::DeviceGetIrqInfo, libc::EINVAL as u32);
+                self.send_err_unless(no_reply, id, Command::DeviceGetIrqInfo, libc::EINVAL as u32);
                 return Ok(());
             }
         };
@@ -356,7 +413,7 @@ impl VfioUserSession {
             x if x == pci_irq::MSIX => (irq_info::EVENTFD, msix_count),
             x if x < pci_irq::NUM_IRQS => (0u32, 0u32),
             _ => {
-                self.send_err(id, Command::DeviceGetIrqInfo, libc::EINVAL as u32);
+                self.send_err_unless(no_reply, id, Command::DeviceGetIrqInfo, libc::EINVAL as u32);
                 return Ok(());
             }
         };
@@ -367,7 +424,7 @@ impl VfioUserSession {
             count,
         };
         let hdr = Header::reply_ok(id, Command::DeviceGetIrqInfo, pl.as_bytes().len() as u32);
-        write_message(&mut self.stream, &hdr, pl.as_bytes(), &[])
+        self.reply(no_reply, &hdr, pl.as_bytes())
             .context("write GET_IRQ_INFO reply")
     }
 
@@ -438,17 +495,18 @@ impl VfioUserSession {
         id: u16,
         msg: &Message,
         device: &mut D,
+        no_reply: bool,
     ) -> anyhow::Result<()> {
         // **review H2** — 解之前先校验长度，避免 slice 越界 panic。
         let want = core::mem::size_of::<RegionAccessPayload>();
         if msg.payload.len() < want {
-            self.send_err(id, Command::RegionRead, libc::EINVAL as u32);
+            self.send_err_unless(no_reply, id, Command::RegionRead, libc::EINVAL as u32);
             return Ok(());
         }
         let req: RegionAccessPayload = match decode_payload(&msg.payload[..want]) {
             Ok(r) => r,
             Err(_) => {
-                self.send_err(id, Command::RegionRead, libc::EINVAL as u32);
+                self.send_err_unless(no_reply, id, Command::RegionRead, libc::EINVAL as u32);
                 return Ok(());
             }
         };
@@ -459,12 +517,12 @@ impl VfioUserSession {
         // 一次 dump 整个 config header）；1/2/4/8 是我们 MMIO 寄存器的约束、非协议
         // 约束。仅校验 count 上限防 OOM + region 越界（上限见 [`MAX_REGION_ACCESS`]）。
         if count == 0 || count > MAX_REGION_ACCESS {
-            self.send_err(id, Command::RegionRead, libc::EINVAL as u32);
+            self.send_err_unless(no_reply, id, Command::RegionRead, libc::EINVAL as u32);
             return Ok(());
         }
         let access_ok = Self::region_access_ok(self.describe_for(device), bar, offset, count);
         if !access_ok {
-            self.send_err(id, Command::RegionRead, libc::EINVAL as u32);
+            self.send_err_unless(no_reply, id, Command::RegionRead, libc::EINVAL as u32);
             return Ok(());
         }
         // CONFIG → host-side config space（identity / BAR probe，bulk 直读）；
@@ -484,7 +542,9 @@ impl VfioUserSession {
         reply_payload.extend_from_slice(echo.as_bytes());
         reply_payload.extend_from_slice(&data);
         let hdr = Header::reply_ok(id, Command::RegionRead, reply_payload.len() as u32);
-        write_message(&mut self.stream, &hdr, &reply_payload, &[])
+        // REGION_READ 携带数据返回，正常情形 QEMU 必然等 reply（不会 posted）；
+        // 但仍统一走 gated reply 保持一致（若 client 误标 NO_REPLY 则不回，安全）。
+        self.reply(no_reply, &hdr, &reply_payload)
             .context("write REGION_READ reply")
     }
 
@@ -493,16 +553,17 @@ impl VfioUserSession {
         id: u16,
         msg: &Message,
         device: &mut D,
+        no_reply: bool,
     ) -> anyhow::Result<()> {
         let req_struct_len = core::mem::size_of::<RegionAccessPayload>();
         if msg.payload.len() < req_struct_len {
-            self.send_err(id, Command::RegionWrite, libc::EINVAL as u32);
+            self.send_err_unless(no_reply, id, Command::RegionWrite, libc::EINVAL as u32);
             return Ok(());
         }
         let req: RegionAccessPayload = match decode_payload(&msg.payload[..req_struct_len]) {
             Ok(r) => r,
             Err(_) => {
-                self.send_err(id, Command::RegionWrite, libc::EINVAL as u32);
+                self.send_err_unless(no_reply, id, Command::RegionWrite, libc::EINVAL as u32);
                 return Ok(());
             }
         };
@@ -513,17 +574,17 @@ impl VfioUserSession {
         // 仅校验 count 上限防 OOM（[`MAX_REGION_ACCESS`]）；payload 须恰好携带
         // struct + count 字节的数据。
         if count == 0 || count > MAX_REGION_ACCESS {
-            self.send_err(id, Command::RegionWrite, libc::EINVAL as u32);
+            self.send_err_unless(no_reply, id, Command::RegionWrite, libc::EINVAL as u32);
             return Ok(());
         }
         if msg.payload.len() != req_struct_len + count {
-            self.send_err(id, Command::RegionWrite, libc::EINVAL as u32);
+            self.send_err_unless(no_reply, id, Command::RegionWrite, libc::EINVAL as u32);
             return Ok(());
         }
         // **vfio-spec** — region index / 越界校验（bogus region → EINVAL）。
         let access_ok = Self::region_access_ok(self.describe_for(device), bar, offset, count);
         if !access_ok {
-            self.send_err(id, Command::RegionWrite, libc::EINVAL as u32);
+            self.send_err_unless(no_reply, id, Command::RegionWrite, libc::EINVAL as u32);
             return Ok(());
         }
         let data = &msg.payload[req_struct_len..];
@@ -533,21 +594,42 @@ impl VfioUserSession {
         if bar == pci_region::CONFIG {
             self.config_for(device).write_bytes(offset, data);
         } else {
-            // 调 PcieDevice — 它通过 DeviceCtx 反向触发 DMA/中断；Phase U3 还没
-            // 给 vfio-user backend 实现 Transport，先用 NoopTransport 屏蔽
-            // dma/irq（U4/U5 接通后真正生效）。
-            let mut t = crate::transport::NoopTransport;
-            let mut ctx = pcie_device_core::DeviceCtx::new(&mut t);
+            // **Bug fix 2026-06-10（真 QEMU 11 guest e2e）** — BAR0 MMIO 写**必须**用
+            // `self`（VfioUserSession 自身实现 `Transport`）当 DeviceCtx，使设备在
+            // 写处理里反向发起的 DMA / 中断真正落到 vfio-user wire。
+            //
+            // 此前误用 `NoopTransport`：guest 写 SQ tail doorbell → 控制器
+            // `ctx.dma_read(SQE)` 被静默丢弃（token=0，wire 上什么都不发）→ admin
+            // 命令永不被 fetch → guest nvme 驱动死等 admin 完成 → 后续 CSTS/CAP
+            // 轮询读全部 `timed out waiting for reply`（QEMU 报错链的下游症状）。
+            // realize-only 测试（CPU `-S` 暂停）从不写 BAR0，故漏掉此 gap。
+            //
+            // `self`（Transport）与 `device`（&mut D）是**不相交**的两个借用，与
+            // `drain_dma_completions` 里 `DeviceCtx::new(self)` + 调 `device` 的模式
+            // 完全一致。设备在 `mmio_write` 内调 `ctx.dma_read` 会同步走 wire 往返
+            // （`dma_read_sync`，期间 interleaved inbound 帧 defer 到 `inbound_queue`），
+            // 把 `(token, data)` 推 `pending_completions`；本 dispatch 返回后由
+            // `dispatch_one` 的 `drain_dma_completions` 投给 `on_dma_complete`。
+            //
+            // **NO_REPLY 注记**：guest 的 MMIO 写（含 doorbell）几乎总是 posted
+            // （`no_reply`）。设备在写处理内反向发起的 **DMA_READ/WRITE 是独立的
+            // server→client COMMAND**（自有 msg_id，QEMU 必等其 reply），与本
+            // REGION_WRITE 的 reply 无关——故下面只 gate REGION_WRITE 自身的 reply，
+            // server-initiated DMA 命令照常发出，不受影响。
+            let mut ctx = pcie_device_core::DeviceCtx::new(self);
             Self::write_bar_bytes(device, &mut ctx, bar, offset, data);
         }
-        // Reply: echo struct only (no data).
+        // Reply: echo struct only (no data)。**注意时序**：设备发起的同步 DMA_READ
+        // 命令在上面 `mmio_write` 栈内已完成 wire 往返，故本 REGION_WRITE reply 排在
+        // 那些 server-initiated 帧**之后**发出 —— 符合 vfio-user 双向独立 msg_id 语义。
+        // posted（NO_REPLY）写则**不发** reply（QEMU 没把该 msg_id 入 pending）。
         let echo = RegionAccessPayload {
             offset,
             region: bar,
             count: count as u32,
         };
         let hdr = Header::reply_ok(id, Command::RegionWrite, echo.as_bytes().len() as u32);
-        write_message(&mut self.stream, &hdr, echo.as_bytes(), &[])
+        self.reply(no_reply, &hdr, echo.as_bytes())
             .context("write REGION_WRITE reply")
     }
 
@@ -556,6 +638,7 @@ impl VfioUserSession {
         id: u16,
         _msg: &Message,
         device: &mut D,
+        no_reply: bool,
     ) -> anyhow::Result<()> {
         device.reset(0); // kind=0 == FLR
         // **Phase W1 / review M-1** — FLR 复位 config space：丢弃缓存，下次访问
@@ -565,7 +648,28 @@ impl VfioUserSession {
         self.config = None;
         self.describe = None;
         let hdr = Header::reply_ok(id, Command::DeviceReset, 0);
-        write_message(&mut self.stream, &hdr, &[], &[]).context("write DEVICE_RESET reply")
+        self.reply(no_reply, &hdr, &[])
+            .context("write DEVICE_RESET reply")
+    }
+
+    /// **NO_REPLY 修复** — 发送一条**成功 reply**，除非该入站 COMMAND 是 posted
+    /// （`no_reply` = true）。posted 时只静默返回 Ok，绝不写 wire（QEMU 没在听，
+    /// 多发会让它失步）。这是所有 handler 成功 reply 的统一出口（DRY）。
+    fn reply(&mut self, no_reply: bool, hdr: &Header, payload: &[u8]) -> anyhow::Result<()> {
+        if no_reply {
+            return Ok(());
+        }
+        write_message(&mut self.stream, hdr, payload, &[])
+    }
+
+    /// **NO_REPLY 修复** — 发送一条 **error reply**，除非 posted。参数错（如 driver
+    /// 探测越界）对普通命令回 errno 让 driver 看到；posted 命令则静默丢弃（QEMU
+    /// 没在听该 msg_id 的任何 reply）。
+    fn send_err_unless(&mut self, no_reply: bool, msg_id: u16, cmd: Command, errno: u32) {
+        if no_reply {
+            return;
+        }
+        self.send_err(msg_id, cmd, errno);
     }
 
     fn send_err(&mut self, msg_id: u16, cmd: Command, errno: u32) {
@@ -797,6 +901,51 @@ mod tests {
         assert_eq!(nr, pci_region::NUM_REGIONS);
         assert_eq!(ni, pci_irq::NUM_IRQS);
         assert!(handle.join().unwrap().unwrap());
+    }
+
+    /// **真 QEMU 11 vfio-user guest e2e 修复（2026-06-10）** — posted（NO_REPLY）
+    /// REGION_WRITE：副作用（mmio_write）发生，但**绝不**发 reply。这是 QEMU 发
+    /// MMIO 写（含 doorbell）的常规方式；之前我们仍回 reply → QEMU `vfio_user_recv_one`
+    /// 在 pending 队列里找不到该 msg_id → "unexpected reply" → wire 失步 → guest 挂。
+    #[test]
+    fn region_write_no_reply_applies_side_effect_without_reply() {
+        let (server, mut client) = pair();
+        let mut sess = VfioUserSession::new(server, neg());
+        let mut dev = MockDev::new();
+        let handle = thread::spawn(move || {
+            let r = sess.pump_one(&mut dev);
+            (r, dev)
+        });
+        // 写 8 byte 到 BAR0 offset 0，带 NO_REPLY（posted）。
+        let mut payload = Vec::new();
+        let access = RegionAccessPayload {
+            offset: 0,
+            region: pci_region::BAR0,
+            count: 8,
+        };
+        payload.extend_from_slice(access.as_bytes());
+        payload.extend_from_slice(&0xCAFEBABE_DEADBEEFu64.to_le_bytes());
+        let hdr = Header {
+            msg_id: 0x55,
+            cmd: Command::RegionWrite as u16,
+            msg_size: HEADER_LEN as u32 + payload.len() as u32,
+            flags: HeaderFlags::command().with_no_reply().0,
+            error_no: 0,
+        };
+        fw_write(&mut client, &hdr, &payload, &[]).unwrap();
+        let (r, dev) = handle.join().unwrap();
+        assert!(r.unwrap(), "pump_one 处理 posted 写应返回 Ok(true)");
+        // 副作用：mmio_write 把值写进 bar0[0]。
+        assert_eq!(dev.bar0[0], 0xCAFEBABE_DEADBEEF);
+        // **关键**：NO_REPLY 写不应有任何 reply 回到 client。
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(150)))
+            .unwrap();
+        let reply = read_message(&mut client);
+        assert!(
+            reply.is_err(),
+            "posted REGION_WRITE 绝不能回 reply（会让 QEMU 失步）"
+        );
     }
 
     /// GET_REGION_INFO BAR0 = R/W, 8 KiB；BAR3 = size=0。
@@ -1420,5 +1569,167 @@ mod tests {
         drop(client); // peer 立即关
         let r = sess.pump_one(&mut dev);
         assert!(matches!(r, Ok(false)));
+    }
+
+    /// `DoorbellDev` 完成回调收集器的类型别名。`clippy::type_complexity`
+    /// 不接受裸 `Arc<Mutex<Vec<(u64, bool, Vec<u8>)>>>`，抽别名兼作可读性。
+    /// 用 `parking_lot::Mutex`（crate 强制；`clippy::disallowed_types` 禁
+    /// `std::sync::Mutex`）—— 其 `.lock()` 直接返 guard，无 `Result`。
+    type DmaCompletions = std::sync::Arc<parking_lot::Mutex<Vec<(u64, bool, Vec<u8>)>>>;
+
+    /// 一个在 BAR0 MMIO 写里反向发起 `ctx.dma_read` 的设备（模拟 NVMe SQ tail
+    /// doorbell fetch SQE）。用于钉死："BAR0 写处理必须用 session 自身当
+    /// Transport，让设备发起的 DMA 真落到 vfio-user wire"。
+    struct DoorbellDev {
+        /// `on_dma_complete` 收到的 (token, ok, data)，验证完成回调真被投递。
+        completed: DmaCompletions,
+    }
+    impl Pde for DoorbellDev {
+        fn describe(&self) -> DeviceDescribe {
+            DeviceDescribe {
+                vendor_id: 0x1234,
+                device_id: 0x5678,
+                class_code: 0x01_08_02,
+                revision: 1,
+                subsystem_vendor: 0,
+                subsystem_device: 0,
+                bars: vec![BarLayout {
+                    index: 0,
+                    size: 8192,
+                    kind: BarKind::Mmio32,
+                    prefetchable: false,
+                }],
+                msix_count: 1,
+                capabilities: vec![],
+                cfg_write_side_effect_offsets: vec![],
+            }
+        }
+        fn mmio_read(&mut self, _bar: u32, _offset: u64, _size: u32) -> u64 {
+            0
+        }
+        fn mmio_write(
+            &mut self,
+            ctx: &mut DeviceCtx<'_>,
+            _bar: u32,
+            offset: u64,
+            _size: u32,
+            _value: u64,
+        ) {
+            // 模拟 doorbell：写到 0x1000 → 反向 dma_read 取 SQE（64 字节）。
+            if offset == 0x1000 {
+                let _tok = ctx.dma_read(0x1100, 64);
+            }
+        }
+        fn on_dma_complete(
+            &mut self,
+            _ctx: &mut DeviceCtx<'_>,
+            token: u64,
+            ok: bool,
+            data: Vec<u8>,
+        ) {
+            self.completed.lock().push((token, ok, data));
+        }
+    }
+
+    /// **Bug fix 2026-06-10（真 QEMU 11 guest e2e 根因回归）** — BAR0 MMIO 写
+    /// 触发的设备 `ctx.dma_read` **必须**作为真 `DMA_READ` 命令出现在 wire 上，
+    /// 而非被 `NoopTransport` 静默丢弃。此前用 NoopTransport → guest 写 SQ tail
+    /// doorbell 时 SQE fetch 落空 → admin 命令永不完成 → guest 死等、QEMU 报
+    /// `timed out waiting for reply`。本测试：① 写 BAR0 doorbell → ② 断言 server
+    /// 在 wire 上发 `DMA_READ` command（顶位 msg_id）→ ③ 答复后 server 投
+    /// `on_dma_complete` 拿到 SQE 字节 → ④ 最后才发 REGION_WRITE reply（时序）。
+    #[test]
+    fn bar0_mmio_write_routes_dma_to_wire_not_noop() {
+        use crate::proto::DmaMapPayload;
+        use crate::proto::dma_map_flags;
+        let (server, mut client) = pair();
+        let mut sess = VfioUserSession::new(server, neg());
+        let completed = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut dev = DoorbellDev {
+            completed: completed.clone(),
+        };
+        // server 线程：先 pump 一条 DMA_MAP（让 0x1100 落在某 region 内，否则
+        // dma_read_sync 查表失败、不发 wire），再 pump 触发 DMA 的 doorbell 写。
+        let h = thread::spawn(move || {
+            sess.pump_one(&mut dev).unwrap(); // DMA_MAP
+            sess.pump_one(&mut dev) // doorbell（内部同步发 DMA_READ）
+        });
+
+        // ① 先 DMA_MAP [0x1000, 0x2000) 覆盖 SQE 所在 0x1100，且不带 fd → 走
+        //    message-mediated 路径（正是要验的 wire DMA_READ）。
+        let map = DmaMapPayload {
+            argsz: core::mem::size_of::<DmaMapPayload>() as u32,
+            flags: dma_map_flags::READABLE | dma_map_flags::WRITEABLE,
+            offset: 0,
+            addr: 0x1000,
+            size: 0x1000,
+        };
+        let hdr = Header::command(6, Command::DmaMap, map.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, map.as_bytes(), &[]).unwrap();
+        let map_reply = read_message(&mut client).unwrap();
+        assert!(!map_reply.header.flags().is_error(), "DMA_MAP 应成功");
+
+        // ② client 发 BAR0 REGION_WRITE @ 0x1000（doorbell），4 字节值 1。
+        let req = RegionAccessPayload {
+            offset: 0x1000,
+            region: 0,
+            count: 4,
+        };
+        let mut pl = Vec::new();
+        pl.extend_from_slice(req.as_bytes());
+        pl.extend_from_slice(&1u32.to_le_bytes());
+        let hdr = Header::command(7, Command::RegionWrite, pl.len() as u32);
+        fw_write(&mut client, &hdr, &pl, &[]).unwrap();
+
+        // ③ server 必须先发一条 server-initiated DMA_READ **command**（非 reply）。
+        let dma_req = read_message(&mut client).unwrap();
+        let dma_cmd = dma_req.header.cmd;
+        assert_eq!(
+            dma_cmd,
+            Command::DmaRead as u16,
+            "BAR0 doorbell 写应触发真 DMA_READ command 上 wire（不是 NoopTransport 丢弃）"
+        );
+        assert!(
+            dma_req.header.flags().is_command(),
+            "DMA_READ 应是 server→client command 方向"
+        );
+        let dma_id = dma_req.header.msg_id;
+        assert!(dma_id & 0x8000 != 0, "server-initiated msg_id 顶位应置 1");
+        let rb: crate::proto::DmaRwHdrPayload = decode_payload(
+            &dma_req.payload[..core::mem::size_of::<crate::proto::DmaRwHdrPayload>()],
+        )
+        .unwrap();
+        let gpa = rb.addr;
+        let cnt = rb.count;
+        assert_eq!(gpa, 0x1100);
+        assert_eq!(cnt, 64);
+
+        // ④ client 答复 DMA_READ：echo hdr + 64 字节 SQE 数据（全 0xAB）。
+        let mut reply_pl = Vec::new();
+        reply_pl.extend_from_slice(
+            crate::proto::DmaRwHdrPayload {
+                addr: 0x1100,
+                count: 64,
+            }
+            .as_bytes(),
+        );
+        reply_pl.extend_from_slice(&[0xABu8; 64]);
+        let rhdr = Header::reply_ok(dma_id, Command::DmaRead, reply_pl.len() as u32);
+        fw_write(&mut client, &rhdr, &reply_pl, &[]).unwrap();
+
+        // ⑤ 最后 server 发 REGION_WRITE reply（在 DMA 往返**之后**）。
+        let wr_reply = read_message(&mut client).unwrap();
+        let wr_cmd = wr_reply.header.cmd;
+        assert_eq!(wr_cmd, Command::RegionWrite as u16);
+        assert!(!wr_reply.header.flags().is_error());
+
+        assert!(h.join().unwrap().unwrap(), "session 应继续存活");
+
+        // ⑥ on_dma_complete 被投递，拿到 SQE 字节。
+        let done = completed.lock();
+        assert_eq!(done.len(), 1, "应恰好一次 DMA 完成回调");
+        let (_tok, ok, data) = &done[0];
+        assert!(*ok, "DMA_READ 成功");
+        assert_eq!(data, &vec![0xABu8; 64], "on_dma_complete 拿到 SQE 数据");
     }
 }

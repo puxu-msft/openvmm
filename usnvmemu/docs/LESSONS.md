@@ -670,3 +670,38 @@ SC+SCT 由 `sf_of(status)` 自动派生。调用点再也不传 SCT → **整类
 **来源**: sc 模块结构性重构（commit `2a6d71ec`）；anchored 测试 `sc_constants_match_nvme_spec`
 （全 sc:: == nvme_spec::Status）；rust-reviewer 2 轮（确认 4 处 intended SCT 校正 + 额外
 挖出 RESERVATION_CONFLICT/LOCKDOWN 2 处错值，HIGH-1 一处 PI error-log 漏 Media SCT）。
+
+## 28. realize-only（CPU 暂停）e2e 掩盖真 guest 才触发的整类 bug —— vfio-user 4 bug (HIGH)
+
+**症状**: vfio-user realize-only harness（QEMU `-S` 暂停 CPU + 只读 config space + 验 PCI
+总线看到设备）一直 PASS，但一引真 guest 驱动设备就 QEMU fatal：`unexpected reply` /
+`bad header size` / `vfio: DMA mapping failed`，guest 串口空白（连内核都没起）。
+
+**根因（4 个，全在"真 guest 驱动设备"路径上，realize 命不到）**:
+1. **posted(NO_REPLY) write 回了 reply → wire 失步**。guest 写 CC.EN→0（BAR0 REGION_WRITE
+   带 QEMU 的 NO_REPLY 标志）我们却回 reply；QEMU 没在等，把那 16 字节当**下一条消息
+   header** 解析 → `unexpected reply` + `bad header size` → 整条流报废。realize 不写 BAR0。
+2. **config space 没 MSI-X capability** → guest `nvme_probe -EINVAL`。realize 不真探中断。
+3. **SET_IRQS 拒绝 masked vector**（QEMU 对 `-1` 向量发 0 个 fd，旧码 `fds.len()!=count`→EINVAL）。
+4. **广告 DBBUF 但只存 shadow 不轮询** → Linux 信任我们轮询而**跳过真 MMIO doorbell** →
+   那些命令永不被 fetch → IO 30s 挂。realize 不做 IO。
+
+**为什么 realize 全命不到**: realize-only = 设备 realize 握手（VERSION/GET_REGION_INFO/config
+读/DMA_MAP）+ `-S` 暂停 CPU。它只验"设备造出来了 + 握手对"，**从不让真 guest CPU 驱动设备**
+——不写 BAR0、不探中断、不做 IO。4 类 bug 全在那条没被走的路径上。同 [[lesson §26]]（in-process
+harness 看不见 >4 GiB）一个道理：便宜 harness 的 PASS 是结构性假安心。
+
+**三条**:
+1. **"设备 realize 成功" ≠ "真 guest 能用"**。realize 只验造设备 + 握手；真 guest 驱动（MMIO
+   读写 / 中断 setup / DMA / IO）是另一整条路径，bug 都藏那。每条 transport 都要真 guest e2e。
+2. **wire 的 posted/fire-and-forget 语义必须严守**：回一个对端不期待的 reply 就**失步**，整流
+   报废。NO_REPLY 标志要 thread 到**每个** reply 点（成功 + 错误路径）。（"失步"=接收方对消息
+   边界判断错位且一路传染——你多发一条它就把后续每条都从错误的地方切开。）
+3. **中立 `describe()` 里别塞 transport 专属的 PCI-config 细节**（MSI-X cap）：它转发给所有
+   transport，在自己用 MsixEmulator 合成 MSI-X 的 OpenHCL 上会撞车（双 cap / 4-align 握手拒）。
+   config-space cap 是 per-transport 派生物，不是中立设备属性——本次在 OpenHCL SDK 转发时 strip。
+
+**来源**: vfio-user guest-boot harness `scripts/qemu_interop/run_qemu_vfio_guest.py` 首跑即抓
+4 bug；fix `vfio_user_transport/{session,dma,irq,framing}.rs` + `nvme_firmware/{cmd,controller/
+mmio,controller/mod,regs}.rs` + `pcie_device_sdk/run.rs`(MSI-X strip)；rust-reviewer 2 轮
+（核心 wire 逻辑 APPROVE + BLOCK 3 项 clippy/fmt/OpenHCL-MSI-X 回归全修）。

@@ -261,16 +261,29 @@ pub fn handle_dma_map(
     table: &mut DmaTable,
     msg_id: u16,
     msg: &mut Message,
+    no_reply: bool,
 ) -> anyhow::Result<()> {
     let want = core::mem::size_of::<DmaMapPayload>();
     if msg.payload.len() != want {
-        send_err(stream, msg_id, Command::DmaMap, libc::EINVAL as u32)?;
+        send_err(
+            stream,
+            msg_id,
+            Command::DmaMap,
+            libc::EINVAL as u32,
+            no_reply,
+        )?;
         return Ok(());
     }
     let pl: DmaMapPayload = match decode_payload(&msg.payload) {
         Ok(p) => p,
         Err(_) => {
-            send_err(stream, msg_id, Command::DmaMap, libc::EINVAL as u32)?;
+            send_err(
+                stream,
+                msg_id,
+                Command::DmaMap,
+                libc::EINVAL as u32,
+                no_reply,
+            )?;
             return Ok(());
         }
     };
@@ -278,11 +291,23 @@ pub fn handle_dma_map(
     let perms =
         pl.flags & (crate::proto::dma_map_flags::READABLE | crate::proto::dma_map_flags::WRITEABLE);
     if pl.size == 0 || perms == 0 {
-        send_err(stream, msg_id, Command::DmaMap, libc::EINVAL as u32)?;
+        send_err(
+            stream,
+            msg_id,
+            Command::DmaMap,
+            libc::EINVAL as u32,
+            no_reply,
+        )?;
         return Ok(());
     }
     if pl.addr.checked_add(pl.size).is_none() {
-        send_err(stream, msg_id, Command::DmaMap, libc::EINVAL as u32)?;
+        send_err(
+            stream,
+            msg_id,
+            Command::DmaMap,
+            libc::EINVAL as u32,
+            no_reply,
+        )?;
         return Ok(());
     }
     let region = DmaRegion {
@@ -292,7 +317,7 @@ pub fn handle_dma_map(
         writeable: pl.flags & crate::proto::dma_map_flags::WRITEABLE != 0,
     };
     if let Err(e) = table.insert(region) {
-        send_err(stream, msg_id, Command::DmaMap, e.errno())?;
+        send_err(stream, msg_id, Command::DmaMap, e.errno(), no_reply)?;
         return Ok(());
     }
     let r_addr = region.addr;
@@ -328,7 +353,10 @@ pub fn handle_dma_map(
         zero_copy,
         "DMA_MAP added"
     );
-    // OK reply：spec 说回 header only。
+    // OK reply：spec 说回 header only。NO_REPLY（posted MAP）则不发。
+    if no_reply {
+        return Ok(());
+    }
     let hdr = Header::reply_ok(msg_id, Command::DmaMap, 0);
     write_message(stream, &hdr, &[], &[]).context("write DMA_MAP reply")
 }
@@ -400,16 +428,29 @@ pub fn handle_dma_unmap(
     table: &mut DmaTable,
     msg_id: u16,
     msg: &Message,
+    no_reply: bool,
 ) -> anyhow::Result<()> {
     let want = core::mem::size_of::<DmaUnmapPayload>();
     if msg.payload.len() != want {
-        send_err(stream, msg_id, Command::DmaUnmap, libc::EINVAL as u32)?;
+        send_err(
+            stream,
+            msg_id,
+            Command::DmaUnmap,
+            libc::EINVAL as u32,
+            no_reply,
+        )?;
         return Ok(());
     }
     let pl: DmaUnmapPayload = match decode_payload(&msg.payload) {
         Ok(p) => p,
         Err(_) => {
-            send_err(stream, msg_id, Command::DmaUnmap, libc::EINVAL as u32)?;
+            send_err(
+                stream,
+                msg_id,
+                Command::DmaUnmap,
+                libc::EINVAL as u32,
+                no_reply,
+            )?;
             return Ok(());
         }
     };
@@ -417,7 +458,7 @@ pub fn handle_dma_unmap(
         table.clear();
         tracing::debug!("DMA_UNMAP all regions");
     } else if let Err(e) = table.remove_exact(pl.addr, pl.size) {
-        send_err(stream, msg_id, Command::DmaUnmap, e.errno())?;
+        send_err(stream, msg_id, Command::DmaUnmap, e.errno(), no_reply)?;
         return Ok(());
     } else {
         let pl_addr = pl.addr;
@@ -429,6 +470,10 @@ pub fn handle_dma_unmap(
         );
     }
     // 回 echo（spec 说 echo struct + 可选 bitmap；我们不实 dirty bitmap）。
+    // NO_REPLY（posted UNMAP）则不发。
+    if no_reply {
+        return Ok(());
+    }
     let hdr = Header::reply_ok(msg_id, Command::DmaUnmap, pl.as_bytes().len() as u32);
     write_message(stream, &hdr, pl.as_bytes(), &[]).context("write DMA_UNMAP reply")
 }
@@ -610,7 +655,19 @@ pub(crate) fn alloc_server_msg_id(next: &mut u16) -> u16 {
 }
 
 /// 与 [`crate::handshake::send_err`] 同等的本模块内联 helper（避免循环 import）。
-fn send_err(stream: &mut UnixStream, msg_id: u16, cmd: Command, errno: u32) -> anyhow::Result<()> {
+///
+/// `no_reply` = true（posted 请求）时静默不发任何 reply（含 error），符合 vfio-user
+/// NO_REPLY 语义（QEMU 没把该 msg_id 入 pending，多发会让它失步）。
+fn send_err(
+    stream: &mut UnixStream,
+    msg_id: u16,
+    cmd: Command,
+    errno: u32,
+    no_reply: bool,
+) -> anyhow::Result<()> {
+    if no_reply {
+        return Ok(());
+    }
     let hdr = Header {
         msg_id,
         cmd: cmd as u16,
@@ -692,9 +749,15 @@ mod tests {
         let h = thread::spawn(move || -> anyhow::Result<DmaTable> {
             // 两轮：MAP + UNMAP
             let mut msg1 = read_message(&mut server)?;
-            handle_dma_map(&mut server, &mut table, msg1.header.msg_id, &mut msg1)?;
+            handle_dma_map(
+                &mut server,
+                &mut table,
+                msg1.header.msg_id,
+                &mut msg1,
+                false,
+            )?;
             let msg2 = read_message(&mut server)?;
-            handle_dma_unmap(&mut server, &mut table, msg2.header.msg_id, &msg2)?;
+            handle_dma_unmap(&mut server, &mut table, msg2.header.msg_id, &msg2, false)?;
             Ok(table)
         });
         // 客户端发 DMA_MAP
@@ -1055,7 +1118,7 @@ mod tests {
             let mut table = DmaTable::default();
             let h = thread::spawn(move || -> anyhow::Result<()> {
                 let mut msg = read_message(&mut server)?;
-                handle_dma_map(&mut server, &mut table, msg.header.msg_id, &mut msg)?;
+                handle_dma_map(&mut server, &mut table, msg.header.msg_id, &mut msg, false)?;
                 Ok(())
             });
             let hdr = Header::command(1, Command::DmaMap, pl.as_bytes().len() as u32);
@@ -1075,9 +1138,9 @@ mod tests {
         let mut table = DmaTable::default();
         let h = thread::spawn(move || -> anyhow::Result<()> {
             let mut m1 = read_message(&mut server)?;
-            handle_dma_map(&mut server, &mut table, m1.header.msg_id, &mut m1)?;
+            handle_dma_map(&mut server, &mut table, m1.header.msg_id, &mut m1, false)?;
             let mut m2 = read_message(&mut server)?;
-            handle_dma_map(&mut server, &mut table, m2.header.msg_id, &mut m2)?;
+            handle_dma_map(&mut server, &mut table, m2.header.msg_id, &mut m2, false)?;
             Ok(())
         });
         let pl = DmaMapPayload {
@@ -1141,7 +1204,7 @@ mod tests {
             dma_map_flags::READABLE | dma_map_flags::WRITEABLE,
             memfd_with(bytes),
         );
-        handle_dma_map(&mut server, &mut table, 1, &mut msg).unwrap();
+        handle_dma_map(&mut server, &mut table, 1, &mut msg, false).unwrap();
         assert!(msg.fds.is_empty(), "fd 应被取走");
         // mmap_read 命中 → 返 memfd 内容。
         assert_eq!(
@@ -1170,7 +1233,7 @@ mod tests {
             dma_map_flags::READABLE | dma_map_flags::WRITEABLE,
             fd,
         );
-        handle_dma_map(&mut server, &mut table, 1, &mut msg).unwrap();
+        handle_dma_map(&mut server, &mut table, 1, &mut msg, false).unwrap();
         let mut next = 0x8000u16;
         let mut q = std::collections::VecDeque::new();
         let payload = b"written-via-mmap";
@@ -1191,7 +1254,7 @@ mod tests {
         let mut table = DmaTable::default();
         let h = thread::spawn(move || -> anyhow::Result<DmaTable> {
             let mut m = read_message(&mut server)?;
-            handle_dma_map(&mut server, &mut table, m.header.msg_id, &mut m)?;
+            handle_dma_map(&mut server, &mut table, m.header.msg_id, &mut m, false)?;
             Ok(table)
         });
         let pl = DmaMapPayload {
@@ -1224,7 +1287,7 @@ mod tests {
             dma_map_flags::READABLE,
             memfd_with(bytes),
         );
-        handle_dma_map(&mut server, &mut table, 1, &mut msg).unwrap();
+        handle_dma_map(&mut server, &mut table, 1, &mut msg, false).unwrap();
         // 读零拷贝 OK。
         assert_eq!(
             table.mmap_read(0x7000, bytes.len() as u32).as_deref(),
@@ -1246,7 +1309,7 @@ mod tests {
             dma_map_flags::READABLE | dma_map_flags::WRITEABLE,
             memfd_with(bytes),
         );
-        handle_dma_map(&mut server, &mut table, 1, &mut msg).unwrap();
+        handle_dma_map(&mut server, &mut table, 1, &mut msg, false).unwrap();
         assert!(table.mmap_read(0x8800, 4).is_some());
         table.remove_exact(0x8800, bytes.len() as u64).unwrap();
         assert!(table.mmap_read(0x8800, 4).is_none(), "unmap 后 mmap 应丢弃");
@@ -1268,7 +1331,7 @@ mod tests {
             dma_map_flags::READABLE | dma_map_flags::WRITEABLE,
             fd,
         );
-        handle_dma_map(&mut server, &mut table, 1, &mut msg).unwrap();
+        handle_dma_map(&mut server, &mut table, 1, &mut msg, false).unwrap();
         // fstat 校验拒绝 mmap（offset+size > 真实大小）→ 无 mmap 附加。
         assert!(
             table.mmap_read(0x9000, 8).is_none(),
@@ -1299,7 +1362,7 @@ mod tests {
             payload: pl.as_bytes().to_vec(),
             fds: vec![fd],
         };
-        handle_dma_map(&mut server, &mut table, 1, &mut msg).unwrap();
+        handle_dma_map(&mut server, &mut table, 1, &mut msg, false).unwrap();
         // gpa 0xA000 → fd offset 4096，读出 marker。
         assert_eq!(
             table.mmap_read(0xA000, marker.len() as u32).as_deref(),

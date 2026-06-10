@@ -29,12 +29,31 @@ use pcie_remote_protocol::codec;
 use pcie_remote_protocol::to_host::Body as HostBody;
 use std::time::Duration;
 
+/// PCI MSI-X Capability ID（PCI 3.0 spec § 6.8.2）。OpenHCL adapter 在转 wire
+/// 时**剥离**这条 cap —— 见 [`to_wire`] 的过滤逻辑与理由。
+const MSIX_CAP_ID: u8 = 0x11;
+
 /// **Phase W1** — 中立 [`crate::DeviceDescribe`] → pcie_remote wire DTO。
 ///
 /// 这是 openhcl adapter 的 wire↔domain seam：中立 domain 类型在此转成
 /// protobuf 编码形态（HelloAck 内发给 VTL2）。W2 拆 crate 后本函数随
 /// openhcl adapter 走；其它 adapter（vfio-user / nvme-of）有各自的转换或
 /// 直接消费 domain 类型，core 不依赖任何 wire crate。
+///
+/// **MSI-X cap 剥离（2026-06-10 真 QEMU vfio-user guest e2e 修复的 OpenHCL 侧回归）**：
+/// 中立 `describe().capabilities` 含一条 MSI-X cap（cap_id 0x11，body 10 字节：
+/// MsgControl 2 + Table 4 + PBA 4），vfio-user 路径用它合成 guest 可见的 cfg-space
+/// cap 链表。但 OpenHCL 路径**不能**转发它，两条独立硬约束：
+///
+/// - 约束①：OpenVMM peer（`pcie_remote_device/src/resolver.rs`）据 `msix_count` 用
+///   `MsixEmulator` **自行合成** MSI-X cap（Hyper-V 中断路由需要它自己那条），且只用
+///   那条建 config space（不消费转发来的 caps）—— 转发会是死字节。
+/// - 约束②：OpenVMM peer 的 handshake（`pcie_remote_device/src/handshake.rs`）校验每条
+///   转发 cap 的 `raw.len()` 必须 4 字节对齐；MSI-X body 是 10 字节 → 非 4 对齐 →
+///   handshake **硬失败** `CapabilityBlob("cap 17 raw len 10 not 4-aligned")`。
+///
+/// 故此处过滤掉 MSI-X cap：`describe()` 保留它（vfio-user 的 config 路径要用），但
+/// OpenHCL 转发出的字节里**不含** MSI-X cap。其它 cap（若将来新增）照常转发。
 fn to_wire(d: crate::DeviceDescribe) -> pcie_remote_protocol::DeviceDescribe {
     use pcie_remote_protocol::BarInfo;
     use pcie_remote_protocol::CapabilityBlob;
@@ -64,6 +83,9 @@ fn to_wire(d: crate::DeviceDescribe) -> pcie_remote_protocol::DeviceDescribe {
         capabilities: d
             .capabilities
             .into_iter()
+            // OpenVMM peer 自合成 MSI-X 且其 handshake 拒绝非 4 对齐 cap body
+            // （MSI-X body=10B）。剥离它；见函数 doc 的两条硬约束。
+            .filter(|c| c.cap_id != MSIX_CAP_ID)
             .map(|c| CapabilityBlob {
                 cap_id: c.cap_id as u32,
                 raw: c.raw,
@@ -245,6 +267,72 @@ mod tests {
         assert_eq!(mask_value(0xdead_beef_cafe_babe, 2), 0xbabe);
         assert_eq!(mask_value(0xdead_beef_cafe_babe, 4), 0xcafe_babe);
         assert_eq!(mask_value(0xdead_beef_cafe_babe, 8), 0xdead_beef_cafe_babe);
+    }
+
+    /// **2026-06-10 真 QEMU vfio-user guest e2e 修复的 OpenHCL 侧回归** —
+    /// `to_wire` 必须**剥离** MSI-X cap（cap_id 0x11，body 10B 非 4 对齐），否则
+    /// OpenVMM peer 的 handshake 硬失败；同时保留其它（4 对齐）cap 原样转发，且
+    /// 不影响 `msix_count`（OpenVMM peer 据它自合成 MSI-X）。
+    #[test]
+    fn to_wire_strips_msix_cap_keeps_others() {
+        use crate::Capability;
+        use crate::DeviceDescribe;
+
+        let d = DeviceDescribe {
+            vendor_id: 0x1414,
+            device_id: 0xc0de,
+            msix_count: 4,
+            capabilities: vec![
+                // MSI-X cap：body 10 字节（MsgControl 2 + Table 4 + PBA 4），非 4 对齐。
+                Capability {
+                    cap_id: MSIX_CAP_ID,
+                    raw: vec![0xAB; 10],
+                },
+                // 一条假想的 4 对齐 cap（如 PM body 6B 不对齐，这里用 8B 对齐演示透传）。
+                Capability {
+                    cap_id: 0x01,
+                    raw: vec![0xCD; 8],
+                },
+            ],
+            ..Default::default()
+        };
+        let wire = to_wire(d);
+        // msix_count 不受影响（OpenVMM peer 据它合成自己的 MSI-X cap）。
+        assert_eq!(wire.msix_count, 4);
+        // 转发的 caps 里**不含** MSI-X（cap_id 0x11）。
+        assert!(
+            wire.capabilities
+                .iter()
+                .all(|c| c.cap_id != MSIX_CAP_ID as u32),
+            "OpenHCL 转发字节不得含 MSI-X cap"
+        );
+        // 非 MSI-X cap 原样保留（cap_id + raw）。
+        assert_eq!(wire.capabilities.len(), 1, "仅保留非 MSI-X cap");
+        assert_eq!(wire.capabilities[0].cap_id, 0x01);
+        assert_eq!(wire.capabilities[0].raw, vec![0xCD; 8]);
+    }
+
+    /// MSI-X 是唯一 cap 时，剥离后转发 caps 为空（这正是 NVMe controller 的实况：
+    /// `describe()` 只含 MSI-X 一条 cap → OpenHCL 转发 0 条 cap → handshake 通过）。
+    #[test]
+    fn to_wire_msix_only_yields_empty_caps() {
+        use crate::Capability;
+        use crate::DeviceDescribe;
+
+        let d = DeviceDescribe {
+            msix_count: 1,
+            capabilities: vec![Capability {
+                cap_id: MSIX_CAP_ID,
+                raw: vec![0u8; 10],
+            }],
+            ..Default::default()
+        };
+        let wire = to_wire(d);
+        assert!(
+            wire.capabilities.is_empty(),
+            "MSI-X 是唯一 cap → 转发 caps 应为空"
+        );
+        assert_eq!(wire.msix_count, 1);
     }
 
     /// **Phase N1**（Phase T 重构后）— DeviceCtx 基础 API：每个动作往
