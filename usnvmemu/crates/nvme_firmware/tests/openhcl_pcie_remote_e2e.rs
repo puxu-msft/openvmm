@@ -137,6 +137,20 @@ const IO_MSIX_VEC2: u16 = 1;
 const WRITE_BUF2Q_GPA: u64 = 0xE_0000;
 const READ_BUF2Q_GPA: u64 = 0xF_0000;
 
+// ── O6（IO 队列生命周期：Delete IO SQ/CQ）队列对 + 数据缓冲 GPA ──
+//
+// 现有布局用到 0xF_0000；从 0x10_0000 起是空的（仍远在 GUEST_MEM_BYTES(16 MiB =
+// 0x100_0000) 内）。第三 IO 队列用 **qid 3**（与 qid 1/2 都不同，证生命周期在 fresh
+// qid 上独立成立），其 SQ/CQ/数据缓冲都用全新 GPA，与前两队列零重叠。CQ 的 IV 取 0
+// （本测试不验中断路由——那是 O5 TEST 1 的 lane；这里只验 create→IO→delete→re-create
+// 的生命周期 + "删后队列真消失" 的 backing-file 独立 oracle）。
+const IO_QID3: u16 = 3;
+const IO_SQ3_GPA: u64 = 0x10_0000;
+const IO_CQ3_GPA: u64 = 0x11_0000;
+/// qid 3 IO 数据缓冲（独立于 qid 1/2 的 WRITE/READ_BUF，证无跨队列污染）。
+const WRITE_BUF3_GPA: u64 = 0x12_0000;
+const READ_BUF3_GPA: u64 = 0x13_0000;
+
 // ═══════════════════════════ 子进程 / 临时文件守卫 ═══════════════════════════
 
 /// 子进程 + 临时文件守卫：Drop 时 kill child + 删 backing/log；测试 panic 时打印
@@ -454,6 +468,64 @@ impl NvmeDriver {
         Err(anyhow!("CC.EN 后 CSTS.RDY 始终未置位"))
     }
 
+    /// **O6（IO 队列生命周期）** — 为 `q`（其 qid/sq_base/cq_base/depth 即建队列几何）建一对
+    /// IO 队列（Create IO CQ 然后 Create IO SQ，spec 要求 CQ 先于 SQ），断言两条 CQE 都 sc==0。
+    /// 与 `setup_enabled_4k_io` 里内联的 Create CQ/SQ 同一惯用法，抽成 helper 让"建 → 删 →
+    /// 重建"在 O6 测试里不重复三遍（几何从 `QueueState` 取，避免一长串裸参数被 clippy 嫌弃）。
+    ///
+    /// - CQ：cdw10 = QID | (depth-1)<<16；cdw11 = PC(bit0) | IEN(bit1) | IV<<16。
+    /// - SQ：cdw10 同；cdw11 = PC(bit0) | CQID<<16（绑同 qid 的 CQ）。
+    ///
+    /// `cid_cq`/`cid_sq` 由 caller 传不同值（重建时换一批，避免与首次 create 的 CID 混淆）。
+    async fn create_io_queue_pair(
+        &self,
+        admin: &mut QueueState,
+        q: &QueueState,
+        iv: u16,
+        cid_cq: u16,
+        cid_sq: u16,
+    ) -> Result<()> {
+        let qid = q.qid;
+        let cdw10_q = (qid as u32) | (((q.depth - 1) as u32) << 16);
+        let cqe = admin
+            .submit(
+                self,
+                Sqe {
+                    opcode: 0x05, // Create IO CQ
+                    cid: cid_cq,
+                    prp1: q.cq_base,
+                    cdw10: cdw10_q,
+                    cdw11: 0b11 | ((iv as u32) << 16), // PC | IEN | IV
+                    ..Default::default()
+                }
+                .encode(),
+            )
+            .await
+            .context("Create IO CQ")?;
+        if cqe.sc != 0 {
+            return Err(anyhow!("Create IO CQ(qid={qid}) sc={:#x}", cqe.sc));
+        }
+        let cqe = admin
+            .submit(
+                self,
+                Sqe {
+                    opcode: 0x01, // Create IO SQ
+                    cid: cid_sq,
+                    prp1: q.sq_base,
+                    cdw10: cdw10_q,
+                    cdw11: 1 | ((qid as u32) << 16), // PC | CQID
+                    ..Default::default()
+                }
+                .encode(),
+            )
+            .await
+            .context("Create IO SQ")?;
+        if cqe.sc != 0 {
+            return Err(anyhow!("Create IO SQ(qid={qid}) sc={:#x}", cqe.sc));
+        }
+        Ok(())
+    }
+
     /// **O4（DBBUF）** — 激活 shadow doorbells：提交 Doorbell Buffer Config admin 命令
     /// （opcode 0x7c，PRP1=shadow buffer GPA、PRP2=event_idx buffer GPA，无数据传输），
     /// 断言 CQE 成功。激活后 controller 不再信任可能 stale 的 MMIO doorbell value，改
@@ -657,6 +729,22 @@ impl QueueState {
             qid: IO_QID2,
             sq_base: IO_SQ2_GPA,
             cq_base: IO_CQ2_GPA,
+            depth: IO_Q_DEPTH,
+            sq_tail: 0,
+            cq_head: 0,
+            cq_phase: true,
+        }
+    }
+
+    /// **O6（IO 队列生命周期）** — qid 3 的 driver 侧本地队列状态（独立 SQ/CQ GPA）。
+    /// 用于 Delete IO SQ/CQ 生命周期测试：先在 fresh qid 3 上建队列并跑 IO，再删，
+    /// 再 re-create。每次 `io3()` 都返初值（tail=0/head=0/phase=1），与 firmware 侧
+    /// 新建队列一致；delete 后 re-create 也用 `io3()` 重置本地状态（与新建对齐）。
+    fn io3() -> Self {
+        Self {
+            qid: IO_QID3,
+            sq_base: IO_SQ3_GPA,
+            cq_base: IO_CQ3_GPA,
             depth: IO_Q_DEPTH,
             sq_tail: 0,
             cq_head: 0,
@@ -2925,3 +3013,342 @@ async fn openhcl_dbbuf_per_queue_shadow_keying() -> Result<()> {
 
     Ok(())
 }
+
+/// **O6（IO 队列生命周期）** — Delete IO SQ/CQ 经 pcie_remote 真 wire（生命周期 + backing
+/// -file 独立 oracle）。
+///
+/// 此前本 e2e harness 只**建** IO 队列从不**删**——`DELETE_IO_SQ`/`DELETE_IO_CQ`
+/// (`controller/admin.rs`) 的 wire 集成在跨进程真异步 wire 上零覆盖（只有 controller 单测
+/// 摸过）。本测试在 fresh **qid 3** 上跑完整生命周期：create → IO Write+Read（证队列工作）
+/// → Delete SQ → Delete CQ（spec 要求 SQ 先于 CQ）→ re-create → 再 IO（证可重建）。
+///
+/// ## 为何 oracle 选 backing-file 的"删后写不落盘"（而非 re-create-成功 / 删不存在队列报错）
+///
+/// 先核对 firmware 的**真实** Delete/Create 行为（`controller/admin.rs`），再据此定 oracle：
+///
+/// - **`DELETE_IO_SQ`/`DELETE_IO_CQ`**：无条件 `self.sqs/cqs.remove(qid)` + 恒返 sc==0。
+///   既**不**校验 qid 是否存在（删不存在的队列也返 success，**没有** "Invalid Queue
+///   Identifier" SC——该常量在本 firmware 根本不存在），也**不**强制 SQ-before-CQ（删仍有
+///   关联 SQ 的 CQ 也不报 "Invalid Queue Deletion"）。故"删不存在队列→特定错误 SC"这条
+///   lifecycle-error oracle **firmware 不提供**，用不了。
+/// - **`CREATE_IO_CQ`/`CREATE_IO_SQ`**：对**已存在**的 qid **静默覆盖**（`insert` 直接重写，
+///   不返 "Queue Identifier Already Exists"）。故"re-create 成功 ⇒ qid 真被释放"是**弱
+///   oracle**——Create 本就覆盖，无论删没删都成功，证不出 delete 真生效。
+///
+/// 既然两条候选 oracle 都弱/不可用，本测试的**真·独立 oracle = 删 SQ 后向其(已消失的)
+/// doorbell 提交一条 IO Write，断言数据 *不落 backing file***：
+///   - `on_sq_tail_doorbell`(DBBUF inactive) → `advance_sq_to_tail` → `self.sqs.get(qid)`
+///     为 None → **提前返回，根本不 fetch SQE** → 命令从未执行 → 从未 `write_at` → backing
+///     file 该 LBA 仍是删除前播种的 sentinel。
+///   - **为何独立**：判据是 firmware **自己 backing file 的真实字节**（它实际持久化了什么），
+///     与 harness 记账无关。firmware 写经 mmap（与 file page 共享）→ `std::fs::read` 立即可见；
+///     若命令真被处理，新 pattern 必现身 file → 断言 FAIL。
+///   - **为何有牙（revert-verify，已实测）**：把 `controller/admin.rs` `DELETE_IO_SQ` 改成
+///     早返 success 而**不** `self.sqs.remove(&qid)`（删 = no-op）→ 删后 SQ 仍在 → 敲其
+///     doorbell → `advance_sq_to_tail` fetch 到 SQE → 处理 Write → 新 pattern(0xA5) 落 mmap
+///     → `std::fs::read` 见 0xA5 ≠ sentinel(0x5A) → 本测试 backing-file 断言 FAIL。
+///
+/// re-create 段仍保留（证 qid 可重建且功能正常），但**明确是较弱信号**（Create 覆盖语义）；
+/// 生命周期的"删真生效"由上面的 backing-file 负 oracle 钉死。
+///
+/// 注：本测试**不**断言"删带关联 SQ 的 CQ 返 Invalid Queue Deletion"——已核对 firmware
+/// 不强制该不变量（`DELETE_IO_CQ` 无条件删），断言它会假阳。
+#[tokio::test]
+async fn openhcl_delete_io_queue_lifecycle() -> Result<()> {
+    // 删后做负 oracle 的目标 LBA（4K LBAF[2] 下 backing 偏移 = LBA*4096，落 4 MiB 内）。
+    const LIFECYCLE_LBA: u32 = 7;
+    const SENTINEL: u8 = 0x5A; // 删除前播种到盘的已知基线
+    const POST_DELETE_PAT: u8 = 0xA5; // 删后试写的 pattern（fix 下不该落盘）
+
+    let (stream, harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    // setup 给 enable + Format NS1→LBAF[2](纯 4K) + qid 1（qid 1 本测试不用，但复用已
+    // 验证的 enable+format 路径最省）。
+    let (mut admin, _io1) = setup_enabled_4k_io(&driver).await?;
+
+    // ── 1) 在 fresh qid 3 建一对 IO 队列（IV=0），断言 create 成功 ──
+    //   先建 io3（携 qid/SQ/CQ GPA/depth 几何），create_io_queue_pair 从中取几何。
+    let mut io3 = QueueState::io3();
+    driver
+        .create_io_queue_pair(
+            &mut admin, &io3, 0,    // IV=0（本测试不验中断路由）
+            0x18, // cid_cq
+            0x19, // cid_sq
+        )
+        .await
+        .context("初次 create qid 3")?;
+
+    // ── 2) 在 qid 3 上跑 IO Write+Read，证队列工作（distinct-per-512 避免 uniform 掩盖偏移）──
+    let mut pattern = vec![0u8; 4096];
+    for i in 0..8 {
+        pattern[i * 512..(i + 1) * 512].fill(0x90 + i as u8);
+    }
+    driver.write_guest(WRITE_BUF3_GPA, pattern.clone());
+    let cqe = io3
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x01, // Write
+                cid: 0x20,
+                nsid: 1,
+                prp1: WRITE_BUF3_GPA,
+                cdw10: LIFECYCLE_LBA,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("qid 3 Write")?;
+    assert_eq!(cqe.sc, 0, "qid 3 Write sc 应=0，实={:#x}", cqe.sc);
+    driver.write_guest(READ_BUF3_GPA, vec![0u8; 4096]);
+    let cqe = io3
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02, // Read
+                cid: 0x21,
+                nsid: 1,
+                prp1: READ_BUF3_GPA,
+                cdw10: LIFECYCLE_LBA,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("qid 3 Read")?;
+    assert_eq!(cqe.sc, 0, "qid 3 Read sc 应=0，实={:#x}", cqe.sc);
+    let rb = driver.read_guest(READ_BUF3_GPA, 4096).await?;
+    assert_eq!(rb, pattern, "qid 3 round-trip 应一致（队列工作）");
+
+    // ── 3) 播种 backing sentinel 到 LIFECYCLE_LBA（趁队列仍工作）：写 0x5A + Flush 落盘。
+    //   这是删后负 oracle 的"删除前真相"——删后若命令未被处理，盘上该 LBA 应仍是 0x5A。
+    driver.write_guest(WRITE_BUF3_GPA, vec![SENTINEL; 4096]);
+    let cqe = io3
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x01, // Write sentinel
+                cid: 0x22,
+                nsid: 1,
+                prp1: WRITE_BUF3_GPA,
+                cdw10: LIFECYCLE_LBA,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("播种 sentinel Write")?;
+    assert_eq!(cqe.sc, 0, "sentinel Write sc 应=0");
+    let cqe = io3
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x00, // Flush（落盘，保证 std::fs::read 见 sentinel）
+                cid: 0x23,
+                nsid: 1,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Flush sentinel")?;
+    assert_eq!(cqe.sc, 0, "Flush sc 应=0");
+    let file = std::fs::read(&harness.backing).context("读 backing(验 sentinel 已落盘)")?;
+    let base = LIFECYCLE_LBA as usize * 4096;
+    assert!(
+        file[base..base + 4096].iter().all(|&b| b == SENTINEL),
+        "删除前 backing[{LIFECYCLE_LBA}*4096] 应已是 sentinel 0x5A（负 oracle 的基线）"
+    );
+
+    // ── 4) Delete IO SQ 然后 Delete IO CQ（spec 要求 SQ 先于 CQ），断言两条 sc==0 ──
+    let cqe = admin
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x00, // DELETE_IO_SQ
+                cid: 0x24,
+                cdw10: IO_QID3 as u32, // cdw10 = QID
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Delete IO SQ")?;
+    assert_eq!(cqe.sc, 0, "Delete IO SQ sc 应=0，实={:#x}", cqe.sc);
+    let cqe = admin
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x04, // DELETE_IO_CQ
+                cid: 0x25,
+                cdw10: IO_QID3 as u32,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Delete IO CQ")?;
+    assert_eq!(cqe.sc, 0, "Delete IO CQ sc 应=0，实={:#x}", cqe.sc);
+
+    // ── 5) ★ 真·独立 oracle：删后向 qid 3 的(已消失) SQ doorbell 提交一条 IO Write，断言
+    //   数据 *不落 backing file*（命令从未被 fetch/处理）。fire-and-forget（**不** poll CQE：
+    //   命令不会处理，自然无 CQE）。
+    //
+    //   place_sqe 把 SQE 写进 qid 3 SQ GPA 并推本地 tail；ring_sq 敲其 SQ doorbell。删后
+    //   `self.sqs` 无 qid 3 → `advance_sq_to_tail` 提前返回，SQE 永不 fetch → 永不 write_at。
+    //
+    //   **关键：admin fence 让负 oracle 不依赖固定 sleep**（避免 timing-fragile 假阴——实测
+    //   单纯 200ms sleep 在 revert-verify 下太短：broken 路径的 IO write 数据 DMA 还没回执就
+    //   被读盘）。原理：本 harness pump 用 `biased` device-first select（见文件头），它**必先**
+    //   把 firmware 的所有在飞 DMA（含 broken 路径下这条 IO write 的 SQE-fetch + data-fetch 两
+    //   段往返）排干，**之后**才会把 test 的下一条命令（admin Identify doorbell）送上 wire。故
+    //   `admin.submit(Identify)` 返回时，broken 路径的 IO write **必已 write_at 落盘** → 读盘见
+    //   0xA5 → 断言 FAIL；correct 路径下 IO doorbell 是 no-op（SQ 不存在），fence 后盘仍 0x5A。
+    driver.write_guest(WRITE_BUF3_GPA, vec![POST_DELETE_PAT; 4096]);
+    io3.place_sqe(
+        &driver,
+        Sqe {
+            opcode: 0x01, // Write（删后试写，不应生效）
+            cid: 0x26,
+            nsid: 1,
+            prp1: WRITE_BUF3_GPA,
+            cdw10: LIFECYCLE_LBA,
+            ..Default::default()
+        }
+        .encode(),
+    );
+    io3.ring_sq(&driver);
+    // admin fence ×2：每条 Identify 是一次完整 admin 往返（SQE-fetch→dispatch→DMA-write
+    // payload→CQE）。受 biased pump 约束，fence doorbell 只在 firmware 在飞 DMA 排干后才上
+    // wire，故 fence 返回 ⇒ 删后 IO write（若 SQ 仍在）已彻底完成。两条给足余量。
+    for fence_cid in [0x2c_u16, 0x2d] {
+        let cqe = admin
+            .submit(
+                &driver,
+                Sqe {
+                    opcode: 0x06, // Identify
+                    cid: fence_cid,
+                    prp1: IDENTIFY_GPA,
+                    cdw10: 1, // CNS=1 Identify Controller
+                    ..Default::default()
+                }
+                .encode(),
+            )
+            .await
+            .context("admin fence Identify")?;
+        assert_eq!(cqe.sc, 0, "admin fence Identify sc 应=0");
+    }
+    let file = std::fs::read(&harness.backing).context("读 backing(验删后写未落盘)")?;
+    assert!(
+        file[base..base + 4096].iter().all(|&b| b == SENTINEL),
+        "删 SQ 后 backing[{LIFECYCLE_LBA}*4096] 应仍是 sentinel 0x5A（命令未被处理）——\
+         若出现 0xA5 即 DELETE_IO_SQ 未真删队列（独立 oracle，源是 firmware 自己的 backing file；\
+         admin fence 已保证 broken 路径的写若会发生则已落盘）"
+    );
+
+    // ── 6) re-create qid 3（**较弱信号**：Create 覆盖语义，证不出 delete；纯证可重建+功能）──
+    //   换一批 CID 避免与首次 create 混淆。re-create 后本地状态用 io3() 重置（与新建对齐）。
+    //
+    //   **关键 harness 卫生**：先 zero qid 3 的 CQ guest-mem。第一段生命周期已往该 CQ 槽
+    //   0..3 写过 4 条 CQE（phase=1）；re-create 的新 CQ 也从 phase=1 / head=0 起。若不清，
+    //   `io3b.poll_cqe` 读槽 0 会**立刻命中残留的旧 CQE(phase=1)** 当成新命令的完成（实测：
+    //   poll 拿到旧 cid + sc=0，但 READ_BUF 从未被真填 → 全 0 → round-trip 失配）。真 driver
+    //   建 CQ 时给的是新分配(清零)内存，firmware 往里 post phase=1；清零正还原这一语义。
+    driver.write_guest(IO_CQ3_GPA, vec![0u8; IO_Q_DEPTH as usize * CQE_BYTES]);
+    let mut io3b = QueueState::io3();
+    driver
+        .create_io_queue_pair(
+            &mut admin, &io3b, 0, 0x28, // cid_cq（重建）
+            0x29, // cid_sq（重建）
+        )
+        .await
+        .context("re-create qid 3")?;
+
+    // re-create 后 IO Write+Read 一轮，证重建出的队列功能正常（写一个 distinct pattern 到
+    // 另一个 LBA，round-trip 验）。
+    let mut pat2 = vec![0u8; 4096];
+    for i in 0..8 {
+        pat2[i * 512..(i + 1) * 512].fill(0x70 + i as u8);
+    }
+    driver.write_guest(WRITE_BUF3_GPA, pat2.clone());
+    let cqe = io3b
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x01, // Write
+                cid: 0x2a,
+                nsid: 1,
+                prp1: WRITE_BUF3_GPA,
+                cdw10: LIFECYCLE_LBA + 1, // 另一个 LBA，与 sentinel LBA 区分
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("re-create 后 Write")?;
+    assert_eq!(cqe.sc, 0, "re-create 后 Write sc 应=0，实={:#x}", cqe.sc);
+    driver.write_guest(READ_BUF3_GPA, vec![0u8; 4096]);
+    let cqe = io3b
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02, // Read
+                cid: 0x2b,
+                nsid: 1,
+                prp1: READ_BUF3_GPA,
+                cdw10: LIFECYCLE_LBA + 1,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("re-create 后 Read")?;
+    assert_eq!(cqe.sc, 0, "re-create 后 Read sc 应=0，实={:#x}", cqe.sc);
+    let rb = driver.read_guest(READ_BUF3_GPA, 4096).await?;
+    assert_eq!(
+        rb, pat2,
+        "re-create 后队列 round-trip 应一致（qid 3 可重建且功能正常）"
+    );
+
+    Ok(())
+}
+
+// ═══════════════════════ Abort 调查 + DBBUF SQ-gone 边界（诚实记录）═══════════════════════
+//
+// ## Abort（opcode 0x08）—— **stub，故意不写 e2e 测试**
+//
+// `controller/admin.rs` 的 `ABORT` 臂是 no-op stub：恒返 `Cqe::success` + `cdw0=1`
+// （bit 0 = "Could Not Abort"），**不**按 SQID+CID 查任何 in-flight 命令、不真中止任何东西、
+// 也无任何可观测副作用。NVMe Abort 的语义本应是"按 SQID|CID<<16 定位目标命令并尝试中止，
+// dw0 bit0 报是否中止成功"，但本 firmware 对**任何** Abort 输入都返同一结果。
+//
+// 据 `docs/TEST_QUALITY.md` 三轴（reached / 独立 oracle / 有牙）与其**明令禁止"断言啥也没
+// 测"的无牙测试**（文中点名 `o3_fused_cw_dispatch_chain_smoke` "断言 events 空=啥也没测"
+// 为待修反例），给 stub 写 e2e 只能断言"返 success + dw0=1"——但那是 stub 的**恒定**输出，
+// 任意改坏 Abort 都不会让它 FAIL（无牙），且 oracle 就是被测代码自身（非独立）。故**SKIP**
+// Abort e2e，诚实记录其为 stub；待 Abort 真实现（真查命令、真中止 in-flight）时再写有牙测试。
+//
+// ## DBBUF "SQ 在轮询途中消失" 分支（`controller/mod.rs` `handle_shadow_sq`）—— **本 harness
+// 结构性不可达，unit-test 可拥有**
+//
+// 该防御分支在"SQ shadow-read 在飞（已发 ReadGpa 等 DmaCompletion）期间，SQ 被 delete/disable
+// 从 `self.sqs` 移除"时收链。问"能否经本 harness 触发（删一个 DBBUF-active 的 IO 队列、趁其
+// poll 链在飞）"——**追踪 pump 后确认：不可达**，与已有 DBBUF burst 测试记录的 HIGH-1
+// settle-窗口竞态**同类**。证据链：
+//
+//  1. **firmware 侧单线程严格串行**（`pcie_device_sdk/src/run.rs` 主循环）：每轮只读**一**条
+//     inbound 帧（或 tick）→ dispatch → drain 全部 outbound。故帧按 wire 到达序逐条处理。
+//  2. **harness pump 用 `biased` device-first select**（本文件头 "并发 pump"）：每轮**先**排
+//     `frame_rx`（device→openhcl 帧），仅当其空才碰 `cmd_rx`（test 命令）。且收到 `ReadGpa`/
+//     `WriteGpa` 当轮**立即**回 `DmaCompletion`，从不滞留。
+//  3. 于是 controller 的 shadow-poll 链一旦起飞（发 ReadGpa），pump 立即喂回 completion，
+//     firmware 自续 re-read…直到链 settle（不再发 ReadGpa）。期间 `frame_rx` 持续有料 →
+//     biased select **永不**轮到 `cmd_rx` → test 的 DELETE doorbell（一条 `Cmd::MmioWrite`）
+//     **只能在链 settle、frame_rx 空之后**才被送上 wire。
+//  4. 故 DELETE **不可能落在** "shadow-read 发出 ~ 其 completion 处理" 的窗口内：链 settle 时
+//     已无在飞 shadow-read，自然无"随后到达的 shadow completion"去撞已删的 SQ。
+//
+//  ⇒ "SQ 轮询途中消失" 经本 harness **结构性不可达**（同 HIGH-1：需 test 帧插进活 poll 链，
+//  被 biased-device-first 杜绝）。其精确触发应由 controller 单测用确定性 `CaptureTransport`
+//  （可任意编排"发 shadow-read → 删 SQ → 投 completion"的帧交错）覆盖；当前该防御分支无
+//  e2e 也无对应单测，属 unit-test-ownable 的 defensive 分支。**不**在此 harness 伪造触发。
