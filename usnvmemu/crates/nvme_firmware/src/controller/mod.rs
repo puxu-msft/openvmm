@@ -1376,10 +1376,10 @@ impl NvmeController {
         let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
         let c_cid = compare_sqe.cid();
         let w_cid = write_sqe.cid();
-        let both = |sc_code: u8, sct: u8| {
+        let both = |status: u16| {
             (
-                Cqe::error(c_cid, sq_id, 0, phase, sc_code, sct),
-                Cqe::error(w_cid, sq_id, 0, phase, sc_code, sct),
+                Cqe::error(c_cid, sq_id, 0, phase, status),
+                Cqe::error(w_cid, sq_id, 0, phase, status),
             )
         };
 
@@ -1400,14 +1400,14 @@ impl NvmeController {
                 slba,
                 "fused CAS: opcode/nsid/slba/nlb 不匹配 → INVALID_FIELD"
             );
-            return both(sc::INVALID_FIELD, 0);
+            return both(sc::INVALID_FIELD);
         }
 
         // ── 全部 ns 操作收在一个借用作用域内，出来再更新 stats/建 CQE ──
         enum Outcome {
             Pass,
             Fail,
-            Rej(u8, u8),
+            Rej(u16),
             Io,
         }
         let outcome = if let Some(ns) = self.namespaces.get_mut(&nsid) {
@@ -1416,7 +1416,7 @@ impl NvmeController {
             let sector = 1u64 << ns.lbads;
             let bytes = (nlb as u64 * sector) as usize;
             if !is_plain || bytes > NVME_PAGE_SIZE as usize {
-                Outcome::Rej(sc::INVALID_FIELD, 0)
+                Outcome::Rej(sc::INVALID_FIELD)
             } else if compare_data.len() != bytes || write_data.len() != bytes {
                 // TOCTOU：lbads 在 R2T 取数后被 Format 改 → 长度不符 → abort。
                 tracing::warn!(
@@ -1425,12 +1425,12 @@ impl NvmeController {
                     got_c = compare_data.len(),
                     "fused CAS: host buffer 长度 != nlb×sector（Format 改了 lbads？）→ abort"
                 );
-                Outcome::Rej(sc::INVALID_FIELD, 0)
+                Outcome::Rej(sc::INVALID_FIELD)
             } else if slba
                 .checked_add(nlb as u64)
                 .is_none_or(|e| e > ns.total_lba)
             {
-                Outcome::Rej(sc::LBA_OUT_OF_RANGE, 0)
+                Outcome::Rej(sc::LBA_OUT_OF_RANGE)
             } else {
                 let mut backing = vec![0u8; bytes];
                 match ns.read_at(&mut backing, slba * sector) {
@@ -1454,7 +1454,7 @@ impl NvmeController {
                 }
             }
         } else {
-            Outcome::Rej(sc::INVALID_NAMESPACE, 0)
+            Outcome::Rej(sc::INVALID_NAMESPACE)
         };
 
         match outcome {
@@ -1476,16 +1476,16 @@ impl NvmeController {
             }
             Outcome::Fail => {
                 self.stat_num_err_log_entries += 1;
-                self.push_error_log(sq_id, c_cid, (sc::COMPARE_FAILURE as u16) << 1, slba, nsid);
+                self.push_error_log(sq_id, c_cid, sc::sf_of(sc::COMPARE_FAILURE), slba, nsid);
                 tracing::info!(
                     nsid,
                     slba,
                     "fused CAS: Compare FAIL → Write aborted (atomic)"
                 );
-                both(sc::COMPARE_FAILURE, sc::SCT_MEDIA_DATA_INTEGRITY)
+                both(sc::COMPARE_FAILURE)
             }
-            Outcome::Rej(sc_code, sct) => both(sc_code, sct),
-            Outcome::Io => both(sc::DATA_TRANSFER_ERROR, 0),
+            Outcome::Rej(status) => both(status),
+            Outcome::Io => both(sc::DATA_TRANSFER_ERROR),
         }
     }
 
@@ -2197,7 +2197,7 @@ impl NvmeController {
         if is_admin && fuse != 0 {
             tracing::warn!(fuse, "Fused operation on Admin SQ → INVALID_FIELD");
             let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
-            let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+            let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD);
             self.post_cqe(ctx, cq_id, cqe);
             return;
         }
@@ -2219,7 +2219,6 @@ impl NvmeController {
                             stranded_head,
                             phase1,
                             sc::INVALID_FIELD,
-                            0,
                         );
                         self.post_cqe(ctx, cq_id, cqe1);
                     }
@@ -2229,7 +2228,7 @@ impl NvmeController {
                     if opc != nvm_opc::COMPARE {
                         tracing::warn!(opc, "Fused FIRST is not Compare → INVALID_FIELD");
                         let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
-                        let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                        let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD);
                         self.post_cqe(ctx, cq_id, cqe);
                         return;
                     }
@@ -2242,7 +2241,6 @@ impl NvmeController {
                             stranded_head,
                             phase,
                             sc::INVALID_FIELD,
-                            0,
                         );
                         self.post_cqe(ctx, cq_id, cqe);
                     }
@@ -2254,7 +2252,7 @@ impl NvmeController {
                     let Some((first, first_head)) = self.pending_fused.remove(&sq_id) else {
                         tracing::warn!("Fused SECOND without FIRST → INVALID_FIELD");
                         let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
-                        let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                        let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD);
                         self.post_cqe(ctx, cq_id, cqe);
                         return;
                     };
@@ -2265,9 +2263,9 @@ impl NvmeController {
                         self.post_cqe(
                             ctx,
                             cq_id,
-                            Cqe::error(first.cid(), sq_id, first_head, phase, sc::INVALID_FIELD, 0),
+                            Cqe::error(first.cid(), sq_id, first_head, phase, sc::INVALID_FIELD),
                         );
-                        let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                        let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD);
                         self.post_cqe(ctx, cq_id, cqe);
                         return;
                     }
@@ -2288,9 +2286,9 @@ impl NvmeController {
                         self.post_cqe(
                             ctx,
                             cq_id,
-                            Cqe::error(first.cid(), sq_id, first_head, phase, sc::INVALID_FIELD, 0),
+                            Cqe::error(first.cid(), sq_id, first_head, phase, sc::INVALID_FIELD),
                         );
-                        let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                        let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD);
                         self.post_cqe(ctx, cq_id, cqe);
                         return;
                     }
@@ -2342,10 +2340,9 @@ impl NvmeController {
                                     first_head,
                                     phase,
                                     sc::INVALID_FIELD,
-                                    0,
                                 ),
                             );
-                            let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                            let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD);
                             self.post_cqe(ctx, cq_id, cqe);
                             return;
                         }
@@ -2371,7 +2368,7 @@ impl NvmeController {
                 _ => {
                     tracing::warn!(fuse, "Reserved fuse value → INVALID_FIELD");
                     let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
-                    let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                    let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD);
                     self.post_cqe(ctx, cq_id, cqe);
                     return;
                 }
@@ -2428,7 +2425,6 @@ impl NvmeController {
                     compare_sq_head,
                     phase,
                     sc::INVALID_NAMESPACE,
-                    0,
                 ),
             );
             self.post_cqe(
@@ -2440,7 +2436,6 @@ impl NvmeController {
                     write_sq_head,
                     phase,
                     sc::INVALID_NAMESPACE,
-                    0,
                 ),
             );
             return;
@@ -2653,7 +2648,7 @@ impl NvmeController {
         let mut backing_buf = vec![0u8; bytes as usize];
         let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
         let Some(ns) = self.namespaces.get_mut(&nsid) else {
-            return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_NAMESPACE, 0);
+            return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_NAMESPACE);
         };
         // **Reviewer M4** — Compare 路径目前仅对非 PI NS 有效（dispatch
         // 层已拒绝 PI Compare）。如果未来放宽这条 gate，此 assert 会让
@@ -2685,22 +2680,15 @@ impl NvmeController {
                         "Compare multi-PRP FAILURE"
                     );
                     self.stat_num_err_log_entries += 1;
-                    self.push_error_log(sq_id, cid, (sc::COMPARE_FAILURE as u16) << 1, lba, nsid);
-                    Cqe::error(
-                        cid,
-                        sq_id,
-                        sq_head,
-                        phase,
-                        sc::COMPARE_FAILURE,
-                        sc::SCT_MEDIA_DATA_INTEGRITY,
-                    )
+                    self.push_error_log(sq_id, cid, sc::sf_of(sc::COMPARE_FAILURE), lba, nsid);
+                    Cqe::error(cid, sq_id, sq_head, phase, sc::COMPARE_FAILURE)
                 }
             }
             Err(e) => {
                 tracing::warn!(error = %e, nsid, lba, "Compare: backing read failed");
                 self.stat_num_err_log_entries += 1;
-                self.push_error_log(sq_id, cid, (sc::DATA_TRANSFER_ERROR as u16) << 1, lba, nsid);
-                Cqe::error(cid, sq_id, sq_head, phase, sc::DATA_TRANSFER_ERROR, 0)
+                self.push_error_log(sq_id, cid, sc::sf_of(sc::DATA_TRANSFER_ERROR), lba, nsid);
+                Cqe::error(cid, sq_id, sq_head, phase, sc::DATA_TRANSFER_ERROR)
             }
         }
     }

@@ -203,12 +203,12 @@ impl NvmeController {
                 // 区分 NVM IO vs admin：admin SQ id=0 时 nsid=0xFFFF_FFFF
                 // 表示 "not applicable"（reviewer M3 修复）。LBA 暂用 0；
                 // 真要追踪需在 PendingOp 变体存 SLBA。
-                let sf = (sc::DATA_TRANSFER_ERROR as u16) << 1;
+                let sf = sc::sf_of(sc::DATA_TRANSFER_ERROR);
                 let nsid = if p.sq_id == 0 { 0xFFFF_FFFF } else { 1 };
                 self.push_error_log(p.sq_id, p.cid, sf, 0, nsid);
                 let cq = self.cqs.get(&p.cq_id);
                 let phase = cq.map(|c| c.phase).unwrap_or(1);
-                let cqe = Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR, 0);
+                let cqe = Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR);
                 self.post_cqe(ctx, p.cq_id, cqe);
             }
             return;
@@ -282,11 +282,11 @@ impl NvmeController {
                             self.push_error_log(
                                 p.sq_id,
                                 p.cid,
-                                (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                                sc::sf_of(sc::DATA_TRANSFER_ERROR),
                                 lba,
                                 1,
                             );
-                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR, 0)
+                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR)
                         }
                     };
                     self.post_cqe(ctx, p.cq_id, cqe);
@@ -336,7 +336,6 @@ impl NvmeController {
                             accum.sq_head,
                             phase,
                             sc::DATA_TRANSFER_ERROR,
-                            0,
                         );
                         self.post_cqe(ctx, accum.cq_id, cqe);
                         self.pending_ios.retain(|_, q| {
@@ -412,7 +411,7 @@ impl NvmeController {
                                 want = data_bytes,
                                 "PI Write DMA-read length mismatch"
                             );
-                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR, 0)
+                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR)
                         } else {
                             let tuple = crate::pi::PiTuple::compute(&data, lba, pi_type);
                             let tuple_bytes = tuple.to_bytes();
@@ -452,7 +451,7 @@ impl NvmeController {
                                     self.push_error_log(
                                         p.sq_id,
                                         p.cid,
-                                        (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                                        sc::sf_of(sc::DATA_TRANSFER_ERROR),
                                         lba,
                                         nsid,
                                     );
@@ -462,13 +461,12 @@ impl NvmeController {
                                         p.sq_head,
                                         phase,
                                         sc::DATA_TRANSFER_ERROR,
-                                        0,
                                     )
                                 }
                             }
                         }
                     } else {
-                        Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE, 0)
+                        Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE)
                     };
                     self.post_cqe(ctx, p.cq_id, cqe);
                 }
@@ -576,11 +574,11 @@ impl NvmeController {
                             self.push_error_log(
                                 p.sq_id,
                                 p.cid,
-                                (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                                sc::sf_of(sc::DATA_TRANSFER_ERROR),
                                 assigned_lba,
                                 nsid,
                             );
-                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR, 0)
+                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR)
                         }
                     };
                     self.post_cqe(ctx, p.cq_id, cqe);
@@ -610,7 +608,6 @@ impl NvmeController {
                             accum.sq_head,
                             phase,
                             sc::DATA_TRANSFER_ERROR,
-                            0,
                         );
                         self.post_cqe(ctx, accum.cq_id, cqe);
                         self.pending_ios.retain(|_, q| {
@@ -680,7 +677,6 @@ impl NvmeController {
                             accum.sq_head,
                             phase,
                             sc::DATA_TRANSFER_ERROR,
-                            0,
                         );
                         self.post_cqe(ctx, accum.cq_id, cqe);
                         self.pending_ios.retain(|_, q| {
@@ -705,7 +701,6 @@ impl NvmeController {
                             accum.sq_head,
                             phase,
                             sc::DATA_TRANSFER_ERROR,
-                            0,
                         );
                         self.post_cqe(ctx, accum.cq_id, cqe);
                         // 顺便清 sibling tokens（防止 silently 完成）
@@ -795,7 +790,7 @@ impl NvmeController {
                             self.push_error_log(
                                 accum.sq_id,
                                 accum.cid,
-                                (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                                sc::sf_of(sc::DATA_TRANSFER_ERROR),
                                 accum.slba + written_count as u64,
                                 nsid,
                             );
@@ -805,7 +800,6 @@ impl NvmeController {
                                 accum.sq_head,
                                 phase,
                                 sc::DATA_TRANSFER_ERROR,
-                                0,
                             )
                         }
                     } else {
@@ -815,7 +809,6 @@ impl NvmeController {
                             accum.sq_head,
                             phase,
                             sc::INVALID_NAMESPACE,
-                            0,
                         )
                     };
                     self.post_cqe(ctx, cq_id, cqe);
@@ -834,14 +827,8 @@ impl NvmeController {
                             want = expected,
                             "COPY range list DMA short read"
                         );
-                        let cqe = Cqe::error(
-                            p.cid,
-                            p.sq_id,
-                            p.sq_head,
-                            phase,
-                            sc::DATA_TRANSFER_ERROR,
-                            0,
-                        );
+                        let cqe =
+                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR);
                         self.post_cqe(ctx, p.cq_id, cqe);
                         return;
                     }
@@ -871,14 +858,7 @@ impl NvmeController {
                                 num_ranges,
                                 "COPY rejected: ranges conflict (S2 SC 0x80)"
                             );
-                            Cqe::error(
-                                p.cid,
-                                p.sq_id,
-                                p.sq_head,
-                                phase,
-                                sc::CONFLICTING_ATTRIBUTES,
-                                sc::SCT_COMMAND_SPECIFIC,
-                            )
+                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::CONFLICTING_ATTRIBUTES)
                         } else {
                             // **Reviewer H-2** — checked_add 防 sdlba/slba 来自
                             // driver / 恶意输入溢出 u64 后绕过 bounds 检查。
@@ -890,14 +870,7 @@ impl NvmeController {
                                         .is_some_and(|e| e <= ns.total_lba)
                                 });
                             if !ok_bounds {
-                                Cqe::error(
-                                    p.cid,
-                                    p.sq_id,
-                                    p.sq_head,
-                                    phase,
-                                    sc::LBA_OUT_OF_RANGE,
-                                    0,
-                                )
+                                Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::LBA_OUT_OF_RANGE)
                             } else {
                                 // Per-range: read backing → write to sdlba offset
                                 let mut dst_off_lba = sdlba;
@@ -921,7 +894,7 @@ impl NvmeController {
                                     self.push_error_log(
                                         p.sq_id,
                                         p.cid,
-                                        (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                                        sc::sf_of(sc::DATA_TRANSFER_ERROR),
                                         sdlba,
                                         nsid,
                                     );
@@ -931,7 +904,6 @@ impl NvmeController {
                                         p.sq_head,
                                         phase,
                                         sc::DATA_TRANSFER_ERROR,
-                                        0,
                                     )
                                 } else {
                                     // 计入 host_reads + host_writes (NVMe spec § 5.16.1.2
@@ -953,7 +925,7 @@ impl NvmeController {
                             }
                         }
                     } else {
-                        Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE, 0)
+                        Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE)
                     };
                     self.post_cqe(ctx, p.cq_id, cqe);
                 }
@@ -985,7 +957,7 @@ impl NvmeController {
                     let cq = self.cqs.get(&p.cq_id);
                     let phase = cq.map(|c| c.phase).unwrap_or(1);
                     let cqe = if data.len() < 2 {
-                        Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR, 0)
+                        Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::DATA_TRANSFER_ERROR)
                     } else {
                         let num_ids = u16::from_le_bytes([data[0], data[1]]) as usize;
                         let max_ids = ((data.len() - 2) / 2).min(2047);
@@ -1024,7 +996,6 @@ impl NvmeController {
                                             p.sq_head,
                                             phase,
                                             sc::NAMESPACE_ALREADY_ATTACHED,
-                                            sc::SCT_COMMAND_SPECIFIC,
                                         )
                                     } else {
                                         ns.attached = true;
@@ -1045,7 +1016,6 @@ impl NvmeController {
                                             p.sq_head,
                                             phase,
                                             sc::NAMESPACE_NOT_ATTACHED,
-                                            sc::SCT_COMMAND_SPECIFIC,
                                         )
                                     } else {
                                         ns.attached = false;
@@ -1053,17 +1023,12 @@ impl NvmeController {
                                         Cqe::success(p.cid, p.sq_id, p.sq_head, phase)
                                     }
                                 }
-                                _ => Cqe::error(
-                                    p.cid,
-                                    p.sq_id,
-                                    p.sq_head,
-                                    phase,
-                                    sc::INVALID_FIELD,
-                                    0,
-                                ),
+                                _ => {
+                                    Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_FIELD)
+                                }
                             }
                         } else {
-                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE, 0)
+                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE)
                         }
                     };
                     self.post_cqe(ctx, p.cq_id, cqe);
@@ -1086,8 +1051,7 @@ impl NvmeController {
                         );
                         let cq = self.cqs.get(&p.cq_id);
                         let phase = cq.map(|c| c.phase).unwrap_or(1);
-                        let cqe =
-                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_FIELD, 0);
+                        let cqe = Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_FIELD);
                         self.post_cqe(ctx, p.cq_id, cqe);
                         return;
                     }
@@ -1115,7 +1079,7 @@ impl NvmeController {
                     let cq = self.cqs.get(&p.cq_id);
                     let phase = cq.map(|c| c.phase).unwrap_or(1);
                     let mut cqe = if data.len() < 30 {
-                        Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_FIELD, 0)
+                        Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_FIELD)
                     } else {
                         let nsze = u64::from_le_bytes(data[0..8].try_into().unwrap());
                         let flbas = data[26] & 0x0f;
@@ -1123,7 +1087,7 @@ impl NvmeController {
                         let pi_type = dps & 0x07;
                         let pi_first = (dps & 0x08) == 0;
                         if nsze == 0 || flbas > 1 || pi_type > 1 {
-                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_FIELD, 0)
+                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_FIELD)
                         } else {
                             let new_lbads = if flbas == 0 { 9u8 } else { 12u8 };
                             let new_meta_size = if flbas == 0 { 0u8 } else { 8u8 };
@@ -1147,7 +1111,6 @@ impl NvmeController {
                                     p.sq_head,
                                     phase,
                                     sc::NAMESPACE_ID_UNAVAILABLE,
-                                    sc::SCT_COMMAND_SPECIFIC,
                                 )
                             } else {
                                 let dir = std::env::temp_dir();
@@ -1212,7 +1175,6 @@ impl NvmeController {
                                             p.sq_head,
                                             phase,
                                             sc::INTERNAL_ERROR,
-                                            0,
                                         )
                                     }
                                 }
@@ -1390,7 +1352,7 @@ impl NvmeController {
                                     self.push_error_log(
                                         p.sq_id,
                                         p.cid,
-                                        (sc::COMPARE_FAILURE as u16) << 1,
+                                        sc::sf_of(sc::COMPARE_FAILURE),
                                         lba,
                                         1,
                                     );
@@ -1400,7 +1362,6 @@ impl NvmeController {
                                         p.sq_head,
                                         phase,
                                         sc::COMPARE_FAILURE,
-                                        sc::SCT_MEDIA_DATA_INTEGRITY,
                                     )
                                 }
                             }
@@ -1410,7 +1371,7 @@ impl NvmeController {
                                 self.push_error_log(
                                     p.sq_id,
                                     p.cid,
-                                    (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                                    sc::sf_of(sc::DATA_TRANSFER_ERROR),
                                     lba,
                                     1,
                                 );
@@ -1420,13 +1381,12 @@ impl NvmeController {
                                     p.sq_head,
                                     phase,
                                     sc::DATA_TRANSFER_ERROR,
-                                    0,
                                 )
                             }
                         }
                     } else {
                         tracing::warn!(nsid = p.nsid, "Compare: unknown NSID at completion");
-                        Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE, 0)
+                        Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE)
                     };
                     self.post_cqe(ctx, p.cq_id, cqe);
                 }
@@ -1479,7 +1439,7 @@ impl NvmeController {
                                     self.push_error_log(
                                         p.sq_id,
                                         p.cid,
-                                        (sc::COMPARE_FAILURE as u16) << 1,
+                                        sc::sf_of(sc::COMPARE_FAILURE),
                                         lba,
                                         p.nsid,
                                     );
@@ -1490,7 +1450,6 @@ impl NvmeController {
                                             p.sq_head,
                                             phase,
                                             sc::COMPARE_FAILURE,
-                                            sc::SCT_MEDIA_DATA_INTEGRITY,
                                         ),
                                         None,
                                     )
@@ -1502,7 +1461,7 @@ impl NvmeController {
                                 self.push_error_log(
                                     p.sq_id,
                                     p.cid,
-                                    (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                                    sc::sf_of(sc::DATA_TRANSFER_ERROR),
                                     lba,
                                     p.nsid,
                                 );
@@ -1513,7 +1472,6 @@ impl NvmeController {
                                         p.sq_head,
                                         phase,
                                         sc::DATA_TRANSFER_ERROR,
-                                        0,
                                     ),
                                     None,
                                 )
@@ -1521,7 +1479,7 @@ impl NvmeController {
                         }
                     } else {
                         (
-                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE, 0),
+                            Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE),
                             None,
                         )
                     };
@@ -1559,7 +1517,6 @@ impl NvmeController {
                                 write_sq_head,
                                 phase,
                                 sc::COMPARE_FAILURE,
-                                sc::SCT_MEDIA_DATA_INTEGRITY,
                             );
                             self.post_cqe(ctx, p.cq_id, cqe);
                         }
@@ -1636,7 +1593,7 @@ impl NvmeController {
                                 self.push_error_log(
                                     accum.sq_id,
                                     accum.cid,
-                                    (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                                    sc::sf_of(sc::DATA_TRANSFER_ERROR),
                                     accum.lba,
                                     1,
                                 );
@@ -1646,7 +1603,6 @@ impl NvmeController {
                                     accum.sq_head,
                                     phase,
                                     sc::DATA_TRANSFER_ERROR,
-                                    0,
                                 )
                             }
                         };
@@ -1769,7 +1725,7 @@ impl NvmeController {
                                 self.push_error_log(
                                     op.sq_id,
                                     op.cid,
-                                    (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                                    sc::sf_of(sc::DATA_TRANSFER_ERROR),
                                     op.lba,
                                     1,
                                 );
@@ -1779,7 +1735,6 @@ impl NvmeController {
                                     op.sq_head,
                                     phase,
                                     sc::DATA_TRANSFER_ERROR,
-                                    0,
                                 )
                             }
                         };
@@ -1954,7 +1909,7 @@ impl NvmeController {
                     };
                     // 处理数据 descriptor → append op.frags（stream offset 由
                     // firmware 自算的 walk_offset 决定，非 driver 输入）。
-                    let mut walk_err: Option<u8> = None;
+                    let mut walk_err: Option<u16> = None;
                     {
                         let op = self.sgl_ops.get_mut(&op_id).unwrap();
                         for d in data_descs {
@@ -2197,18 +2152,11 @@ impl NvmeController {
                     self.push_error_log(
                         op.sq_id,
                         op.cid,
-                        (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                        sc::sf_of(sc::DATA_TRANSFER_ERROR),
                         op.lba,
                         op.nsid,
                     );
-                    Cqe::error(
-                        op.cid,
-                        op.sq_id,
-                        op.sq_head,
-                        phase,
-                        sc::DATA_TRANSFER_ERROR,
-                        0,
-                    )
+                    Cqe::error(op.cid, op.sq_id, op.sq_head, phase, sc::DATA_TRANSFER_ERROR)
                 }
             };
             self.post_cqe(ctx, op.cq_id, cqe);
@@ -2223,7 +2171,7 @@ impl NvmeController {
     /// **Phase R2** — SGL op 出错：清同 op 的 sibling pending + 累积器 +
     /// 记 error log + post 一次 error CQE（保证 spec § 4.6.1 "one CQE per
     /// command"）。
-    fn finish_sgl_error(&mut self, ctx: &mut DeviceCtx<'_>, op_id: u64, sc_byte: u8) {
+    fn finish_sgl_error(&mut self, ctx: &mut DeviceCtx<'_>, op_id: u64, status: u16) {
         self.pending_ios.retain(|_, q| match q.op {
             PendingOp::NvmSglFetch { op_id: o, .. } | PendingOp::NvmSglData { op_id: o, .. } => {
                 o != op_id
@@ -2234,8 +2182,8 @@ impl NvmeController {
             let cq = self.cqs.get(&op.cq_id);
             let phase = cq.map(|c| c.phase).unwrap_or(1);
             self.stat_num_err_log_entries += 1;
-            self.push_error_log(op.sq_id, op.cid, (sc_byte as u16) << 1, op.lba, op.nsid);
-            let cqe = Cqe::error(op.cid, op.sq_id, op.sq_head, phase, sc_byte, 0);
+            self.push_error_log(op.sq_id, op.cid, sc::sf_of(status), op.lba, op.nsid);
+            let cqe = Cqe::error(op.cid, op.sq_id, op.sq_head, phase, status);
             self.post_cqe(ctx, op.cq_id, cqe);
         }
     }

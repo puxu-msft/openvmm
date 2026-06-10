@@ -42,7 +42,7 @@ use std::io::SeekFrom;
 /// ZOFF = ZONE_IS_OFFLINE。`-` = no-op（成功无副作用）。
 ///
 /// 不在表中的 ZSA → INVALID_FIELD。
-pub(crate) fn check_zsa_transition(state: ZoneState, zsa: u8) -> Option<u8> {
+pub(crate) fn check_zsa_transition(state: ZoneState, zsa: u8) -> Option<u16> {
     use ZoneState::*;
     match (state, zsa) {
         // Close
@@ -207,7 +207,6 @@ pub(crate) fn check_zns_write(
             sq_head,
             phase,
             sc::ZONE_BOUNDARY_ERR,
-            sc::SCT_COMMAND_SPECIFIC,
         ));
     }
     match zone.state {
@@ -218,28 +217,13 @@ pub(crate) fn check_zns_write(
                 sq_head,
                 phase,
                 sc::ZONE_IS_READ_ONLY,
-                sc::SCT_COMMAND_SPECIFIC,
             ));
         }
         ZoneState::Offline => {
-            return Some(Cqe::error(
-                cid,
-                sq_id,
-                sq_head,
-                phase,
-                sc::ZONE_IS_OFFLINE,
-                sc::SCT_COMMAND_SPECIFIC,
-            ));
+            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::ZONE_IS_OFFLINE));
         }
         ZoneState::Full => {
-            return Some(Cqe::error(
-                cid,
-                sq_id,
-                sq_head,
-                phase,
-                sc::ZONE_IS_FULL,
-                sc::SCT_COMMAND_SPECIFIC,
-            ));
+            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::ZONE_IS_FULL));
         }
         _ => {}
     }
@@ -252,7 +236,6 @@ pub(crate) fn check_zns_write(
             sq_head,
             phase,
             sc::ZONE_INVALID_WRITE,
-            sc::SCT_COMMAND_SPECIFIC,
         ));
     }
     None
@@ -272,14 +255,7 @@ pub(crate) fn check_zns_read(
     let zone_idx = (slba / zns.zone_size) as usize;
     let zone = zns.zones.get(zone_idx)?;
     if matches!(zone.state, ZoneState::Offline) {
-        return Some(Cqe::error(
-            cid,
-            sq_id,
-            sq_head,
-            phase,
-            sc::ZONE_IS_OFFLINE,
-            sc::SCT_COMMAND_SPECIFIC,
-        ));
+        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::ZONE_IS_OFFLINE));
     }
     None
 }
@@ -333,7 +309,7 @@ pub(crate) enum DataPointer {
 ///   * 其他 type (Bit Bucket / Segment / Keyed) → reject
 /// - PSDT=10 (SGL Segment pointer)：返 `SglSegment`，caller 走 R2 segment walk
 /// - PSDT=11 reserved → INVALID_FIELD
-pub(crate) fn resolve_data_pointers(sqe: &Sqe) -> Result<DataPointer, u8> {
+pub(crate) fn resolve_data_pointers(sqe: &Sqe) -> Result<DataPointer, u16> {
     let psdt = sqe.psdt();
     let prp1 = sqe.prp1;
     let prp2 = sqe.prp2;
@@ -407,7 +383,7 @@ pub(crate) fn resolve_data_pointers(sqe: &Sqe) -> Result<DataPointer, u8> {
 /// 非零 / ≤ 1 page（教学单段上限）。
 pub(crate) fn validate_segment_pointer(
     desc: &crate::sgl::SglDescriptor,
-) -> Result<(u32, bool), u8> {
+) -> Result<(u32, bool), u16> {
     if desc.sub_type != 0 {
         tracing::warn!(
             sub_type = desc.sub_type,
@@ -434,7 +410,7 @@ pub(crate) fn validate_segment_pointer(
 /// **Phase R2** — 解析 PSDT=10 的 embedded SGL1 descriptor（必须是 Segment /
 /// Last Segment，sub_type=0）。返 `(segment_addr, segment_len, is_last)`。
 /// 校验逻辑见 `validate_segment_pointer`。
-fn parse_sgl1_segment(bytes: &[u8; 16]) -> Result<(u64, u32, bool), u8> {
+fn parse_sgl1_segment(bytes: &[u8; 16]) -> Result<(u64, u32, bool), u16> {
     let desc = crate::sgl::SglDescriptor::parse(bytes).ok_or(sc::SGL_DESCRIPTOR_TYPE_INVALID)?;
     let (len, is_last) = validate_segment_pointer(&desc)?;
     Ok((desc.address, len, is_last))
@@ -442,7 +418,7 @@ fn parse_sgl1_segment(bytes: &[u8; 16]) -> Result<(u64, u32, bool), u8> {
 
 /// **Phase S1** — Write-protection guard：所有写类 IO (WRITE/WRITE_ZEROES/
 /// WRITE_UNCORRECTABLE/DSM/COPY/ZONE_APPEND/Zone Mgmt Send) dispatch 入口前
-/// 调用，命中返 Some(cqe with NAMESPACE_IS_WRITE_PROTECTED, SCT=Cmd-Specific)。
+/// 调用，命中返 Some(cqe with NAMESPACE_IS_WRITE_PROTECTED, SCT=Generic)。
 pub(crate) fn check_ns_write_protection(
     ns: &crate::controller::Namespace,
     cid: u16,
@@ -458,7 +434,6 @@ pub(crate) fn check_ns_write_protection(
             sq_head,
             phase,
             sc::NAMESPACE_IS_WRITE_PROTECTED,
-            sc::SCT_COMMAND_SPECIFIC,
         ));
     }
     None
@@ -494,21 +469,14 @@ impl NvmeController {
         let bytes = nlb as u64 * sector_bytes;
         // 用真实扇区字节复查 MDTS（与 plain READ 一致）。
         if bytes > MDTS_MAX_BYTES {
-            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
         }
         // LBA 边界校验（SGL 走独立分流，故此处自检，不复用 plain 路径的检查）。
         let total_lba = self.ns(nsid).map(|n| n.total_lba).unwrap_or(0);
         match slba.checked_add(nlb as u64) {
             Some(end) if end <= total_lba => {}
             _ => {
-                return Some(Cqe::error(
-                    cid,
-                    sq_id,
-                    sq_head,
-                    phase,
-                    sc::LBA_OUT_OF_RANGE,
-                    0,
-                ));
+                return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE));
             }
         }
         // ZNS Read 校验（Offline zone 拒读，与 plain READ 一致）。
@@ -520,7 +488,7 @@ impl NvmeController {
         // 解析 embedded SGL1 → 必须 Last Segment（R2a 单段）。
         let (seg_addr, seg_len, is_last) = match parse_sgl1_segment(&sqe.embedded_sgl_bytes()) {
             Ok(t) => t,
-            Err(sc_byte) => return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte, 0)),
+            Err(sc_byte) => return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte)),
         };
         // **R2b** — SGL1 既可是 Last Segment（单段）也可是 Segment（chain 首段）；
         // `is_last` 透传给 NvmSglFetch 决定本段是否末段。
@@ -535,7 +503,6 @@ impl NvmeController {
                 sq_head,
                 phase,
                 sc::DATA_TRANSFER_ERROR,
-                0,
             ));
         }
         let op_id = self.alloc_op_id();
@@ -601,21 +568,14 @@ impl NvmeController {
     ) -> Option<Cqe> {
         let bytes = nlb as u64 * sector_bytes;
         if bytes > MDTS_MAX_BYTES {
-            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
         }
         // LBA 边界校验。
         let total_lba = self.ns(nsid).map(|n| n.total_lba).unwrap_or(0);
         match slba.checked_add(nlb as u64) {
             Some(end) if end <= total_lba => {}
             _ => {
-                return Some(Cqe::error(
-                    cid,
-                    sq_id,
-                    sq_head,
-                    phase,
-                    sc::LBA_OUT_OF_RANGE,
-                    0,
-                ));
+                return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE));
             }
         }
         // ZNS Write 校验（SWR + state + 边界，与 plain WRITE 一致）。
@@ -626,7 +586,7 @@ impl NvmeController {
         }
         let (seg_addr, seg_len, is_last) = match parse_sgl1_segment(&sqe.embedded_sgl_bytes()) {
             Ok(t) => t,
-            Err(sc_byte) => return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte, 0)),
+            Err(sc_byte) => return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte)),
         };
         // **R2b** — SGL1 既可 Last Segment（单段）也可 Segment（chain 首段）。
         let op_id = self.alloc_op_id();
@@ -688,7 +648,6 @@ impl NvmeController {
                 sq_head,
                 phase,
                 sc::SANITIZE_IN_PROGRESS,
-                0,
             ));
         }
         // **Phase S4** — NS Attachment：若 sqe.nsid 已 detached，IO 全拒
@@ -706,7 +665,6 @@ impl NvmeController {
                 sq_head,
                 phase,
                 sc::INVALID_NAMESPACE,
-                0,
             ));
         }
         match sqe.opcode() {
@@ -727,7 +685,7 @@ impl NvmeController {
                     Ok(DataPointer::Prp { prp1, prp2 }) => (prp1, prp2, false),
                     Ok(DataPointer::SglSegment) => (0, 0, true),
                     Err(sc_byte) => {
-                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte, 0));
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte));
                     }
                 };
                 // **Phase Q1** — PRACT (Protection Information Action) bit 29。
@@ -753,7 +711,7 @@ impl NvmeController {
                     "NVM READ"
                 );
                 if bytes > MDTS_MAX_BYTES {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 // **Phase H4** — NSID 校验 + 取 NS（含 total_lba）
                 let Some(ns) = self.ns(nsid) else {
@@ -763,7 +721,6 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::INVALID_NAMESPACE,
-                        0,
                     ));
                 };
                 // **Phase K1/K4** — IO 路径分流：
@@ -792,7 +749,6 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::INVALID_PROTECTION_INFO,
-                        0,
                     ));
                 }
                 if !pract && is_pi_path {
@@ -806,7 +762,6 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::INVALID_PROTECTION_INFO,
-                        0,
                     ));
                 }
                 if !is_pi_path && !is_plain {
@@ -819,7 +774,6 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::INVALID_PROTECTION_INFO,
-                        0,
                     ));
                 }
                 // **Phase R2** — SGL Segment（PSDT=10）走平行 scatter 路径。
@@ -833,7 +787,6 @@ impl NvmeController {
                             sq_head,
                             phase,
                             sc::INVALID_PROTECTION_INFO,
-                            0,
                         ));
                     }
                     return self.dispatch_sgl_read(
@@ -868,12 +821,11 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::LBA_OUT_OF_RANGE,
-                                0,
                             ));
                         }
                     }
                     if (data_bytes as u64 * nlb as u64) > MDTS_MAX_BYTES {
-                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                     }
                     let mut interleaved = vec![0u8; block_bytes * nlb as usize];
                     let ns_mut = self.ns_mut(nsid).unwrap();
@@ -885,7 +837,6 @@ impl NvmeController {
                             sq_head,
                             phase,
                             sc::DATA_TRANSFER_ERROR,
-                            0,
                         ));
                     }
                     // Verify per-LBA + 抽出纯 data 部分
@@ -909,14 +860,19 @@ impl NvmeController {
                                 "K4c multi-LBA PI verify FAIL"
                             );
                             self.stat_num_err_log_entries += 1;
-                            self.push_error_log(sq_id, cid, (sc_byte as u16) << 1, lba_i, nsid);
+                            self.push_error_log(
+                                sq_id,
+                                cid,
+                                sc::sf_of(sc::status(sc_byte, sc::SCT_MEDIA_DATA_INTEGRITY)),
+                                lba_i,
+                                nsid,
+                            );
                             return Some(Cqe::error(
                                 cid,
                                 sq_id,
                                 sq_head,
                                 phase,
-                                sc_byte,
-                                sc::SCT_MEDIA_DATA_INTEGRITY,
+                                sc::status(sc_byte, sc::SCT_MEDIA_DATA_INTEGRITY),
                             ));
                         }
                         data_only.extend_from_slice(data_slice);
@@ -1031,14 +987,7 @@ impl NvmeController {
                 match slba.checked_add(nlb as u64) {
                     Some(end) if end <= total_lba => {}
                     _ => {
-                        return Some(Cqe::error(
-                            cid,
-                            sq_id,
-                            sq_head,
-                            phase,
-                            sc::LBA_OUT_OF_RANGE,
-                            0,
-                        ));
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE));
                     }
                 }
                 // **Reviewer H-1** — ZNS Read：Offline zone 拒绝（其他 state 允许读）
@@ -1064,7 +1013,6 @@ impl NvmeController {
                             sq_head,
                             phase,
                             sc::DATA_TRANSFER_ERROR,
-                            0,
                         ));
                     }
                     // 拆 data / tuple — pi_first 决定 tuple 在头还是尾
@@ -1083,8 +1031,20 @@ impl NvmeController {
                         // PI 校验失败 → 返 Media/Data Integrity SC
                         tracing::warn!(nsid, slba, ?check, "PI READ verify FAIL");
                         self.stat_num_err_log_entries += 1;
-                        self.push_error_log(sq_id, cid, (sc as u16) << 1, slba, nsid);
-                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc, 0));
+                        self.push_error_log(
+                            sq_id,
+                            cid,
+                            sc::sf_of(sc::status(sc, sc::SCT_MEDIA_DATA_INTEGRITY)),
+                            slba,
+                            nsid,
+                        );
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::status(sc, sc::SCT_MEDIA_DATA_INTEGRITY),
+                        ));
                     }
                     // verify OK → dma_write 仅 data 部分 (4 KiB)
                     let tok = ctx.dma_write(prp1, data_slice.to_vec());
@@ -1105,7 +1065,7 @@ impl NvmeController {
                 // + 偏移（512B → 512 / 纯 4K → 4096）；并以真实大小复查 MDTS。
                 let bytes = nlb as u64 * sector_bytes;
                 if bytes > MDTS_MAX_BYTES {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 let mut buf = vec![0u8; bytes as usize];
                 let ns_mut = self.ns_mut(nsid).unwrap();
@@ -1118,7 +1078,6 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::DATA_TRANSFER_ERROR,
-                        0,
                     ));
                 }
                 // 三档 PRP 分流（NVMe spec § 4.4）：
@@ -1223,7 +1182,7 @@ impl NvmeController {
                     Ok(DataPointer::Prp { prp1, prp2 }) => (prp1, prp2, false),
                     Ok(DataPointer::SglSegment) => (0, 0, true),
                     Err(sc_byte) => {
-                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte, 0));
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte));
                     }
                 };
                 // **Phase Q1** — PRACT bit 29，参 READ 注释。PRACT=1 在 PI
@@ -1244,7 +1203,7 @@ impl NvmeController {
                     "NVM WRITE"
                 );
                 if bytes > MDTS_MAX_BYTES {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 // **Phase H4** — NSID 校验
                 let Some(ns) = self.ns(nsid) else {
@@ -1254,7 +1213,6 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::INVALID_NAMESPACE,
-                        0,
                     ));
                 };
                 // **Phase S1** — Namespace Write Protection 拒写
@@ -1278,7 +1236,6 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::INVALID_PROTECTION_INFO,
-                        0,
                     ));
                 }
                 if !pract && is_pi_capable {
@@ -1292,7 +1249,6 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::INVALID_PROTECTION_INFO,
-                        0,
                     ));
                 }
                 // **Phase R2** — SGL Segment（PSDT=10）走平行 gather 路径。
@@ -1306,7 +1262,6 @@ impl NvmeController {
                             sq_head,
                             phase,
                             sc::INVALID_PROTECTION_INFO,
-                            0,
                         ));
                     }
                     return self.dispatch_sgl_write(
@@ -1333,7 +1288,6 @@ impl NvmeController {
                             sq_head,
                             phase,
                             sc::INVALID_PROTECTION_INFO,
-                            0,
                         ));
                     }
                     // **Phase L1f** — PI + ZNS 组合。WRITE PI 在 ZNS NS 上
@@ -1363,20 +1317,12 @@ impl NvmeController {
                                     sq_head,
                                     phase,
                                     sc::LBA_OUT_OF_RANGE,
-                                    0,
                                 ));
                             }
                         }
                         let data_bytes_total = ns.data_bytes() as u64 * nlb as u64;
                         if data_bytes_total > MDTS_MAX_BYTES {
-                            return Some(Cqe::error(
-                                cid,
-                                sq_id,
-                                sq_head,
-                                phase,
-                                sc::INVALID_FIELD,
-                                0,
-                            ));
+                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                         }
                         let op_id = self.alloc_op_id();
                         let pages_total = data_bytes_total.div_ceil(NVME_PAGE_SIZE) as u32;
@@ -1487,14 +1433,7 @@ impl NvmeController {
                     }
                     let total_lba = ns.total_lba;
                     if slba >= total_lba {
-                        return Some(Cqe::error(
-                            cid,
-                            sq_id,
-                            sq_head,
-                            phase,
-                            sc::LBA_OUT_OF_RANGE,
-                            0,
-                        ));
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE));
                     }
                     let pi_bytes = ns.data_bytes() as u32;
                     let tok = ctx.dma_read(prp1, pi_bytes);
@@ -1518,14 +1457,7 @@ impl NvmeController {
                 match slba.checked_add(nlb as u64) {
                     Some(end) if end <= total_lba => {}
                     _ => {
-                        return Some(Cqe::error(
-                            cid,
-                            sq_id,
-                            sq_head,
-                            phase,
-                            sc::LBA_OUT_OF_RANGE,
-                            0,
-                        ));
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE));
                     }
                 }
                 // **Reviewer M-2 + H-1** — 普通 NVM WRITE 落到 ZNS NS 时必须
@@ -1537,7 +1469,7 @@ impl NvmeController {
                 // + 复查 MDTS（dma_read 拉的数据量、后续 completion 写盘偏移据此）。
                 let bytes = nlb as u64 * sector_bytes;
                 if bytes > MDTS_MAX_BYTES {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 // 三档 PRP 分流（同 READ 路径）：≤1page / ≤2page / PRP list。
                 if bytes <= NVME_PAGE_SIZE {
@@ -1677,7 +1609,6 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::INVALID_NAMESPACE,
-                        0,
                     ));
                 };
                 for target in targets {
@@ -1693,7 +1624,6 @@ impl NvmeController {
                             sq_head,
                             phase,
                             sc::DATA_TRANSFER_ERROR,
-                            0,
                         ));
                     }
                 }
@@ -1717,7 +1647,7 @@ impl NvmeController {
                         pending_ios = self.pending_ios.len(),
                         "WRITE ZEROES rejected: IO in flight (ordering hazard)"
                     );
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 let nsid = sqe.nsid;
                 let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
@@ -1731,7 +1661,6 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::INVALID_NAMESPACE,
-                        0,
                     ));
                 };
                 // **Phase S1** — NS Write Protection gate（WRITE_ZEROES）
@@ -1745,21 +1674,14 @@ impl NvmeController {
                     ns.meta_size == 0 && !ns.pi_enabled() && (ns.lbads == 9 || ns.lbads == 12);
                 let sector_bytes = 1u64 << ns.lbads;
                 if !is_pi_path && !is_plain {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 let total_lba = ns.total_lba;
                 // **H4 修复**：用 checked_add 防 slba + nlb 溢出。
                 match slba.checked_add(nlb as u64) {
                     Some(end) if end <= total_lba => {} // 范围合法
                     _ => {
-                        return Some(Cqe::error(
-                            cid,
-                            sq_id,
-                            sq_head,
-                            phase,
-                            sc::LBA_OUT_OF_RANGE,
-                            0,
-                        ));
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE));
                     }
                 }
                 // **Reviewer H-1** — WRITE_ZEROES 在 ZNS NS 上同样守 SWR
@@ -1796,7 +1718,6 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::DATA_TRANSFER_ERROR,
-                                0,
                             ));
                         }
                     }
@@ -1825,7 +1746,6 @@ impl NvmeController {
                             sq_head,
                             phase,
                             sc::DATA_TRANSFER_ERROR,
-                            0,
                         ));
                     }
                     remaining -= n;
@@ -1852,7 +1772,6 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::INVALID_NAMESPACE,
-                        0,
                     ));
                 };
                 // **Phase S1** — NS Write Protection gate（DSM Deallocate 等效 write）
@@ -1887,7 +1806,7 @@ impl NvmeController {
                 let srf = ((sqe.cdw12 >> 8) & 0xff) as u8;
                 if srf != 0 {
                     tracing::warn!(srf, "COPY: only Source Range Format 0 supported");
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 let Some(ns) = self.ns(nsid) else {
                     return Some(Cqe::error(
@@ -1896,7 +1815,6 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::INVALID_NAMESPACE,
-                        0,
                     ));
                 };
                 // **Phase S1** — NS Write Protection gate（COPY 写目的 NS）
@@ -1912,25 +1830,17 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::INVALID_PROTECTION_INFO,
-                        0,
                     ));
                 }
                 // ZNS：Copy 目标 zone 需走 SWR 校验，简化先拒
                 if ns.zns.is_some() {
                     tracing::warn!(nsid, "COPY on ZNS NS not supported");
-                    return Some(Cqe::error(
-                        cid,
-                        sq_id,
-                        sq_head,
-                        phase,
-                        sc::INVALID_OPCODE,
-                        0,
-                    ));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_OPCODE));
                 }
                 let range_list_bytes = nr as u32 * 32;
                 if range_list_bytes as u64 > NVME_PAGE_SIZE {
                     // 教学：range list > 1 page 需 PRP-list 取，本路径暂限 1 page = 128 ranges
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 let tok = ctx.dma_read(sqe.prp1, range_list_bytes);
                 self.pending_ios.insert(
@@ -1967,7 +1877,6 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::INVALID_NAMESPACE,
-                        0,
                     ));
                 };
                 // **2026-06-09**：plain 含 512B(LBAF[0]) 与纯-4K(LBAF[2])；DMA
@@ -1975,26 +1884,19 @@ impl NvmeController {
                 let is_plain =
                     ns.meta_size == 0 && !ns.pi_enabled() && (ns.lbads == 9 || ns.lbads == 12);
                 if !is_plain {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 let sector_bytes = 1u64 << ns.lbads;
                 let total_lba = ns.total_lba;
                 let bytes = nlb as u64 * sector_bytes;
                 tracing::debug!(nsid, slba, nlb, bytes, "NVM COMPARE");
                 if bytes > MDTS_MAX_BYTES {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 match slba.checked_add(nlb as u64) {
                     Some(end) if end <= total_lba => {}
                     _ => {
-                        return Some(Cqe::error(
-                            cid,
-                            sq_id,
-                            sq_head,
-                            phase,
-                            sc::LBA_OUT_OF_RANGE,
-                            0,
-                        ));
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE));
                     }
                 }
                 if bytes <= NVME_PAGE_SIZE {
@@ -2133,7 +2035,6 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::INVALID_NAMESPACE,
-                        0,
                     ));
                 };
                 let is_pi_path = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
@@ -2142,20 +2043,13 @@ impl NvmeController {
                 let is_plain =
                     ns.meta_size == 0 && !ns.pi_enabled() && (ns.lbads == 9 || ns.lbads == 12);
                 if !is_pi_path && !is_plain {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 let total_lba = ns.total_lba;
                 match slba.checked_add(nlb as u64) {
                     Some(end) if end <= total_lba => {}
                     _ => {
-                        return Some(Cqe::error(
-                            cid,
-                            sq_id,
-                            sq_head,
-                            phase,
-                            sc::LBA_OUT_OF_RANGE,
-                            0,
-                        ));
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE));
                     }
                 }
                 if is_pi_path {
@@ -2179,7 +2073,6 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::DATA_TRANSFER_ERROR,
-                                0,
                             ));
                         }
                         let (data_slice, tuple_slice) = if pi_first {
@@ -2193,8 +2086,20 @@ impl NvmeController {
                         if let Some(sc_code) = check.to_sc() {
                             tracing::warn!(nsid, lba, ?check, "Verify PI FAIL");
                             self.stat_num_err_log_entries += 1;
-                            self.push_error_log(sq_id, cid, (sc_code as u16) << 1, lba, nsid);
-                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_code, 0));
+                            self.push_error_log(
+                                sq_id,
+                                cid,
+                                sc::sf_of(sc::status(sc_code, sc::SCT_MEDIA_DATA_INTEGRITY)),
+                                lba,
+                                nsid,
+                            );
+                            return Some(Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::status(sc_code, sc::SCT_MEDIA_DATA_INTEGRITY),
+                            ));
                         }
                     }
                     tracing::debug!(nsid, slba, nlb, "Verify PI OK");
@@ -2220,7 +2125,6 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::INVALID_NAMESPACE,
-                        0,
                     ));
                 };
                 // **Phase S1** — NS Write Protection gate（Zone Mgmt Send 含
@@ -2231,14 +2135,7 @@ impl NvmeController {
                 }
                 let Some(zns) = ns.zns.as_mut() else {
                     tracing::warn!(nsid, "Zone Mgmt Send: not a ZNS NS");
-                    return Some(Cqe::error(
-                        cid,
-                        sq_id,
-                        sq_head,
-                        phase,
-                        sc::INVALID_OPCODE,
-                        0,
-                    ));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_OPCODE));
                 };
                 // 构造要处理的 zone 索引列表（select-all → 全部；否则只一个）
                 let zone_indices: Vec<usize> = if select_all {
@@ -2246,14 +2143,7 @@ impl NvmeController {
                 } else {
                     let zone_idx = (slba / zns.zone_size) as usize;
                     if zone_idx >= zns.zones.len() {
-                        return Some(Cqe::error(
-                            cid,
-                            sq_id,
-                            sq_head,
-                            phase,
-                            sc::LBA_OUT_OF_RANGE,
-                            0,
-                        ));
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE));
                     }
                     vec![zone_idx]
                 };
@@ -2290,14 +2180,7 @@ impl NvmeController {
                             tracing::trace!(zone_idx = i, ?z.state, zsa, "skip illegal in select-all");
                             continue;
                         }
-                        return Some(Cqe::error(
-                            cid,
-                            sq_id,
-                            sq_head,
-                            phase,
-                            sc_byte,
-                            sc::SCT_COMMAND_SPECIFIC,
-                        ));
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte));
                     }
                     // 资源差额：Open ZSA 把 Closed/Empty 变 ExplicitOpen
                     if zsa == 0x03 && matches!(z.state, ZoneState::Empty | ZoneState::Closed) {
@@ -2316,7 +2199,6 @@ impl NvmeController {
                             sq_head,
                             phase,
                             sc::TOO_MANY_OPEN_ZONES,
-                            sc::SCT_COMMAND_SPECIFIC,
                         ));
                     }
                     if max_active > 0 && cur_active + new_active > max_active {
@@ -2326,7 +2208,6 @@ impl NvmeController {
                             sq_head,
                             phase,
                             sc::TOO_MANY_ACTIVE_ZONES,
-                            sc::SCT_COMMAND_SPECIFIC,
                         ));
                     }
                 }
@@ -2349,14 +2230,14 @@ impl NvmeController {
                 // **Reviewer M2** — checked_add 防 cdw12=0xFFFF_FFFF 时
                 // numd 回绕到 0 → bytes=0 silent。
                 let Some(numd) = sqe.cdw12.checked_add(1) else {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 };
                 let bytes = numd as usize * 4;
                 // **review M-1（2026-06-10）** — host 控的 NUMD→bytes 无上限会让 build_*
                 // 分配巨量内存（最坏 ~16 GiB DoS）。比照 Get Log Page 卡 2 MiB（单 PRP-list
                 // 页可服务范围）；超过 INVALID_FIELD 让 driver 分块。
                 if bytes > 2 * 1024 * 1024 {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 let zra = (sqe.cdw13 & 0xff) as u8;
                 let Some(ns) = self.ns(nsid) else {
@@ -2366,21 +2247,13 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::INVALID_NAMESPACE,
-                        0,
                     ));
                 };
                 let Some(zns) = ns.zns.as_ref() else {
-                    return Some(Cqe::error(
-                        cid,
-                        sq_id,
-                        sq_head,
-                        phase,
-                        sc::INVALID_OPCODE,
-                        0,
-                    ));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_OPCODE));
                 };
                 if zra != 0 {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 let start_zone_idx = (slba / zns.zone_size) as usize;
                 let buf = build_zone_report(zns, start_zone_idx, bytes);
@@ -2411,7 +2284,6 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::INVALID_NAMESPACE,
-                        0,
                     ));
                 };
                 // **Phase S1** — NS Write Protection gate（ZONE_APPEND 写入路径）
@@ -2423,29 +2295,15 @@ impl NvmeController {
                 let bytes_per_lba_host = ns.data_bytes(); // 512 or 4096
                 let host_bytes = nlb as u64 * bytes_per_lba_host;
                 let Some(zns) = ns.zns.as_ref() else {
-                    return Some(Cqe::error(
-                        cid,
-                        sq_id,
-                        sq_head,
-                        phase,
-                        sc::INVALID_OPCODE,
-                        0,
-                    ));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_OPCODE));
                 };
                 if host_bytes > NVME_PAGE_SIZE {
                     // 单 PRP only for ZNS Append (教学简化)
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 let zone_idx = (zslba / zns.zone_size) as usize;
                 if zone_idx >= zns.zones.len() {
-                    return Some(Cqe::error(
-                        cid,
-                        sq_id,
-                        sq_head,
-                        phase,
-                        sc::LBA_OUT_OF_RANGE,
-                        0,
-                    ));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE));
                 }
                 let zone = zns.zones[zone_idx];
                 if matches!(zone.state, ZoneState::ReadOnly) {
@@ -2455,28 +2313,13 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::ZONE_IS_READ_ONLY,
-                        sc::SCT_COMMAND_SPECIFIC,
                     ));
                 }
                 if matches!(zone.state, ZoneState::Offline) {
-                    return Some(Cqe::error(
-                        cid,
-                        sq_id,
-                        sq_head,
-                        phase,
-                        sc::ZONE_IS_OFFLINE,
-                        sc::SCT_COMMAND_SPECIFIC,
-                    ));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::ZONE_IS_OFFLINE));
                 }
                 if matches!(zone.state, ZoneState::Full) {
-                    return Some(Cqe::error(
-                        cid,
-                        sq_id,
-                        sq_head,
-                        phase,
-                        sc::ZONE_IS_FULL,
-                        sc::SCT_COMMAND_SPECIFIC,
-                    ));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::ZONE_IS_FULL));
                 }
                 if zone.write_pointer + nlb as u64 > zns.zone_capacity {
                     return Some(Cqe::error(
@@ -2485,7 +2328,6 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::ZONE_BOUNDARY_ERR,
-                        sc::SCT_COMMAND_SPECIFIC,
                     ));
                 }
                 // **Reviewer H2** — 隐式 Open 也要受 MAR/MOR 约束（spec ZNS § 2.2）
@@ -2518,7 +2360,6 @@ impl NvmeController {
                             sq_head,
                             phase,
                             sc::TOO_MANY_OPEN_ZONES,
-                            sc::SCT_COMMAND_SPECIFIC,
                         ));
                     }
                     if matches!(zone.state, ZoneState::Empty)
@@ -2531,7 +2372,6 @@ impl NvmeController {
                             sq_head,
                             phase,
                             sc::TOO_MANY_ACTIVE_ZONES,
-                            sc::SCT_COMMAND_SPECIFIC,
                         ));
                     }
                 }
@@ -2590,14 +2430,7 @@ impl NvmeController {
                 // 我们 backing 无 ECC 概念；返 INVALID_OPCODE 让 driver
                 // 走 fallback。
                 tracing::debug!(cid, "Write Uncorrectable (INVALID_OPCODE)");
-                Some(Cqe::error(
-                    cid,
-                    sq_id,
-                    sq_head,
-                    phase,
-                    sc::INVALID_OPCODE,
-                    0,
-                ))
+                Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_OPCODE))
             }
             nvm_opc::RESERVATION_REGISTER => {
                 // **Phase H6** — NVMe spec § 6.13 Reservation Register。
@@ -2658,19 +2491,19 @@ impl NvmeController {
                 let nsid = sqe.nsid;
                 // **Reviewer M2** — checked_add 防 NUMD=0xFFFF_FFFF 时回绕。
                 let Some(numd) = sqe.cdw10.checked_add(1) else {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 };
                 let eds = sqe.cdw11 & 0x1 != 0;
                 if eds {
                     tracing::warn!(nsid, "Reservation Report EDS=1 not yet supported");
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 let bytes = numd as usize * 4;
                 // **review M-1（2026-06-10）** — host 控的 NUMD→bytes 无上限会让 build_*
                 // 分配巨量内存（最坏 ~16 GiB DoS）。比照 Get Log Page 卡 2 MiB（单 PRP-list
                 // 页可服务范围）；超过 INVALID_FIELD 让 driver 分块。
                 if bytes > 2 * 1024 * 1024 {
-                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 let Some(ns) = self.ns(nsid) else {
                     return Some(Cqe::error(
@@ -2679,7 +2512,6 @@ impl NvmeController {
                         sq_head,
                         phase,
                         sc::INVALID_NAMESPACE,
-                        0,
                     ));
                 };
                 let buf = super::reservation::build_reservation_report(ns, bytes);
@@ -2690,14 +2522,7 @@ impl NvmeController {
             }
             opc => {
                 tracing::warn!(opc, "unsupported NVM opcode");
-                Some(Cqe::error(
-                    cid,
-                    sq_id,
-                    sq_head,
-                    phase,
-                    sc::INVALID_OPCODE,
-                    0,
-                ))
+                Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_OPCODE))
             }
         }
     }
@@ -2724,7 +2549,6 @@ impl NvmeController {
                 sq_head,
                 phase,
                 sc::INVALID_NAMESPACE,
-                0,
             ));
         }
         let action = (sqe.cdw10 & 0x7) as u8;

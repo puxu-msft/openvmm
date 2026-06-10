@@ -121,7 +121,6 @@ impl NvmeController {
                 sq_head,
                 phase,
                 sc::COMMAND_PROHIBITED_BY_LOCKDOWN,
-                sc::SCT_COMMAND_SPECIFIC,
             ));
         }
         match sqe.opcode() {
@@ -134,14 +133,7 @@ impl NvmeController {
                     0x00 => {
                         // Identify Namespace — 用 NSID 选具体 NS（Phase H4）
                         let Some(ns) = self.ns(nsid) else {
-                            return Some(Cqe::error(
-                                cid,
-                                0,
-                                sq_head,
-                                phase,
-                                sc::INVALID_NAMESPACE,
-                                0,
-                            ));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE));
                         };
                         /* Phase A+K1: spec-correct 200+ fields via nvme_spec
                          * with per-NS LBAF/PI parameters */
@@ -209,14 +201,7 @@ impl NvmeController {
                         // CSI → zeros 让 driver 走 fallback。
                         let csi = (sqe.cdw11 & 0xff) as u8;
                         let Some(ns) = self.ns(nsid) else {
-                            return Some(Cqe::error(
-                                cid,
-                                0,
-                                sq_head,
-                                phase,
-                                sc::INVALID_NAMESPACE,
-                                0,
-                            ));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE));
                         };
                         if csi == 0x02 {
                             if let Some(zns) = ns.zns.as_ref() {
@@ -268,14 +253,7 @@ impl NvmeController {
                         // descriptor，含 NSFEAT/NMIC/RESCAP/FPI/NSTAT。
                         // （之前 commit 误用 CNS 0x06。）
                         if self.ns(nsid).is_none() {
-                            return Some(Cqe::error(
-                                cid,
-                                0,
-                                sq_head,
-                                phase,
-                                sc::INVALID_NAMESPACE,
-                                0,
-                            ));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE));
                         }
                         build_cs_indep_ns_identify()
                     }
@@ -314,18 +292,11 @@ impl NvmeController {
                         // **review M3** — NSID=0 / broadcast 0xFFFF_FFFF 在
                         // CNS 0x12 不合法 (spec 表 273) → INVALID_FIELD。
                         if nsid == 0 || nsid == 0xFFFF_FFFF {
-                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                         }
                         let start_cntlid = ((sqe.cdw10 >> 16) & 0xffff) as u16;
                         let Some(ns) = self.namespaces.get(&nsid) else {
-                            return Some(Cqe::error(
-                                cid,
-                                0,
-                                sq_head,
-                                phase,
-                                sc::INVALID_NAMESPACE,
-                                0,
-                            ));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE));
                         };
                         let mut buf = vec![0u8; 4096];
                         if ns.attached && start_cntlid <= 1 {
@@ -371,10 +342,10 @@ impl NvmeController {
                 // 超授予上限。DenseMap 越界 insert 静默丢弃，必须在此显式拒，否则会
                 // 对未创建的队列误返 success。
                 if qid == 0 || qid > self.io_queue_pairs {
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
                 if !pc {
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
                 tracing::info!(
                     qid,
@@ -409,13 +380,13 @@ impl NvmeController {
                 let prp1 = sqe.prp1;
                 // **2026-06-09** — qid 范围校验（同 Create IO CQ；防 DenseMap 越界误 success）。
                 if qid == 0 || qid > self.io_queue_pairs {
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
                 if !pc {
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
                 if !self.cqs.contains_key(&cqid) {
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
                 tracing::info!(
                     qid,
@@ -476,7 +447,7 @@ impl NvmeController {
                         let ps = (cdw11 & 0x1F) as u8;
                         if ps >= 8 {
                             // Identify Controller .npss = 7 (8 states)
-                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                         }
                         self.current_ps = ps;
                         self.features.insert(fid, cdw11);
@@ -567,24 +538,17 @@ impl NvmeController {
                         let wps = (cdw11 & 0x7) as u8;
                         let nsid = sqe.nsid;
                         if nsid == 0 || nsid == 0xFFFF_FFFF {
-                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                         }
                         let Some(ns) = self.namespaces.get_mut(&nsid) else {
-                            return Some(Cqe::error(
-                                cid,
-                                0,
-                                sq_head,
-                                phase,
-                                sc::INVALID_NAMESPACE,
-                                0,
-                            ));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE));
                         };
                         if ns.nswp == 3 {
                             tracing::warn!(
                                 nsid,
                                 "Set Features 0x84 on permanently-write-protected NS rejected"
                             );
-                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                         }
                         ns.nswp = wps;
                         // **Phase S1 H2** — 不写 self.features：per-NS 值的
@@ -645,17 +609,10 @@ impl NvmeController {
                         // 读取目标 NS 的 nswp，而不是回 controller-global 缓存。
                         let nsid = sqe.nsid;
                         if nsid == 0 || nsid == 0xFFFF_FFFF {
-                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                         }
                         let Some(ns) = self.namespaces.get(&nsid) else {
-                            return Some(Cqe::error(
-                                cid,
-                                0,
-                                sq_head,
-                                phase,
-                                sc::INVALID_NAMESPACE,
-                                0,
-                            ));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE));
                         };
                         ns.nswp as u32
                     }
@@ -705,7 +662,13 @@ impl NvmeController {
                         cap = CTRL_AER_HARD_CAP,
                         "AsyncEventRequest rejected: controller-side global hard cap exceeded"
                     );
-                    return Some(Cqe::error(cid, 0, sq_head, phase, 0x05, 0));
+                    return Some(Cqe::error(
+                        cid,
+                        0,
+                        sq_head,
+                        phase,
+                        sc::ASYNC_EVENT_REQUEST_LIMIT_EXCEEDED,
+                    ));
                 }
                 let conn_id = self.current_dispatch_conn_id;
                 if conn_id != 0 {
@@ -719,7 +682,13 @@ impl NvmeController {
                             "AsyncEventRequest rejected: per-conn hard cap exceeded \
                              (V8d反 cross-tenant AER squat)"
                         );
-                        return Some(Cqe::error(cid, 0, sq_head, phase, 0x05, 0));
+                        return Some(Cqe::error(
+                            cid,
+                            0,
+                            sq_head,
+                            phase,
+                            sc::ASYNC_EVENT_REQUEST_LIMIT_EXCEEDED,
+                        ));
                     }
                 }
                 self.aen_pending
@@ -759,7 +728,7 @@ impl NvmeController {
                         bytes = bytes_req,
                         "Get Log Page: request > 2 MiB unsupported (PRP list chaining 未实现)"
                     );
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
                 let bytes = bytes_req as usize;
                 let buf: Vec<u8> = match lid {
@@ -877,7 +846,7 @@ impl NvmeController {
                         mset,
                         "Format rejected: only LBAF[0/1/2] + PI Type 0/1 supported"
                     );
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
                 // **Phase K1 + 2026-06-09** 计算新 LBAF + PI 配置。
                 // LBAF: 0→(512B,no-meta) / 1→(4K,8B-meta) / 2→(4K,no-meta)。
@@ -888,7 +857,7 @@ impl NvmeController {
                 };
                 if pi != 0 && new_meta_size == 0 {
                     // PI 需要 metadata 空间承载 8-byte tuple（纯 4K LBAF[2] 不能开 PI）。
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
                 let new_pi_type = pi;
                 let new_pi_first = pil == 0; // PIL=0 → first 8, PIL=1 → last 8
@@ -916,14 +885,7 @@ impl NvmeController {
                         "Format NVM rejected: IO in flight"
                     );
                     // SC 0x84 Format In Progress (NVMe 1.4 § 4.6.1.2.1)。
-                    return Some(Cqe::error(
-                        cid,
-                        0,
-                        sq_head,
-                        phase,
-                        sc::FORMAT_IN_PROGRESS,
-                        0,
-                    ));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::FORMAT_IN_PROGRESS));
                 }
                 if ses == 1 || ses == 2 {
                     // SES=1 User Data Erase / SES=2 Cryptographic Erase。
@@ -955,7 +917,7 @@ impl NvmeController {
                     } else if self.namespaces.contains_key(&nsid) {
                         vec![nsid]
                     } else {
-                        return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE, 0));
+                        return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE));
                     };
                     // **Phase S1 H1** — Format 会清盘，对任何 write-protected NS
                     // 必须拒绝 (NVMe 2.0 § 8.19 + cmd::fid::NS_WRITE_PROTECTION)。
@@ -976,7 +938,6 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::NAMESPACE_IS_WRITE_PROTECTED,
-                                sc::SCT_COMMAND_SPECIFIC,
                             ));
                         }
                     }
@@ -992,7 +953,6 @@ impl NvmeController {
                                     sq_head,
                                     phase,
                                     sc::INTERNAL_ERROR,
-                                    0,
                                 ));
                             }
                         };
@@ -1004,13 +964,13 @@ impl NvmeController {
                             tracing::warn!(error = %e, nsid = target_nsid, "Format NVM: truncate failed");
                             // 失败也尝试 rebuild mmap 以维持一致性
                             ns.mmap = crate::controller::try_mmap_file(&ns.file);
-                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INTERNAL_ERROR, 0));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INTERNAL_ERROR));
                         }
                         use std::io::Write as _;
                         if let Err(e) = ns.file.flush() {
                             tracing::warn!(error = %e, nsid = target_nsid, "Format NVM: flush failed");
                             ns.mmap = crate::controller::try_mmap_file(&ns.file);
-                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INTERNAL_ERROR, 0));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INTERNAL_ERROR));
                         }
                         // **Reviewer C-2** — rebuild mmap，让后续 read_at/write_at
                         // 重走零拷贝 fast path。
@@ -1041,7 +1001,7 @@ impl NvmeController {
                     } else if self.namespaces.contains_key(&nsid) {
                         vec![nsid]
                     } else {
-                        return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE, 0));
+                        return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE));
                     };
                     // **Phase S1 H1** — Format 会清盘，对任何 write-protected NS
                     // 必须拒绝 (NVMe 2.0 § 8.19 + cmd::fid::NS_WRITE_PROTECTION)。
@@ -1062,7 +1022,6 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::NAMESPACE_IS_WRITE_PROTECTED,
-                                sc::SCT_COMMAND_SPECIFIC,
                             ));
                         }
                     }
@@ -1105,7 +1064,7 @@ impl NvmeController {
                 let ca = ((sqe.cdw10 >> 3) & 0x7) as u8;
                 tracing::info!(fs, ca, "Firmware Commit");
                 if !(1..=7).contains(&fs) {
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
                 let buf_len = self.fw_download_buf.len();
                 match ca {
@@ -1115,7 +1074,7 @@ impl NvmeController {
                         // 真硬件这是 vendor 编码 image。
                         if buf_len < 8 {
                             tracing::warn!(buf_len, "FW Commit: insufficient downloaded image");
-                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                         }
                         let rev_bytes: [u8; 8] = self.fw_download_buf[..8].try_into().unwrap();
                         let rev = String::from_utf8_lossy(&rev_bytes).to_string();
@@ -1128,7 +1087,7 @@ impl NvmeController {
                     2 => {
                         // 仅 mark next-boot active
                         if self.fw_slot_revisions[fs as usize].is_empty() {
-                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                         }
                         self.fw_next_active_slot = fs;
                     }
@@ -1137,14 +1096,7 @@ impl NvmeController {
                         if self.fw_slot_revisions[fs as usize].is_empty() {
                             // 没 image：用 download buffer 先 flash 再激活
                             if buf_len < 8 {
-                                return Some(Cqe::error(
-                                    cid,
-                                    0,
-                                    sq_head,
-                                    phase,
-                                    sc::INVALID_FIELD,
-                                    0,
-                                ));
+                                return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                             }
                             let rev_bytes: [u8; 8] = self.fw_download_buf[..8].try_into().unwrap();
                             self.fw_slot_revisions[fs as usize] =
@@ -1153,7 +1105,7 @@ impl NvmeController {
                         self.fw_active_slot = fs;
                         tracing::info!(fs, "FW Commit: activated immediately");
                     }
-                    _ => return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0)),
+                    _ => return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD)),
                 }
                 // 清 download buffer（spec § 5.16：commit consumes download)
                 self.fw_download_buf.clear();
@@ -1171,7 +1123,7 @@ impl NvmeController {
                 let numd = match (sqe.cdw10 as u64).checked_add(1) {
                     Some(n) => n, // dwords (4 byte units)
                     None => {
-                        return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                        return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                     }
                 };
                 let offset_dwords = sqe.cdw11 as u64;
@@ -1188,13 +1140,13 @@ impl NvmeController {
                     Some(t) => t,
                     None => {
                         tracing::warn!("FW Download offset+bytes overflow");
-                        return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                        return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                     }
                 };
                 if need_total > FW_MAX || bytes_count_u64 == 0 || bytes_count_u64 > u32::MAX as u64
                 {
                     tracing::warn!(need_total, "FW Download invalid size");
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
                 if self.fw_download_buf.len() < need_total as usize {
                     self.fw_download_buf.resize(need_total as usize, 0);
@@ -1256,7 +1208,6 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::SELF_TEST_IN_PROGRESS,
-                                sc::SCT_COMMAND_SPECIFIC,
                             ));
                         }
                         let total = if stc == 0x1 { 5 } else { 20 };
@@ -1271,7 +1222,7 @@ impl NvmeController {
                     }
                     _ => {
                         tracing::warn!(stc, "Self-Test: unsupported STC");
-                        Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0))
+                        Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD))
                     }
                 }
             }
@@ -1290,7 +1241,7 @@ impl NvmeController {
                     0 => {
                         // Create — DMA-read 4 KiB Identify NS 结构
                         if sqe.nsid != 0xFFFF_FFFF {
-                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                         }
                         let tok = ctx.dma_read(sqe.prp1, 4096);
                         self.pending_ios.insert(
@@ -1310,7 +1261,7 @@ impl NvmeController {
                         // Delete — NSID 立即删
                         let nsid = sqe.nsid;
                         if nsid == 0 || nsid == 0xFFFF_FFFF {
-                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                         }
                         // **reviewer H1 修复** — Delete 时若有 in-flight IO
                         // 关联该 NSID，必须拒绝。否则完成回调找不到 NS 误
@@ -1323,7 +1274,7 @@ impl NvmeController {
                             || self.compare_ops.values().any(|o| o.nsid == nsid);
                         if busy {
                             tracing::warn!(nsid, "NS Mgmt Delete rejected: IO in flight");
-                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                         }
                         // **reviewer M2** — 删 backing temp file 不泄漏
                         if let Some(ns) = self.namespaces.remove(&nsid) {
@@ -1334,18 +1285,11 @@ impl NvmeController {
                                 "NS Mgmt Delete OK + temp file unlink"
                             );
                         } else {
-                            return Some(Cqe::error(
-                                cid,
-                                0,
-                                sq_head,
-                                phase,
-                                sc::INVALID_NAMESPACE,
-                                0,
-                            ));
+                            return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE));
                         }
                         Some(Cqe::success(cid, 0, sq_head, phase))
                     }
-                    _ => Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0)),
+                    _ => Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD)),
                 }
             }
             admin_opc::NS_ATTACHMENT => {
@@ -1358,13 +1302,13 @@ impl NvmeController {
                 let sel = (sqe.cdw10 & 0xf) as u8;
                 let nsid = sqe.nsid;
                 if nsid == 0 || nsid == 0xFFFF_FFFF {
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
                 if !self.namespaces.contains_key(&nsid) {
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE, 0));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE));
                 }
                 if sel > 1 {
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
                 // PRP1 → controller list 4 KiB DMA read，完成在 on_dma_complete。
                 let tok = ctx.dma_read(sqe.prp1, 4096);
@@ -1388,7 +1332,7 @@ impl NvmeController {
                 // 其它 SECP 我们都没真实现 → 一律 INVALID_FIELD。
                 let secp = ((sqe.cdw10 >> 16) & 0xff) as u8;
                 tracing::debug!(secp, "Security Send (INVALID_FIELD; no SP impl)");
-                Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0))
+                Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD))
             }
             admin_opc::SECURITY_RECEIVE => {
                 // **Phase L5 + O reviewer M4 修复** — spec § 5.28 Security
@@ -1413,7 +1357,7 @@ impl NvmeController {
                     );
                     None
                 } else {
-                    Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0))
+                    Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD))
                 }
             }
             admin_opc::DIRECTIVE_SEND => {
@@ -1441,7 +1385,7 @@ impl NvmeController {
                 // 我们不实现 SR-IOV / VF resource alloc；返 INVALID_FIELD
                 // 让 driver fallback。
                 tracing::debug!(cid, "Virtualization Mgmt (INVALID_FIELD)");
-                Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0))
+                Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD))
             }
             admin_opc::GET_LBA_STATUS => {
                 // **Phase L5 + reviewer H-4** — Get LBA Status (spec § 5.15)。
@@ -1467,7 +1411,7 @@ impl NvmeController {
                 //   bit 9      NDAS   — No Deallocate After Sanitize
                 let sanact = (sqe.cdw10 & 0x7) as u8;
                 if sanact == 0 || sanact > 4 {
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
                 if sanact == 1 {
                     // Exit Failure：清失败状态
@@ -1478,14 +1422,7 @@ impl NvmeController {
                 }
                 // 已在进行 → spec § 5.26 'Sanitize In Progress' (SC 0x12)
                 if self.sanitize.is_some() {
-                    return Some(Cqe::error(
-                        cid,
-                        0,
-                        sq_head,
-                        phase,
-                        sc::SANITIZE_IN_PROGRESS,
-                        0,
-                    ));
+                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::SANITIZE_IN_PROGRESS));
                 }
                 // **Phase S1 H1** — Sanitize 抹整盘，命中任何 protected NS 都
                 // 拒（NVMe 2.0 § 8.19）。Sanitize 是 controller 范围，遍历所有 NS。
@@ -1502,7 +1439,6 @@ impl NvmeController {
                             sq_head,
                             phase,
                             sc::NAMESPACE_IS_WRITE_PROTECTED,
-                            sc::SCT_COMMAND_SPECIFIC,
                         ));
                     }
                 }
@@ -1571,7 +1507,7 @@ impl NvmeController {
                 // fail device — Linux nvme_set_features / Windows
                 // nvme_query_directive 都把它视为 'feature 不支持'。
                 tracing::warn!(opc, "unsupported admin opcode → INVALID_OPCODE");
-                Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_OPCODE, 0))
+                Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_OPCODE))
             }
         }
     }

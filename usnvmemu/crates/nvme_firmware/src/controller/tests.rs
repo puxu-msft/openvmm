@@ -243,7 +243,8 @@ fn reservation_state_machine() {
     let mut c = make_ctrl_with_tmp("rsv");
     let nsid = 1u32;
     // 提取 CQE 的 SC byte（spec dw3 bits 17..25）
-    let sc = |cqe: &Cqe| -> u8 { ((cqe.dw3 >> 17) & 0xff) as u8 };
+    let sc =
+        |cqe: &Cqe| -> u16 { (((cqe.dw3 >> 17) & 0xff) | (((cqe.dw3 >> 25) & 0x7) << 8)) as u16 };
     // Register host A with rkey=0x1001
     let mut buf = vec![0u8; 16];
     buf[8..16].copy_from_slice(&0x1001u64.to_le_bytes()); // NRKEY
@@ -598,7 +599,7 @@ fn pure_4k_io_round_trip_mixed_ns() {
 
     // 从 CQ 槽位区间 [lo,hi) 的最后一条 16B DmaWrite 解析 SC（dw3 bits 24:17）。
     // CQ tail 每 post 递增，故 CQE 落在 base+tail×16，而非固定 base。
-    fn last_cqe_sc(cap: &pcie_device_core::CaptureTransport, pre: usize, lo: u64, hi: u64) -> u8 {
+    fn last_cqe_sc(cap: &pcie_device_core::CaptureTransport, pre: usize, lo: u64, hi: u64) -> u16 {
         let cqe = cap
             .events()
             .iter()
@@ -614,7 +615,7 @@ fn pure_4k_io_round_trip_mixed_ns() {
             .next_back()
             .expect("应有一条 CQE 写到 CQ 槽位");
         let dw3 = u32::from_le_bytes(cqe[12..16].try_into().unwrap());
-        (dw3 >> 17) as u8
+        (((dw3 >> 17) & 0xff) | (((dw3 >> 25) & 0x7) << 8)) as u16
     }
     const COMPARE: u8 = 0x05;
     // CQ1 槽位区间：base 0x1_0000, size 64 → [0x1_0000, 0x1_0400)。
@@ -762,7 +763,8 @@ fn fused_cas_atomic_compare_and_write() {
         b[48..52].copy_from_slice(&0u32.to_le_bytes()); // cdw12 nlb-1=0 → 1 LBA
         <Sqe as zerocopy::FromBytes>::read_from_bytes(&b[..]).unwrap()
     };
-    let sc = |cqe: &crate::cmd::Cqe| ((cqe.dw3 >> 17) & 0xff) as u8;
+    let sc =
+        |cqe: &crate::cmd::Cqe| (((cqe.dw3 >> 17) & 0xff) | (((cqe.dw3 >> 25) & 0x7) << 8)) as u16;
     let cid_of = |cqe: &crate::cmd::Cqe| (cqe.dw3 & 0xffff) as u16;
     let read_lba = |c: &NvmeController| {
         let mut g = vec![0u8; sector];
@@ -960,7 +962,8 @@ fn pure_4k_copy_offset() {
             _ => None,
         })
         .expect("COPY 应 post 一条 CQE");
-    let sc = (u32::from_le_bytes(cqe[12..16].try_into().unwrap()) >> 17) & 0xff;
+    let __dw3 = u32::from_le_bytes(cqe[12..16].try_into().unwrap());
+    let sc = (((__dw3 >> 17) & 0xff) | (((__dw3 >> 25) & 0x7) << 8)) as u16;
     assert_eq!(sc, 0, "COPY 成功 SC=0");
 
     let ns = c.namespaces.get(&1).unwrap();
@@ -1318,13 +1321,13 @@ fn check_zns_write_rejections() {
     assert!(check_zns_write(&c.namespaces[&1], 0, 1, 0, 0, 0, 1).is_none());
     // 跨 zone 边界 → ZONE_BOUNDARY_ERR
     let cqe = check_zns_write(&c.namespaces[&1], zone_size - 1, 2, 0, 0, 0, 1).unwrap();
-    let sc = (cqe.dw3 >> 17) as u8;
+    let sc = (((cqe.dw3 >> 17) & 0xff) | (((cqe.dw3 >> 25) & 0x7) << 8)) as u16;
     assert_eq!(sc, sc::ZONE_BOUNDARY_ERR);
     let sct = ((cqe.dw3 >> 25) & 0x7) as u8;
     assert_eq!(sct, sc::SCT_COMMAND_SPECIFIC);
     // SWR mismatch：在 Empty zone WP=0 写 LBA=5 应 ZONE_INVALID_WRITE
     let cqe = check_zns_write(&c.namespaces[&1], 5, 1, 0, 0, 0, 1).unwrap();
-    let sc = (cqe.dw3 >> 17) as u8;
+    let sc = (((cqe.dw3 >> 17) & 0xff) | (((cqe.dw3 >> 25) & 0x7) << 8)) as u16;
     assert_eq!(sc, sc::ZONE_INVALID_WRITE);
     // 模拟 zone 0 Full
     {
@@ -1332,21 +1335,30 @@ fn check_zns_write_rejections() {
         zns.zones[0].state = ZoneState::Full;
     }
     let cqe = check_zns_write(&c.namespaces[&1], 0, 1, 0, 0, 0, 1).unwrap();
-    assert_eq!((cqe.dw3 >> 17) as u8, sc::ZONE_IS_FULL);
+    assert_eq!(
+        (((cqe.dw3 >> 17) & 0xff) | (((cqe.dw3 >> 25) & 0x7) << 8)) as u16,
+        sc::ZONE_IS_FULL
+    );
     // Offline
     {
         let zns = c.namespaces.get_mut(&1).unwrap().zns.as_mut().unwrap();
         zns.zones[0].state = ZoneState::Offline;
     }
     let cqe = check_zns_write(&c.namespaces[&1], 0, 1, 0, 0, 0, 1).unwrap();
-    assert_eq!((cqe.dw3 >> 17) as u8, sc::ZONE_IS_OFFLINE);
+    assert_eq!(
+        (((cqe.dw3 >> 17) & 0xff) | (((cqe.dw3 >> 25) & 0x7) << 8)) as u16,
+        sc::ZONE_IS_OFFLINE
+    );
     // ReadOnly
     {
         let zns = c.namespaces.get_mut(&1).unwrap().zns.as_mut().unwrap();
         zns.zones[0].state = ZoneState::ReadOnly;
     }
     let cqe = check_zns_write(&c.namespaces[&1], 0, 1, 0, 0, 0, 1).unwrap();
-    assert_eq!((cqe.dw3 >> 17) as u8, sc::ZONE_IS_READ_ONLY);
+    assert_eq!(
+        (((cqe.dw3 >> 17) & 0xff) | (((cqe.dw3 >> 25) & 0x7) << 8)) as u16,
+        sc::ZONE_IS_READ_ONLY
+    );
 }
 
 /// **Reviewer (final round)** — `check_zns_read` 只对 Offline zone reject。
@@ -1376,7 +1388,10 @@ fn check_zns_read_offline_only() {
         .zones[0]
         .state = ZoneState::Offline;
     let cqe = check_zns_read(&c.namespaces[&1], 0, 0, 0, 0, 1).unwrap();
-    assert_eq!((cqe.dw3 >> 17) as u8, sc::ZONE_IS_OFFLINE);
+    assert_eq!(
+        (((cqe.dw3 >> 17) & 0xff) | (((cqe.dw3 >> 25) & 0x7) << 8)) as u16,
+        sc::ZONE_IS_OFFLINE
+    );
     // ReadOnly / Full 允许读
     c.namespaces
         .get_mut(&1)
@@ -2080,60 +2095,126 @@ fn identify_controller_sgls_matches_impl() {
     );
 }
 
-/// **R2d** — SGL Generic Command Status 码**锚定**到仓库内 canonical
-/// `nvme_spec::Status`（vm/devices/storage/nvme_spec），防 R1 那种手填错值
-/// （0x14-0x17 全错）再次发生。`sc::` 只存 SC 低字节；Generic SCT=0 时
-/// `nvme_spec::Status` 高字节为 0，故直接比 `.0 as u8`。
+/// **R2d-followup** — **全** `sc::` 状态码锚定到仓库内 canonical
+/// `nvme_spec::Status`（vm/devices/storage/nvme_spec）。常量现是完整 16-bit
+/// status（SC + SCT<<8），故 `sc::X == Status::Y.0` 精确逐位比对——任何手填错
+/// 值（R1 把 SGL SC 填 0x14-0x17、SANITIZE 填 0x12、ATOMIC_WRITE 填 0x85、
+/// NAMESPACE_NOT_ATTACHED 填 0x19 …）都在编译/测试期红。ZNS 码 nvme_spec 无
+/// 对应枚举，单独断言其 SCT=Command-Specific + SC byte。
 #[test]
-fn sgl_status_codes_match_nvme_spec() {
+fn sc_constants_match_nvme_spec() {
     use crate::cmd::sc;
     use nvme_spec::Status;
+    // Generic (SCT=0)
+    assert_eq!(sc::SUCCESS, Status::SUCCESS.0);
+    assert_eq!(sc::INVALID_OPCODE, Status::INVALID_COMMAND_OPCODE.0);
+    assert_eq!(sc::INVALID_FIELD, Status::INVALID_FIELD_IN_COMMAND.0);
+    assert_eq!(sc::DATA_TRANSFER_ERROR, Status::DATA_TRANSFER_ERROR.0);
+    assert_eq!(sc::INTERNAL_ERROR, Status::INTERNAL_ERROR.0);
+    assert_eq!(sc::INVALID_NAMESPACE, Status::INVALID_NAMESPACE_OR_FORMAT.0);
+    assert_eq!(sc::SANITIZE_IN_PROGRESS, Status::SANITIZE_IN_PROGRESS.0);
+    assert_eq!(sc::LBA_OUT_OF_RANGE, Status::LBA_OUT_OF_RANGE.0);
+    assert_eq!(sc::NAMESPACE_NOT_READY, Status::NAMESPACE_NOT_READY.0);
+    assert_eq!(sc::RESERVATION_CONFLICT, Status::RESERVATION_CONFLICT.0);
+    assert_eq!(sc::FORMAT_IN_PROGRESS, Status::FORMAT_IN_PROGRESS.0);
+    assert_eq!(
+        sc::ATOMIC_WRITE_UNIT_EXCEEDED,
+        Status::ATOMIC_WRITE_UNIT_EXCEEDED.0
+    );
+    assert_eq!(
+        sc::NAMESPACE_IS_WRITE_PROTECTED,
+        Status::NAMESPACE_IS_WRITE_PROTECTED.0
+    );
+    assert_eq!(
+        sc::COMMAND_PROHIBITED_BY_LOCKDOWN,
+        Status::COMMAND_PROHIBITED_BY_COMMAND_AND_FEATURE_LOCKDOWN.0
+    );
+    // SGL Generic (SCT=0)
     assert_eq!(
         sc::INVALID_SGL_SEGMENT_DESCRIPTOR,
-        Status::INVALID_SGL_SEGMENT_DESCRIPTOR.0 as u8
+        Status::INVALID_SGL_SEGMENT_DESCRIPTOR.0
     );
     assert_eq!(
         sc::SGL_INVALID_NUMBER_OF_DESCRIPTORS,
-        Status::INVALID_NUMBER_OF_SGL_DESCRIPTORS.0 as u8
+        Status::INVALID_NUMBER_OF_SGL_DESCRIPTORS.0
     );
     assert_eq!(
         sc::DATA_SGL_LENGTH_INVALID,
-        Status::DATA_SGL_LENGTH_INVALID.0 as u8
+        Status::DATA_SGL_LENGTH_INVALID.0
     );
     assert_eq!(
         sc::SGL_DESCRIPTOR_TYPE_INVALID,
-        Status::SGL_DESCRIPTOR_TYPE_INVALID.0 as u8
+        Status::SGL_DESCRIPTOR_TYPE_INVALID.0
     );
     assert_eq!(
         sc::SGL_INVALID_USE_OF_CMB,
-        Status::INVALID_USE_OF_CONTROLLER_MEMORY_BUFFER.0 as u8
+        Status::INVALID_USE_OF_CONTROLLER_MEMORY_BUFFER.0
     );
     assert_eq!(
         sc::SGL_DATA_BLOCK_GRANULARITY_INVALID,
-        Status::SGL_DATA_BLOCK_GRANULARITY_INVALID.0 as u8
+        Status::SGL_DATA_BLOCK_GRANULARITY_INVALID.0
     );
-    // 相邻 Generic / Command-Specific 码也锚定（R2d 校正 SANITIZE 时与
-    // SGL_INVALID_USE_OF_CMB=0x12 撞 byte 暴露的 R1 手填错值）。Command-Specific
-    // 码 spec 值在 0x1xx，`sc::` 只存低字节，故 `& 0xff`。
+    // Command-Specific (SCT=1)
     assert_eq!(
-        sc::SANITIZE_IN_PROGRESS,
-        Status::SANITIZE_IN_PROGRESS.0 as u8,
-        "Sanitize In Progress 是 Generic 0x1d（非 R1 误填的 0x12）"
+        sc::NAMESPACE_ALREADY_ATTACHED,
+        Status::NAMESPACE_ALREADY_ATTACHED.0
+    );
+    assert_eq!(sc::NAMESPACE_NOT_ATTACHED, Status::NAMESPACE_NOT_ATTACHED.0);
+    assert_eq!(
+        sc::NAMESPACE_ID_UNAVAILABLE,
+        Status::NAMESPACE_IDENTIFIER_UNAVAILABLE.0
     );
     assert_eq!(
-        sc::SELF_TEST_IN_PROGRESS,
-        (Status::DEVICE_SELF_TEST_IN_PROGRESS.0 & 0xff) as u8,
-        "Self-Test In Progress SC byte = 0x1d（spec 0x11d，Command-Specific）"
+        sc::ASYNC_EVENT_REQUEST_LIMIT_EXCEEDED,
+        Status::ASYNCHRONOUS_EVENT_REQUEST_LIMIT_EXCEEDED.0
     );
     assert_eq!(
         sc::BOOT_PARTITION_WRITE_PROHIBITED,
-        (Status::BOOT_PARTITION_WRITE_PROHIBITED.0 & 0xff) as u8,
-        "Boot Partition Write Prohibited SC byte = 0x1e（spec 0x11e，Command-Specific）"
+        Status::BOOT_PARTITION_WRITE_PROHIBITED.0
     );
+    assert_eq!(
+        sc::SELF_TEST_IN_PROGRESS,
+        Status::DEVICE_SELF_TEST_IN_PROGRESS.0
+    );
+    assert_eq!(
+        sc::INVALID_PROTECTION_INFO,
+        Status::INVALID_PROTECTION_INFORMATION.0
+    );
+    assert_eq!(sc::CONFLICTING_ATTRIBUTES, Status::CONFLICTING_ATTRIBUTES.0);
+    assert_eq!(
+        sc::ATTEMPTED_WRITE_TO_READ_ONLY_RANGE,
+        Status::ATTEMPTED_WRITE_TO_READ_ONLY_RANGE.0
+    );
+    // Media and Data Integrity (SCT=2)
+    assert_eq!(sc::COMPARE_FAILURE, Status::MEDIA_COMPARE_FAILURE.0);
+    // ZNS Command Set Specific (SCT=1；nvme_spec 无对应枚举，校验 SCT+byte)
+    for code in [
+        sc::ZONE_BOUNDARY_ERR,
+        sc::ZONE_IS_FULL,
+        sc::ZONE_IS_READ_ONLY,
+        sc::ZONE_IS_OFFLINE,
+        sc::ZONE_INVALID_WRITE,
+        sc::TOO_MANY_ACTIVE_ZONES,
+        sc::TOO_MANY_OPEN_ZONES,
+        sc::INVALID_ZONE_STATE_TRANSITION,
+    ] {
+        assert_eq!(
+            code >> 8,
+            sc::SCT_COMMAND_SPECIFIC as u16,
+            "ZNS 码须 Command-Specific"
+        );
+        assert!(
+            (0xb8..=0xbf).contains(&(code & 0xff)),
+            "ZNS SC byte 0xB8-0xBF"
+        );
+    }
+    // sf_of：完整 status → CQE Status Field（SC<<1 | SCT<<9）。
+    assert_eq!(sc::sf_of(sc::COMPARE_FAILURE), (0x85 << 1) | (0x2 << 9));
+    assert_eq!(sc::sf_of(sc::INVALID_FIELD), 0x02 << 1);
 }
 
 /// **Phase S1** — `nswp == 0` 默认放行；`nswp != 0` 返
-/// NAMESPACE_IS_WRITE_PROTECTED (SC 0x20, SCT = Command Specific)。
+/// NAMESPACE_IS_WRITE_PROTECTED (SC 0x20, Generic)。
 #[test]
 fn ns_write_protection_blocks_writes() {
     use crate::controller::io::check_ns_write_protection;
@@ -2143,10 +2224,9 @@ fn ns_write_protection_blocks_writes() {
     // 切到 WPS=1 (Write Protect) → 拒
     c.namespaces.get_mut(&1).unwrap().nswp = 1;
     let cqe = check_ns_write_protection(&c.namespaces[&1], 0x11, 1, 0, 1).unwrap();
-    let sc = (cqe.dw3 >> 17) as u8;
-    let sct = ((cqe.dw3 >> 25) & 0x7) as u8;
-    assert_eq!(sc, sc::NAMESPACE_IS_WRITE_PROTECTED);
-    assert_eq!(sct, sc::SCT_COMMAND_SPECIFIC);
+    let status = (((cqe.dw3 >> 17) & 0xff) | (((cqe.dw3 >> 25) & 0x7) << 8)) as u16;
+    // NAMESPACE_IS_WRITE_PROTECTED 是 Generic（SCT=0）——R2d-followup 校正（R1 误当 Cmd-Specific 发）。
+    assert_eq!(status, sc::NAMESPACE_IS_WRITE_PROTECTED);
     // WPS=2 (Write Protect Until Power Cycle) 同样拒
     c.namespaces.get_mut(&1).unwrap().nswp = 2;
     assert!(check_ns_write_protection(&c.namespaces[&1], 0x11, 1, 0, 1).is_some());
@@ -2222,7 +2302,7 @@ fn ns_write_protection_get_set_round_trip() {
         sqe.cdw10 = crate::cmd::fid::NS_WRITE_PROTECTION as u32;
         sqe
     };
-    let sc_of = |cqe: &Cqe| (cqe.dw3 >> 17) as u8;
+    let sc_of = |cqe: &Cqe| (((cqe.dw3 >> 17) & 0xff) | (((cqe.dw3 >> 25) & 0x7) << 8)) as u16;
 
     {
         let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
@@ -2429,7 +2509,7 @@ fn ns_attachment_via_admin_round_trip() {
         .expect("Already-Attached 应 post 一条 CQE 到 admin CQ");
     // Cqe 16 byte：dw0(4) + dw1(4) + dw2(4) + dw3(4)
     let dw3 = u32::from_le_bytes(cqe_bytes[12..16].try_into().unwrap());
-    let sc = (dw3 >> 17) as u8;
+    let sc = (((dw3 >> 17) & 0xff) | (((dw3 >> 25) & 0x7) << 8)) as u16;
     let sct = ((dw3 >> 25) & 0x7) as u8;
     assert_eq!(
         sc,
@@ -2728,7 +2808,7 @@ fn create_io_queue_rejects_out_of_range_qid() {
     let mut c = make_ctrl_with_tmp("qid");
     let mut cap = pcie_device_core::CaptureTransport::new();
     let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
-    let sc_of = |cqe: &Cqe| (cqe.dw3 >> 17) as u8;
+    let sc_of = |cqe: &Cqe| (((cqe.dw3 >> 17) & 0xff) | (((cqe.dw3 >> 25) & 0x7) << 8)) as u16;
     let mk_cq = |qid: u16| {
         let zero = [0u8; 64];
         let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
@@ -2803,7 +2883,7 @@ fn create_io_queue_gate_uses_runtime_io_queue_pairs() {
     c.set_io_queue_pairs(4).unwrap();
     let mut cap = pcie_device_core::CaptureTransport::new();
     let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
-    let sc_of = |cqe: &Cqe| (cqe.dw3 >> 17) as u8;
+    let sc_of = |cqe: &Cqe| (((cqe.dw3 >> 17) & 0xff) | (((cqe.dw3 >> 25) & 0x7) << 8)) as u16;
     let mk_cq = |qid: u16| {
         let zero = [0u8; 64];
         let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();

@@ -209,110 +209,103 @@ pub mod nvm_opc {
 
 /// CQE.SC (Status Code) — Generic Command Status (NVMe spec 1.4 § 4.6.1.2.1).
 #[allow(dead_code)]
+/// NVMe Status Code 常量 + helpers。
+///
+/// **R2d-followup 结构性校正（2026-06-10）**：每个常量是**完整 16-bit status**
+/// （SC 低字节 + SCT 高字节，**精确镜像** `nvme_spec::Status`，见
+/// tests.rs::sc_constants_match_nvme_spec anchored 测试）。SCT 由值的高字节天然
+/// 携带（0x0xx Generic / 0x1xx Command-Specific / 0x2xx Media），`Cqe::error` 单参
+/// 接 status 后自动派生 SC+SCT——彻底消除"在每个调用点手填 SCT 填错"的整类 bug。
+///
+/// R1 历史教训：曾把 SGL SC 手填 0x14-0x17（全错）、SANITIZE 填 0x12、且 SCT 在
+/// 224 个 `Cqe::error` 调用点手填，多处填错（INVALID_PROTECTION_INFO 当 Generic
+/// 发、NS_WRITE_PROTECTED 当 Cmd-Specific 发）。结构性重构 + anchor 一并根治。
 pub mod sc {
-    pub const SUCCESS: u8 = 0x00;
-    pub const INVALID_OPCODE: u8 = 0x01;
-    pub const INVALID_FIELD: u8 = 0x02;
-    pub const DATA_TRANSFER_ERROR: u8 = 0x04;
-    pub const INTERNAL_ERROR: u8 = 0x06;
-    /// LBA Out of Range (NVM CSD)
-    pub const LBA_OUT_OF_RANGE: u8 = 0x80;
-    /// **Phase O / R2d 校正** — 命名常量供 grep。值以 canonical
-    /// `nvme_spec::Status` 为准（见 tests.rs::sgl_status_codes_match_nvme_spec）。
-    /// - SANITIZE_IN_PROGRESS：Generic SC **0x1d**（R1 误填 0x12=Invalid Use of
-    ///   CMB，emit SCT=0 时 driver 误解为 CMB 错——R2d 校正）。
-    /// - SELF_TEST_IN_PROGRESS：SC byte 0x1d，但 spec 是 **Command-Specific**
-    ///   (0x11d)，故 emit 时须配 `SCT_COMMAND_SPECIFIC`（与 Generic 0x1d 的
-    ///   Sanitize 靠 SCT 区分）。
-    pub const SANITIZE_IN_PROGRESS: u8 = 0x1d;
-    pub const SELF_TEST_IN_PROGRESS: u8 = 0x1d;
-    pub const FORMAT_IN_PROGRESS: u8 = 0x84;
-    /// **Phase L1** — ZNS Command Set Specific status codes (spec ZNS § 5)。
-    /// SC bytes appear in CQE.dw3 SF.SC，SCT=0x02 Command Specific：
-    pub const ZONE_BOUNDARY_ERR: u8 = 0xB8;
-    pub const ZONE_IS_FULL: u8 = 0xB9;
-    pub const ZONE_IS_READ_ONLY: u8 = 0xBA;
-    pub const ZONE_IS_OFFLINE: u8 = 0xBB;
-    pub const ZONE_INVALID_WRITE: u8 = 0xBC;
-    pub const TOO_MANY_ACTIVE_ZONES: u8 = 0xBD;
-    pub const TOO_MANY_OPEN_ZONES: u8 = 0xBE;
-    /// Phase H3：Compare Failure — Media/Data Integrity 类 (SCT=0x02)。
-    /// NVM CS spec § 4.1。CQE 的 Status Field 编码：bits 15:1 包括
-    /// `SCT(11:9) | SC(8:1)`；本常量是 SC byte，SCT 在 Cqe::error 还需
-    /// 单独指定 — 当前 helper 没暴露 SCT 参数，对 Compare 我们用 0x85
-    /// SC + driver 通常按 NVM/Media 解析。
-    pub const COMPARE_FAILURE: u8 = 0x85;
-    /// Phase H4：Invalid Namespace or Format — NVMe spec § 6.1 当 IO
-    /// 命令带未注册 NSID 时返。
-    pub const INVALID_NAMESPACE: u8 = 0x0b;
-    /// **Phase H6** — Reservation 相关 SC (NVM CS § 4.1)。
-    /// Reservation Conflict — 命令与现有 reservation 冲突。
-    pub const RESERVATION_CONFLICT: u8 = 0x83;
-    /// **Reviewer H4/H5/H8** — NVM CS § 4.2 Protection Information SC.
-    /// Driver 看到此 SC 知道是 PI 不支持，而不是误判 driver bug。
-    pub const INVALID_PROTECTION_INFO: u8 = 0x81;
-    /// **Reviewer H2** — ZNS Invalid Zone State Transition (spec ZNS § 5)。
-    /// Zone Mgmt Send 在非法 source state 上请求 transition 时返；
-    /// 配 SCT_COMMAND_SPECIFIC 使用。
-    pub const INVALID_ZONE_STATE_TRANSITION: u8 = 0xBF;
-    /// **Reviewer H-6** — Status Code Type values（NVMe spec Figure
-    /// "Status Code – Status Code Type Definition"）。`Cqe::error`
-    /// 第二个参数。重要的是 ZNS / Reservation 等 Command-Specific SC 必须配
-    /// `SCT_COMMAND_SPECIFIC=0x01`，否则 driver 把它当 Generic 解释会失败。
+    /// 从 (sc, sct) 拼完整 u16 status（少数运行期算出 SC byte 的路径用，如 PI
+    /// media 错误：`sc::status(sc_byte, SCT_MEDIA_DATA_INTEGRITY)`）。
+    pub const fn status(sc: u8, sct: u8) -> u16 {
+        (sc as u16) | ((sct as u16) << 8)
+    }
+    /// 完整 status → CQE / error-log 的 Status Field（SC 在 bits[8:1]，SCT 在
+    /// bits[11:9]）。
+    pub const fn sf_of(status: u16) -> u16 {
+        let sc = status & 0xff;
+        let sct = (status >> 8) & 0x7;
+        (sc << 1) | (sct << 9)
+    }
+
+    // ── Status Code Type（高字节语义；`status()` 运行期路径用）──
     pub const SCT_GENERIC: u8 = 0x00;
     pub const SCT_COMMAND_SPECIFIC: u8 = 0x01;
     pub const SCT_MEDIA_DATA_INTEGRITY: u8 = 0x02;
-    /// **Phase Q7** — Command Prohibited by Command and Feature Lockdown
-    /// (spec § 4.6.1.2.1 + § 5.18) — driver 已 lock 此 opcode 时返。
-    pub const COMMAND_PROHIBITED_BY_LOCKDOWN: u8 = 0x23;
-    /// **Phase S1** — NAMESPACE_IS_WRITE_PROTECTED (spec § 4.6.1.2.1 SC 0x20)。
-    /// Driver 对 write-protected NS 发 Write/Write Zeroes/DSM/Format 等
-    /// 写入命令时返。配合 Feature 0x84 NS Write Protection 使用。
-    pub const NAMESPACE_IS_WRITE_PROTECTED: u8 = 0x20;
-    /// **Phase S2** — NAMESPACE_NOT_READY (spec § 4.6.1.2.1 SC 0x82, Generic)。
-    /// NS 已识别但 controller 暂未 ready 服务（如 Format 进行中、NS Resize）。
-    pub const NAMESPACE_NOT_READY: u8 = 0x82;
-    /// **Phase S2** — ATOMIC_WRITE_UNIT_EXCEEDED (spec § 4.6.1.2.1 SC 0x85, Generic)。
-    /// 单条 Write 超过 Identify Controller.AWUN/AWUPF 声明的原子单位。
-    pub const ATOMIC_WRITE_UNIT_EXCEEDED: u8 = 0x85;
-    /// **Phase S2** — CONFLICTING_ATTRIBUTES (spec § 4.6.1.2.1 SC 0x180)。
-    /// DSM range 互相重叠 / Read 与 DSM 抢同 LBA 等。
-    pub const CONFLICTING_ATTRIBUTES: u8 = 0x80;
-    /// **Phase S2** — ATTEMPTED_WRITE_TO_READ_ONLY_RANGE (spec SC 0x182)。
-    /// DSM AD=1 deallocate 一个被显式标 read-only 的 range。
-    pub const ATTEMPTED_WRITE_TO_READ_ONLY_RANGE: u8 = 0x82;
-    /// **Phase S2** — BOOT_PARTITION_WRITE_PROHIBITED (spec SC 0x11E)。
-    /// FW Image Download with BPID=1 (Boot Partition write) 当 BP 被
-    /// LOCKDOWN 或 read-only 时返。
-    pub const BOOT_PARTITION_WRITE_PROHIBITED: u8 = 0x1E;
-    /// **Phase S2** — NAMESPACE_ALREADY_ATTACHED (spec SC 0x18)。
-    /// NS Attachment SEL=0 (Attach) 时 NS 已 attached 到本 controller。
-    pub const NAMESPACE_ALREADY_ATTACHED: u8 = 0x18;
-    /// **Phase S2** — NAMESPACE_NOT_ATTACHED (spec SC 0x19, Cmd-Specific)。
-    /// NS Attachment SEL=1 (Detach) 时 NS 已 detached（对称 0x18）。
-    pub const NAMESPACE_NOT_ATTACHED: u8 = 0x19;
-    /// **2026-06-09** — Namespace Identifier Unavailable (spec SC 0x16,
-    /// Cmd-Specific)。NS Management Create 时无空闲 NSID（已达 NAMESPACE_SLOT_CAPACITY）。
-    pub const NAMESPACE_ID_UNAVAILABLE: u8 = 0x16;
-    // ── SGL Generic Command Status (SCT=0)。**值以仓库内 canonical
-    //    `nvme_spec::Status` 为准**（vm/devices/storage/nvme_spec/src/lib.rs
-    //    ~280-300），见 controller/tests.rs::sgl_status_codes_match_nvme_spec
-    //    anchored 测试。R1 原把这些手填成 0x14-0x17（全错：实为 ATOMIC_WRITE_
-    //    UNIT_EXCEEDED / OPERATION_DENIED / SGL_OFFSET_INVALID / RESERVED）——
-    //    SGL 极少被真驱动跑到，长期未暴露。R2d 按 spec 校正。──
-    /// SGL segment descriptor 本身非法（如 segment 字节数非 16 倍数）。spec 0x0d。
-    pub const INVALID_SGL_SEGMENT_DESCRIPTOR: u8 = 0x0d;
-    /// SGL descriptor 数量非法（如 segment chain 段数超上限）。spec 0x0e。
-    pub const SGL_INVALID_NUMBER_OF_DESCRIPTORS: u8 = 0x0e;
-    /// **Phase R2d** — Data SGL 总长度与命令传输大小不符（fragment 覆盖 ≠
-    /// NLB*sector）。spec 0x0f。
-    pub const DATA_SGL_LENGTH_INVALID: u8 = 0x0f;
-    /// driver SGL 解析出未识别 / 不该出现的 descriptor type 时返。spec 0x11。
-    pub const SGL_DESCRIPTOR_TYPE_INVALID: u8 = 0x11;
-    /// SGL Data Block 指向无效 CMB（CMB 未启用时返）。spec 0x12。
-    pub const SGL_INVALID_USE_OF_CMB: u8 = 0x12;
-    /// SGL Data Block granularity 非法。spec 0x1e。
-    pub const SGL_DATA_BLOCK_GRANULARITY_INVALID: u8 = 0x1e;
+
+    // ── Generic Command Status (SCT=0)，值 == nvme_spec::Status ──
+    pub const SUCCESS: u16 = 0x0000;
+    pub const INVALID_OPCODE: u16 = 0x0001;
+    pub const INVALID_FIELD: u16 = 0x0002;
+    pub const DATA_TRANSFER_ERROR: u16 = 0x0004;
+    pub const INTERNAL_ERROR: u16 = 0x0006;
+    /// Invalid Namespace or Format — IO 命令带未注册 NSID。
+    pub const INVALID_NAMESPACE: u16 = 0x000b;
+    /// Sanitize In Progress（Generic 0x1d；R1 误填 0x12=Invalid Use of CMB）。
+    pub const SANITIZE_IN_PROGRESS: u16 = 0x001d;
+    pub const LBA_OUT_OF_RANGE: u16 = 0x0080;
+    /// NS 已识别但 controller 暂未 ready（Format 进行中 / NS Resize）。
+    pub const NAMESPACE_NOT_READY: u16 = 0x0082;
+    pub const RESERVATION_CONFLICT: u16 = 0x0083;
+    pub const FORMAT_IN_PROGRESS: u16 = 0x0084;
+    /// 单条 Write 超 AWUN/AWUPF（R1 误填 0x85=Media Compare Failure byte）。
+    pub const ATOMIC_WRITE_UNIT_EXCEEDED: u16 = 0x0014;
+    /// NS Write Protection（Generic 0x20；R1 emit 当 Cmd-Specific 发，错）。
+    pub const NAMESPACE_IS_WRITE_PROTECTED: u16 = 0x0020;
+    /// Command Prohibited by Command and Feature Lockdown。
+    pub const COMMAND_PROHIBITED_BY_LOCKDOWN: u16 = 0x0023;
+
+    // ── SGL Generic Command Status (SCT=0)（R2d 已锚定校正）──
+    pub const INVALID_SGL_SEGMENT_DESCRIPTOR: u16 = 0x000d;
+    pub const SGL_INVALID_NUMBER_OF_DESCRIPTORS: u16 = 0x000e;
+    pub const DATA_SGL_LENGTH_INVALID: u16 = 0x000f;
+    pub const SGL_DESCRIPTOR_TYPE_INVALID: u16 = 0x0011;
+    pub const SGL_INVALID_USE_OF_CMB: u16 = 0x0012;
+    pub const SGL_DATA_BLOCK_GRANULARITY_INVALID: u16 = 0x001e;
+
+    // ── Command Specific Status (SCT=1)，值 == nvme_spec::Status（含 0x1xx）──
+    /// NS Attachment Attach 时 NS 已 attached。
+    pub const NAMESPACE_ALREADY_ATTACHED: u16 = 0x0118;
+    /// NS Attachment Detach 时 NS 已 detached（R1 误填 0x119=NS Is Private）。
+    pub const NAMESPACE_NOT_ATTACHED: u16 = 0x011a;
+    /// NS Management Create 无空闲 NSID。
+    pub const NAMESPACE_ID_UNAVAILABLE: u16 = 0x0116;
+    /// Async Event Request 超过 controller 支持的并发上限（AERL）。
+    pub const ASYNC_EVENT_REQUEST_LIMIT_EXCEEDED: u16 = 0x0105;
+    /// Boot Partition write 被 lockdown / read-only。
+    pub const BOOT_PARTITION_WRITE_PROHIBITED: u16 = 0x011e;
+    /// Device Self-Test In Progress（Cmd-Specific 0x11d；与 Generic 0x1d 的
+    /// Sanitize 同 SC byte，靠 SCT 区分）。
+    pub const SELF_TEST_IN_PROGRESS: u16 = 0x011d;
+    /// Invalid Protection Information（Cmd-Specific 0x181；R1 emit 当 Generic
+    /// 发，driver 误读为 Capacity Exceeded）。
+    pub const INVALID_PROTECTION_INFO: u16 = 0x0181;
+
+    // ── NVM Command Set 专属 Command Specific (SCT=1) ──
+    /// DSM range 互重叠 / Read 与 DSM 抢同 LBA。
+    pub const CONFLICTING_ATTRIBUTES: u16 = 0x0180;
+    /// DSM AD=1 deallocate 一个 read-only range。
+    pub const ATTEMPTED_WRITE_TO_READ_ONLY_RANGE: u16 = 0x0182;
+
+    // ── Media and Data Integrity (SCT=2) ──
+    /// Compare 失败（Media 0x285）。
+    pub const COMPARE_FAILURE: u16 = 0x0285;
+
+    // ── ZNS Command Set Specific (SCT=1，ZNS spec § 5；SC bytes 0xB8-0xBF) ──
+    pub const ZONE_BOUNDARY_ERR: u16 = 0x01b8;
+    pub const ZONE_IS_FULL: u16 = 0x01b9;
+    pub const ZONE_IS_READ_ONLY: u16 = 0x01ba;
+    pub const ZONE_IS_OFFLINE: u16 = 0x01bb;
+    pub const ZONE_INVALID_WRITE: u16 = 0x01bc;
+    pub const TOO_MANY_ACTIVE_ZONES: u16 = 0x01bd;
+    pub const TOO_MANY_OPEN_ZONES: u16 = 0x01be;
+    pub const INVALID_ZONE_STATE_TRANSITION: u16 = 0x01bf;
 }
 
 /// Submission Queue Entry — 64 bytes 固定。
@@ -410,10 +403,13 @@ impl Cqe {
     }
 
     /// 构造一个 ERROR CQE，sc=status code, sct=status code type。
-    pub fn error(cid: u16, sq_id: u16, sq_head: u16, phase: u8, sc: u8, sct: u8) -> Self {
+    /// 构造一个 error CQE。`status` 是完整 16-bit NVMe status（SC 低字节 +
+    /// SCT 高字节，镜像 `nvme_spec::Status` / `sc::` 常量）；SC + SCT 一并由它
+    /// 派生，调用点不再单独传 SCT（消除手填 SCT 填错的整类 bug）。
+    pub fn error(cid: u16, sq_id: u16, sq_head: u16, phase: u8, status: u16) -> Self {
         let dw2 = ((sq_id as u32) << 16) | sq_head as u32;
         // SF layout: bits 17..=24 SC, bits 25..=27 SCT, bit 28 CRD, bit 29 M (more), bit 30 DNR
-        let sf = ((sc as u32) << 1) | ((sct as u32 & 0x7) << 9);
+        let sf = sc::sf_of(status) as u32;
         let dw3 = (cid as u32) | ((phase as u32 & 1) << 16) | (sf << 16);
         Cqe {
             cdw0: 0,
