@@ -46,6 +46,8 @@ vfio-user = ["dep:vfio_user_transport"]
 # 起真 nvme_firmware bin（--tcp-addr）经 pcie_remote 协议驱动 NVMe。仅 dev 用。
 # 是 nvme-of interop_py / vfio qemu_interop 在 pcie_remote transport 的对位 harness。
 [dev-dependencies]
+proptest = "1"
+crc = "3"
 pcie_remote_protocol = { path = "../../../vm/devices/pcie_remote_protocol" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }

@@ -3252,3 +3252,163 @@ fn ns_create_gate_uses_runtime_max_namespaces() {
         "max_namespaces=2、2 已加载 → 无空位，动态 Create 被运行时上限挡"
     );
 }
+
+// ════════════════════════ Wave 3：proptest 属性测试 ════════════════════════
+//
+// 对纯/近纯函数喂随机输入 + 断言**不变量**（而非具体值），找 example 测试列不全
+// 的边界（含静默 corruption + panic-on-untrusted-input 类）。每个 oracle **独立**
+// 于被测代码（u128 brute / crc crate / 长度契约），非 self-consistent（LESSONS §20）。
+use proptest::prelude::*;
+
+/// copy-range-conflict 的独立 **u128 暴力** oracle：u128 不溢出，故是 ground
+/// truth。与生产 `check_copy_range_conflict` 用同一半开区间公式，但独立书写——
+/// 生产里的 off-by-one / `i==j` self-skip / `<` vs `<=` 一旦变异即与本 oracle 背离。
+fn brute_copy_conflict(sdlba: u64, dst_total: u64, ranges: &[(u64, u32)]) -> bool {
+    let d0 = sdlba as u128;
+    let d1 = d0 + dst_total as u128;
+    let iv = |s: u64, n: u32| (s as u128, s as u128 + n as u128);
+    for (i, &(s1r, n1)) in ranges.iter().enumerate() {
+        let (s1, e1) = iv(s1r, n1);
+        if s1 < d1 && d0 < e1 {
+            return true; // src ↔ dst 区间重叠
+        }
+        for (j, &(s2r, n2)) in ranges.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let (s2, e2) = iv(s2r, n2);
+            if s1 < e2 && s2 < e1 {
+                return true; // src ↔ src 区间重叠
+            }
+        }
+    }
+    false
+}
+
+/// **HIGH** — ZNS 状态转移的独立 spec 矩阵 oracle（io.rs 文档表 § ZNS Zone State
+/// Machine 独立转写，非 copy 生产 match）。生产删/改任一臂即与本表背离。
+fn zsa_oracle(state: ZoneState, zsa: u8) -> Option<u16> {
+    use crate::cmd::sc;
+    use ZoneState::*;
+    match zsa {
+        0x01 | 0x02 | 0x04 => match state {
+            // Close(1)/Finish(2)/Reset(4)：ReadOnly/Offline 拒，其余 OK/no-op
+            ReadOnly => Some(sc::ZONE_IS_READ_ONLY),
+            Offline => Some(sc::ZONE_IS_OFFLINE),
+            _ => None,
+        },
+        0x03 => match state {
+            // Open(3)：Full 非法转移，ReadOnly/Offline 拒
+            Full => Some(sc::INVALID_ZONE_STATE_TRANSITION),
+            ReadOnly => Some(sc::ZONE_IS_READ_ONLY),
+            Offline => Some(sc::ZONE_IS_OFFLINE),
+            _ => None,
+        },
+        0x05 => match state {
+            // Offline(5)：仅 Full/ReadOnly/Offline 合法，其余非法转移
+            Full | ReadOnly | Offline => None,
+            _ => Some(sc::INVALID_ZONE_STATE_TRANSITION),
+        },
+        _ => Some(sc::INVALID_FIELD),
+    }
+}
+
+proptest! {
+    /// **HIGH** — copy-range-conflict == u128 brute（小窗口避溢出 + 频繁 overlap）。
+    /// false-negative = 重叠 copy 没拦 → 静默 corruption。
+    #[test]
+    fn pt_copy_conflict_matches_brute(
+        sdlba in 0u64..4096,
+        dst_total in 0u64..512,
+        ranges in prop::collection::vec((0u64..4096, 0u32..512), 0..12),
+    ) {
+        let got = super::completion::check_copy_range_conflict(sdlba, dst_total, &ranges);
+        let want = brute_copy_conflict(sdlba, dst_total, &ranges);
+        prop_assert_eq!(got, want);
+    }
+
+    /// **HIGH** — 溢出 ⇒ 保守 true（生产 checked_add None → true）。
+    /// `u64::MAX + n` (n>=1) 必溢出 → e1=None → dst_overlap=true。
+    #[test]
+    fn pt_copy_conflict_overflow_true(n in 1u32..512) {
+        prop_assert!(super::completion::check_copy_range_conflict(0, 1, &[(u64::MAX, n)]));
+    }
+
+    /// **HIGH** — crc16_t10dif == crc crate CRC_16_T10DIF（独立实现）。杀
+    /// cargo-mutants 在 PiTuple::compute `&→^` 的存活变异（pi.rs:79）。
+    #[test]
+    fn pt_crc16_matches_reference(data in prop::collection::vec(any::<u8>(), 0..4100)) {
+        let reference = crc::Crc::<u16>::new(&crc::CRC_16_T10_DIF).checksum(&data);
+        prop_assert_eq!(crate::pi::crc16_t10dif(&data), reference);
+    }
+
+    /// **HIGH** — parse_sgl_list 对任意 host bytes **不 panic** + 长度契约
+    /// （Ok ⇒ len%16==0 且 count==len/16）。不可信 host 内存解析面。
+    #[test]
+    fn pt_parse_sgl_list_no_panic(buf in prop::collection::vec(any::<u8>(), 0..256)) {
+        if let Ok(v) = crate::sgl::parse_sgl_list(&buf) {
+            prop_assert_eq!(buf.len() % 16, 0);
+            prop_assert_eq!(v.len(), buf.len() / 16);
+        }
+    }
+
+    /// **HIGH** — ZNS check_zsa_transition == 独立矩阵 oracle（zsa 全 0..=255）。
+    #[test]
+    fn pt_zsa_transition_matches_oracle(state_idx in 0usize..7, zsa in any::<u8>()) {
+        let state = [
+            ZoneState::Empty, ZoneState::ImplicitOpen, ZoneState::ExplicitOpen,
+            ZoneState::Closed, ZoneState::Full, ZoneState::ReadOnly, ZoneState::Offline,
+        ][state_idx];
+        prop_assert_eq!(
+            crate::controller::io::check_zsa_transition(state, zsa),
+            zsa_oracle(state, zsa)
+        );
+    }
+
+    /// **MEDIUM** — parse_prp_list encode→decode 恒等（含 GPA=0 透传，M2 回归锁）。
+    #[test]
+    fn pt_parse_prp_list_identity(entries in prop::collection::vec(any::<u64>(), 0..64)) {
+        let mut buf = Vec::new();
+        for e in &entries {
+            buf.extend_from_slice(&e.to_le_bytes());
+        }
+        prop_assert_eq!(parse_prp_list(&buf), entries);
+    }
+
+    /// **MEDIUM** — PI compute→verify round-trip = Ok（任意 data/lba/type）。
+    #[test]
+    fn pt_pi_compute_verify_roundtrip(
+        data in prop::collection::vec(any::<u8>(), 1..4096),
+        lba in any::<u64>(),
+        pi_type in 1u8..=3,
+    ) {
+        let tuple = crate::pi::PiTuple::compute(&data, lba, pi_type);
+        prop_assert!(matches!(tuple.verify(&data, lba, pi_type), crate::pi::PiCheck::Ok));
+    }
+}
+
+/// **mutant-kill（Wave 3）** — PI compute 的 ref_tag/guard **known-answer**。
+/// cargo-mutants 在 pi.rs:79 `lba & 0xFFFF_FFFF`→`^` 的变异**存活**，因为
+/// compute→verify 自洽（两边同样错）+ proptest CRC 只覆盖 crc16_t10dif 不覆盖
+/// compute。唯有钉死 ref_tag 的**实际值**能区分（§20：self-consistent 测不出）。
+#[test]
+fn pi_compute_known_ref_tag_and_guard() {
+    use crate::pi::PiTuple;
+    let data = [0u8; 512];
+    // Type 1/2：ref_tag = LBA 低 32 位（& 0xFFFFFFFF）。`^` 变异会得 0xDCBA9876，红。
+    assert_eq!(
+        PiTuple::compute(&data, 0x1_2345_6789, 1).ref_tag,
+        0x2345_6789
+    );
+    assert_eq!(
+        PiTuple::compute(&data, 0xFFFF_FFFF_0000_0001, 2).ref_tag,
+        0x0000_0001
+    );
+    // Type 3：ref_tag 不检查 = 0。
+    assert_eq!(PiTuple::compute(&data, 0x1_2345_6789, 3).ref_tag, 0);
+    // guard = crc16_t10dif(data)（独立 crc 已 proptest 锚；此处只钉 compute 用了它）。
+    assert_eq!(
+        PiTuple::compute(&data, 0, 1).guard,
+        crate::pi::crc16_t10dif(&data)
+    );
+}
