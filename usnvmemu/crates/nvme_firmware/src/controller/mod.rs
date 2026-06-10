@@ -2639,10 +2639,10 @@ impl NvmeController {
     ///   是后发的 tok2 → transport in-order completion 下它触发时 sibling 已落，两页
     ///   齐才 post CQE。DMA-fail 由 `on_dma_complete` 顶部 `!ok` 分支统一处理
     ///   （含移除 sibling 防其后到 post success 覆盖 error）。
-    /// - **> 2 page**：PRP2 是 PRP list **指针**（非 page1 数据）→ dual 路径会写坏
-    ///   list，故**回退旧行为**（整 buf 连续写 PRP1）。PRP list 解析留 P2。命中者主要
-    ///   是 > 8 KiB 的 Zone Report / Reservation Report；回退路径与 P1 前完全相同 →
-    ///   无回归，P2 再彻底修。
+    /// - **> 2 page（P2）**：PRP2 是 PRP **list** 页指针 → 复用 IO read 的 device→host
+    ///   list 机件（`PrpListOp` + `NvmReadPrpList{Fetch,Data}`）：DMA-read list 页 → parse →
+    ///   逐页 DMA-write（page0→PRP1，page1..→list entry）→ 全到齐 post CQE。单 list 页容
+    ///   513 数据页（~2 MiB）；超过需 list chaining（未实现）→ 回退连续写 PRP1（status quo）。
     fn dma_write_then_complete(
         &mut self,
         ctx: &mut DeviceCtx<'_>,
@@ -2670,13 +2670,66 @@ impl NvmeController {
             return;
         }
         if data.len() as u64 > 2 * NVME_PAGE_SIZE {
-            // > 2 page：PRP2 = PRP list 指针，dual 会写坏 list。P2 补 list 解析；
-            // 此处回退连续写 PRP1（= P1 前行为，无回归）。
-            tracing::debug!(
-                bytes = data.len(),
-                "data > 2 page：PRP list 未实现(P2)，回退连续写 PRP1"
+            // > 2 page：PRP2 = PRP **list** 页指针。**P2（2026-06-10）**——复用 IO read 的
+            // device→host PRP-list 机件（`PrpListOp` + `NvmReadPrpList{Fetch,Data}`，零新
+            // 代码路径）：把 buf 按页切进 `data_pages` → 入 op → DMA-read list 页（在 prp2）
+            // → 完成 arm parse list + 逐页 DMA-write（page0→PRP1，page1..→list entry）→ 全
+            // 到齐 post CQE。
+            //
+            // **容量上限**：单 PRP list 页装 `NVME_PAGE_SIZE/8 = 512` 个 entry → 最多 512
+            // 数据页 + PRP1 = 513 页（~2 MiB）。再大需 list **chaining**（末 entry 指下一
+            // list 页），未实现 → 回退连续写 PRP1（= status quo，不比 P1 前更坏）。caller
+            // 侧 Get Log Page 已把请求卡在 2 MiB 内；只有越界的 Zone/Reservation Report 命中。
+            let total_pages = data.len().div_ceil(NVME_PAGE_SIZE as usize) as u32;
+            let entries_per_list_page = (NVME_PAGE_SIZE / 8) as u32; // 512
+            if total_pages > entries_per_list_page + 1 {
+                tracing::debug!(
+                    bytes = data.len(),
+                    total_pages,
+                    "data > 单 PRP list 页容量(513)：list chaining 未实现，回退连续写 PRP1"
+                );
+                let tok = ctx.dma_write(prp1, data);
+                self.pending_ios.insert(
+                    tok,
+                    PendingIo {
+                        sq_id,
+                        cid,
+                        sq_head,
+                        cq_id,
+                        nsid: 0,
+                        op: PendingOp::NvmReadDmaWrite { num_blocks: 0 },
+                    },
+                );
+                return;
+            }
+            // 按页切 buf（page0 = PRP1 数据，page1.. = list entry 数据）。
+            let mut data_pages: Vec<Option<Vec<u8>>> = Vec::with_capacity(total_pages as usize);
+            for i in 0..total_pages as usize {
+                let off = i * NVME_PAGE_SIZE as usize;
+                let end = ((i + 1) * NVME_PAGE_SIZE as usize).min(data.len());
+                data_pages.push(Some(data[off..end].to_vec()));
+            }
+            let op_id = self.alloc_op_id();
+            self.prp_list_ops.insert(
+                op_id,
+                PrpListOp {
+                    sq_id,
+                    cid,
+                    sq_head,
+                    cq_id,
+                    nsid: 0,
+                    lba: 0,
+                    num_blocks: 0, // admin/report payload —— 不计 SMART host-read
+                    is_write: false,
+                    prp1_gpa: prp1,
+                    list_entries: None,
+                    total_pages,
+                    pages_done: 0,
+                    data_pages,
+                },
             );
-            let tok = ctx.dma_write(prp1, data);
+            // DMA-read PRP list 页（在 prp2）；到达后 NvmReadPrpListFetch 解析 + per-page 写。
+            let tok = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
             self.pending_ios.insert(
                 tok,
                 PendingIo {
@@ -2685,7 +2738,7 @@ impl NvmeController {
                     sq_head,
                     cq_id,
                     nsid: 0,
-                    op: PendingOp::NvmReadDmaWrite { num_blocks: 0 },
+                    op: PendingOp::NvmReadPrpListFetch { op_id },
                 },
             );
             return;

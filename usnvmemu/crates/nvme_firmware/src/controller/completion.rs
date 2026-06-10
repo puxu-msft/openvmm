@@ -1870,9 +1870,15 @@ impl NvmeController {
                         );
                         let cq = self.cqs.get(&op.cq_id);
                         let phase = cq.map(|c| c.phase).unwrap_or(1);
-                        // Phase F：PRP-list Read 完成 → 计数。
-                        self.stat_host_reads += 1;
-                        self.stat_lba_read += op.num_blocks as u64;
+                        // Phase F：PRP-list Read 完成 → 计数 host read。
+                        // **P2 (2026-06-10)**：admin/report 数据写（Get Log Page /
+                        // Zone Report / Reservation Report）也复用本 PRP-list 机件，
+                        // 它们 num_blocks=0、不是 NVM host read → 守 `> 0` 不污染 SMART
+                        // （与 NvmReadDmaWrite success arm 一致）。
+                        if op.num_blocks > 0 {
+                            self.stat_host_reads += 1;
+                            self.stat_lba_read += op.num_blocks as u64;
+                        }
                         let cqe = Cqe::success(op.cid, op.sq_id, op.sq_head, phase);
                         self.post_cqe(ctx, op.cq_id, cqe);
                     }

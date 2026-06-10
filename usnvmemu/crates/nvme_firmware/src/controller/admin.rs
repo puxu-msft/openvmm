@@ -749,14 +749,15 @@ impl NvmeController {
                 let bytes_req = numd * 4; // bytes
                 let lpo: u64 = (sqe.cdw12 as u64) | ((sqe.cdw13 as u64) << 32);
                 tracing::debug!(lid, bytes = bytes_req, lpo, "Get Log Page");
-                // **H1 修复**：我们目前没实现 PRP list（Phase E TODO），
-                // 单次最多用 PRP1+PRP2 = 8 KiB；超过返 INVALID_FIELD 让
-                // driver 明确知道（不再 silent truncate）。
-                if bytes_req > 8192 {
+                // **P2（2026-06-10）** — admin 数据 DMA 现支持 PRP list（`dma_write_then_complete`
+                // 复用 IO read 的 device→host list 机件）。单 PRP list 页装 512 entry → 最多
+                // 513 数据页 ≈ 2 MiB；上限设 2 MiB，再大需 list chaining（未实现）→ INVALID_FIELD
+                // 让 driver 用 LPO 分块拉。realistic log（Telemetry / Persistent Event）远小于此。
+                if bytes_req > 2 * 1024 * 1024 {
                     tracing::warn!(
                         lid,
                         bytes = bytes_req,
-                        "Get Log Page: request > 8 KiB unsupported (no PRP list yet)"
+                        "Get Log Page: request > 2 MiB unsupported (PRP list chaining 未实现)"
                     );
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0));
                 }

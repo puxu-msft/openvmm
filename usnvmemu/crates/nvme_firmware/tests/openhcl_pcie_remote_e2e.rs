@@ -1076,3 +1076,87 @@ async fn openhcl_get_log_page_noncontiguous_prp() -> Result<()> {
 
     Ok(())
 }
+
+/// P2 —— admin 数据 DMA 的 **PRP list**（> 2 page，去 8 KiB 上限）。
+///
+/// > 2 page 时 PRP2 是 PRP **list 页**指针。本测试请求 12 KiB(3 page) Get Log Page，在
+/// guest-mem 放一个**真 PRP list 页**（2 个 entry 指向**非连续**数据页 GPA），断言
+/// firmware：① DMA-read 该 list 页 ② page0→PRP1、page1→list[0]、page2→list[1]（非连续
+/// 落地）③ **不**碰连续写 bug 会命中的 PRP1+4096 / PRP1+8192。
+///
+/// **revert-verify**：把 helper > 2 页分支退回连续写，本测试必 FAIL。
+#[tokio::test]
+async fn openhcl_get_log_page_prp_list() -> Result<()> {
+    const LOG_PRP1: u64 = 0xA_0000; // page 0 目标
+    const LOG_LIST: u64 = 0xB_0000; // PRP list 页（= prp2）
+    const LIST_E0: u64 = 0xC_0000; // list[0] → page 1 目标（与 PRP1 非连续）
+    const LIST_E1: u64 = 0xE_0000; // list[1] → page 2 目标（非连续）
+    const BUG_P1: u64 = LOG_PRP1 + 4096; // 0xA1000 —— 连续写 bug 会把 page1 写这
+    const BUG_P2: u64 = LOG_PRP1 + 8192; // 0xA2000 —— 连续写 bug 会把 page2 写这
+    const LOG_BYTES: usize = 12288; // 3 page → 触发 PRP list 路径
+
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    driver.enable_controller().await.context("enable")?;
+    let mut admin = QueueState::admin();
+
+    // 放真 PRP list 页：entry0 = LIST_E0、entry1 = LIST_E1（LE u64）。
+    let mut list_page = vec![0u8; 16];
+    list_page[0..8].copy_from_slice(&LIST_E0.to_le_bytes());
+    list_page[8..16].copy_from_slice(&LIST_E1.to_le_bytes());
+    driver.write_guest(LOG_LIST, list_page);
+
+    // 种 sentinel：连续写 bug 命中的 PRP1+4096/+8192 = 0x77（fix 下不该碰）；
+    // list entry 目标 = 0x88/0x99（fix 下该被写）。
+    driver.write_guest(BUG_P1, vec![0x77; 4096]);
+    driver.write_guest(BUG_P2, vec![0x77; 4096]);
+    driver.write_guest(LIST_E0, vec![0x88; 4096]);
+    driver.write_guest(LIST_E1, vec![0x99; 4096]);
+
+    // Get Log Page 12 KiB，prp1=LOG_PRP1，prp2=LOG_LIST(PRP list 页)。
+    let numd = (LOG_BYTES / 4 - 1) as u32;
+    let cdw10 = 0x07u32 | ((numd & 0xffff) << 16);
+    let cdw11 = numd >> 16;
+    let cqe = admin
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02,
+                cid: 0x60,
+                nsid: 0xffff_ffff,
+                prp1: LOG_PRP1,
+                prp2: LOG_LIST,
+                cdw10,
+                cdw11,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Get Log Page (PRP list)")?;
+    assert_eq!(cqe.sc, 0, "Get Log Page(>8KiB) sc 应=0，实={:#x}", cqe.sc);
+
+    // ★ 独立 oracle：page1/page2 落 list entry，不碰连续写 bug 位。
+    let bug1 = driver.read_guest(BUG_P1, 4096).await?;
+    assert!(
+        bug1.iter().all(|&b| b == 0x77),
+        "PRP1+4096 应仍 sentinel 0x77（page1 未越界连续写）—— 否则即 ×连续 PRP bug"
+    );
+    let bug2 = driver.read_guest(BUG_P2, 4096).await?;
+    assert!(
+        bug2.iter().all(|&b| b == 0x77),
+        "PRP1+8192 应仍 sentinel 0x77（page2 未越界连续写）"
+    );
+    let e0 = driver.read_guest(LIST_E0, 4096).await?;
+    assert!(
+        !e0.iter().all(|&b| b == 0x88),
+        "list[0](0xC0000) 应被写入 page1 数据（不再全 0x88）"
+    );
+    let e1 = driver.read_guest(LIST_E1, 4096).await?;
+    assert!(
+        !e1.iter().all(|&b| b == 0x99),
+        "list[1](0xE0000) 应被写入 page2 数据（不再全 0x99）"
+    );
+
+    Ok(())
+}
