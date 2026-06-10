@@ -185,11 +185,11 @@ impl NvmeController {
                             }
                         }
                     }
-                    PendingOp::NvmSglFetch { op_id } | PendingOp::NvmSglData { op_id, .. } => {
+                    PendingOp::NvmSglFetch { op_id, .. } | PendingOp::NvmSglData { op_id, .. } => {
                         // **Phase R2** — SGL 多 fragment op：清 sibling pending +
                         // 累积器，保证只 post 一次 error CQE（同 C1 修复语义）。
                         self.pending_ios.retain(|_, q| match q.op {
-                            PendingOp::NvmSglFetch { op_id: o }
+                            PendingOp::NvmSglFetch { op_id: o, .. }
                             | PendingOp::NvmSglData { op_id: o, .. } => o != op_id,
                             _ => true,
                         });
@@ -1898,14 +1898,19 @@ impl NvmeController {
                         self.post_cqe(ctx, op.cq_id, cqe);
                     }
                 }
-                PendingOp::NvmSglFetch { op_id } => {
-                    // **Phase R2a** — SGL segment 页到达：parse descriptor →
-                    // 构建 fragment plan（每片 host address + 数据流偏移 + 长度）
-                    // → 启动逐 fragment 传输（READ scatter / WRITE gather）。
+                PendingOp::NvmSglFetch { op_id, is_last } => {
+                    // **Phase R2a/R2b** — SGL segment 页到达：parse descriptor →
+                    // 累积 fragment plan（每片 host address + 数据流偏移 + 长度）。
                     //
-                    // R2a：经 Last Segment 到达（单段），全部 descriptor 应为
-                    // Data Block。Segment/LastSegment continuation → R2b；
-                    // Bit Bucket → R2c；其它 → reject。
+                    // `is_last`：本段经哪种 descriptor 到达——
+                    //   - true（经 Last Segment 到达，spec § 4.4）：本段全是数据
+                    //     descriptor（Data Block / Bit Bucket），无 continuation。
+                    //   - false（经 Segment 到达）：本段**末位** descriptor 是
+                    //     continuation（Segment / Last Segment）指向下一段，前缀
+                    //     才是数据 descriptor → 递归 fetch 下一段（R2b chain）。
+                    // 全段 walk 完后（is_last 段处理完）启动逐 fragment 传输。
+                    //
+                    // R2a：仅 Data Block。Bit Bucket → R2c；Keyed → reject。
                     let descs = match crate::sgl::parse_sgl_list(&data) {
                         Ok(d) => d,
                         Err(e) => {
@@ -1914,40 +1919,75 @@ impl NvmeController {
                             return;
                         }
                     };
-                    let mut walk_offset = match self.sgl_ops.get(&op_id) {
-                        Some(op) => op.walk_offset,
+                    // segment-hop 上限：防恶意 driver 构造 Segment 自环无限 fetch。
+                    let hops = match self.sgl_ops.get_mut(&op_id) {
+                        Some(op) => {
+                            op.walk_segments += 1;
+                            op.walk_segments
+                        }
                         None => {
                             tracing::warn!(op_id, "NvmSglFetch unknown op_id");
                             return;
                         }
                     };
-                    let mut frags: Vec<crate::controller::SglPlanFrag> =
-                        Vec::with_capacity(descs.len());
+                    if hops > crate::controller::MAX_SGL_SEGMENTS {
+                        tracing::warn!(op_id, hops, "SGL segment chain 超上限（疑似自环）");
+                        self.finish_sgl_error(ctx, op_id, sc::SGL_INVALID_NUMBER_OF_DESCRIPTORS);
+                        return;
+                    }
+                    // 分出数据 descriptor 与 continuation：
+                    //   is_last：全部是数据 descriptor，无 continuation。
+                    //   !is_last：末位须 (Last)Segment continuation，前缀是数据。
+                    let (data_descs, cont): (
+                        &[crate::sgl::SglDescriptor],
+                        Option<&crate::sgl::SglDescriptor>,
+                    ) = if is_last {
+                        (&descs[..], None)
+                    } else if let Some((last, head)) = descs.split_last() {
+                        (head, Some(last))
+                    } else {
+                        // 非-last 段必须含 ≥1 descriptor（至少 continuation）。
+                        tracing::warn!(op_id, "SGL 非-last segment 为空");
+                        self.finish_sgl_error(ctx, op_id, sc::SGL_DESCRIPTOR_TYPE_INVALID);
+                        return;
+                    };
+                    // 处理数据 descriptor → append op.frags（stream offset 由
+                    // firmware 自算的 walk_offset 决定，非 driver 输入）。
                     let mut walk_err: Option<u8> = None;
-                    for d in &descs {
-                        if d.sub_type != 0 {
-                            tracing::warn!(sub_type = d.sub_type, "SGL fragment sub_type 非 0");
-                            walk_err = Some(sc::SGL_DESCRIPTOR_TYPE_INVALID);
-                            break;
-                        }
-                        match d.sgl_type {
-                            crate::sgl::SglType::DataBlock => {
-                                frags.push(crate::controller::SglPlanFrag {
-                                    address: d.address,
-                                    stream_offset: walk_offset,
-                                    length: d.length,
-                                });
-                                walk_offset = walk_offset.saturating_add(d.length as u64);
-                            }
-                            other => {
-                                // R2a 仅 Data Block：Bit Bucket(R2c) / Segment
-                                // chain(R2b) / Keyed 均未实现。
-                                tracing::warn!(
-                                    kind = ?other,
-                                    "SGL descriptor type R2a 未实现 (chain=R2b / bit bucket=R2c)"
-                                );
+                    {
+                        let op = self.sgl_ops.get_mut(&op_id).unwrap();
+                        for d in data_descs {
+                            if d.sub_type != 0 {
+                                tracing::warn!(sub_type = d.sub_type, "SGL fragment sub_type 非 0");
                                 walk_err = Some(sc::SGL_DESCRIPTOR_TYPE_INVALID);
                                 break;
+                            }
+                            match d.sgl_type {
+                                crate::sgl::SglType::DataBlock => {
+                                    // 0 长度 Data Block 无数据传输：跳过（不 push
+                                    // frag / 不发 DMA），防恶意 driver 用海量
+                                    // 0-length block 制造 no-op DMA 放大（覆盖检查
+                                    // 不约束其数量）。
+                                    if d.length == 0 {
+                                        continue;
+                                    }
+                                    op.frags.push(crate::controller::SglPlanFrag {
+                                        address: d.address,
+                                        stream_offset: op.walk_offset,
+                                        length: d.length,
+                                    });
+                                    op.walk_offset = op.walk_offset.saturating_add(d.length as u64);
+                                }
+                                other => {
+                                    // 数据位置出现 (Last)Segment = 非法（chain 只能
+                                    // 在段末位）；Bit Bucket → R2c；Keyed → reject。
+                                    tracing::warn!(
+                                        kind = ?other,
+                                        "SGL 数据位置非 Data Block (chain 须末位 / bit bucket=R2c)"
+                                    );
+                                    walk_err = Some(sc::SGL_DESCRIPTOR_TYPE_INVALID);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1955,60 +1995,43 @@ impl NvmeController {
                         self.finish_sgl_error(ctx, op_id, sc_byte);
                         return;
                     }
-                    // fragment 覆盖须正好 == expected_bytes（不足/超出都是 driver
-                    // 编码错；R2d 进一步细分 SC，这里先用 INVALID_NUMBER_OF_DESCRIPTORS）。
-                    let expected = self
-                        .sgl_ops
-                        .get(&op_id)
-                        .map(|o| o.expected_bytes)
-                        .unwrap_or(0);
-                    if walk_offset != expected {
-                        tracing::warn!(
-                            op_id,
-                            got = walk_offset,
-                            expected,
-                            "SGL fragment 覆盖与传输大小不符"
-                        );
-                        self.finish_sgl_error(ctx, op_id, sc::SGL_INVALID_NUMBER_OF_DESCRIPTORS);
-                        return;
-                    }
-                    // 提交 plan + 进入 TRANSFER 阶段。
-                    let (sq_id, cid, sq_head, cq_id, nsid, is_write) = {
-                        let op = self.sgl_ops.get_mut(&op_id).unwrap();
-                        op.frags = frags.clone();
-                        op.walk_offset = walk_offset;
-                        op.transfers_total = frags.len() as u32;
-                        (op.sq_id, op.cid, op.sq_head, op.cq_id, op.nsid, op.is_write)
-                    };
-                    if frags.is_empty() {
-                        // 0 fragment（expected 也应为 0，已被上面 != expected 挡掉
-                        // 非零情形）→ 无数据传输，直接完成。
-                        self.finish_sgl_done(ctx, op_id);
-                        return;
-                    }
-                    for (idx, frag) in frags.iter().enumerate() {
-                        let frag_idx = idx as u32;
-                        let tok = if is_write {
-                            // WRITE gather：dma_read host → 后续填 data。
-                            ctx.dma_read(frag.address, frag.length)
-                        } else {
-                            // READ scatter：从 data 切片 dma_write 到 host。
-                            let off = frag.stream_offset as usize;
-                            let end = off + frag.length as usize;
-                            let slice = self.sgl_ops[&op_id].data[off..end].to_vec();
-                            ctx.dma_write(frag.address, slice)
-                        };
-                        self.pending_ios.insert(
-                            tok,
-                            PendingIo {
-                                sq_id,
-                                cid,
-                                sq_head,
-                                cq_id,
-                                nsid,
-                                op: PendingOp::NvmSglData { op_id, frag_idx },
-                            },
-                        );
+                    match cont {
+                        None => {
+                            // Last Segment 段处理完 → walk 结束，启动数据传输。
+                            self.start_sgl_transfer(ctx, op_id);
+                        }
+                        Some(c) => {
+                            // **R2b** — 末位 continuation：用与 SGL1 同一份 wire
+                            // 校验谓词（type ∈ {Segment, Last Segment}、sub_type=0、
+                            // length 16 倍数 / 非零 / ≤1 page）后 DMA-read 下一段。
+                            let (next_len, next_is_last) =
+                                match crate::controller::io::validate_segment_pointer(c) {
+                                    Ok(t) => t,
+                                    Err(sc_byte) => {
+                                        self.finish_sgl_error(ctx, op_id, sc_byte);
+                                        return;
+                                    }
+                                };
+                            let (sq_id, cid, sq_head, cq_id, nsid) = {
+                                let op = &self.sgl_ops[&op_id];
+                                (op.sq_id, op.cid, op.sq_head, op.cq_id, op.nsid)
+                            };
+                            let tok = ctx.dma_read(c.address, next_len);
+                            self.pending_ios.insert(
+                                tok,
+                                PendingIo {
+                                    sq_id,
+                                    cid,
+                                    sq_head,
+                                    cq_id,
+                                    nsid,
+                                    op: PendingOp::NvmSglFetch {
+                                        op_id,
+                                        is_last: next_is_last,
+                                    },
+                                },
+                            );
+                        }
                     }
                 }
                 PendingOp::NvmSglData { op_id, frag_idx } => {
@@ -2054,6 +2077,76 @@ impl NvmeController {
             return;
         }
         tracing::debug!(token, "DMA completion for unknown token (likely 2nd PRP)");
+    }
+
+    /// **Phase R2** — segment walk 全部完成后启动数据传输阶段。
+    /// 先校验 fragment 覆盖正好 == expected_bytes（不足/超出都是 driver 编码
+    /// 错），再逐 fragment dispatch：READ = 从 data 切片 dma_write(scatter)；
+    /// WRITE = dma_read(gather) host 后填 data。0 fragment（仅当 expected==0）
+    /// 直接完成。
+    fn start_sgl_transfer(&mut self, ctx: &mut DeviceCtx<'_>, op_id: u64) {
+        let (walk_offset, expected) = match self.sgl_ops.get(&op_id) {
+            Some(op) => (op.walk_offset, op.expected_bytes),
+            None => {
+                tracing::warn!(op_id, "start_sgl_transfer unknown op_id");
+                return;
+            }
+        };
+        if walk_offset != expected {
+            tracing::warn!(
+                op_id,
+                got = walk_offset,
+                expected,
+                "SGL fragment 覆盖与传输大小不符"
+            );
+            self.finish_sgl_error(ctx, op_id, sc::SGL_INVALID_NUMBER_OF_DESCRIPTORS);
+            return;
+        }
+        // 取出 plan + 上下文（clone plan 以脱离对 sgl_ops 的借用，便于循环内
+        // 同时读 op.data 切片）。
+        let (sq_id, cid, sq_head, cq_id, nsid, is_write, plan) = {
+            let op = self.sgl_ops.get_mut(&op_id).unwrap();
+            op.transfers_total = op.frags.len() as u32;
+            (
+                op.sq_id,
+                op.cid,
+                op.sq_head,
+                op.cq_id,
+                op.nsid,
+                op.is_write,
+                op.frags.clone(),
+            )
+        };
+        if plan.is_empty() {
+            // 0 fragment（expected 也应为 0，已被上面覆盖检查挡掉非零情形）→
+            // 无数据传输，直接完成。
+            self.finish_sgl_done(ctx, op_id);
+            return;
+        }
+        for (idx, frag) in plan.iter().enumerate() {
+            let frag_idx = idx as u32;
+            let tok = if is_write {
+                // WRITE gather：dma_read host → 后续填 data。
+                ctx.dma_read(frag.address, frag.length)
+            } else {
+                // READ scatter：从 data 切片 dma_write 到 host。
+                let off = frag.stream_offset as usize;
+                let end = off + frag.length as usize;
+                let slice = self.sgl_ops[&op_id].data[off..end].to_vec();
+                ctx.dma_write(frag.address, slice)
+            };
+            self.pending_ios.insert(
+                tok,
+                PendingIo {
+                    sq_id,
+                    cid,
+                    sq_head,
+                    cq_id,
+                    nsid,
+                    op: PendingOp::NvmSglData { op_id, frag_idx },
+                },
+            );
+        }
     }
 
     /// **Phase R2** — SGL op 全 fragment 传输完成 → 终结。
@@ -2115,7 +2208,7 @@ impl NvmeController {
     /// command"）。
     fn finish_sgl_error(&mut self, ctx: &mut DeviceCtx<'_>, op_id: u64, sc_byte: u8) {
         self.pending_ios.retain(|_, q| match q.op {
-            PendingOp::NvmSglFetch { op_id: o } | PendingOp::NvmSglData { op_id: o, .. } => {
+            PendingOp::NvmSglFetch { op_id: o, .. } | PendingOp::NvmSglData { op_id: o, .. } => {
                 o != op_id
             }
             _ => true,

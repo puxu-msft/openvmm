@@ -478,6 +478,15 @@ fn sgl1_last_segment(seg_addr: u64, seg_len: u32) -> (u64, u64) {
     (prp1, prp2)
 }
 
+/// **Phase R2b** — SGL1 = Segment (type 2) 指针（chain 首段，其末位 descriptor 是
+/// continuation 指向下一段）。返回 (prp1, prp2)。
+fn sgl1_segment(seg_addr: u64, seg_len: u32) -> (u64, u64) {
+    // byte 15 = 0x20 → Segment (type 2), sub 0。
+    let prp1 = seg_addr;
+    let prp2 = (0x20u64 << 56) | seg_len as u64;
+    (prp1, prp2)
+}
+
 /// CQE 关键字段。
 struct CqeResult {
     cid: u16,
@@ -1513,6 +1522,271 @@ async fn openhcl_sgl_segment_write_gather() -> Result<()> {
     assert_eq!(cqe.sc, 0, "readback sc 应=0");
     let rb = driver.read_guest(READ_BUF_GPA, 4096).await?;
     assert_eq!(rb, expected, "PRP readback 应=gather 数据");
+
+    Ok(())
+}
+
+/// **Phase R2b** — SGL Segment **chain** Read（PSDT=10，SGL1=Segment → 2 段链）。
+///
+/// SGL1 是 Segment(type 2) 指向 SEG0；SEG0 末位是 Last Segment continuation 指向 SEG1。
+/// 数据 fragment 跨段：SEG0 含 FRAG0(2048)，SEG1 含 FRAG1(1024)+FRAG2(1024)，总 4096。
+/// firmware 须递归 fetch SEG1 才能拿到 FRAG1/FRAG2 → 验证 chain walk + 跨段 stream 偏移。
+///
+/// **差分独立 oracle**：每个 fragment（含**第二段**的 FRAG1/FRAG2）落对自己的切片；
+/// 若 chain 未跟进，FRAG1/FRAG2 保持 sentinel → assert 失败。
+///
+/// **revert-verify（已实测）**：completion.rs NvmSglFetch 的 `Some(c)` 分支改成
+/// `self.start_sgl_transfer(ctx, op_id)`（不 fetch 下一段）→ 只覆盖 2048 ≠ expected 4096
+/// → coverage mismatch → CQE sc != 0 → 本测试 FAIL。
+#[tokio::test]
+async fn openhcl_sgl_segment_chain_read() -> Result<()> {
+    const SEG0_GPA: u64 = 0xA_0000; // 首段（SGL1=Segment 指向）
+    const SEG1_GPA: u64 = 0xB_0000; // 末段（SEG0 continuation 指向）
+    const FRAG0_GPA: u64 = 0xC_0000;
+    const FRAG1_GPA: u64 = 0xD_0000;
+    const FRAG2_GPA: u64 = 0xE_0000;
+
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (_admin, mut io) = setup_enabled_4k_io(&driver).await?;
+
+    let mut pattern = vec![0u8; 4096];
+    for i in 0..8 {
+        pattern[i * 512..(i + 1) * 512].fill(0xD0 + i as u8);
+    }
+    // 播种 backing@slba=8。
+    driver.write_guest(WRITE_BUF_GPA, pattern.clone());
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x01,
+                cid: 0x40,
+                nsid: 1,
+                prp1: WRITE_BUF_GPA,
+                cdw10: 8,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("seed Write")?;
+    assert_eq!(cqe.sc, 0, "seed Write sc 应=0，实={:#x}", cqe.sc);
+
+    // SEG0：[Data Block FRAG0(2048), Last Segment continuation → SEG1(len 32)]。
+    let mut seg0 = Vec::new();
+    seg0.extend_from_slice(&sgl_desc(FRAG0_GPA, 2048, 0x00));
+    seg0.extend_from_slice(&sgl_desc(SEG1_GPA, 32, 0x30)); // 0x30 = Last Segment
+    driver.write_guest(SEG0_GPA, seg0);
+    // SEG1（末段）：[Data Block FRAG1(1024), Data Block FRAG2(1024)]。
+    let mut seg1 = Vec::new();
+    seg1.extend_from_slice(&sgl_desc(FRAG1_GPA, 1024, 0x00));
+    seg1.extend_from_slice(&sgl_desc(FRAG2_GPA, 1024, 0x00));
+    driver.write_guest(SEG1_GPA, seg1);
+
+    driver.write_guest(FRAG0_GPA, vec![0x77; 4096]);
+    driver.write_guest(FRAG1_GPA, vec![0x77; 4096]);
+    driver.write_guest(FRAG2_GPA, vec![0x77; 4096]);
+
+    // SGL Read @ slba=8：SGL1 = Segment → SEG0（len 32 = 2 descriptor）。
+    let (p1, p2) = sgl1_segment(SEG0_GPA, 32);
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02,
+                psdt: 2,
+                cid: 0x41,
+                nsid: 1,
+                prp1: p1,
+                prp2: p2,
+                cdw10: 8,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("SGL chain Read")?;
+    assert_eq!(cqe.sc, 0, "SGL chain Read sc 应=0，实={:#x}", cqe.sc);
+
+    // ★ 差分 oracle：跨段 fragment 各落对切片。
+    let f0 = driver.read_guest(FRAG0_GPA, 2048).await?;
+    assert_eq!(f0, pattern[0..2048], "FRAG0(SEG0) 应=pattern[0..2048]");
+    let f1 = driver.read_guest(FRAG1_GPA, 1024).await?;
+    assert_eq!(
+        f1,
+        pattern[2048..3072],
+        "FRAG1(SEG1，第二段) 应=pattern[2048..3072]（chain walk 跟进 + 跨段偏移正确）"
+    );
+    let f2 = driver.read_guest(FRAG2_GPA, 1024).await?;
+    assert_eq!(
+        f2,
+        pattern[3072..4096],
+        "FRAG2(SEG1) 应=pattern[3072..4096]"
+    );
+
+    Ok(())
+}
+
+/// **Phase R2b** — SGL Segment **chain** Write（gather 跨段）。
+///
+/// 同 chain 拓扑，方向相反：3 个非连续 source fragment 跨 2 段 gather 成连续 4096 写盘。
+/// **直读 backing file 独立 oracle**：backing[9*4096..] == concat(frag0, frag1, frag2)。
+///
+/// **revert-verify（已实测）**：同 chain_read，去掉 continuation fetch → coverage 不足 →
+/// CQE sc != 0 → FAIL。
+#[tokio::test]
+async fn openhcl_sgl_segment_chain_write() -> Result<()> {
+    const SEG0_GPA: u64 = 0xA_0000;
+    const SEG1_GPA: u64 = 0xB_0000;
+    const FRAG0_GPA: u64 = 0xC_0000;
+    const FRAG1_GPA: u64 = 0xD_0000;
+    const FRAG2_GPA: u64 = 0xE_0000;
+
+    let (stream, harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (_admin, mut io) = setup_enabled_4k_io(&driver).await?;
+
+    let f0 = vec![0xA0u8; 2048];
+    let f1 = vec![0xB0u8; 1024];
+    let f2 = vec![0xC0u8; 1024];
+    driver.write_guest(FRAG0_GPA, f0.clone());
+    driver.write_guest(FRAG1_GPA, f1.clone());
+    driver.write_guest(FRAG2_GPA, f2.clone());
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&f0);
+    expected.extend_from_slice(&f1);
+    expected.extend_from_slice(&f2);
+
+    // SEG0：[FRAG0(2048), Last Segment → SEG1]。SEG1：[FRAG1(1024), FRAG2(1024)]。
+    let mut seg0 = Vec::new();
+    seg0.extend_from_slice(&sgl_desc(FRAG0_GPA, 2048, 0x00));
+    seg0.extend_from_slice(&sgl_desc(SEG1_GPA, 32, 0x30));
+    driver.write_guest(SEG0_GPA, seg0);
+    let mut seg1 = Vec::new();
+    seg1.extend_from_slice(&sgl_desc(FRAG1_GPA, 1024, 0x00));
+    seg1.extend_from_slice(&sgl_desc(FRAG2_GPA, 1024, 0x00));
+    driver.write_guest(SEG1_GPA, seg1);
+
+    let (p1, p2) = sgl1_segment(SEG0_GPA, 32);
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x01,
+                psdt: 2,
+                cid: 0x42,
+                nsid: 1,
+                prp1: p1,
+                prp2: p2,
+                cdw10: 9,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("SGL chain Write")?;
+    assert_eq!(cqe.sc, 0, "SGL chain Write sc 应=0，实={:#x}", cqe.sc);
+
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x00,
+                cid: 0x43,
+                nsid: 1,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Flush")?;
+    assert_eq!(cqe.sc, 0, "Flush sc 应=0");
+    let file = std::fs::read(&harness.backing).context("读 backing")?;
+    let at = &file[9 * 4096..9 * 4096 + 4096];
+    assert_eq!(
+        at,
+        &expected[..],
+        "backing[9*4096] 应=跨段 gather 拼接（独立 oracle）"
+    );
+
+    Ok(())
+}
+
+/// **Phase R2b（reviewer LOW 加固）** — 0 长度 Data Block 被**跳过**而非报错。
+///
+/// 单 Last Segment 含 [Data 2048, **Data 0**, Data 2048]（中间 0 长度）。firmware
+/// 应跳过 0 长度块（不发 no-op DMA），剩两块覆盖正好 4096 → 命令成功 + 数据落对。
+/// 防恶意 driver 用海量 0-length block 制造 no-op DMA 放大。
+#[tokio::test]
+async fn openhcl_sgl_zero_length_datablock_skipped() -> Result<()> {
+    const SEG_GPA: u64 = 0xA_0000;
+    const FRAG0_GPA: u64 = 0xC_0000;
+    const FRAG1_GPA: u64 = 0xE_0000;
+
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (_admin, mut io) = setup_enabled_4k_io(&driver).await?;
+
+    let mut pattern = vec![0u8; 4096];
+    for i in 0..8 {
+        pattern[i * 512..(i + 1) * 512].fill(0xD0 + i as u8);
+    }
+    driver.write_guest(WRITE_BUF_GPA, pattern.clone());
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x01,
+                cid: 0x50,
+                nsid: 1,
+                prp1: WRITE_BUF_GPA,
+                cdw10: 10,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("seed Write")?;
+    assert_eq!(cqe.sc, 0, "seed Write sc 应=0，实={:#x}", cqe.sc);
+
+    // 段：[Data 2048, Data **0**, Data 2048] = 3 descriptor (48 byte)，覆盖 4096。
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&sgl_desc(FRAG0_GPA, 2048, 0x00));
+    seg.extend_from_slice(&sgl_desc(0xBAD0_0000, 0, 0x00)); // 0 长度（地址应被忽略）
+    seg.extend_from_slice(&sgl_desc(FRAG1_GPA, 2048, 0x00));
+    driver.write_guest(SEG_GPA, seg);
+    driver.write_guest(FRAG0_GPA, vec![0x77; 4096]);
+    driver.write_guest(FRAG1_GPA, vec![0x77; 4096]);
+
+    let (p1, p2) = sgl1_last_segment(SEG_GPA, 3 * 16);
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02,
+                psdt: 2,
+                cid: 0x51,
+                nsid: 1,
+                prp1: p1,
+                prp2: p2,
+                cdw10: 10,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("SGL Read with 0-len block")?;
+    assert_eq!(cqe.sc, 0, "0 长度块应被跳过，命令成功，实 sc={:#x}", cqe.sc);
+
+    let f0 = driver.read_guest(FRAG0_GPA, 2048).await?;
+    assert_eq!(f0, pattern[0..2048], "FRAG0 应=pattern[0..2048]");
+    let f1 = driver.read_guest(FRAG1_GPA, 2048).await?;
+    assert_eq!(
+        f1,
+        pattern[2048..4096],
+        "FRAG1 应=pattern[2048..4096]（0 长度块跳过后偏移正确）"
+    );
 
     Ok(())
 }

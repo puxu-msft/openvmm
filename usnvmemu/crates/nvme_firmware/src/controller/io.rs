@@ -396,26 +396,30 @@ pub(crate) fn resolve_data_pointers(sqe: &Sqe) -> Result<DataPointer, u8> {
     }
 }
 
-/// **Phase R2** — 解析 PSDT=10 的 embedded SGL1 descriptor（必须是 Segment /
-/// Last Segment，sub_type=0）。返 `(segment_addr, segment_len, is_last)`。
+/// **Phase R2** — 校验一个 SGL (Last)Segment **指针** descriptor，返
+/// `(segment_len, is_last)`。embedded SGL1（dispatch）与 chain 中段末位
+/// continuation（completion）共用，避免 DRY drift（同一份 wire 校验谓词）。
 ///
-/// `is_last` = true 表示经 Last Segment 到达（被指向的 segment 全是 Data Block /
-/// Bit Bucket，无后续 chain）；false 表示 Segment（其末位 descriptor 是 continuation
-/// 指向下一段，见 R2b）。
+/// `is_last` = true 表示 Last Segment（被指向段全是数据 descriptor，无 chain）；
+/// false 表示 Segment（被指向段末位仍是 continuation，见 R2b）。
 ///
-/// segment_len 须为 16 的倍数、非零、≤ 1 page（教学单段上限；> 1 page segment
-/// 罕见，留作未来扩展）。
-fn parse_sgl1_segment(bytes: &[u8; 16]) -> Result<(u64, u32, bool), u8> {
-    let desc = crate::sgl::SglDescriptor::parse(bytes).ok_or(sc::SGL_DESCRIPTOR_TYPE_INVALID)?;
+/// 校验：sub_type=0 (Address)、type ∈ {Segment, Last Segment}、length 16 倍数 /
+/// 非零 / ≤ 1 page（教学单段上限）。
+pub(crate) fn validate_segment_pointer(
+    desc: &crate::sgl::SglDescriptor,
+) -> Result<(u32, bool), u8> {
     if desc.sub_type != 0 {
-        tracing::warn!(sub_type = desc.sub_type, "SGL1 sub_type 非 0 (仅 Address)");
+        tracing::warn!(
+            sub_type = desc.sub_type,
+            "SGL segment 指针 sub_type 非 0 (仅 Address)"
+        );
         return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID);
     }
     let is_last = match desc.sgl_type {
         crate::sgl::SglType::LastSegment => true,
         crate::sgl::SglType::Segment => false,
         _ => {
-            tracing::warn!("PSDT=10 embedded SGL1 必须是 (Last)Segment descriptor");
+            tracing::warn!("SGL segment 指针必须是 (Last)Segment descriptor");
             return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID);
         }
     };
@@ -424,6 +428,15 @@ fn parse_sgl1_segment(bytes: &[u8; 16]) -> Result<(u64, u32, bool), u8> {
         tracing::warn!(len, "SGL segment length 非法（须 16 倍数、非零、≤1 page）");
         return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID);
     }
+    Ok((len, is_last))
+}
+
+/// **Phase R2** — 解析 PSDT=10 的 embedded SGL1 descriptor（必须是 Segment /
+/// Last Segment，sub_type=0）。返 `(segment_addr, segment_len, is_last)`。
+/// 校验逻辑见 `validate_segment_pointer`。
+fn parse_sgl1_segment(bytes: &[u8; 16]) -> Result<(u64, u32, bool), u8> {
+    let desc = crate::sgl::SglDescriptor::parse(bytes).ok_or(sc::SGL_DESCRIPTOR_TYPE_INVALID)?;
+    let (len, is_last) = validate_segment_pointer(&desc)?;
     Ok((desc.address, len, is_last))
 }
 
@@ -461,8 +474,8 @@ impl NvmeController {
     ///   3. fetch 完成 parse descriptor → 构建 fragment plan → 逐 fragment
     ///      `dma_write`（scatter）到 host → 全到齐 post CQE（见 completion.rs）。
     ///
-    /// 仅 plain NS（无 PI/meta）；调用前 caller 已确认 is_plain。R2a 只支持
-    /// **单 segment**（SGL1 = Last Segment）；Segment chain 留 R2b。
+    /// 仅 plain NS（无 PI/meta）；调用前 caller 已确认 is_plain。SGL1 可是
+    /// Last Segment（单段）或 Segment（R2b chain 首段，末位 continuation 递归）。
     #[allow(clippy::too_many_arguments)]
     fn dispatch_sgl_read(
         &mut self,
@@ -509,17 +522,8 @@ impl NvmeController {
             Ok(t) => t,
             Err(sc_byte) => return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte, 0)),
         };
-        if !is_last {
-            tracing::warn!("SGL Segment chain (R2b) 未实现，SGL1 须 Last Segment");
-            return Some(Cqe::error(
-                cid,
-                sq_id,
-                sq_head,
-                phase,
-                sc::SGL_DESCRIPTOR_TYPE_INVALID,
-                0,
-            ));
-        }
+        // **R2b** — SGL1 既可是 Last Segment（单段）也可是 Segment（chain 首段）；
+        // `is_last` 透传给 NvmSglFetch 决定本段是否末段。
         // 一次性把 backing 读到 data buffer（READ：先读盘再 scatter）。
         let mut data = vec![0u8; bytes as usize];
         let ns_mut = self.ns_mut(nsid).unwrap();
@@ -551,6 +555,7 @@ impl NvmeController {
                 data,
                 frags: Vec::new(),
                 walk_offset: 0,
+                walk_segments: 0,
                 transfers_done: 0,
                 transfers_total: 0,
             },
@@ -564,7 +569,7 @@ impl NvmeController {
                 sq_head,
                 cq_id,
                 nsid,
-                op: PendingOp::NvmSglFetch { op_id },
+                op: PendingOp::NvmSglFetch { op_id, is_last },
             },
         );
         None
@@ -578,7 +583,7 @@ impl NvmeController {
     ///   3. fetch 完成 parse descriptor → 逐 fragment `dma_read`（gather）自
     ///      host 填 `data` → 全到齐后一次性 `write_at` backing → post CQE。
     ///
-    /// 仅 plain NS；NS Write Protection 已在 caller 校验。R2a 仅单 segment。
+    /// 仅 plain NS；NS Write Protection 已在 caller 校验。SGL1 可单段或 R2b chain。
     #[allow(clippy::too_many_arguments)]
     fn dispatch_sgl_write(
         &mut self,
@@ -623,17 +628,7 @@ impl NvmeController {
             Ok(t) => t,
             Err(sc_byte) => return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte, 0)),
         };
-        if !is_last {
-            tracing::warn!("SGL Segment chain (R2b) 未实现，SGL1 须 Last Segment");
-            return Some(Cqe::error(
-                cid,
-                sq_id,
-                sq_head,
-                phase,
-                sc::SGL_DESCRIPTOR_TYPE_INVALID,
-                0,
-            ));
-        }
+        // **R2b** — SGL1 既可 Last Segment（单段）也可 Segment（chain 首段）。
         let op_id = self.alloc_op_id();
         self.sgl_ops.insert(
             op_id,
@@ -651,6 +646,7 @@ impl NvmeController {
                 data: vec![0u8; bytes as usize],
                 frags: Vec::new(),
                 walk_offset: 0,
+                walk_segments: 0,
                 transfers_done: 0,
                 transfers_total: 0,
             },
@@ -664,7 +660,7 @@ impl NvmeController {
                 sq_head,
                 cq_id,
                 nsid,
-                op: PendingOp::NvmSglFetch { op_id },
+                op: PendingOp::NvmSglFetch { op_id, is_last },
             },
         );
         None

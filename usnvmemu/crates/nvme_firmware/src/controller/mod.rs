@@ -364,9 +364,10 @@ pub(super) enum PendingOp {
     /// `page_idx` 是 PRP 中第几个数据页。
     NvmReadPrpListData { op_id: u64, page_idx: u32 },
     /// **Phase R2** — SGL Segment（PSDT=10）：embedded SGL1 指向的 segment 页
-    /// DMA-read 完成 → parse descriptor + 构建 fragment plan + 启动数据传输。
-    /// （R2b：末位 continuation descriptor → 递归 fetch 下一段。）
-    NvmSglFetch { op_id: u64 },
+    /// DMA-read 完成 → parse descriptor + 累积 fragment plan。`is_last` 标记本段
+    /// 经 Last Segment(true) 还是 Segment(false) 到达：false 时末位 descriptor 是
+    /// continuation → 递归 fetch 下一段（R2b chain）。
+    NvmSglFetch { op_id: u64, is_last: bool },
     /// **Phase R2** — SGL 数据 fragment 传输完成（READ = scatter dma_write 到
     /// host / WRITE = gather dma_read 自 host）。`frag_idx` 索引 `SglOp.frags`。
     NvmSglData { op_id: u64, frag_idx: u32 },
@@ -588,6 +589,11 @@ pub(super) struct PrpListOp {
     pub(super) data_pages: Vec<Option<Vec<u8>>>,
 }
 
+/// **Phase R2b** — SGL segment chain fetch 段数上限（防恶意 driver 构造
+/// Segment 自环导致无限 DMA-read）。教学路径：单段 ≤ 1 page = 256 descriptor，
+/// 64 段足够任何合法 MDTS 传输（远超真实驱动用量）。
+pub(super) const MAX_SGL_SEGMENTS: u32 = 64;
+
 /// **Phase R2** — SGL Segment 数据路径累积器（PSDT=10）。
 ///
 /// 镜像 `PrpListOp`，但 SGL 数据是任意 (address, length) fragment 的
@@ -621,6 +627,9 @@ pub(super) struct SglOp {
     pub(super) frags: Vec<SglPlanFrag>,
     /// walk 中数据流累积偏移（下一个 fragment 在 `data` 流中的起点）。
     pub(super) walk_offset: u64,
+    /// **Phase R2b** — 已 fetch 的 segment 段数（chain 自环上限保护，见
+    /// `MAX_SGL_SEGMENTS`）。
+    pub(super) walk_segments: u32,
     /// TRANSFER 阶段已完成的数据 fragment DMA 数。
     pub(super) transfers_done: u32,
     /// TRANSFER 阶段需完成的数据 fragment DMA 总数（walk 完成后 set）。
