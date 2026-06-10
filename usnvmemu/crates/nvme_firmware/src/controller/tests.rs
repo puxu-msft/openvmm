@@ -1696,6 +1696,33 @@ fn identify_controller_advertises_fused_cw() {
 #[test]
 fn copy_opcode_constant_matches_spec() {
     assert_eq!(crate::cmd::nvm_opc::COPY, 0x19);
+    // **给牙（Wave 4）**：doc 曾承诺"COPY 在 PI NS 上拒"但 body 只查常量。真驱
+    // COPY 到 PI-enabled NS，断言 INVALID_PROTECTION_INFO（去掉 io.rs COPY 的
+    // pi_enabled 拒绝分支 → 此断言红）。
+    let mut c = make_ctrl_with_tmp("copy_pi");
+    {
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+    }
+    let mut cap = pcie_device_core::CaptureTransport::with_start_token(0x100);
+    let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+    let cqe = c
+        .dispatch_io(
+            &mut ctx,
+            1,
+            io_sqe(crate::cmd::nvm_opc::COPY, 1, 0, 1, 0x1000, false, 0x21),
+            0x21,
+            0,
+            1,
+        )
+        .expect("COPY on PI NS 同步拒");
+    assert_eq!(
+        cqe_status(&cqe),
+        crate::cmd::sc::INVALID_PROTECTION_INFO,
+        "COPY on PI NS → INVALID_PROTECTION_INFO（教学路径未实现 PI+Copy）"
+    );
 }
 
 /// **Reviewer C-2 (7轮)** — Format NVM SES=1 路径 drop+rebuild mmap，
@@ -2709,12 +2736,26 @@ fn identify_namespace_advertises_atomic_granularity() {
 fn ns_detached_blocks_io() {
     let mut c = make_ctrl_with_tmp("ns_detach");
     assert!(c.namespaces[&1].attached, "默认 attached=true");
-    // 模拟 detach
+    let mut cap = pcie_device_core::CaptureTransport::with_start_token(0x100);
+    let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+    // **给牙（Wave 4）**：真驱 dispatch_io 到 detached NS 断言 INVALID_NAMESPACE。
+    // 此前只翻 `attached` bool 再断言自己——去掉 io.rs detached 检查也照过。
     c.namespaces.get_mut(&1).unwrap().attached = false;
-    // 直接调 dispatch_io 太重；用 attached 字段直观断言 + 一次 helper 调用
-    // 不是 helper 测得到的；这里只验状态机翻转。完整 IO 拒绝在
-    // ns_attachment_detach_via_admin 走 admin dispatch。
-    assert!(!c.namespaces[&1].attached);
+    let cqe = c
+        .dispatch_io(
+            &mut ctx,
+            1,
+            io_sqe(0x02, 1, 0, 1, 0x1000, false, 0x20),
+            0x20,
+            0,
+            1,
+        )
+        .expect("detached NS 上 IO 同步拒");
+    assert_eq!(
+        cqe_status(&cqe),
+        crate::cmd::sc::INVALID_NAMESPACE,
+        "detached NS → INVALID_NAMESPACE（去掉 io.rs detached 检查 → 红）"
+    );
 }
 
 /// **Phase S4** — NS Attachment Set Attach / Detach 走 admin dispatch +
