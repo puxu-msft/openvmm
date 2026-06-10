@@ -1,9 +1,10 @@
 # Plan — Admin 数据 DMA 的完整 PRP 处理（教学简化 → spec-complete）
 
-> 状态：**P1 ✅ SHIPPED**（commit `5a87cf08`，2026-06-10，含 revert-verify + rust-reviewer
-> 0 C/H/M）/ **P2 📋 待续**（>2 page PRP list，去 Get Log Page 8KiB 上限）。
-> 类型：silent-corruption-class firmware core 手术 —— 必须走完整严谨循环
-> （设计 → 实施 → unit + harness 测试 → **revert-verify** → rust-reviewer → commit）。
+> 状态：**✅ 完成**（P1 `5a87cf08` + P2 `2a63a6d5` + followup `cb48faee`，2026-06-10）。
+> P1（≤2 page PRP1+PRP2 修 latent corruption）+ P2（>2 page PRP list，Get Log Page
+> 上限 8KiB→2MiB）+ followup（Zone/Reservation Report 分配 cap + clippy + 注释）。
+> 全程 revert-verify + rust-reviewer 0 C/H。
+> 类型：silent-corruption-class firmware core 手术 —— 完整严谨循环已走完。
 
 ## What（精确缺口）
 
