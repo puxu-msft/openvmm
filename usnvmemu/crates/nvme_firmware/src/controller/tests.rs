@@ -195,6 +195,73 @@ fn smart_log_byte_layout_and_counters() {
     assert_eq!(nerr, 3);
 }
 
+/// **M2 布局锚定（Wave 7）** — SMART/Health log 字节布局锚到 **NVMe 2.0c
+/// Figure 207** 的 spec offset，而非"test 照抄 builder magic offset"（那是自洽假锚，
+/// 测不出 spec-vs-impl 偏移，LESSONS §25/§30）。
+///
+/// 机制：`#[repr(C, packed)]` struct 按 spec figure **独立转写**字段（含 reserved
+/// gap）→ 编译器算出的 `offset_of!` 与 spec figure 数字对照（转写错即红）→ 再读
+/// **builder 输出**在这些 offset 上的值（builder 若用错 offset，读 offset_of! 位
+/// 置得 0 → 红）。其余 log（error-log entry / ZNS Identify / reservation report）
+/// 同 pattern，见 docs/TEST_QUALITY.md follow-up。
+#[test]
+fn smart_log_offsets_anchored_to_spec_figure() {
+    use std::mem::offset_of;
+    // NVMe 2.0c Figure 207 "SMART / Health Information Log Page"。
+    #[repr(C, packed)]
+    struct SmartLogLayout {
+        critical_warning: u8,          // 0
+        composite_temp: u16,           // 1
+        available_spare: u8,           // 3
+        available_spare_threshold: u8, // 4
+        percentage_used: u8,           // 5
+        endurance_group_cw: u8,        // 6
+        _rsvd7: [u8; 25],              // 7..32
+        data_units_read: u128,         // 32
+        data_units_written: u128,      // 48
+        host_read_commands: u128,      // 64
+        host_write_commands: u128,     // 80
+        controller_busy_time: u128,    // 96
+        power_cycles: u128,            // 112
+        power_on_hours: u128,          // 128
+        unsafe_shutdowns: u128,        // 144
+        media_errors: u128,            // 160
+        num_err_log_entries: u128,     // 176
+    }
+    // ① offset_of!（编译器算）== spec figure 数字（独立转写双校）。
+    assert_eq!(offset_of!(SmartLogLayout, critical_warning), 0);
+    assert_eq!(offset_of!(SmartLogLayout, composite_temp), 1);
+    assert_eq!(offset_of!(SmartLogLayout, available_spare), 3);
+    assert_eq!(offset_of!(SmartLogLayout, percentage_used), 5);
+    assert_eq!(offset_of!(SmartLogLayout, data_units_read), 32);
+    assert_eq!(offset_of!(SmartLogLayout, data_units_written), 48);
+    assert_eq!(offset_of!(SmartLogLayout, host_read_commands), 64);
+    assert_eq!(offset_of!(SmartLogLayout, host_write_commands), 80);
+    assert_eq!(offset_of!(SmartLogLayout, power_cycles), 112);
+    assert_eq!(offset_of!(SmartLogLayout, power_on_hours), 128);
+    assert_eq!(offset_of!(SmartLogLayout, num_err_log_entries), 176);
+
+    // ② builder 输出在 spec-anchored offset 上的值正确（builder 用错 offset → 红）。
+    let mut c = make_ctrl_with_tmp("smart_anchor");
+    c.stat_host_reads = 9;
+    c.stat_host_writes = 4;
+    c.stat_lba_read = 2_001; // ceil(/1000) = 3
+    c.stat_lba_written = 5_000; // = 5
+    c.stat_num_err_log_entries = 2;
+    let buf = super::logs::build_smart_health(&c, 512);
+    let rd = |off: usize| u128::from_le_bytes(buf[off..off + 16].try_into().unwrap());
+    assert_eq!(rd(offset_of!(SmartLogLayout, data_units_read)), 3);
+    assert_eq!(rd(offset_of!(SmartLogLayout, data_units_written)), 5);
+    assert_eq!(rd(offset_of!(SmartLogLayout, host_read_commands)), 9);
+    assert_eq!(rd(offset_of!(SmartLogLayout, host_write_commands)), 4);
+    assert_eq!(rd(offset_of!(SmartLogLayout, num_err_log_entries)), 2);
+    assert_eq!(
+        buf[offset_of!(SmartLogLayout, available_spare)],
+        100,
+        "available_spare @ spec offset 3"
+    );
+}
+
 /// Phase E (M2 修复后)：parse_prp_list 不再 0 终止 — 返回所有 entry，
 /// caller 用 total_pages 自行截断。GPA = 0 是合法地址，不能视作终止。
 #[test]
