@@ -1075,13 +1075,51 @@ pub struct NvmeController {
     /// 最近一次 Sanitize 完成的 Sanitize Status Log 0x81 数据。
     pub(super) sanitize_last_status: u8, // 0=never, 1=success, 2=in-progress, 3=failed
 
-    // ----- Phase K6: Doorbell Buffer Config -----
+    // ----- Phase K6 / DBBUF (shadow doorbells, spec § 5.7 + § 7.13) -----
     /// driver 提供的 shadow doorbell buffer GPA（PRP1）+ event idx buffer
-    /// (PRP2)。我们存下来但不做 polling（vsock 模型 MMIO 已是事件源）。
-    #[allow(dead_code)]
+    /// (PRP2)。非 0 表示 DBBUF **active** —— controller 不再信任 MMIO doorbell
+    /// 的 value（可能 stale），而是 DMA-poll shadow buffer 拿真 tail/head，并写回
+    /// event_idx 告诉 driver 何时该 ring 真 doorbell（Linux `nvme_dbbuf_need_event`）。
+    /// 二者全 0 = DBBUF inactive，走纯 MMIO doorbell 路径（admin qid 0 永远走此路径，
+    /// 因 Linux `nvme_dbbuf_init` 跳过 qid 0）。
     pub(super) doorbell_shadow_gpa: u64,
-    #[allow(dead_code)]
     pub(super) doorbell_event_idx_gpa: u64,
+    /// in-flight shadow-poll DMA reads：token → 该 read 在轮询哪个队列。完成回调
+    /// (`on_dma_complete`) 据此路由进 `handle_shadow_poll_complete`。
+    pub(super) pending_shadow_polls: std::collections::HashMap<u64, ShadowPollCtx>,
+    /// in-flight event_idx 写回的 token 集合；完成回调静默消费（无后续动作），
+    /// 不让它们落到 unknown-token 警告路径。
+    pub(super) pending_eventidx_writes: std::collections::HashSet<u64>,
+    /// 当前有 poll 链在飞的 (qid, is_cq)。doorbell ring 仅是"唤醒"信号：若已有链
+    /// 在 drain，它下一次 re-read 会读到最新 shadow，故跳过启动重复链（也避免重复
+    /// fetch 同一批 SQE）。链终止时清除。
+    pub(super) shadow_poll_inflight: std::collections::HashSet<(u16, bool)>,
+    /// **HIGH-1（async transport 漏 ring 修复）** — "链在飞期间又来了一次 ring" 的
+    /// 一次性待处理标记，按 (qid, is_cq) 记。
+    ///
+    /// 背景：OpenHCL 真异步 transport 下，doorbell-ring 帧（`start_shadow_*_poll`）
+    /// 与 re-read 的 DmaCompletion 帧由同一 run-loop **逐条** dispatch，可能交错。
+    /// 旧逻辑里 `start_shadow_*_poll` 见 inflight 即静默 return —— 若该 ring 恰落在
+    /// "host 已服务 re-read 但 driver 尚未存 shadow" 的窗口内，这次唤醒被**丢弃**，
+    /// 对应槽位要等下一次 ~5s tick 兜底才 fetch（延迟失速，非丢命令）。
+    ///
+    /// 修复：`start_shadow_*_poll` 发现链在飞时**置此标记**（而非静默 return）。链在
+    /// settle 分支（`shadow == processed`）清 inflight 前先查：若标记置位 → 清标记并
+    /// **再发一次 re-read**（续链）而非 settle。如此每个被丢的 ring 都转成"再 poll 一
+    /// 次"，settle 窗口内的提交必被捕获。一次性语义：续链前先 `remove` 标记，故除非
+    /// **新** ring 再次置位否则不会重复触发，不会无限续链。`disable()` 一并清除。
+    pub(super) shadow_ring_pending: std::collections::HashSet<(u16, bool)>,
+    /// 每个 IO SQ 最近一次**真 MMIO** doorbell 写入的原始 value（仅用于证明日志：
+    /// 当 shadow tail 领先于此值，说明 driver 跳过了一次真 ring 而 controller 经
+    /// shadow 追上 —— 即 DBBUF 被真正行使）。
+    pub(super) last_mmio_sq_doorbell: std::collections::HashMap<u16, u32>,
+    /// 每个 IO SQ 最近写回 driver 的 SQ event_idx 值；避免冗余写 + 防 poll 链
+    /// 在 `shadow == processed` 分支无谓重写而打转。
+    pub(super) last_eventidx_sq: std::collections::HashMap<u16, u32>,
+    /// shadow tail 被发现领先于"最近真 MMIO doorbell"的累计次数。`> 0` 即证明
+    /// Linux driver 真的跳过了 ring 而 controller 经 shadow 捕获到（DBBUF 真行使，
+    /// 非静默退回 MMIO）。harness server.log + 单测据此断言。
+    pub(super) dbbuf_shadow_ahead_count: u64,
     /// **Phase Q7** — Lockdown 命令禁用的 admin opcode 集合。
     /// dispatch_admin 进入前查；命中则返 COMMAND_PROHIBITED_BY_LOCKDOWN。
     pub(super) locked_admin_opcodes: std::collections::HashSet<u8>,
@@ -1140,6 +1178,23 @@ struct FetchCtx {
     count: u32,
     /// 起始 slot index（在 SQ 中）。
     start_slot: u32,
+}
+
+/// DBBUF shadow-poll 的 in-flight 上下文：一次 `dma_read(shadow doorbell, 4)` 在等
+/// 完成时记录"它在轮询哪个队列、本链已自续到多深"。完成回调据 token 取回本结构后
+/// 驱动 race-safe 轮询循环（见 `handle_shadow_poll_complete`）。
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ShadowPollCtx {
+    /// 被轮询的队列 id（IO 队列；qid 0 admin 不参与 DBBUF）。
+    pub(super) qid: u16,
+    /// false = SQ tail doorbell；true = CQ head doorbell。
+    pub(super) is_cq: bool,
+    /// **HIGH-2（host-thread liveness）** — 本轮询链的**自续深度**：本链至今发出的
+    /// shadow re-read（自我续接）总数。链起始（`start_shadow_*_poll`）的首读为 0；之后
+    /// 每发一次自续 re-read（SQ advance 分支 re-read **或** HIGH-1 settle-续读）就 +1，
+    /// **唯一**在链起始处重置 0。撞 `MAX_SHADOW_POLL_ITERS` → 置 CSTS.CFS 并收链。
+    /// 这是**深度上限**而非环距离启发——见 `MAX_SHADOW_POLL_ITERS` 文档。
+    pub(super) iters: u32,
 }
 
 /// **Phase H6** — Reservation 命令类别（分流完成回调）。
@@ -2030,6 +2085,13 @@ impl NvmeController {
             sanitize_last_status: 0,
             doorbell_shadow_gpa: 0,
             doorbell_event_idx_gpa: 0,
+            pending_shadow_polls: std::collections::HashMap::new(),
+            pending_eventidx_writes: std::collections::HashSet::new(),
+            shadow_poll_inflight: std::collections::HashSet::new(),
+            shadow_ring_pending: std::collections::HashSet::new(),
+            last_mmio_sq_doorbell: std::collections::HashMap::new(),
+            last_eventidx_sq: std::collections::HashMap::new(),
+            dbbuf_shadow_ahead_count: 0,
             locked_admin_opcodes: std::collections::HashSet::new(),
             crypto_gen: 0,
             reservation_notification_log: std::collections::VecDeque::new(),
@@ -2071,8 +2133,17 @@ impl NvmeController {
         Some((!is_cq, qid)) // returns (is_sq, qid)
     }
 
-    /// SQyTDBL 写入：driver 通告新 SQE。host 立即 DMA-read 新 entries。
-    /// 支持 wrap：[old_tail..size) + [0..new_tail) 拆两段独立 DMA fetch。
+    /// SQyTDBL 写入：driver 通告新 SQE。
+    ///
+    /// **两条路径**：
+    /// - **DBBUF active**（`doorbell_shadow_gpa != 0`）且 `sq_id != 0`（IO 队列）：
+    ///   传入的 MMIO `value` 可能 **stale**（driver 经 shadow 多推了几条却按
+    ///   `nvme_dbbuf_need_event` 跳过了真 ring，本次 ring 只是"晚到的唤醒"）。忽略
+    ///   `value` 作 fetch 依据，转而 DMA-poll shadow doorbell 拿真 tail（见
+    ///   `start_shadow_sq_poll` → race-safe 循环）。仅把 `value` 记成"最近真 MMIO
+    ///   doorbell"供证明日志比对。
+    /// - **DBBUF inactive 或 admin SQ（qid 0）**：保持原行为 —— 直接信任 `value`
+    ///   做两段 wrap fetch（Linux `nvme_dbbuf_init` 跳过 qid 0，故 admin 永走此路径）。
     fn on_sq_tail_doorbell(&mut self, ctx: &mut DeviceCtx<'_>, sq_id: u16, new_tail: u32) {
         // **Quiesce（spec § 3.1.4.5）**：controller 未 operational 时不处理新命令——
         // 关机完成（CSTS.SHST=complete）或未 enable（CSTS.RDY=0）时忽略 SQ tail doorbell。
@@ -2088,30 +2159,56 @@ impl NvmeController {
             );
             return;
         }
-        // 先校验：spec 要求 0 ≤ new_tail < size；越界视为 driver bug，
-        // 设 CSTS.CFS 让 driver 见到 fatal 状态。在写 sq.tail 前校验，
-        // 否则脏 state 已经在 SQ 中持久化。
+        // **DBBUF active + IO SQ** → shadow 是真相，MMIO value 仅作唤醒 + 证明比对。
+        if self.dbbuf_active() && sq_id != 0 {
+            if !self.sqs.contains_key(&sq_id) {
+                tracing::warn!(sq_id, "SQ tail doorbell (DBBUF) to unknown SQ");
+                return;
+            }
+            // 记录最近真 MMIO doorbell（裸 value）。当 shadow tail 之后被发现领先
+            // 于此值，即证明 driver 跳过了一次真 ring 而 controller 经 shadow 追上。
+            self.last_mmio_sq_doorbell.insert(sq_id, new_tail);
+            self.start_shadow_sq_poll(ctx, sq_id);
+            return;
+        }
+        // —— 纯 MMIO doorbell 路径（DBBUF inactive 或 admin qid 0）——
+        self.advance_sq_to_tail(ctx, sq_id, new_tail);
+    }
+
+    /// **DBBUF 是否 active**：driver 已通过 Doorbell Buffer Config 提供 shadow +
+    /// event_idx buffer（二者非 0）。inactive 时所有 shadow-poll 入口都是 no-op。
+    pub(super) fn dbbuf_active(&self) -> bool {
+        self.doorbell_shadow_gpa != 0 && self.doorbell_event_idx_gpa != 0
+    }
+
+    /// **共享 "把 SQ 推进到 tail T" 例程**（MMIO 路径与 shadow-poll 路径**共用**，
+    /// 不重复 SQE fetch/dispatch 逻辑）。校验 `T < size`（越界 → CSTS.CFS）；把
+    /// `sq.tail`（= host 已 issue fetch 到的位置 = processed_sq_tail）从旧值推进到
+    /// `T`，对 `[old..T)` 两段 wrap fetch。`old == T` 时无事可做。
+    ///
+    /// 返回 `true` 表示推进成功（或已在目标，无需 fetch）；`false` 表示越界已置 CFS。
+    fn advance_sq_to_tail(&mut self, ctx: &mut DeviceCtx<'_>, sq_id: u16, new_tail: u32) -> bool {
         let (base_gpa, size, old_tail) = {
             let Some(sq) = self.sqs.get(&sq_id) else {
-                tracing::warn!(sq_id, "SQ tail doorbell to unknown SQ");
-                return;
+                tracing::warn!(sq_id, "advance_sq_to_tail: unknown SQ");
+                return false;
             };
             if new_tail >= sq.size {
                 tracing::error!(
                     sq_id,
                     new_tail,
                     size = sq.size,
-                    "SQ doorbell out of range; setting CSTS.CFS"
+                    "SQ tail out of range; setting CSTS.CFS"
                 );
                 self.csts |= csts::CFS;
-                return;
+                return false;
             }
             (sq.base_gpa, sq.size, sq.tail)
         };
-        // 校验通过后才写 sq.tail。
+        // 校验通过后才写 sq.tail（processed_sq_tail）。
         self.sqs.get_mut(&sq_id).unwrap().tail = new_tail;
         if old_tail == new_tail {
-            return;
+            return true;
         }
         // 分两段：上半 [old_tail..end_of_q) + 下半 [0..new_tail)。
         // 非 wrap 时下半 count=0，跳过。
@@ -2164,14 +2261,343 @@ impl NvmeController {
                 "SQ doorbell: fetch segment 2 (wrap)"
             );
         }
+        true
     }
 
-    /// CQyHDBL 写入：driver 通告已处理多少 CQE。host 仅用于流控（v1 不做）。
-    fn on_cq_head_doorbell(&mut self, cq_id: u16, new_head: u32) {
+    /// CQyHDBL 写入：driver 通告已处理多少 CQE（释放完成槽）。
+    ///
+    /// DBBUF active + IO CQ：MMIO value 可能 stale，转而 poll shadow CQ head 学真
+    /// head 并写 CQ event_idx（见 `start_shadow_cq_poll`）。DBBUF inactive 时保持
+    /// 原行为（直接存 `new_head`，仅作流控信息）。
+    fn on_cq_head_doorbell(&mut self, ctx: &mut DeviceCtx<'_>, cq_id: u16, new_head: u32) {
         if let Some(cq) = self.cqs.get_mut(&cq_id) {
             cq.head = new_head;
             tracing::debug!(cq_id, new_head, "CQ head doorbell");
+        } else {
+            return;
         }
+        if self.dbbuf_active() && cq_id != 0 {
+            self.start_shadow_cq_poll(ctx, cq_id);
+        }
+    }
+
+    // ======================= DBBUF shadow-doorbell polling =======================
+    //
+    // 背景（Linux drivers/nvme/host/pci.c）：广告 OACS Doorbell Buffer Config 后，
+    // driver 给每个 IO 队列在 guest mem 维护 shadow doorbell（dbbuf_dbs）+ eventidx
+    // (dbbuf_eis)。提交时它写 shadow tail、读 eventidx，**仅当** `need_event` 为真才
+    // ring 真 MMIO doorbell（省 VM-exit）。故真 MMIO doorbell 的 value 可能 stale：
+    // driver 已把 shadow 推得更远却跳过了 ring。controller **必须**读 shadow 拿真
+    // tail/head，并写 eventidx 告诉 driver "下次提交超过我已消费的就 ring 我"。
+    //
+    // DSTRD=0（本 controller）：队列 qid 的 SQ doorbell 在 shadow buffer 字节偏移
+    // `qid*8`，CQ doorbell 在 `qid*8+4`，各一个 LE u32。eventidx buffer 同布局。
+    //
+    // **transport 无同步读**（`dma_read` 是 token-异步，完成经 `on_dma_complete`），
+    // 故轮询循环实现成跨完成回调的异步状态机：一次 shadow read 完成 → 推进 + 写
+    // eventidx → **再发一次 shadow read** 闭合 race → … 直到 `shadow == processed`。
+    // vfio-user adapter 在单次 pump 内 drain 所有（含回调里再发的）完成，OpenHCL 则
+    // 真异步逐条回调 —— 两者都只靠 "token 终会被回调一次" 契约，循环收敛一致。
+
+    /// DBBUF 上限：界定**单条 poll 链的自续深度**（本链发出的 shadow re-read 总数），
+    /// **为 HOST-THREAD LIVENESS** 而设。
+    ///
+    /// vfio `dma_read` 是**同步**的：`vfio_user_transport` 在 wire 往返内联完成并把
+    /// completion 立刻 `push_back` 到 `drain_dma_completions` 正在 drain 的同一队列。
+    /// 于是 `handle_shadow_sq` 里每发一次自续 re-read，都会让**同一个** `while let
+    /// Some(c) = pop_front()` 在**同一次** `pump_one` 内立刻取到它的 completion——一个
+    /// 自喂的 re-read 循环会把 host 线程**永久**卡在一次 `drain_dma_completions` 调用里。
+    /// 一个 **in-range 震荡**的 guest shadow（如 2↔4 反复，两者皆 < size；
+    /// `advance_sq_to_tail` 把 `new_tail < old_tail` 当 wrap 仍前进）令 `shadow != processed`
+    /// 步步成立、链无逃逸——正是触发此自喂的 case。
+    ///
+    /// 正确 driver 的链在 ~几十次 re-read 内 settle（自喂规模 = controller 往返期间并发
+    /// 提交数，实测 harness ~14，**远** ≪ `1<<16`）→ **永不**误触。runaway（震荡/in-range
+    /// garbage shadow）在此处撞顶 → 置 CFS + 收链（有限 ≤ 65536 次往返后停，而非无限
+    /// hang）。**这是深度上限，不是环距离启发**（不引入 `fwd > size/2` 之类探测器——那是
+    /// 脆弱启发，被本次修复刻意排除）。in-range 震荡正是经此 cap 收敛；真正的**越界**
+    /// garbage（`shadow >= size`）另由 `handle_shadow_sq` 顶部守卫即时置 CFS。
+    ///
+    /// 互补强化（未在此处做，留作未来）：在 vfio transport 的 `drain_dma_completions`
+    /// （`session.rs`）里**每次循环让出一次**，可在 runaway 期间保持 host 线程对外
+    /// 响应——本 cap 保证有限终止，那个 yield 保证终止前不僵死。二者正交。
+    const MAX_SHADOW_POLL_ITERS: u32 = 1 << 16;
+
+    /// 启动一条 **SQ** shadow-poll 链（若该 (qid, SQ) 尚无链在飞）。doorbell ring 只是
+    /// 唤醒：已有链在 drain 时其下一次 re-read 自会读到最新 shadow，故跳过启动重复链
+    /// （同时避免重复 fetch 同批 SQE）。
+    fn start_shadow_sq_poll(&mut self, ctx: &mut DeviceCtx<'_>, qid: u16) {
+        if !self.dbbuf_active() || qid == 0 {
+            return;
+        }
+        if !self.shadow_poll_inflight.insert((qid, false)) {
+            // 已有 SQ 链在飞。**HIGH-1**：不静默丢这次唤醒 —— 置 "ring 待处理" 标记，
+            // 让链在 settle 前再 re-read 一次，闭合 async transport 下 ring/re-read 帧
+            // 交错导致的 settle-窗口漏 ring（详见 `shadow_ring_pending` 文档）。
+            self.shadow_ring_pending.insert((qid, false));
+            return;
+        }
+        // 新链：自续深度从 0 起算（首读不算 re-read；之后每次自续 +1）。
+        self.issue_shadow_read(ctx, qid, false, 0);
+    }
+
+    /// 启动一条 **CQ** shadow-poll 链（若该 (qid, CQ) 尚无链在飞）。
+    fn start_shadow_cq_poll(&mut self, ctx: &mut DeviceCtx<'_>, qid: u16) {
+        if !self.dbbuf_active() || qid == 0 {
+            return;
+        }
+        if !self.shadow_poll_inflight.insert((qid, true)) {
+            // 已有 CQ 链在飞。**HIGH-1**：同 SQ，记一次性待处理 ring，settle 时补一读。
+            self.shadow_ring_pending.insert((qid, true));
+            return;
+        }
+        self.issue_shadow_read(ctx, qid, true, 0);
+    }
+
+    /// 发一次 shadow doorbell 的 4 字节 DMA-read 并登记 token → 轮询上下文，让
+    /// `on_dma_complete` 路由回 `handle_shadow_poll_complete`。`iters` 透传本链**自续
+    /// 深度**（chain start 处为 0，每次自续 +1；见 `MAX_SHADOW_POLL_ITERS`）。
+    fn issue_shadow_read(&mut self, ctx: &mut DeviceCtx<'_>, qid: u16, is_cq: bool, iters: u32) {
+        let off = qid as u64 * 8 + if is_cq { 4 } else { 0 };
+        let gpa = self.doorbell_shadow_gpa + off;
+        let token = ctx.dma_read(gpa, 4);
+        self.pending_shadow_polls
+            .insert(token, ShadowPollCtx { qid, is_cq, iters });
+        tracing::trace!(
+            qid,
+            is_cq,
+            iters,
+            gpa = format_args!("{:#x}", gpa),
+            token,
+            "DBBUF: shadow doorbell read issued"
+        );
+    }
+
+    /// 写一个 event_idx slot（LE u32）并登记 token 到 `pending_eventidx_writes`，
+    /// 让其完成回调被静默消费（无后续动作）。
+    fn write_eventidx(&mut self, ctx: &mut DeviceCtx<'_>, qid: u16, is_cq: bool, value: u32) {
+        let off = qid as u64 * 8 + if is_cq { 4 } else { 0 };
+        let gpa = self.doorbell_event_idx_gpa + off;
+        let token = ctx.dma_write(gpa, value.to_le_bytes().to_vec());
+        self.pending_eventidx_writes.insert(token);
+        tracing::trace!(
+            qid,
+            is_cq,
+            value,
+            gpa = format_args!("{:#x}", gpa),
+            token,
+            "DBBUF: event_idx written"
+        );
+    }
+
+    /// shadow-poll DMA-read 完成回调（由 `on_dma_complete` 顶部据 token 派发）。
+    /// 解析 shadow value 后驱动 race-safe 循环：SQ 侧推进 + 写 eventidx + re-read，
+    /// CQ 侧学 head + 写 eventidx（无需循环，详见各分支注释）。
+    pub(super) fn handle_shadow_poll_complete(
+        &mut self,
+        ctx: &mut DeviceCtx<'_>,
+        p: ShadowPollCtx,
+        ok: bool,
+        data: Vec<u8>,
+    ) {
+        let ShadowPollCtx { qid, is_cq, iters } = p;
+        // 读失败或字节不足 → 不推进，清 inflight（下次 doorbell / tick 再起链）。
+        // **HIGH-1**：一并清漏 ring 标记 —— 链已死，标记无处续读；下次 ring/tick 重起。
+        if !ok || data.len() < 4 {
+            tracing::warn!(
+                qid,
+                is_cq,
+                ok,
+                got = data.len(),
+                "DBBUF: shadow read failed/short; ending poll chain"
+            );
+            self.shadow_poll_inflight.remove(&(qid, is_cq));
+            self.shadow_ring_pending.remove(&(qid, is_cq));
+            return;
+        }
+        let shadow = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        if is_cq {
+            self.handle_shadow_cq(ctx, qid, shadow);
+        } else {
+            self.handle_shadow_sq(ctx, qid, shadow, iters);
+        }
+    }
+
+    /// **SQ** shadow 轮询单步 + race-safe 循环推进。
+    ///
+    /// `processed` = `sq.tail`（host 已 issue fetch 到的位置）。`iters` = 本链**自续深度**
+    /// （HIGH-2 host-thread-liveness 上限的载体；见 `MAX_SHADOW_POLL_ITERS`）。
+    /// - `shadow != processed`：driver 提交了我们尚未 fetch 的 SQE。推进 fetch 到
+    ///   shadow（`advance_sq_to_tail`）、写 eventidx=shadow、**再 re-read** 闭合
+    ///   "读后-提交" race（一次自续：`iters` += 1）。
+    /// - `shadow == processed`：已追平。确保 eventidx==processed（driver 下次提交即
+    ///   ring）。**HIGH-1**：settle 前查 `shadow_ring_pending`——若链在飞期间漏过一次
+    ///   ring，清标记并**续一次 re-read** 而非停（把丢的 ring 转成"再 poll 一次"，覆盖
+    ///   settle 窗口内的提交；同样是一次自续：`iters` += 1）；否则**停止**（不 re-read）。
+    ///   因终止时 `eventidx==processed==shadow`，driver 下次提交 old==eventidx →
+    ///   `need_event` 必真 → 必 ring，race 已闭合。
+    ///
+    /// **HIGH-2（host-thread liveness 上限）**：vfio `dma_read` 同步，自喂的 re-read
+    /// 循环会把 host 线程卡在一次 `drain_dma_completions` 内（见 `MAX_SHADOW_POLL_ITERS`）。
+    /// 上限界定**本链自续深度**：每次自续 re-read（advance 分支 **与** settle-续读两处）
+    /// 前先 `next_iters = iters + 1`；撞 `MAX_SHADOW_POLL_ITERS` → 置 CSTS.CFS + 收链
+    /// （与越界路径同款 fail-safe）。**深度上限非环距离启发**——in-range 震荡（shadow 在
+    /// 小窗口打转、`advance_sq_to_tail` 把回退当 wrap 仍前进、`shadow != processed` 步步
+    /// 成立）正是经此 cap 在有限 ≤ 65536 步后收敛，而非无限 hang。脏 shadow 的另一道防线
+    /// 是下方 `shadow >= size` 的**越界守卫**：任何越界值即时置 CSTS.CFS 并收链。
+    fn handle_shadow_sq(&mut self, ctx: &mut DeviceCtx<'_>, qid: u16, shadow: u32, iters: u32) {
+        let Some(processed) = self.sqs.get(&qid).map(|s| s.tail) else {
+            // SQ 在轮询途中消失（disable/delete）→ 收链。
+            self.shadow_poll_inflight.remove(&(qid, false));
+            self.shadow_ring_pending.remove(&(qid, false));
+            return;
+        };
+        let size = self.sqs.get(&qid).map(|s| s.size).unwrap_or(0);
+        // shadow 越界（driver bug / 脏 shadow）：置 CFS，收链。
+        if size == 0 || shadow >= size {
+            tracing::error!(
+                qid,
+                shadow,
+                size,
+                "DBBUF: shadow SQ tail out of range; setting CSTS.CFS"
+            );
+            self.csts |= csts::CFS;
+            self.shadow_poll_inflight.remove(&(qid, false));
+            self.shadow_ring_pending.remove(&(qid, false));
+            return;
+        }
+
+        if shadow != processed {
+            // —— 证明：shadow 领先于最近真 MMIO doorbell ⇒ driver 跳过了一次真 ring，
+            //    controller 经 shadow 追上（DBBUF 被真正行使，非静默退回 MMIO）。仅当
+            //    确有"最近 MMIO doorbell"可比（Some）且 shadow 与之不同才计数 —— 避免
+            //    tick 在首个真 ring 之前发起的 poll 把"领先于 None(0)"误记为跳过。
+            if let Some(last_mmio) = self
+                .last_mmio_sq_doorbell
+                .get(&qid)
+                .copied()
+                .filter(|&m| shadow != m)
+            {
+                self.dbbuf_shadow_ahead_count += 1;
+                tracing::info!(
+                    qid,
+                    shadow_tail = shadow,
+                    processed,
+                    last_mmio_doorbell = last_mmio,
+                    ahead_count = self.dbbuf_shadow_ahead_count,
+                    "DBBUF shadow poll: SQ advanced via shadow AHEAD of last MMIO doorbell \
+                     (driver skipped a real ring; controller caught it)"
+                );
+            }
+            // 推进 fetch 到 shadow（processed := shadow）。越界已在上面拦，故必 true。
+            // **LOW-1**：用 debug_assert! 锚定返回值，使未来若改动 advance 的越界守卫而
+            // 意外让 processed/eventidx 失步时在 test 立即响（而非静默 desync）。
+            debug_assert!(
+                self.advance_sq_to_tail(ctx, qid, shadow),
+                "advance_sq_to_tail 应成功：shadow 已在上面校验 < size"
+            );
+            // 写 eventidx = shadow（= 新 processed）：告诉 driver "提交超过 shadow 才 ring"。
+            self.write_eventidx(ctx, qid, false, shadow);
+            self.last_eventidx_sq.insert(qid, shadow);
+            // **HIGH-2（host-thread liveness）**：本步发一次自续 re-read → 自续深度 +1。
+            // 撞顶（runaway：in-range 震荡 / garbage in-range shadow 步步使 shadow != processed）
+            // → 置 CFS + 收链，bound 同步 vfio 自喂为有限 ≤ 65536 次往返而非无限 hang。
+            // 正确 driver 的链在 ~几十次内 settle（≪ 1<<16）→ 永不误触。
+            let next_iters = iters + 1;
+            if next_iters >= Self::MAX_SHADOW_POLL_ITERS {
+                tracing::error!(
+                    qid,
+                    iters = next_iters,
+                    shadow,
+                    "DBBUF: SQ poll chain hit self-continuation DEPTH cap (runaway shadow); \
+                     setting CSTS.CFS"
+                );
+                self.csts |= csts::CFS;
+                self.shadow_poll_inflight.remove(&(qid, false));
+                self.shadow_ring_pending.remove(&(qid, false));
+                return;
+            }
+            // **re-read 闭合 race**：若 driver 在 "我读 shadow ~ 我写 eventidx" 窗口内又
+            // 提交，shadow 会再次领先 processed，下一次完成回调会再推进。
+            self.issue_shadow_read(ctx, qid, false, next_iters);
+        } else {
+            // 已追平。确保 eventidx==processed（仅在变化时写，免无谓 DMA + 防打转）。
+            if self.last_eventidx_sq.get(&qid).copied() != Some(processed) {
+                self.write_eventidx(ctx, qid, false, processed);
+                self.last_eventidx_sq.insert(qid, processed);
+            }
+            // **HIGH-1**：settle 前查"链在飞期间漏 ring"标记。若置位 → 清标记并**再 re-read
+            // 一次**（续链）而非 settle —— 把每个被丢的 ring 转成"再 poll 一次"，使落在
+            // settle 窗口内的提交必被下一读捕获。一次性：标记已 remove，故除非**新** ring
+            // 再置位否则不续链（无限链不可能）。
+            if self.shadow_ring_pending.remove(&(qid, false)) {
+                tracing::trace!(
+                    qid,
+                    processed,
+                    "DBBUF: settle 见漏 ring 标记 → 续一次 re-read（HIGH-1）"
+                );
+                // 续链：inflight 仍持有（未 remove）。这是一次自续 re-read → 自续深度 +1
+                // （**不**重置——重置只在 chain start）；同样受 host-thread-liveness 上限
+                // 约束（settle/advance 交替的 runaway 也被 bound）。
+                let next_iters = iters + 1;
+                if next_iters >= Self::MAX_SHADOW_POLL_ITERS {
+                    tracing::error!(
+                        qid,
+                        iters = next_iters,
+                        "DBBUF: SQ poll chain hit self-continuation DEPTH cap at settle-continue; \
+                         setting CSTS.CFS"
+                    );
+                    self.csts |= csts::CFS;
+                    self.shadow_poll_inflight.remove(&(qid, false));
+                    self.shadow_ring_pending.remove(&(qid, false));
+                    return;
+                }
+                self.issue_shadow_read(ctx, qid, false, next_iters);
+                return;
+            }
+            self.shadow_poll_inflight.remove(&(qid, false));
+            tracing::trace!(qid, processed, "DBBUF: SQ poll chain settled");
+        }
+    }
+
+    /// **CQ** shadow 轮询单步。post_cqe 从不在 CQ-full 上阻塞（fire-and-forget），故
+    /// CQ shadow 跳过 ≠ 挂死，仅"晚学到 head"。因此 CQ 侧**无需** race 循环：读 shadow
+    /// head → 更新 `cq.head` → 写 CQ eventidx = head（driver 据此在推进 head 时 ring，
+    /// 让 controller 及时学到释放的完成槽）→ 停。
+    ///
+    /// **HIGH-1**：CQ 也有"链在飞期间漏 ring"问题（`start_shadow_cq_poll` 见 inflight 时
+    /// 置 `shadow_ring_pending`）。停止前查标记：若置位 → 清标记并**再读一次** CQ shadow
+    /// （同 SQ 的一次性续读），把被丢的 CQ ring 转成"再学一次 head"而非等下一 tick。
+    fn handle_shadow_cq(&mut self, ctx: &mut DeviceCtx<'_>, qid: u16, shadow: u32) {
+        let size = self.cqs.get(&qid).map(|c| c.size).unwrap_or(0);
+        if size == 0 || shadow >= size {
+            tracing::error!(
+                qid,
+                shadow,
+                size,
+                "DBBUF: shadow CQ head out of range; ending poll chain"
+            );
+            self.shadow_poll_inflight.remove(&(qid, true));
+            self.shadow_ring_pending.remove(&(qid, true));
+            return;
+        }
+        if let Some(cq) = self.cqs.get_mut(&qid) {
+            cq.head = shadow;
+        }
+        // eventidx = 当前 head：driver 推进 head 越过此值即 ring（need_event 语义）。
+        self.write_eventidx(ctx, qid, true, shadow);
+        // **HIGH-1**：漏 ring 标记 → 续一次 CQ 读（一次性，标记已 remove）而非 settle。
+        if self.shadow_ring_pending.remove(&(qid, true)) {
+            tracing::trace!(
+                qid,
+                head = shadow,
+                "DBBUF: CQ settle 见漏 ring 标记 → 续一次 re-read（HIGH-1）"
+            );
+            self.issue_shadow_read(ctx, qid, true, 0); // CQ 不参与深度上限（同步 drain 下不自喂）
+            return;
+        }
+        self.shadow_poll_inflight.remove(&(qid, true));
+        tracing::trace!(qid, head = shadow, "DBBUF: CQ poll chain settled");
     }
 
     /// Dispatch SQE 单条命令。可能立即完成（构造 CQE 发出去）或入 pending（等
@@ -3115,6 +3541,22 @@ impl PcieDevice for NvmeController {
                 ctx.fire_interrupt(iv as u32);
             }
         }
+        // **DBBUF 安全网（spec § 7.13）** — doorbell-ring 路径是主路（poll 仅在被唤醒
+        // 时跑，延迟有界）；tick 这条是兜底：覆盖 *完全跳过* ring 的极端场景（driver
+        // 的 eventidx 已让它对某次提交不 ring，而我们因故没在 ring 路径起链）以及 CQ
+        // 侧 head 推进的周期学习。inflight guard 让"已有链在飞"时近乎零成本；DBBUF
+        // inactive 时下面 `dbbuf_active()` 直接短路，tick 不付任何 DBBUF 代价。
+        if self.dbbuf_active() {
+            // 收集 IO 队列 id（避开遍历时 &self 与 &mut self 冲突）。admin qid 0 不参与。
+            let sq_ids: Vec<u16> = self.sqs.keys().filter(|&q| q != 0).collect();
+            for qid in sq_ids {
+                self.start_shadow_sq_poll(ctx, qid);
+            }
+            let cq_ids: Vec<u16> = self.cqs.keys().filter(|&q| q != 0).collect();
+            for qid in cq_ids {
+                self.start_shadow_cq_poll(ctx, qid);
+            }
+        }
     }
 
     /// **H-3 修复** — DMA 完成派发委托到 `controller/completion.rs` 中的
@@ -3145,3 +3587,922 @@ pub(super) fn parse_prp_list(data: &[u8]) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests;
+
+/// **DBBUF（shadow doorbells, spec § 5.7 + § 7.13）单测** —— 用中立
+/// `pcie_device_core::CaptureTransport` 驱动 shadow 读/写，断言：
+/// 1. `need_event` 镜像（与 Linux `nvme_dbbuf_need_event` 同公式）+ 我们写的
+///    event_idx 选值确实让 driver 在"提交超过已消费"时才 ring；
+/// 2. poll-advances-SQ：shadow 领先时 controller 经 shadow fetch 到真 tail；
+/// 3. submit-during-window race：写 event_idx 后的 **re-read** 捕获窗口内的新提交
+///    （**revert 锚点** —— 去掉 re-read 此用例红）；
+/// 4. CQ 学 head + 写 CQ event_idx；
+/// 5. DBBUF inactive 时退回纯 MMIO 路径（行为不变）；stale MMIO value 被忽略。
+#[cfg(test)]
+mod dbbuf_tests {
+    use super::*;
+    use crate::regs::{SQE_BYTES, SubmissionQueue, csts};
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+
+    const SHADOW_GPA: u64 = 0x10_0000;
+    const EVENTIDX_GPA: u64 = 0x20_0000;
+    const SQ1_BASE: u64 = 0x2_0000;
+    const SQ_DEPTH: u32 = 64;
+
+    fn mk() -> NvmeController {
+        let path = std::env::temp_dir().join(format!(
+            "nvme_dbbuf_test_{}_{:?}.img",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(4 * 1024 * 1024).unwrap();
+        drop(f);
+        NvmeController::open(&[path.to_str().unwrap().to_string()], 0x1414, 0, &[]).unwrap()
+    }
+
+    /// enable + 装一条 IO SQ(qid=1) + 激活 DBBUF。
+    fn mk_dbbuf() -> NvmeController {
+        let mut c = mk();
+        c.csts |= csts::RDY;
+        c.sqs.insert(
+            1,
+            SubmissionQueue {
+                base_gpa: SQ1_BASE,
+                size: SQ_DEPTH,
+                head: 0,
+                tail: 0,
+                cq_id: 1,
+            },
+        );
+        c.doorbell_shadow_gpa = SHADOW_GPA;
+        c.doorbell_event_idx_gpa = EVENTIDX_GPA;
+        c
+    }
+
+    /// 在 `cap.events()[from..]` 里找最后一条对 `gpa` 的 DmaWrite，返回其 4 字节 LE 值。
+    fn last_eventidx_write(cap: &CaptureTransport, from: usize, gpa: u64) -> Option<u32> {
+        cap.events()[from..].iter().rev().find_map(|e| match e {
+            TransportEvent::DmaWrite { gpa: g, data, .. } if *g == gpa && data.len() == 4 => {
+                Some(u32::from_le_bytes([data[0], data[1], data[2], data[3]]))
+            }
+            _ => None,
+        })
+    }
+
+    /// 找 `cap.events()[from..]` 里**首条**对 `gpa` 的 DmaRead，返回其 token。
+    fn first_read_token(cap: &CaptureTransport, from: usize, gpa: u64) -> Option<u64> {
+        cap.events()[from..].iter().find_map(|e| match e {
+            TransportEvent::DmaRead { gpa: g, token, len } if *g == gpa && *len == 4 => {
+                Some(*token)
+            }
+            _ => None,
+        })
+    }
+
+    /// 统计 `cap.events()[from..]` 里对 `gpa` 的 4-byte DmaRead 次数（shadow 读次数）。
+    fn count_shadow_reads(cap: &CaptureTransport, from: usize, gpa: u64) -> usize {
+        cap.events()[from..]
+            .iter()
+            .filter(|e| {
+                matches!(e, TransportEvent::DmaRead { gpa: g, len, .. } if *g == gpa && *len == 4)
+            })
+            .count()
+    }
+
+    // ---------------- 1) need_event 镜像 + event_idx 选值正确性 ----------------
+
+    /// 与 Linux `nvme_dbbuf_need_event` 逐字节同公式（unsigned 16-bit wrap）。
+    fn need_event(event_idx: u16, new: u16, old: u16) -> bool {
+        (new.wrapping_sub(event_idx).wrapping_sub(1)) < (new.wrapping_sub(old))
+    }
+
+    #[test]
+    fn need_event_matches_kernel_formula_examples() {
+        // driver 从 old→new 提交；event_idx 是 controller 写回的值。
+        // 我们写 event_idx = processed（已消费到的 tail）。
+        // 关键不变式：当 controller 追平（event_idx == old == processed），driver 下一次
+        // 提交 new>old 必 ring。
+        assert!(need_event(5, 6, 5), "old==event_idx, 提交一条 → 必 ring");
+        assert!(need_event(5, 8, 5), "old==event_idx, 提交多条 → 必 ring");
+        // driver 已领先 controller（old > event_idx），再提交可能跳过 ring —— 这正是
+        // 我们必须靠 re-read 追平后才停的原因。
+        assert!(
+            !need_event(5, 7, 6),
+            "old(6) > event_idx(5) 且新值未越过窗口 → driver 跳过 ring"
+        );
+        // wrap：event_idx 接近 u16::MAX，new 绕回。
+        assert!(
+            need_event(65535, 0, 65535),
+            "wrap 边界：old==event_idx → ring"
+        );
+    }
+
+    /// 证明我们的 event_idx 选值（= processed_sq_tail）在 controller 追平后让 driver
+    /// 对**任何**新提交都 ring（即 race 已闭合，不会有"提交了却不 ring"的悬空命令）。
+    #[test]
+    fn settled_eventidx_forces_ring_on_any_new_submit() {
+        let processed: u16 = 10; // controller 已消费到 10，写 event_idx=10
+        // 队列深度 N 最多容纳 N-1 条 outstanding（tail==head 表示空，不表示满），故
+        // 有效新提交量 delta ∈ [1, N-1]；delta==N 即绕回同一 index（净 0 条，不算提交）。
+        for delta in 1..SQ_DEPTH as u16 {
+            let new = (processed + delta) % SQ_DEPTH as u16;
+            // 追平时 driver 的 old == processed（它上次提交也到这），event_idx==processed。
+            assert!(
+                need_event(processed, new, processed),
+                "追平后提交到 {new}（delta={delta}）必 ring（event_idx==old==processed）"
+            );
+        }
+    }
+
+    // ---------------- 2) poll-advances-SQ via shadow ----------------
+
+    #[test]
+    fn sq_poll_advances_via_shadow_and_writes_eventidx() {
+        let mut c = mk_dbbuf();
+        let mut cap = CaptureTransport::with_start_token(0x1000);
+
+        // driver ring 真 MMIO doorbell，但 value=0 是 STALE（它已把 shadow 推到 4
+        // 却因 need_event 跳过了把真值写进 MMIO）。
+        let pre = cap.events().len();
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_sq_tail_doorbell(&mut ctx, 1, 0); // stale MMIO value=0 → 应被忽略
+        }
+        // 应发起一次 shadow SQ 读（SQ offset = qid*8；qid=1 → 8）。
+        let sq_shadow_gpa = SHADOW_GPA + 8;
+        let tok = first_read_token(&cap, pre, sq_shadow_gpa).expect("应发起 shadow SQ 读");
+
+        // 完成 shadow 读：真 tail=4（领先 stale MMIO 0 与 processed 0）。
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_dma_complete_impl(&mut ctx, tok, true, 4u32.to_le_bytes().to_vec());
+        }
+        // 证明计数：shadow(4) 领先 last_mmio(0) → +1。
+        assert_eq!(
+            c.dbbuf_shadow_ahead_count, 1,
+            "shadow 领先 MMIO → ahead_count 自增（DBBUF 真行使）"
+        );
+        // 应据 shadow=4 发起 SQE fetch（从 processed=0 到 4，4 条，gpa=SQ1_BASE）。
+        let fetched = cap.events()[pre..].iter().any(|e| {
+            matches!(e, TransportEvent::DmaRead { gpa, len, .. }
+                if *gpa == SQ1_BASE && *len == 4 * SQE_BYTES as u32)
+        });
+        assert!(fetched, "应据 shadow=4 fetch 4 条 SQE");
+        // processed 推进到 4。
+        assert_eq!(
+            c.sqs.get(&1).unwrap().tail,
+            4,
+            "sq.tail(processed) 推进到 shadow=4"
+        );
+        // 写回 event_idx = 4（SQ offset = qid*8；qid=1 → 8）。
+        let ei_gpa = EVENTIDX_GPA + 8;
+        assert_eq!(
+            last_eventidx_write(&cap, pre, ei_gpa),
+            Some(4),
+            "event_idx 写回 = processed(4)"
+        );
+        // 推进分支后应**再发一次** shadow 读（re-read 闭合 race）。
+        let reread_token = {
+            // 找推进后第二次对 shadow 的读。
+            let reads: Vec<u64> = cap.events()[pre..]
+                .iter()
+                .filter_map(|e| match e {
+                    TransportEvent::DmaRead { gpa, token, len }
+                        if *gpa == sq_shadow_gpa && *len == 4 =>
+                    {
+                        Some(*token)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(reads.len() >= 2, "推进后应 re-read shadow（闭合 race）");
+            reads[1]
+        };
+
+        // 完成 re-read：shadow 仍是 4（无新提交）→ 链应终止（不再 re-read）。
+        let pre2 = cap.events().len();
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_dma_complete_impl(&mut ctx, reread_token, true, 4u32.to_le_bytes().to_vec());
+        }
+        // 终止：不应再有新的 shadow 读。
+        assert_eq!(
+            count_shadow_reads(&cap, pre2, sq_shadow_gpa),
+            0,
+            "shadow==processed → 链终止，不再 re-read"
+        );
+        // inflight 已清。
+        assert!(
+            !c.shadow_poll_inflight.contains(&(1, false)),
+            "链终止后 inflight 清除"
+        );
+    }
+
+    // ---------------- 3) submit-during-window race（revert 锚点）----------------
+
+    /// **核心 race 用例 / revert 锚点**：controller 读 shadow=4、推进、写 event_idx=4
+    /// 后 re-read；在 re-read 完成时 driver 已又提交到 6（窗口内提交，因 event_idx
+    /// 让它跳过了 ring）。re-read 必须捕获 6 并继续推进 —— 否则命令 4..6 永不 fetch
+    /// → 真 driver 挂死。去掉 `handle_shadow_sq` 的 re-read（step 4）此用例立刻红。
+    #[test]
+    fn sq_poll_reread_catches_submit_during_window() {
+        let mut c = mk_dbbuf();
+        let mut cap = CaptureTransport::with_start_token(0x2000);
+        let sq_shadow_gpa = SHADOW_GPA + 8;
+        let ei_gpa = EVENTIDX_GPA + 8;
+
+        let pre = cap.events().len();
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_sq_tail_doorbell(&mut ctx, 1, 0);
+        }
+        let tok = first_read_token(&cap, pre, sq_shadow_gpa).unwrap();
+        // 第一次 shadow 读 → 4。
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_dma_complete_impl(&mut ctx, tok, true, 4u32.to_le_bytes().to_vec());
+        }
+        assert_eq!(c.sqs.get(&1).unwrap().tail, 4);
+        // 取 re-read token。
+        let reread = cap.events()[pre..]
+            .iter()
+            .filter_map(|e| match e {
+                TransportEvent::DmaRead { gpa, token, len }
+                    if *gpa == sq_shadow_gpa && *len == 4 =>
+                {
+                    Some(*token)
+                }
+                _ => None,
+            })
+            .nth(1)
+            .expect("应有 re-read");
+
+        // **窗口内 driver 又提交到 6** → re-read 完成时读到 6（不是 4）。
+        let pre_catch = cap.events().len();
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_dma_complete_impl(&mut ctx, reread, true, 6u32.to_le_bytes().to_vec());
+        }
+        // 必须继续推进到 6（否则命令 4..6 丢失 → 挂死）。
+        assert_eq!(
+            c.sqs.get(&1).unwrap().tail,
+            6,
+            "re-read 捕获窗口内提交(6)并继续推进 —— race 闭合的关键"
+        );
+        // 应 fetch 4..6（2 条）。
+        let fetched_4_6 = cap.events()[pre_catch..].iter().any(|e| {
+            matches!(e, TransportEvent::DmaRead { gpa, len, .. }
+                if *gpa == SQ1_BASE + 4 * SQE_BYTES && *len == 2 * SQE_BYTES as u32)
+        });
+        assert!(fetched_4_6, "应 fetch SQE 槽位 4..6");
+        // event_idx 推进到 6。
+        assert_eq!(last_eventidx_write(&cap, pre_catch, ei_gpa), Some(6));
+        // 又一次 re-read（因又推进了）。
+        assert!(
+            count_shadow_reads(&cap, pre_catch, sq_shadow_gpa) >= 1,
+            "再次推进后再 re-read"
+        );
+        assert_eq!(
+            c.dbbuf_shadow_ahead_count, 2,
+            "两次 shadow 领先 → ahead_count=2"
+        );
+    }
+
+    // ---------------- 4) CQ 学 head + 写 CQ event_idx ----------------
+
+    #[test]
+    fn cq_poll_learns_head_and_writes_eventidx() {
+        let mut c = mk_dbbuf();
+        // 装一条 IO CQ(qid=1)。
+        c.cqs.insert(
+            1,
+            crate::regs::CompletionQueue {
+                base_gpa: 0x3_0000,
+                size: SQ_DEPTH,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 1,
+                interrupt_enabled: true,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        let mut cap = CaptureTransport::with_start_token(0x3000);
+        let cq_shadow_gpa = SHADOW_GPA + 8 + 4; // CQ offset = qid*8+4（qid=1 → 12）
+        let cq_ei_gpa = EVENTIDX_GPA + 8 + 4;
+
+        let pre = cap.events().len();
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_cq_head_doorbell(&mut ctx, 1, 0); // stale MMIO head
+        }
+        let tok = first_read_token(&cap, pre, cq_shadow_gpa).expect("应发起 shadow CQ 读");
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_dma_complete_impl(&mut ctx, tok, true, 7u32.to_le_bytes().to_vec());
+        }
+        // 学到真 head=7。
+        assert_eq!(c.cqs.get(&1).unwrap().head, 7, "经 shadow 学到真 CQ head=7");
+        // 写 CQ event_idx = 7。
+        assert_eq!(
+            last_eventidx_write(&cap, pre, cq_ei_gpa),
+            Some(7),
+            "CQ event_idx 写回 = head(7)"
+        );
+        // CQ 侧无 re-read 循环 → 仅一次 shadow 读。
+        assert_eq!(
+            count_shadow_reads(&cap, pre, cq_shadow_gpa),
+            1,
+            "CQ 侧单次读（无 race 循环）"
+        );
+        assert!(
+            !c.shadow_poll_inflight.contains(&(1, true)),
+            "CQ 链终止清 inflight"
+        );
+    }
+
+    // ---------------- 5) inactive → 纯 MMIO 路径不变；stale value 被忽略 ----------------
+
+    #[test]
+    fn dbbuf_inactive_uses_plain_mmio_fetch() {
+        let mut c = mk();
+        c.csts |= csts::RDY;
+        c.sqs.insert(
+            1,
+            SubmissionQueue {
+                base_gpa: SQ1_BASE,
+                size: SQ_DEPTH,
+                head: 0,
+                tail: 0,
+                cq_id: 1,
+            },
+        );
+        // DBBUF 未激活（两 GPA 仍 0）。
+        assert!(!c.dbbuf_active());
+        let mut cap = CaptureTransport::with_start_token(0x4000);
+        let pre = cap.events().len();
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_sq_tail_doorbell(&mut ctx, 1, 3); // MMIO value=3 → 直接信任
+        }
+        // 应直接 fetch 3 条 SQE（从 0 到 3），**无** shadow 读。
+        let direct_fetch = cap.events()[pre..].iter().any(|e| {
+            matches!(e, TransportEvent::DmaRead { gpa, len, .. }
+                if *gpa == SQ1_BASE && *len == 3 * SQE_BYTES as u32)
+        });
+        assert!(direct_fetch, "inactive：直接按 MMIO value=3 fetch");
+        assert_eq!(
+            c.sqs.get(&1).unwrap().tail,
+            3,
+            "inactive：sq.tail = MMIO value"
+        );
+        // 没有任何对 shadow 区的读。
+        assert_eq!(
+            count_shadow_reads(&cap, pre, SHADOW_GPA + 8),
+            0,
+            "inactive：不碰 shadow"
+        );
+    }
+
+    /// DBBUF active 时 `on_sq_tail_doorbell` 的 MMIO value 仅作"最近 MMIO doorbell"
+    /// 记录，**不**作 fetch 依据；真相全凭 shadow。
+    #[test]
+    fn active_ignores_stale_mmio_value_uses_shadow() {
+        let mut c = mk_dbbuf();
+        let mut cap = CaptureTransport::with_start_token(0x5000);
+        let sq_shadow_gpa = SHADOW_GPA + 8;
+        let pre = cap.events().len();
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            // 故意传一个"错"的 MMIO value=2；shadow 才是真值。
+            c.on_sq_tail_doorbell(&mut ctx, 1, 2);
+        }
+        // 记录了 last_mmio=2。
+        assert_eq!(c.last_mmio_sq_doorbell.get(&1).copied(), Some(2));
+        // 但 **没有** 按 value=2 直接 fetch（active 路径只发 shadow 读）。
+        let bad_direct = cap.events()[pre..].iter().any(|e| {
+            matches!(e, TransportEvent::DmaRead { gpa, len, .. }
+                if *gpa == SQ1_BASE && *len == 2 * SQE_BYTES as u32)
+        });
+        assert!(!bad_direct, "active：绝不按 stale MMIO value 直接 fetch");
+        // sq.tail 仍 0（要等 shadow 读完成才推进）。
+        assert_eq!(
+            c.sqs.get(&1).unwrap().tail,
+            0,
+            "active：未读 shadow 前 processed 不动"
+        );
+        // 完成 shadow 读 = 5 → 按 5（非 2）推进。
+        let tok = first_read_token(&cap, pre, sq_shadow_gpa).unwrap();
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_dma_complete_impl(&mut ctx, tok, true, 5u32.to_le_bytes().to_vec());
+        }
+        assert_eq!(
+            c.sqs.get(&1).unwrap().tail,
+            5,
+            "按 shadow=5 推进（证 shadow 是真相）"
+        );
+    }
+
+    /// inflight guard：一条链在飞时，重复 doorbell / tick 不再起新链（避免重复 fetch）。
+    #[test]
+    fn inflight_guard_suppresses_duplicate_chain() {
+        let mut c = mk_dbbuf();
+        let mut cap = CaptureTransport::with_start_token(0x6000);
+        let sq_shadow_gpa = SHADOW_GPA + 8;
+        let pre = cap.events().len();
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_sq_tail_doorbell(&mut ctx, 1, 0); // 起链（inflight set）
+            // 链尚未完成（shadow 读未回）。再来一次 doorbell + tick：
+            c.on_sq_tail_doorbell(&mut ctx, 1, 0);
+            c.tick(&mut ctx);
+        }
+        // 仅 1 次 shadow 读（后两次被 inflight guard 抑制）。
+        assert_eq!(
+            count_shadow_reads(&cap, pre, sq_shadow_gpa),
+            1,
+            "inflight 时不起重复链"
+        );
+    }
+
+    /// disable 清空所有 DBBUF in-flight 状态（含 GPA、inflight、缓存）。
+    #[test]
+    fn disable_clears_dbbuf_state() {
+        let mut c = mk_dbbuf();
+        c.shadow_poll_inflight.insert((1, false));
+        c.shadow_ring_pending.insert((1, false));
+        c.last_mmio_sq_doorbell.insert(1, 3);
+        c.last_eventidx_sq.insert(1, 3);
+        c.pending_shadow_polls.insert(
+            99,
+            ShadowPollCtx {
+                qid: 1,
+                is_cq: false,
+                iters: 0,
+            },
+        );
+        c.disable();
+        assert_eq!(c.doorbell_shadow_gpa, 0);
+        assert_eq!(c.doorbell_event_idx_gpa, 0);
+        assert!(!c.dbbuf_active());
+        assert!(c.shadow_poll_inflight.is_empty());
+        assert!(c.shadow_ring_pending.is_empty());
+        assert!(c.pending_shadow_polls.is_empty());
+        assert!(c.pending_eventidx_writes.is_empty());
+        assert!(c.last_mmio_sq_doorbell.is_empty());
+        assert!(c.last_eventidx_sq.is_empty());
+    }
+
+    // ---------------- 6) HIGH-1：async transport 下 settle 窗口漏 ring 修复 ----------------
+
+    /// 取 `pending_shadow_polls` 中 token 最大者（= 最近一次 issue 的 re-read）的上下文，
+    /// 用于在直接调 `handle_shadow_sq` 的循环里把链状态 `iters`（自续深度）回喂下一步。
+    fn latest_shadow_chain_ctx(c: &NvmeController) -> Option<ShadowPollCtx> {
+        c.pending_shadow_polls
+            .iter()
+            .max_by_key(|(tok, _)| **tok)
+            .map(|(_, ctx)| *ctx)
+    }
+
+    /// **HIGH-1 核心 race / revert 锚点**：OpenHCL 真异步 transport 下，doorbell-ring 帧
+    /// 与 re-read 的 DmaCompletion 帧逐条交错。可达漏 ring 链（reviewer 步骤 1-5）：
+    ///
+    /// 1. controller 已推进到 P 并发出 re-read R（eventidx=P，inflight 持有）。
+    /// 2. host 服务 R 时 driver 尚未存 shadow → R 完成将携带 shadow==processed==P。
+    /// 3. driver 提交槽 P：shadow:=P+1、读 eventidx=P、need_event(P,P+1,P)=true → **ring**。
+    /// 4. ring 帧先被 dispatch → `start_shadow_sq_poll` 见链在飞 → **置 pending 标记**
+    ///    （旧代码静默 return → ring 丢失）。
+    /// 5. R 完成 → `handle_shadow_sq` 见 shadow(P)==processed(P) → settle 分支：**因
+    ///    pending 标记置位 → 续一次 re-read** 而非 settle（旧代码直接 settle → 槽 P 要等
+    ///    下一次 ~5s tick 才 fetch = 延迟失速）。续读捕获 P+1 → 槽 P 被 fetch。
+    ///
+    /// **revert-verify**：去掉修复（settle 分支不查 pending / start 见 inflight 静默 return）
+    /// 后，第 5 步直接 settle 不续读 → 续读断言失败、槽 P 不被 fetch → 本用例红。
+    #[test]
+    fn high1_dropped_ring_during_settle_window_is_recovered() {
+        const P: u32 = 4;
+        let mut c = mk_dbbuf();
+        let mut cap = CaptureTransport::with_start_token(0x7000);
+        let sq_shadow_gpa = SHADOW_GPA + 8;
+
+        // —— 步骤 1：把 controller 推进到 processed=P 并令 re-read R 在飞 ——
+        // doorbell（DBBUF 下 MMIO value 仅作唤醒）。
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_sq_tail_doorbell(&mut ctx, 1, 0);
+        }
+        let first_tok = first_read_token(&cap, 0, sq_shadow_gpa).expect("应起 shadow 读");
+        // 完成首读 = P → 推进到 P、写 eventidx=P、发 re-read R。
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_dma_complete_impl(&mut ctx, first_tok, true, P.to_le_bytes().to_vec());
+        }
+        assert_eq!(c.sqs.get(&1).unwrap().tail, P, "processed 推进到 P");
+        assert!(
+            c.shadow_poll_inflight.contains(&(1, false)),
+            "re-read R 在飞，inflight 持有"
+        );
+        // 取 R 的 token（推进后第 2 次 shadow 读）。
+        let reread_r = cap.events()[0..]
+            .iter()
+            .filter_map(|e| match e {
+                TransportEvent::DmaRead { gpa, token, len }
+                    if *gpa == sq_shadow_gpa && *len == 4 =>
+                {
+                    Some(*token)
+                }
+                _ => None,
+            })
+            .nth(1)
+            .expect("应有 re-read R");
+
+        // —— 步骤 4：ring 帧先于 R 的完成被 dispatch（链在飞）→ 置 pending 标记 ——
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_sq_tail_doorbell(&mut ctx, 1, P); // driver ring（value 在 DBBUF 下被忽略）
+        }
+        assert!(
+            c.shadow_ring_pending.contains(&(1, false)),
+            "链在飞期间的 ring 被记成 pending（而非静默丢弃）"
+        );
+
+        // —— 步骤 5：R 完成，观察到 shadow==processed==P（driver 尚未让 host 看到 P+1）——
+        let pre_settle = cap.events().len();
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_dma_complete_impl(&mut ctx, reread_r, true, P.to_le_bytes().to_vec());
+        }
+        // 修复：settle 窗口见 pending → **续一次 re-read** 而非 settle。
+        assert_eq!(
+            count_shadow_reads(&cap, pre_settle, sq_shadow_gpa),
+            1,
+            "settle 窗口的漏 ring → 续一次 re-read（HIGH-1 修复）"
+        );
+        assert!(
+            !c.shadow_ring_pending.contains(&(1, false)),
+            "pending 一次性消费：续读后清除"
+        );
+        assert!(
+            c.shadow_poll_inflight.contains(&(1, false)),
+            "续读后链仍在飞（未 settle）"
+        );
+        // 取续读 token。
+        let reread_r2 = latest_shadow_chain_ctx(&c)
+            .map(|_| {
+                cap.events()[pre_settle..]
+                    .iter()
+                    .find_map(|e| match e {
+                        TransportEvent::DmaRead { gpa, token, len }
+                            if *gpa == sq_shadow_gpa && *len == 4 =>
+                        {
+                            Some(*token)
+                        }
+                        _ => None,
+                    })
+                    .expect("续读 token")
+            })
+            .expect("续读应已登记到 pending_shadow_polls");
+
+        // —— 续读完成：driver 的 P+1 现已可见 → 推进到 P+1、**fetch 槽 P** ——
+        let pre_fetch = cap.events().len();
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_dma_complete_impl(&mut ctx, reread_r2, true, (P + 1).to_le_bytes().to_vec());
+        }
+        assert_eq!(
+            c.sqs.get(&1).unwrap().tail,
+            P + 1,
+            "续读捕获窗口内提交(P+1)并推进 —— 槽 P 不再被搁置到下一 tick"
+        );
+        // 断言槽 P 的 SQE 被 fetch（1 条，gpa = SQ1_BASE + P*SQE_BYTES）。
+        let fetched_slot_p = cap.events()[pre_fetch..].iter().any(|e| {
+            matches!(e, TransportEvent::DmaRead { gpa, len, .. }
+                if *gpa == SQ1_BASE + P as u64 * SQE_BYTES && *len == SQE_BYTES as u32)
+        });
+        assert!(
+            fetched_slot_p,
+            "槽 P 的 SQE 被 fetch（HIGH-1：漏 ring 已转成续读捕获）"
+        );
+    }
+
+    /// HIGH-1 CQ 侧对位：链在飞期间漏的 CQ ring 在 settle 时续一次 CQ 读（学到新 head），
+    /// 而非等下一 tick。
+    #[test]
+    fn high1_cq_dropped_ring_recovered() {
+        let mut c = mk_dbbuf();
+        c.cqs.insert(
+            1,
+            crate::regs::CompletionQueue {
+                base_gpa: 0x3_0000,
+                size: SQ_DEPTH,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 1,
+                interrupt_enabled: true,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        let mut cap = CaptureTransport::with_start_token(0x7800);
+        let cq_shadow_gpa = SHADOW_GPA + 8 + 4;
+
+        // 起 CQ 链。
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_cq_head_doorbell(&mut ctx, 1, 0);
+        }
+        let tok = first_read_token(&cap, 0, cq_shadow_gpa).expect("应起 CQ shadow 读");
+        // 链在飞期间又来一次 CQ ring → 置 pending。
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_cq_head_doorbell(&mut ctx, 1, 0);
+        }
+        assert!(
+            c.shadow_ring_pending.contains(&(1, true)),
+            "CQ 链在飞期间的 ring 记成 pending"
+        );
+        // 完成首读 head=3 → settle 见 pending → 续一次 CQ 读。
+        let pre = cap.events().len();
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.on_dma_complete_impl(&mut ctx, tok, true, 3u32.to_le_bytes().to_vec());
+        }
+        assert_eq!(c.cqs.get(&1).unwrap().head, 3, "学到 head=3");
+        assert_eq!(
+            count_shadow_reads(&cap, pre, cq_shadow_gpa),
+            1,
+            "CQ 漏 ring → settle 时续一次 CQ 读（HIGH-1）"
+        );
+        assert!(
+            !c.shadow_ring_pending.contains(&(1, true)),
+            "CQ pending 一次性消费"
+        );
+    }
+
+    // ---------------- 7) HIGH-2：自续深度上限（host-thread liveness）----------------
+
+    /// **HIGH-2 / live-cap 锚点**：上限界定**单条链的自续深度**（本链发出的 re-read 总数），
+    /// 为同步 vfio drain 的 host-thread liveness 而设。两段证"深度 ≪ cap 的健康负载不误触"：
+    /// (a) **单条 modest-深度（≪ cap）链**做 1023 步**前进**推进（size=1024，不 wrap），
+    ///     回喂 `iters`，断言每步 `iters == step_tail`（**live 增量锚点**：自续深度逐步 +1）
+    ///     且全程 CFS 未置（1023 ≪ 1<<16 → 不撞顶）。**revert-verify** — 删掉 advance 分支的
+    ///     `iters += 1`（cap 退化），`iters` 恒 0 → `iters == step_tail` 断言（step≥1 时）立刻红。
+    /// (b) 跨**多条短链**累计推进数 **远超** `MAX_SHADOW_POLL_ITERS`（1<<16），断言 CFS 始终
+    ///     未置 —— 证**每条链在 chain start 重置深度**，故"持续高负载 over time"无论总量多大
+    ///     都不触 cap（这是 per-chain 深度上限下"sustained load 不误触"的真正保证）。
+    #[test]
+    fn high2_sustained_progress_never_trips_cfs() {
+        // —— (a) 单条 modest 链：size=1024，前进 1..=1023 不 wrap，深度逐步 +1 ——
+        let mut c = mk();
+        c.csts |= csts::RDY;
+        const BIG_DEPTH: u32 = 1024;
+        c.sqs.insert(
+            1,
+            SubmissionQueue {
+                base_gpa: SQ1_BASE,
+                size: BIG_DEPTH,
+                head: 0,
+                tail: 0,
+                cq_id: 1,
+            },
+        );
+        c.doorbell_shadow_gpa = SHADOW_GPA;
+        c.doorbell_event_idx_gpa = EVENTIDX_GPA;
+        let mut cap = CaptureTransport::with_start_token(0x8000);
+        c.shadow_poll_inflight.insert((1, false));
+        let mut iters = 0u32;
+        for step_tail in 1..BIG_DEPTH {
+            {
+                let mut ctx = DeviceCtx::new(&mut cap);
+                c.handle_shadow_sq(&mut ctx, 1, step_tail, iters);
+            }
+            let cx = latest_shadow_chain_ctx(&c).expect("续读应登记");
+            iters = cx.iters;
+            // **live 增量锚点**：每发一次自续 re-read，自续深度 +1（step_tail 从 1 起，
+            // 第 k 步发出第 k 次自续 → iters == k == step_tail）。
+            assert_eq!(iters, step_tail, "自续深度逐步 +1（step_tail={step_tail}）");
+            assert_eq!(c.csts & csts::CFS, 0, "深度 ≪ cap 全程不触 CFS");
+            c.pending_shadow_polls.clear(); // 防 map 膨胀
+        }
+
+        // —— (b) 多条短链，总推进 > cap，仍不触 CFS（每条链 chain start 重置深度）——
+        let mut c2 = mk_dbbuf();
+        let mut cap2 = CaptureTransport::with_start_token(0x8400);
+        let total_advances_target: u64 = (1u64 << 16) + 5_000;
+        let mut advances: u64 = 0;
+        while advances < total_advances_target {
+            c2.sqs.get_mut(&1).unwrap().tail = 0;
+            c2.shadow_poll_inflight.insert((1, false));
+            let mut it = 0u32; // 新链：深度从 0 起（模拟 start_shadow_sq_poll 的 seed）
+            for step_tail in 1..=4u32 {
+                {
+                    let mut ctx = DeviceCtx::new(&mut cap2);
+                    c2.handle_shadow_sq(&mut ctx, 1, step_tail, it);
+                }
+                advances += 1;
+                let cx = latest_shadow_chain_ctx(&c2).expect("续读应登记");
+                it = cx.iters;
+            }
+            {
+                let mut ctx = DeviceCtx::new(&mut cap2);
+                c2.handle_shadow_sq(&mut ctx, 1, 4, it); // settle
+            }
+            c2.pending_shadow_polls.clear();
+        }
+        assert!(advances > (1 << 16), "总推进确超 cap（{advances} > 65536）");
+        assert_eq!(
+            c2.csts & csts::CFS,
+            0,
+            "持续真进展（>65536 次，跨多链、每链深度重置）绝不触 CFS（HIGH-2）"
+        );
+    }
+
+    /// **HIGH-2 (a)：realistic max-depth wrap SETTLES → 永不误触**。最深队列（`size =
+    /// MAX_MAX_QUEUE_ENTRIES = 65536`）上，模拟 driver 每个 round-trip 提交一批 SQE
+    /// （大步前进），跨**一两整圈** ring wrap，最后 `shadow == processed` settle。断言
+    /// 全程 CFS CLEAR、自续深度始终 ≪ cap、链最终 settle（inflight 清除）。
+    ///
+    /// **为何关键**：证明真实重负载（max-depth 队列被反复 wrap）在**自续深度上限**下
+    /// **不**误触——一条正确 driver 的链在 ~几十次 re-read 内 settle（这里 ~32 步跨 2 圈，
+    /// 远 ≪ 1<<16）。深度上限只 bound **自喂不收敛**的 runaway（见配套的 oscillation 用例），
+    /// 不碰会 settle 的健康 wrap 负载。
+    #[test]
+    fn high2_realistic_maxdepth_wrap_settles_never_trips_cfs() {
+        let mut c = mk();
+        c.csts |= csts::RDY;
+        const MAXD: u32 = MAX_MAX_QUEUE_ENTRIES; // 65536
+        c.sqs.insert(
+            1,
+            SubmissionQueue {
+                base_gpa: SQ1_BASE,
+                size: MAXD,
+                head: 0,
+                tail: 0,
+                cq_id: 1,
+            },
+        );
+        c.doorbell_shadow_gpa = SHADOW_GPA;
+        c.doorbell_event_idx_gpa = EVENTIDX_GPA;
+        let mut cap = CaptureTransport::with_start_token(0xA000);
+        c.shadow_poll_inflight.insert((1, false));
+
+        // 每 round-trip driver 推进 STRIDE 条（< size，故每步 shadow != processed = 真前进）。
+        // 走 STEPS 步使总前向距离 ≈ STEPS*STRIDE 跨过 ~2 整圈（2*size = 131072）。
+        const STRIDE: u32 = 4096;
+        const STEPS: u32 = 2 * MAXD / STRIDE + 4; // ~36 步：越过 2 整圈
+        let mut iters = 0u32;
+        let mut prev: u32 = 0;
+        for step in 0..STEPS {
+            let shadow = (prev + STRIDE) % MAXD;
+            {
+                let mut ctx = DeviceCtx::new(&mut cap);
+                c.handle_shadow_sq(&mut ctx, 1, shadow, iters);
+            }
+            assert_eq!(
+                c.csts & csts::CFS,
+                0,
+                "健康 wrap 负载不得触 CFS（step={step} shadow={shadow}）"
+            );
+            let cx = latest_shadow_chain_ctx(&c).expect("续读应登记");
+            iters = cx.iters;
+            // 自续深度逐步 +1，但始终 ≪ cap（这条链 ~36 步就跨完 2 圈）。
+            assert_eq!(iters, step + 1, "自续深度逐步 +1（step={step}）");
+            assert!(
+                iters < NvmeController::MAX_SHADOW_POLL_ITERS,
+                "健康链深度始终 ≪ cap（iters={iters}）"
+            );
+            prev = shadow;
+            c.pending_shadow_polls.clear(); // 防 map 膨胀
+        }
+        // 现在 driver 不再提交：喂 shadow == processed（= prev）→ settle 分支。
+        // processed 此刻 == prev（上一步 advance 到 prev）。无 pending → 链 settle。
+        assert_eq!(c.sqs.get(&1).unwrap().tail, prev, "processed 已追到 prev");
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.handle_shadow_sq(&mut ctx, 1, prev, iters);
+        }
+        assert_eq!(
+            c.csts & csts::CFS,
+            0,
+            "跨 2 整圈后 settle，全程 CFS 仍 CLEAR（深度上限不误触健康 wrap）"
+        );
+        assert!(
+            !c.shadow_poll_inflight.contains(&(1, false)),
+            "shadow==processed 且无 pending → 链 settle（inflight 清除）"
+        );
+    }
+
+    /// **HIGH-2 (b)：in-range OSCILLATING 链 → 在 cap 处 TRIP CFS + 收链**（核心 blocker
+    /// 回归 + live-cap revert 锚点）。
+    ///
+    /// **blocker（reviewer 已确认、可达）**：vfio `dma_read` 同步——`handle_shadow_sq` 里
+    /// 每发一次自续 re-read，同一次 `drain_dma_completions` 立刻取到它的 completion。一个
+    /// in-range 震荡 guest shadow（2↔4，皆 < size；`advance_sq_to_tail` 把回退当 wrap 仍前进）
+    /// 令 `shadow != processed` 步步成立 → 自喂 drain 循环**无逃逸** → 旧 dead cap 下 host
+    /// 线程**永久** spin。新 live cap 在自续深度撞 `MAX_SHADOW_POLL_ITERS` 时置 CFS + 收链，
+    /// 把它 bound 成有限 ≤ 65536 次往返后停。
+    ///
+    /// **合成驱动**（**关键**：TEST 自身**不**能 infinite-loop）：经 `handle_shadow_sq`
+    /// 直接喂一段**有界**的震荡 shadow 序列、回喂自续深度，**不**依赖真同步 drain（那会
+    /// 把测试挂死）。硬上界 `feed_cap = MAX + 8` 兜底——若链未在界内自终止（CFS）即 panic
+    /// （= 探测到非终止）。
+    ///
+    /// **revert-verify**：把 advance 分支的 live `iters += 1`（cap 增量）删掉（cap 退化成
+    /// dead），震荡链在所喂序列内**永不** trip → 下方 "CFS set" 断言失败（或经 `feed_cap`
+    /// 兜底计数探测到非终止）；恢复增量 → 通过。
+    #[test]
+    fn high2_inrange_oscillating_chain_trips_cfs_at_cap() {
+        let mut c = mk_dbbuf(); // SQ size = SQ_DEPTH(64)
+        let mut cap = CaptureTransport::with_start_token(0xB000);
+        c.shadow_poll_inflight.insert((1, false));
+
+        // 震荡：2↔4（皆 < 64）。每步 shadow != processed → 永走 advance 分支 → 自续 +1。
+        const OSC: [u32; 2] = [2, 4];
+        // 链 start 已 seed 深度 0（issue read#0）；此处从首个 completion 起喂。
+        let mut iters = 0u32;
+        let mut tripped_at: Option<u32> = None;
+        // **有界**喂入：最多 MAX+8 次（远超必触点 = 第 MAX 次）。链应在界内自终止。
+        let feed_cap: u32 = NvmeController::MAX_SHADOW_POLL_ITERS + 8;
+        for i in 0..feed_cap {
+            let shadow = OSC[(i as usize) & 1];
+            // 记录本次"进入 handle_shadow_sq 的 incoming iters"——撞顶发生在 incoming
+            // iters == MAX-1（此时 next_iters == MAX → trip）。
+            let incoming = iters;
+            {
+                let mut ctx = DeviceCtx::new(&mut cap);
+                c.handle_shadow_sq(&mut ctx, 1, shadow, incoming);
+            }
+            if c.csts & csts::CFS != 0 {
+                tripped_at = Some(incoming);
+                break;
+            }
+            // 未 trip：取本链续读的自续深度回喂。
+            let cx = latest_shadow_chain_ctx(&c).expect("未 trip 时应已发续读");
+            iters = cx.iters;
+            c.pending_shadow_polls.clear(); // 防 map 膨胀（不影响链状态，已回喂 iters）
+        }
+
+        // 必须在有界序列内 TRIP（否则 = 非终止 / cap dead → revert-verify 红）。
+        let trip_incoming = tripped_at
+            .expect("in-range 震荡链必在喂入界内 trip CFS（若未 trip = live cap 失效 / 非终止）");
+        // **精确**：trip 发生在自续深度撞 cap 的那一步，即 incoming iters == MAX-1
+        // （next_iters == MAX）。证"在 EXACTLY MAX_SHADOW_POLL_ITERS 次 re-read 处终止"。
+        assert_eq!(
+            trip_incoming,
+            NvmeController::MAX_SHADOW_POLL_ITERS - 1,
+            "trip 发生在第 MAX 次自续 re-read（incoming depth == MAX-1 → next == MAX）"
+        );
+        assert_ne!(
+            c.csts & csts::CFS,
+            0,
+            "震荡 runaway 撞自续深度上限 → 置 CSTS.CFS"
+        );
+        // 撞顶后收链：inflight + pending 清除（与越界路径同款 fail-safe shutdown）。
+        assert!(
+            !c.shadow_poll_inflight.contains(&(1, false)),
+            "trip 后收链（inflight 清除）"
+        );
+        assert!(
+            !c.shadow_ring_pending.contains(&(1, false)),
+            "trip 后 pending 标记一并清除"
+        );
+    }
+
+    /// **HIGH-2 garbage guard**：自续深度上限只 bound **in-range** runaway（震荡/in-range
+    /// garbage 步步 `shadow != processed` 自喂，见配套 oscillating 用例——在 cap 处 trip）。
+    /// **越界** garbage（`shadow >= size`）则由 `handle_shadow_sq` 顶部的**越界守卫**单步
+    /// 即时置 CSTS.CFS 并收链，不必等深度上限。本用例锚定该越界守卫仍生效——它与深度上限
+    /// 互补，覆盖"一步即非法"的脏 shadow。
+    ///
+    /// **revert-verify**：若删掉 `handle_shadow_sq` 顶部的 `shadow >= size` 越界守卫，
+    /// 本用例的 CFS 断言立刻红（越界值不再被拦）。
+    #[test]
+    fn high2_out_of_range_shadow_trips_cfs_garbage_guard() {
+        let mut c = mk_dbbuf(); // SQ size = SQ_DEPTH(64)
+        let mut cap = CaptureTransport::with_start_token(0x9000);
+        c.shadow_poll_inflight.insert((1, false));
+        // 越界 shadow（>= size=64）：driver bug / 脏 shadow / 恶意值。单步即应置 CFS 收链。
+        let garbage = SQ_DEPTH; // == size → 越界（合法 tail ∈ [0, size)）
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.handle_shadow_sq(&mut ctx, 1, garbage, 0);
+        }
+        assert_ne!(
+            c.csts & csts::CFS,
+            0,
+            "越界 shadow（garbage）→ 经 shadow>=size 越界守卫立即置 CFS"
+        );
+        // 触发后链已收：inflight + pending 清除。
+        assert!(
+            !c.shadow_poll_inflight.contains(&(1, false)),
+            "garbage 触 CFS 后收链（inflight 清除）"
+        );
+        assert!(
+            !c.shadow_ring_pending.contains(&(1, false)),
+            "garbage 触 CFS 后 pending 标记一并清除"
+        );
+    }
+}

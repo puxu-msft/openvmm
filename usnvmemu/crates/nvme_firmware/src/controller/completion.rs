@@ -70,6 +70,21 @@ impl NvmeController {
         // 已抽出的纯函数 helpers：advance_zns_wp / check_zns_write /
         // check_zns_read / apply_zsa / check_zsa_transition /
         // should_fire_irq / build_zone_report。
+        //
+        // **DBBUF（spec § 7.13）token 派发** —— 必须在 `!ok` 通用清理**之前**：
+        // shadow-poll 读 / event_idx 写各有独立的 in-flight 表与 ok 处理（读失败要
+        // 收链而非走 IO 清理路径；event_idx 写完成静默消费）。它们不属于 pending_ios /
+        // pending_fetches。
+        if self.pending_eventidx_writes.remove(&token) {
+            // event_idx DMA-write 完成：无后续动作（成败都不影响正确性 —— 下次唤醒
+            // 会重读 shadow / 重写 eventidx）。仅静默消费 token，避免落 unknown-token 警告。
+            tracing::trace!(token, ok, "DBBUF: event_idx write completed");
+            return;
+        }
+        if let Some(p) = self.pending_shadow_polls.remove(&token) {
+            self.handle_shadow_poll_complete(ctx, p, ok, data);
+            return;
+        }
         if !ok {
             tracing::warn!(token, "DMA failed");
             // 清相关 pending（IO 或 fetch）

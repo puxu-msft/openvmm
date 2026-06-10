@@ -164,9 +164,18 @@ impl NvmeController {
         // K5: sanitize 跨 reset 撤回（spec § 5.26 'Sanitize Operation
         // Aborts on Reset'），last_status 保留作 history
         self.sanitize = None;
-        // K6: doorbell buffer 跨 reset 清（driver 重新配置）
+        // K6 / DBBUF: doorbell buffer 跨 reset 清（driver 重新配置）。连带清所有
+        // shadow-poll in-flight 状态：in-flight DMA 完成时其 token 已不在表中 →
+        // 静默走 unknown-token 路径（无害）；下次 enable + Doorbell Buffer Config
+        // 重新登记。
         self.doorbell_shadow_gpa = 0;
         self.doorbell_event_idx_gpa = 0;
+        self.pending_shadow_polls.clear();
+        self.pending_eventidx_writes.clear();
+        self.shadow_poll_inflight.clear();
+        self.shadow_ring_pending.clear();
+        self.last_mmio_sq_doorbell.clear();
+        self.last_eventidx_sq.clear();
         // K8: power state 重置到 PS0
         self.current_ps = 0;
         // M1: interrupt coalescing 重置默认（无 coalesce）

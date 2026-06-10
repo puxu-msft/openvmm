@@ -580,18 +580,14 @@ impl IdentifyController {
             .with_firmware_activate_firmware_download(true)
             .with_self_test(true)
             .with_ns_management(true) // Phase K3
-            // **真 QEMU 11 vfio-user guest e2e 修复（2026-06-10）** — **不**广告
-            // Doorbell Buffer Config (DBBUF)。spec § 5.7：controller 若广告 DBBUF，
-            // driver（Linux nvme）会启用 shadow doorbell——把 SQ/CQ tail/head 写到
-            // guest mem 的 shadow buffer，并据 controller 写回的 event_idx 决定**是否**
-            // ring 真 MMIO doorbell（省 VM-exit）。本教学 controller 只**存**了 shadow
-            // GPA 却**从不 poll / 不更新 event_idx**（admin.rs `not actively polled`），
-            // 于是 driver 的 `nvme_dbbuf_need_event` 误以为"controller 会轮询 shadow"，
-            // 对部分提交**跳过**真 doorbell → 那些命令永不被 fetch → IO 30s timeout
-            // （真 QEMU guest 实测：guest 的 partition-scan READ 卡死、命令 off-by-one）。
-            // 广告 false 后 driver 退回纯真-MMIO-doorbell 路径，controller 正确处理。
-            // 未来若真正实现 shadow 轮询，可重新置 true（须同时更新 event_idx）。
-            .with_doorbell_buffer_config(false)
+            // **DBBUF 真实现完成（2026-06-10）** — 广告 Doorbell Buffer Config（spec
+            // § 5.7 + § 7.13）。controller 现在真正 DMA-poll driver 的 shadow doorbell
+            // buffer 拿真 tail/head 并写回 event_idx（race-safe 循环见 controller/mod.rs
+            // `handle_shadow_sq`/`handle_shadow_cq`，admin.rs DOORBELL_BUFFER_CONFIG
+            // 激活），故 Linux nvme 启用 shadow doorbell 后命令不再被跳过的真 ring 卡住。
+            // 真 QEMU 11 vfio-user guest e2e 复验：DBBUF 行使（shadow 领先于 MMIO
+            // doorbell）且 GUEST_RESULT=PASS。
+            .with_doorbell_buffer_config(true)
             .with_directives(true) // Phase L4
             .with_get_lba_status(true) // Phase L5
             .with_security_send_security_receive(true); // Phase L5

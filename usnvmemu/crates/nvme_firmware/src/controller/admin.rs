@@ -1453,17 +1453,24 @@ impl NvmeController {
                 Some(Cqe::success(cid, 0, sq_head, phase))
             }
             admin_opc::DOORBELL_BUFFER_CONFIG => {
-                // **Phase K6** — NVMe spec § 5.7。PRP1 = shadow doorbell GPA，
-                // PRP2 = event idx GPA。我们存下来但不真做 polling（vsock
-                // 模型 MMIO 已 OK）；driver 信任 controller 偶尔会 poll。
+                // **DBBUF（spec § 5.7 Doorbell Buffer Config + § 7.13 shadow doorbells）**
+                // PRP1 = shadow doorbell buffer GPA（dbbuf_dbs）；PRP2 = event idx
+                // buffer GPA（dbbuf_eis）。存下二者即 **激活** DBBUF：此后 controller 不
+                // 再信任可能 stale 的 MMIO doorbell value，改 DMA-poll shadow 拿真
+                // tail/head 并写回 event_idx（race-safe 循环见 mod.rs
+                // `handle_shadow_sq` / `handle_shadow_cq`）。Linux nvme 据 event_idx 的
+                // `nvme_dbbuf_need_event` 决定是否 ring 真 doorbell（省 VM-exit）。
                 let prp1 = sqe.prp1;
                 let prp2 = sqe.prp2;
                 self.doorbell_shadow_gpa = prp1;
                 self.doorbell_event_idx_gpa = prp2;
+                // (重)配置 → 清上次写回的 event_idx 缓存，保证新 buffer 被重新写入
+                // （否则 last_eventidx_sq 残留会让 "已追平" 分支误判无需写）。
+                self.last_eventidx_sq.clear();
                 tracing::info!(
                     shadow = format_args!("{:#x}", prp1),
                     event_idx = format_args!("{:#x}", prp2),
-                    "Doorbell Buffer Config (stored, not actively polled)"
+                    "Doorbell Buffer Config: DBBUF activated (shadow doorbells polled)"
                 );
                 Some(Cqe::success(cid, 0, sq_head, phase))
             }

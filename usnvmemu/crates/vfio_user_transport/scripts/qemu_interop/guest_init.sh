@@ -40,4 +40,27 @@ if [ "$RB" = "$MARKER" ]; then
 else
     echo "GUEST_RESULT=FAIL_MISMATCH rb=[$RB]"
 fi
+
+# ---- DBBUF stress burst (NOT part of the PASS oracle above) ----
+# Provoke the Linux nvme driver into SKIPPING a real doorbell ring via shadow
+# doorbells: with 2 vCPUs hammering the single IO queue, one CPU rings while the
+# other submits back-to-back and may read a *stale* event_idx (controller hasn't
+# written it yet) → nvme_dbbuf_need_event returns false → no MMIO ring → shadow
+# tail ends up AHEAD of the last real doorbell. The controller must catch that via
+# the shadow (server.log: "advanced via shadow AHEAD of last MMIO doorbell").
+# Writers target HIGH offsets (seek>=1024 sectors) so they never clobber the LBA0
+# marker / readback region the PASS oracle above already validated.
+echo "GUEST: DBBUF burst (concurrent writers on 2 vCPUs)…"
+i=0
+while [ $i -lt 8 ]; do
+    # each background writer: many small back-to-back writes → submission pressure
+    ( j=0; while [ $j -lt 64 ]; do
+        dd if=/dev/zero of=/dev/nvme0n1 bs=512 count=1 seek=$((1024 + i * 64 + j)) 2>/dev/null
+        j=$((j + 1))
+      done ) &
+    i=$((i + 1))
+done
+wait
+sync
+echo "GUEST: DBBUF burst done"
 poweroff -f

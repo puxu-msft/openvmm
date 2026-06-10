@@ -647,6 +647,14 @@ pub(crate) fn validate_dma_reply(
 
 /// server-initiated msg_id 分配器：顶位 `0x8000` 起始，便于日志区分；
 /// `next_server_msg_id` 由 caller (VfioUserSession) 持有。
+///
+/// **LOW-2（DBBUF 负载放大说明）**：firmware 广告 OACS Doorbell Buffer Config 后，
+/// 每次 SQ/CQ 提交 controller 都可能多发一组 shadow-doorbell DMA（读 shadow + 写
+/// event_idx），这把经本 transport 的 DMA-op 速率成倍放大 → `0x8000..=0xFFFF`
+/// （32768 值）这段 server msg_id 空间在更高速率下成为**承载关键**。仍然安全：任一
+/// 时刻 outstanding 的 server-initiated 请求数极小（DMA 同步往返、逐条完成），值在
+/// 绕回复用前早已周转过千万次，不会与在飞 id 撞。但若未来把 DMA 改成大批量并发在飞，
+/// 需重新核对此空间容量。
 pub(crate) fn alloc_server_msg_id(next: &mut u16) -> u16 {
     let v = *next;
     // wraparound 后跳回 0x8000；保顶位 1。

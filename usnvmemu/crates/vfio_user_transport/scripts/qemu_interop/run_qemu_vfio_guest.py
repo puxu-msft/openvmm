@@ -105,6 +105,12 @@ def main() -> int:
                 qemu_bin,
                 "-machine", "q35,accel=kvm:tcg",
                 "-cpu", "host",
+                # 2 vCPU：让两个提交者并发命中**同一** IO 队列。一个 vCPU ring 真
+                # doorbell 后，另一个抢到 sq_lock 立刻提交并读 event_idx —— 若读到的是
+                # controller 尚未写回的 *stale* event_idx，Linux `nvme_dbbuf_need_event`
+                # 让它**跳过**真 ring（shadow 领先 MMIO）。这正是 DBBUF 要被真正行使、
+                # controller 必须经 shadow 追上的场景（单 vCPU 串行 IO 几乎不触发）。
+                "-smp", "2",
                 "-m", "512M",
                 "-object", "memory-backend-memfd,id=mem,size=512M,share=on",
                 "-machine", "memory-backend=mem",

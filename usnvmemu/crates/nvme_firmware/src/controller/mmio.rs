@@ -154,7 +154,7 @@ impl NvmeController {
                     if is_sq {
                         self.on_sq_tail_doorbell(ctx, qid, value as u32);
                     } else {
-                        self.on_cq_head_doorbell(qid, value as u32);
+                        self.on_cq_head_doorbell(ctx, qid, value as u32);
                     }
                 }
             }
@@ -231,25 +231,25 @@ mod addr_reg_tests {
         assert_eq!(cfg[cap_ptr], MSIX_CAP_ID, "CapPtr 指向 MSI-X cap_id");
     }
 
-    /// **真 QEMU 11 vfio-user guest e2e 修复（2026-06-10）回归** — controller **不**
-    /// 广告 OACS Doorbell Buffer Config（bit 8）。我们只存 shadow GPA 却从不 poll，
-    /// 广告会让 Linux nvme 启用 shadow doorbell → 对部分提交跳过真 MMIO doorbell →
-    /// 命令永不 fetch → IO 30s timeout。OACS bit8 必须为 0。
+    /// **DBBUF 真实现完成（2026-06-10）** — controller **广告** OACS Doorbell Buffer
+    /// Config（bit 8）。shadow doorbell 轮询已真正实现（controller DMA-poll driver 的
+    /// shadow buffer 拿真 tail/head 并写回 event_idx），故 Linux nvme 启用 shadow
+    /// doorbell 后命令不再被跳过的真 ring 卡住。OACS bit8 必须为 1。
     #[test]
-    fn identify_controller_does_not_advertise_dbbuf() {
+    fn identify_controller_advertises_dbbuf() {
         use crate::cmd::IdentifyController;
         let c = mk();
         // 真实 enumeration 走 build_v2_bytes_with_cntrltype（admin.rs 用它）；OACS
         // 在 Identify Controller 数据结构 offset 256（u16, little-endian）。
         let bytes = IdentifyController::build_v2_bytes_with_cntrltype(c.vid, c.ssvid, 1, 0x01, 0);
         let oacs = u16::from_le_bytes([bytes[256], bytes[257]]);
-        assert_eq!(
+        assert_ne!(
             oacs & (1 << 8),
             0,
-            "OACS bit8 (Doorbell Buffer Config) 必须为 0（shadow doorbell 未实现轮询）"
+            "OACS bit8 (Doorbell Buffer Config) 必须为 1（shadow doorbell 轮询已实现）"
         );
-        // 其它 OACS 能力仍在（非全清）——controller 仍广告 Format/FW/Self-test 等。
-        assert_ne!(oacs, 0, "OACS 不应全 0（只清 DBBUF，保留其它能力）");
+        // 其它 OACS 能力仍在——controller 仍广告 Format/FW/Self-test 等。
+        assert_ne!(oacs, 0, "OACS 不应全 0（保留全部能力）");
     }
 
     /// **通用机制（回归 "64-bit 寄存器写/读无视 size 而截断" 这一整类 bug，由
