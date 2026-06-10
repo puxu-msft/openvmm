@@ -20,7 +20,7 @@
   每个**复制 nvme_spec 的常量**（sc / admin_opc / nvm_opc / fid / regs::Reg / pi SC byte）编译/测试期锚到
   canonical `nvme_spec`，drift 即红。**一加上就抓出真 bug**（`GET_LBA_STATUS=0x1e` 应 0x86）。
   *新增任何 spec 常量 → 顺手 anchor。*
-- **M2 布局锚定** *(部分完成，见 follow-up)* — log/report 字节布局用 `#[repr(C)]` struct + `offset_of!`
+- **M2 布局锚定** *(SMART Figure 207 + error-log Figure 205 已锚；ZNS-Id/resv-report 待)* — log/report 字节布局用 `#[repr(C)]` struct + `offset_of!`
   锚到 spec figure（替代"test 照抄 builder"的自洽假锚）。
 - **M3 proptest** — `pt_*`：纯/近纯函数随机输入 + **独立 oracle** 不变量（copy-conflict 的 u128 brute /
   CRC 的 crc crate / SGL parser no-panic / ZNS 矩阵 / parse_prp_list 恒等 / PI 往返）。
@@ -60,7 +60,7 @@ rustup component add llvm-tools-preview   # llvm-cov 需要
 
 ## Follow-up（按 LESSONS §30：清理 ≠ 删 scaffolding；不 speculative wire）
 
-- **M2 布局 struct**（未完）：SMART log / error-log entry / ZNS Identify / reservation report 写成
+- **M2 布局 struct**（SMART+error-log 已做，ZNS-Id+resv 待）：ZNS Identify / reservation report 写成
   `#[repr(C)]` + `offset_of!` 锚 spec figure +（有真设备时）golden wire 字节。当前这些是手填 offset +
   自洽测试（test 照抄 builder，测不出 spec-vs-impl 偏移）。
 - **剩余无牙测试上牙**：`o3_fused_cw_dispatch_chain_smoke`（断言 events 空=啥也没测）、
@@ -70,5 +70,5 @@ rustup component add llvm-tools-preview   # llvm-cov 需要
   门（NAMESPACE_NOT_READY）、boot-partition（BOOT_PARTITION_WRITE_PROHIBITED）、CMB
   （SGL_INVALID_USE_OF_CMB）—— 这 4+2 个 sc 常量是 spec-complete scaffolding，**已锚定**，对应特性
   做时再 emit。
-- **错误码普查扩展**：M4 矩阵当前覆盖 5 个高价值同步码；reservation 分支 / NS-attach 族 / zone 限额 /
+- **错误码普查扩展**：M4 矩阵当前覆盖 6 个同步码（含 SANITIZE）；reservation 分支 / NS-attach 族 / zone 限额 /
   PI media SCT=2 的 driven 断言可继续加（async completion 路径需 DeviceCtx 驱动）。

@@ -262,6 +262,58 @@ fn smart_log_offsets_anchored_to_spec_figure() {
     );
 }
 
+/// **M2 布局锚定（Wave 7）** — Error Information Log Entry 锚到 **NVMe 2.0c
+/// Figure 205**（64 字节）。同 SMART 的机制：repr(C,packed) 独立转写 → offset_of!
+/// 双校 spec figure → 读 builder 输出。
+#[test]
+fn error_log_entry_offsets_anchored_to_spec_figure() {
+    use std::mem::offset_of;
+    #[repr(C, packed)]
+    struct ErrorLogEntryLayout {
+        error_count: u64,  // 0
+        sq_id: u16,        // 8
+        cid: u16,          // 10
+        status_field: u16, // 12
+        param_loc: u16,    // 14
+        lba: u64,          // 16
+        nsid: u32,         // 24
+        _vendor: [u8; 36], // 28..64
+    }
+    assert_eq!(offset_of!(ErrorLogEntryLayout, error_count), 0);
+    assert_eq!(offset_of!(ErrorLogEntryLayout, sq_id), 8);
+    assert_eq!(offset_of!(ErrorLogEntryLayout, cid), 10);
+    assert_eq!(offset_of!(ErrorLogEntryLayout, status_field), 12);
+    assert_eq!(offset_of!(ErrorLogEntryLayout, param_loc), 14);
+    assert_eq!(offset_of!(ErrorLogEntryLayout, lba), 16);
+    assert_eq!(offset_of!(ErrorLogEntryLayout, nsid), 24);
+    assert_eq!(std::mem::size_of::<ErrorLogEntryLayout>(), 64);
+
+    let mut c = make_ctrl_with_tmp("errlog_anchor");
+    c.stat_num_err_log_entries = 1;
+    c.push_error_log(0x0007, 0x0042, 0x0050, 0xABCD, 0x3);
+    let buf = super::logs::build_error_info(&c, 64);
+    let rd16 = |off: usize| u16::from_le_bytes(buf[off..off + 2].try_into().unwrap());
+    assert_eq!(rd16(offset_of!(ErrorLogEntryLayout, sq_id)), 0x0007);
+    assert_eq!(rd16(offset_of!(ErrorLogEntryLayout, cid)), 0x0042);
+    assert_eq!(rd16(offset_of!(ErrorLogEntryLayout, status_field)), 0x0050);
+    assert_eq!(
+        u64::from_le_bytes(
+            buf[offset_of!(ErrorLogEntryLayout, lba)..][..8]
+                .try_into()
+                .unwrap()
+        ),
+        0xABCD
+    );
+    assert_eq!(
+        u32::from_le_bytes(
+            buf[offset_of!(ErrorLogEntryLayout, nsid)..][..4]
+                .try_into()
+                .unwrap()
+        ),
+        0x3
+    );
+}
+
 /// Phase E (M2 修复后)：parse_prp_list 不再 0 终止 — 返回所有 entry，
 /// caller 用 total_pages 自行截断。GPA = 0 是合法地址，不能视作终止。
 #[test]
