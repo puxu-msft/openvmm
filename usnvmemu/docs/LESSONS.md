@@ -572,3 +572,35 @@ R2T 发**错 cccid** → 比错 buffer → **静默 CAS corruption**。还有 HI
 capture-based BLOCK HIGH-1/2/3 → hoisted 重设计 APPROVE）；firmware 单元
 `fused_cas_atomic_compare_and_write`（FAIL→backing 不变 原子性不变量）+ wire e2e
 `fused_cw_e2e.py` 9 检查含对抗状态机。
+
+## 25. spec 常量值（SC/offset）必须 anchor 到 canonical 源, 手填的迟早错 (HIGH)
+
+**症状**: SGL R2d 收尾时给 `sc::` 的 SGL status code 写 anchored 测试（每个常量 ==
+`nvme_spec::Status::*.0`），一跑就红：R1 把 SGL SC **全部手填错**——
+`SGL_DESCRIPTOR_TYPE_INVALID` 填 0x15（实为 OPERATION_DENIED）、`..NUMBER_OF_
+DESCRIPTORS` 填 0x14（实为 ATOMIC_WRITE_UNIT_EXCEEDED）、CMB 0x16（实为
+SGL_OFFSET_INVALID）、granularity 0x17（实为 RESERVED）。连带 reviewer 又揪出
+`SANITIZE_IN_PROGRESS=0x12`（应 0x1d Generic）是 **live wire bug**：Sanitize-in-
+progress 完成包以 SC 0x12 = Invalid Use of CMB 发出，真 driver 误解。
+
+**为什么长期没暴露**: SGL「极少被真驱动跑到」（[[scope]]：OpenHCL+fabric 都走 PRP），
+错的 SC 从没被对照过。doc comment 还信誓旦旦写「spec § 4.6.1.2.1 Generic SC 0x15」
+——自己编的注释给自己背书（[[lesson §22]] 同模式：用不可信源自证）。
+
+**根治**: `cmd.rs::sc` 既然 crate 已依赖仓库内 canonical `nvme_spec`，就把每个 SC 常量
+**编译期 anchor** 到 `nvme_spec::Status::X.0`——drift 即测试红。Command-Specific 码
+（spec 值在 0x1xx）用 `& 0xff` 取 SC byte，emit 时配 `SCT_COMMAND_SPECIFIC`。这与
+[[lesson §1]] 的 `offset_of!` 锚定是**同一把尺子**：spec 数值（offset / SC / field
+位）一律不手抄，绑到 canonical 源，让 build 替你查。
+
+**三条**:
+1. **任何 spec 数值（SC、offset、bit 位、长度）手填 = 迟早错且静默**。有 canonical
+   源（nvme_spec / kernel header / libnvme）就 anchor；没有就 `offset_of!` / 真 wire
+   字节捕获自锚。手算/手抄的 confidence 是假的（[[lesson §1]][[lesson §17]] 同源）。
+2. **自己写的 doc comment 不是 spec**。「spec SC 0x15」这种注释是作者当时的理解，可能
+   就是 bug 本身；校验得回 canonical 源，不是回自己的注释。
+3. **anchored 测试是低成本高杠杆**：一个 `assert_eq!(ours, canonical)` 把一整类「手填
+   错值」挡在编译期。新增 spec 常量就顺手 anchor，别等真驱动跑到才发现。
+
+**来源**: SGL R2d（commit `2babf32a`）；anchored 测试 `sgl_status_codes_match_nvme_spec`；
+reviewer 2 轮（HIGH 0x12 collision + live Sanitize bug → 校正 + 扩 anchor）。

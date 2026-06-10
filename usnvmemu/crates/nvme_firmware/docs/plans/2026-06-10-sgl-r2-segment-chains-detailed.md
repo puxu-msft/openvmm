@@ -1,9 +1,12 @@
 # Plan — SGL R2：Segment chains + Bit Bucket（完整 SGL 数据路径）
 
-> 状态：📋 SCOPED（2026-06-10）。**先决已做**：advertise⟺implement 对齐（SGLS
-> over-advertise 的 Bit Bucket/byte-aligned 已清，commit 见 git log）。本 plan 是把
-> SGL 从 R1（inline 单 Data Block）补到 R2（任意 segment chain），补完后再把 SGLS
-> bit16/17 加回。
+> 状态：✅ **DONE（2026-06-10）**。R2a/b/c/d 全段完成并各过 rust-reviewer + revert-verify。
+> commits：R2a 83b0cdf4 / R2b 059de7cd / R2c 9240ff87 / R2d 2babf32a。100 lib + 16 e2e
+> pass，clippy 0 warning。SGLS bit16 已回填，advertise⟺implement 重新对齐。
+> **R2d 附带收获**：anchored 测试（sc:: ↔ nvme_spec::Status）暴露并校正了 R1 把 SGL SC
+> 全手填错（0x14-0x17 实为别的码）+ SANITIZE_IN_PROGRESS=0x12 的 live wire bug。
+>
+> 原始 scope（已全部落地）：
 > 类型：niche（OpenHCL + fabric 两接入都走 PRP 进 controller，SGL 极少被驱动）但真
 > spec completion；silent-corruption-class（数据路径）—— 须完整严谨循环。
 
