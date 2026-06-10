@@ -28,13 +28,17 @@
 //!                 0x2-0xF = reserved / vendor
 //! ```
 //!
-//! ## 教学限制
+//! ## 教学限制（R1，2026-06-10 校正 advertise⟺implement）
 //!
-//! 当前实现：
-//! - Data Block (Type 0) + Bit Bucket (Type 1) 完整支持
-//! - Segment / Last Segment (Type 2/3) 通过 controller-side 解析支持
-//! - Keyed Data Block / Transport-specific: 返 SGL_DESCRIPTOR_TYPE_INVALID
-//!   （这些是 NVMe over Fabrics 专属，本地 PCIe 不用）
+//! `io.rs::resolve_data_pointers` 当前**只**接受 PSDT=01 的 **inline 单 Data Block
+//! (Type 0)、sub_type=0 (Address)、length ≤ 1 page**，映射成单 PRP 复用 PRP 路径。
+//! 其余一律返 SGL_DESCRIPTOR_TYPE_INVALID：
+//! - Bit Bucket (Type 1) / Segment / Last Segment (Type 2/3)：**未 wire**
+//!   （`parse_sgl_list` + `flatten_data_blocks` 是 R2 scaffolding，dead-code 待接）。
+//!   SGLS 也已不 advertise Bit Bucket（一致性，见 `cmd.rs` sgls）。
+//! - Keyed Data Block / Transport-specific：NVMe-oF 专属，本地 PCIe 不用。
+//! - PSDT=10 (Segment pointer)：留 R2，见
+//!   `docs/plans/2026-06-10-sgl-r2-segment-chains-detailed.md`。
 
 /// SGL Descriptor Type (high nibble of byte 15)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

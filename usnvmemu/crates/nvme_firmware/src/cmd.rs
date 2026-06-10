@@ -637,15 +637,18 @@ impl IdentifyController {
         id.anacap = 0x0F; // optimized + non-opt + inaccessible + persistent loss states 都支持
         id.anagrpmax = 1; // 最多 1 ANA group
         id.nanagrpid = 1; // 当前 1 ANA group active
-        // **Phase R3** — SGLS (SGL Support) field (spec § 5.17.2.2)。
+        // **Phase R3 + 2026-06-10 advertise⟺implement 对齐** — SGLS (SGL Support)
+        // field (spec § 5.17.2.2)。
         // bits 1:0 = 01 (SGL supported, no alignment requirements 不强制对齐)
-        // bit 2     = 0 (Keyed SGL Data Block not supported — NVMe-oF only)
-        // bit 16    = 1 (SGL Bit Bucket descriptor supported)
-        // bit 17    = 1 (SGL Byte-Aligned 即 length 任意，与 PRP page-aligned 区别)
-        // bit 19    = 0 (SGL transport data block 不支持)
-        // 教学：driver Set PSDT=01 后我们走 R1 inline-Data-Block 路径；多
-        // fragment / Segment chain 仍返 INVALID 让 driver 拆小 IO 或回 PRP。
-        id.sgls = 0x0003_0001;
+        //
+        // **修正**：原值 0x0003_0001 还置了 bit 16(Bit Bucket descriptor supported) +
+        // bit 17(byte-alignment / granularity 相关位，spec § 5.1.13.2)，但
+        // `io.rs::resolve_data_pointers` **显式拒绝** Bit Bucket、Segment、> 1 page Data
+        // Block（R1 只实现 inline 单 Data Block sub_type=0 ≤1page）。over-advertise 会让
+        // "按 SGLS 用 Bit Bucket"的 driver 收到 SGL_DESCRIPTOR_TYPE_INVALID。现只 advertise
+        // R1 真支持的 basic SGL Data Block（bits 1:0=01），bit 16/17 清零。完整 Bit Bucket +
+        // Segment 链(R2)见 docs/plans/2026-06-10-sgl-r2-segment-chains-detailed.md。
+        id.sgls = 0x0000_0001;
         // **Phase S3** — Atomic Write Unit (NVMe spec § 5.15.2.2 + § 4.10)。
         // AWUN/AWUPF/ACWU 都是 0-based：值 N → N+1 LBAs。
         //   awun  = 全 NS power-loss safe atomic write 上限

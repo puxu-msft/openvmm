@@ -2012,15 +2012,62 @@ fn psdt_segment_pointer_rejected() {
     assert_eq!(r, Err(crate::cmd::sc::SGL_DESCRIPTOR_TYPE_INVALID));
 }
 
-/// **Phase R3** — IdentifyController.sgls advertise (bits 1:0 = 01 + Bit Bucket + byte-aligned)
+/// **advertise⟺implement** — inline Bit Bucket (Type 1) 被拒（故 SGLS 不 advertise bit16）。
 #[test]
-fn identify_controller_advertises_sgl() {
+fn sgl_inline_bit_bucket_rejected() {
+    use crate::controller::io::resolve_data_pointers;
+    let zero = [0u8; 64];
+    let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+    sqe.cdw0 = 0x0042_4002; // PSDT=01
+    sqe.prp1 = 0xCAFE_1000; // descriptor address
+    // descriptor byte 15 (= SQE byte 39 = prp2 高字节) = 0x10 → Type=1 Bit Bucket, sub=0。
+    sqe.prp2 = (0x10u64 << 56) | 4096; // length=4096 + ID 0x10
+    assert_eq!(
+        resolve_data_pointers(&sqe),
+        Err(crate::cmd::sc::SGL_DESCRIPTOR_TYPE_INVALID)
+    );
+}
+
+/// **advertise⟺implement** — inline Data Block > 1 page 被拒（故 SGLS 不 advertise 任意 length）。
+#[test]
+fn sgl_inline_data_block_over_one_page_rejected() {
+    use crate::controller::io::resolve_data_pointers;
+    let zero = [0u8; 64];
+    let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+    sqe.cdw0 = 0x0042_4002; // PSDT=01
+    sqe.prp1 = 0xCAFE_1000;
+    sqe.prp2 = 8192; // length=8192 (>1 page)，ID byte=0 (Data Block sub 0)
+    assert_eq!(
+        resolve_data_pointers(&sqe),
+        Err(crate::cmd::sc::SGL_DESCRIPTOR_TYPE_INVALID)
+    );
+}
+
+/// **2026-06-10 advertise⟺implement 一致** — IdentifyController.sgls 只 advertise R1 真
+/// 实现的 basic SGL Data Block（bits 1:0=01）。**不**置 Bit Bucket(bit16) / byte-aligned
+/// (bit17)，因为 `resolve_data_pointers` 显式拒绝它们（见上面 sgl_inline_* / psdt_* 测试）。
+/// 原值 0x0003_0001 over-advertise → 按 SGLS 用 Bit Bucket 的 driver 会收
+/// SGL_DESCRIPTOR_TYPE_INVALID。完整 advertise 需先实现 R2（segment chains + Bit Bucket）。
+#[test]
+fn identify_controller_sgls_matches_impl() {
     let buf = IdentifyController::build_v2_bytes(0x1414, 0xc0de, 1);
     // SGLS @ offset 536..540 (NVMe 2.0c Identify Controller Figure 282)
     let sgls = u32::from_le_bytes(buf[536..540].try_into().unwrap());
-    assert_eq!(sgls & 0x0003, 0x0001, "SGL Supported bits 1:0 = 01");
-    assert!(sgls & (1 << 16) != 0, "Bit Bucket supported");
-    assert!(sgls & (1 << 17) != 0, "Byte-aligned supported");
+    assert_eq!(
+        sgls & 0x0003,
+        0x0001,
+        "bits 1:0=01 (R1 inline Data Block 支持)"
+    );
+    assert_eq!(
+        sgls & (1 << 16),
+        0,
+        "Bit Bucket 不 advertise（impl 拒绝它）"
+    );
+    assert_eq!(
+        sgls & (1 << 17),
+        0,
+        "byte-aligned 不 advertise（impl 拒 >1page）"
+    );
 }
 
 /// **Phase S1** — `nswp == 0` 默认放行；`nswp != 0` 返
