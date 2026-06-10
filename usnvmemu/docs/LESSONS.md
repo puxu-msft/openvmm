@@ -760,3 +760,33 @@ HIGH-2 wrap-saturation → point-3 vfio 自馈死锁（每轮修完下一轮挖�
 `high2_realistic_maxdepth_wrap_settles_never_trips_cfs` / `high2_inrange_oscillating_chain_
 trips_cfs_at_cap` 等，全 revert-verify）；真 QEMU 11 vfio 2-vCPU guest GREEN（19 次 shadow 领先
 MMIO，burst 0 CFS）。
+
+## 30. 清理"死代码"前先分辨：过时残留 vs 前瞻 scaffolding (HIGH)
+
+**用户铁律（2026-06-11）**：「清理旧代码必须确保真的是过时代码，而不是为了完整、长远
+目标提前埋设的内容」。删除是不可逆动作；删错一个前瞻预置 = 撤掉长远正确路线上的台阶。
+
+**背景**：测试覆盖率审计把 6 个"从不 emit 的 `sc::` 常量"标成 dead；本想 Wave 4 删其中
+2 个（`BOOT_PARTITION_WRITE_PROHIBITED`、`SGL_INVALID_USE_OF_CMB`）。用户喊停——它们是
+**有效 NVMe 状态码、为 spec 完整性预置**（boot-partition / CMB 特性落地即用）。删 = 撤
+scaffolding。改判：**保留 + 锚到 nvme_spec（验值）+ `#[allow(dead_code)]` 注明"X 支持
+落地时 wire"**；那 4 个真缺口（NAMESPACE_NOT_READY/ATOMIC_WRITE_UNIT_EXCEEDED）不是删，
+是 **wire（补实现）**。
+
+**判据（未用符号该删还是该留）**：
+1. **对得上 spec / 已声明的长远目标 → 保留 + 锚定**（如本项目 [[teaching-means-rigor-not-toy]]：
+   每层 spec-complete 是目标，spec 状态码即使暂未 emit 也是完整性的一部分）。
+2. **对不上、纯历史残留 / 重复 / 已被取代 → 才清**（如 [[lesson §26]] 删的不是常量而是
+   "手填 SCT 参数"那个 footgun 形状）。
+3. **拿不准 → 留 + 标注意图**，别赌。删错的代价 >> 留一个带注释的未用符号。
+
+**纪律**：
+- 审计工具（cargo-mutants/llvm-cov/dead-code lint）报"未用"是**信号不是判决**——它不知道
+  "前瞻预置"的意图。删除前回到 spec / 项目愿景核对。
+- "未用 + 对得上 spec" 的正确动作是 **anchor 它**（值锚到 canonical 源）+ 注明落地条件，
+  而非删。这样既不积灰（值有锚保护）又不撤 scaffolding。
+- reflection：每轮清理后回看自己是否删过 scaffolding，及时挽救（本轮自查：sc 重构
+  `comm -23` 证 0 常量被 drop，R2 的 flatten_data_blocks/SglFragment scaffolding 仍在，
+  无违规——在 Wave 4 真删之前就被用户铁律拦下）。
+
+**来源**：测试覆盖率 Wave 4 计划评审（2026-06-11，用户两次强调 + 要求长记）。
