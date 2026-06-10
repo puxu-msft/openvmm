@@ -75,7 +75,7 @@ impl NvmeController {
         let c_host_id_lo = self.host_id_lo;
         let c_host_id_hi = self.host_id_hi;
         let Some(ns) = self.namespaces.get_mut(&nsid) else {
-            return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_NAMESPACE, 0);
+            return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_NAMESPACE);
         };
         // **Phase S6** — 累积本 cmd 触发的 notification type，match 结束后
         // 借 &mut self push（避免与 `ns: &mut Namespace` 借用冲突）。
@@ -88,7 +88,7 @@ impl NvmeController {
         match kind {
             ReservationKind::Register => {
                 if data.len() < 16 {
-                    return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                    return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD);
                 }
                 let crkey = read_u64(data, 0);
                 let nrkey = read_u64(data, 8);
@@ -108,7 +108,6 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::RESERVATION_CONFLICT,
-                                sc::SCT_COMMAND_SPECIFIC,
                             );
                         }
                         // K9：把 controller 当前 host_id 一起记，若 driver
@@ -150,7 +149,6 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::RESERVATION_CONFLICT,
-                                sc::SCT_COMMAND_SPECIFIC,
                             );
                         }
                         if let Some(pos) = ns.rkey_pos(crkey) {
@@ -169,12 +167,11 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::RESERVATION_CONFLICT,
-                                sc::SCT_COMMAND_SPECIFIC,
                             );
                         }
                         tracing::info!(nsid, crkey, nrkey, "Reservation Replace OK");
                     }
-                    _ => return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0),
+                    _ => return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD),
                 }
                 // **Phase P1 (PTPL)** — Register 命令的 cdw10 bits 31:30
                 // 控制 PTPL（spec § 6.13）：
@@ -208,23 +205,16 @@ impl NvmeController {
             }
             ReservationKind::Acquire => {
                 if data.len() < 16 {
-                    return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                    return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD);
                 }
                 let crkey = read_u64(data, 0);
                 let prkey = read_u64(data, 8);
                 if !ns.has_rkey(crkey) {
                     tracing::warn!(nsid, crkey, "Acquire: crkey not registered");
-                    return Cqe::error(
-                        cid,
-                        sq_id,
-                        sq_head,
-                        phase,
-                        sc::RESERVATION_CONFLICT,
-                        sc::SCT_COMMAND_SPECIFIC,
-                    );
+                    return Cqe::error(cid, sq_id, sq_head, phase, sc::RESERVATION_CONFLICT);
                 }
                 if !(1..=6).contains(&rtype) {
-                    return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                    return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD);
                 }
                 match action {
                     0 => {
@@ -236,7 +226,6 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::RESERVATION_CONFLICT,
-                                sc::SCT_COMMAND_SPECIFIC,
                             );
                         }
                         ns.reservation = Some((crkey, rtype));
@@ -255,7 +244,6 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::RESERVATION_CONFLICT,
-                                sc::SCT_COMMAND_SPECIFIC,
                             );
                         }
                         let had_prior = ns.reservation.is_some();
@@ -267,12 +255,12 @@ impl NvmeController {
                         }
                         tracing::info!(nsid, crkey, prkey, rtype, "Reservation Preempt OK");
                     }
-                    _ => return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0),
+                    _ => return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD),
                 }
             }
             ReservationKind::Release => {
                 if data.len() < 8 {
-                    return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0);
+                    return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD);
                 }
                 let crkey = read_u64(data, 0);
                 match action {
@@ -296,14 +284,7 @@ impl NvmeController {
                                     requested = rtype,
                                     "Release rtype mismatch (INVALID_FIELD)"
                                 );
-                                return Cqe::error(
-                                    cid,
-                                    sq_id,
-                                    sq_head,
-                                    phase,
-                                    sc::INVALID_FIELD,
-                                    0,
-                                );
+                                return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD);
                             }
                             _ => {
                                 return Cqe::error(
@@ -312,7 +293,6 @@ impl NvmeController {
                                     sq_head,
                                     phase,
                                     sc::RESERVATION_CONFLICT,
-                                    sc::SCT_COMMAND_SPECIFIC,
                                 );
                             }
                         }
@@ -329,7 +309,6 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::RESERVATION_CONFLICT,
-                                sc::SCT_COMMAND_SPECIFIC,
                             );
                         }
                         if ns.reservation.is_some() {
@@ -340,7 +319,7 @@ impl NvmeController {
                         }
                         tracing::info!(nsid, "Reservation Clear OK");
                     }
-                    _ => return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0),
+                    _ => return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD),
                 }
             }
         }
