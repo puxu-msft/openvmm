@@ -490,7 +490,11 @@ fn sgl1_segment(seg_addr: u64, seg_len: u32) -> (u64, u64) {
 /// CQE 关键字段。
 struct CqeResult {
     cid: u16,
+    /// SC 低字节（成功 = 0；历史断言用）。
     sc: u8,
+    /// **完整 16-bit status（SC | SCT<<8）** —— de-blind：此前 e2e 只取 8-bit SC，
+    /// 结构性丢 SCT，**无法** catch SCT 回归（LESSONS §26）。错误断言改用本字段。
+    status: u16,
     #[allow(dead_code)]
     dw0: u32,
 }
@@ -559,6 +563,7 @@ impl QueueState {
                 let res = CqeResult {
                     cid: (dw3 & 0xffff) as u16,
                     sc: ((dw3 >> 17) & 0xff) as u8,
+                    status: (((dw3 >> 17) & 0xff) | (((dw3 >> 25) & 0x7) << 8)) as u16,
                     dw0: u32::from_le_bytes([cqe[0], cqe[1], cqe[2], cqe[3]]),
                 };
                 self.cq_head = (self.cq_head + 1) % self.depth;
@@ -1972,7 +1977,7 @@ async fn openhcl_sgl_bit_bucket_write_ignored() -> Result<()> {
 async fn openhcl_sgl_length_mismatch_rejected() -> Result<()> {
     const SEG_GPA: u64 = 0xA_0000;
     const FRAG0_GPA: u64 = 0xC_0000;
-    const SC_DATA_SGL_LENGTH_INVALID: u8 = 0x0f;
+    const SC_DATA_SGL_LENGTH_INVALID: u16 = 0x000f; // Generic SCT=0, SC 0x0f
 
     let (stream, _harness) = spawn_and_accept().await?;
     let (driver, _dev) = NvmeDriver::start(stream).await?;
@@ -2002,9 +2007,9 @@ async fn openhcl_sgl_length_mismatch_rejected() -> Result<()> {
         .await
         .context("SGL Read 覆盖不足")?;
     assert_eq!(
-        cqe.sc, SC_DATA_SGL_LENGTH_INVALID,
-        "覆盖不足应返 Data SGL Length Invalid (0x0f)，实 sc={:#x}",
-        cqe.sc
+        cqe.status, SC_DATA_SGL_LENGTH_INVALID,
+        "覆盖不足应返 Data SGL Length Invalid (full status 0x000f，含 SCT)，实 status={:#x}",
+        cqe.status
     );
 
     Ok(())

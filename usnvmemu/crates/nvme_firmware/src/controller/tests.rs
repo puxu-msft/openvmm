@@ -19,6 +19,123 @@ fn make_ctrl_with_tmp(tag: &str) -> NvmeController {
     c
 }
 
+/// 从 CQE dw3 取**完整 16-bit status**（SC | SCT<<8），对比 `sc::` u16 常量。
+/// dw3 bits[24:17]=SC，bits[27:25]=SCT。比只取 SC 低字节多验了 SCT——这次结构性
+/// SC bug 全在 SCT 上（INVALID_PROTECTION_INFO 当 Generic 发等），只验 SC byte
+/// 测不出（LESSONS §26）。
+fn cqe_status(cqe: &Cqe) -> u16 {
+    (((cqe.dw3 >> 17) & 0xff) | (((cqe.dw3 >> 25) & 0x7) << 8)) as u16
+}
+
+/// 构造一个 IO SQE（支持 PRACT bit29，用来驱 PI 错误路径）。
+fn io_sqe(opc: u8, nsid: u32, slba: u64, nlb: u32, prp1: u64, pract: bool, cid: u16) -> Sqe {
+    let zero = [0u8; 64];
+    let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+    sqe.cdw0 = (opc as u32) | ((cid as u32) << 16);
+    sqe.nsid = nsid;
+    sqe.cdw10 = slba as u32;
+    sqe.cdw11 = (slba >> 32) as u32;
+    sqe.cdw12 = (nlb - 1) | if pract { 1 << 29 } else { 0 };
+    sqe.prp1 = prp1;
+    sqe
+}
+
+/// **M4 driven 错误码矩阵（Wave 2）** — 真正把 controller 驱动进各错误路径，断言
+/// emit 的**完整 16-bit status（含 SCT）**。这次结构性 SC bug
+/// （`INVALID_PROTECTION_INFO` 曾当 Generic 发→driver 误读 Capacity Exceeded、
+/// `NAMESPACE_IS_WRITE_PROTECTED` 曾当 Cmd-Specific 发）都活在"执行到但没人验 SCT"
+/// 的路径里。每条 `dispatch_io` 同步返 `Some(Cqe)`（在 DMA 前拒），无需 completion。
+///
+/// **职责分工（避免误读成 §20 self-consistent trap）**：本矩阵锚的是"**哪个**条件
+/// 发**哪个** `sc::` 常量"（dispatch 路径正确性，revert-verify：把某 emit 改成别的
+/// 码 → FAIL，已实测 2≠385）；常量本身的**值/SCT 正确性**由
+/// `sc_constants_match_nvme_spec` 独立锚到 nvme_spec。两测合起来 = 路径对 × 值对。
+#[test]
+fn error_status_driven_matrix() {
+    const WRITE: u8 = 0x01;
+    const READ: u8 = 0x02;
+    let mut c = make_ctrl_with_tmp("err_matrix");
+    let mut cap = pcie_device_core::CaptureTransport::with_start_token(0x100);
+    let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
+
+    // INVALID_PROTECTION_INFO (Cmd-Specific 0x0181)：plain NS 上 PRACT=1 → 拒。
+    // **SCT 必须 = 1**；R1 当 Generic 0x81 (=Capacity Exceeded) 发是真 bug。
+    let cqe = c
+        .dispatch_io(
+            &mut ctx,
+            1,
+            io_sqe(READ, 1, 0, 1, 0x1000, true, 0x10),
+            0x10,
+            0,
+            1,
+        )
+        .expect("PRACT=1 plain NS 同步拒");
+    assert_eq!(
+        cqe_status(&cqe),
+        crate::cmd::sc::INVALID_PROTECTION_INFO,
+        "PRACT=1 on plain NS → 0x0181 (SCT=1)，非 Generic 0x81"
+    );
+
+    // NAMESPACE_IS_WRITE_PROTECTED (Generic 0x0020)：nswp=1 + WRITE。
+    // **SCT 必须 = 0**；R1 当 Cmd-Specific 发是真 bug。
+    c.namespaces.get_mut(&1).unwrap().nswp = 1;
+    let cqe = c
+        .dispatch_io(
+            &mut ctx,
+            1,
+            io_sqe(WRITE, 1, 0, 1, 0x1000, false, 0x11),
+            0x11,
+            0,
+            1,
+        )
+        .expect("write-protected NS 同步拒");
+    assert_eq!(
+        cqe_status(&cqe),
+        crate::cmd::sc::NAMESPACE_IS_WRITE_PROTECTED,
+        "nswp=1 WRITE → 0x0020 (Generic)，非 Cmd-Specific"
+    );
+    c.namespaces.get_mut(&1).unwrap().nswp = 0;
+
+    // LBA_OUT_OF_RANGE (Generic 0x0080)：slba 越界。
+    let cqe = c
+        .dispatch_io(
+            &mut ctx,
+            1,
+            io_sqe(READ, 1, 1_000_000, 1, 0x1000, false, 0x12),
+            0x12,
+            0,
+            1,
+        )
+        .expect("越界同步拒");
+    assert_eq!(cqe_status(&cqe), crate::cmd::sc::LBA_OUT_OF_RANGE);
+
+    // INVALID_NAMESPACE (Generic 0x000b)：未注册 NSID。
+    let cqe = c
+        .dispatch_io(
+            &mut ctx,
+            1,
+            io_sqe(READ, 99, 0, 1, 0x1000, false, 0x13),
+            0x13,
+            0,
+            1,
+        )
+        .expect("未知 NSID 同步拒");
+    assert_eq!(cqe_status(&cqe), crate::cmd::sc::INVALID_NAMESPACE);
+
+    // INVALID_OPCODE (Generic 0x0001)：未知 IO opcode。
+    let cqe = c
+        .dispatch_io(
+            &mut ctx,
+            1,
+            io_sqe(0xFF, 1, 0, 1, 0x1000, false, 0x14),
+            0x14,
+            0,
+            1,
+        )
+        .expect("未知 opcode 同步拒");
+    assert_eq!(cqe_status(&cqe), crate::cmd::sc::INVALID_OPCODE);
+}
+
 /// Phase F：SMART log 关键 offset + counter 写入校验。
 #[test]
 fn smart_log_byte_layout_and_counters() {
