@@ -135,6 +135,7 @@ impl NvmeController {
         self.pending_ios.clear();
         self.dual_prp_writes.clear();
         self.prp_list_ops.clear();
+        self.sgl_ops.clear();
         self.compare_ops.clear();
         self.pi_writes.clear();
         self.pi_reads.clear();
@@ -143,6 +144,7 @@ impl NvmeController {
         debug_assert!(self.pending_ios.is_empty());
         debug_assert!(self.dual_prp_writes.is_empty());
         debug_assert!(self.prp_list_ops.is_empty());
+        debug_assert!(self.sgl_ops.is_empty());
         debug_assert!(self.compare_ops.is_empty());
         debug_assert!(self.pi_writes.is_empty());
         debug_assert!(self.pi_reads.is_empty());

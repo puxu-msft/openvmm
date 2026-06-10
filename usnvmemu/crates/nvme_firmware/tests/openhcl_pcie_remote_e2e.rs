@@ -428,6 +428,8 @@ struct Sqe {
     opcode: u8,
     /// fuse bits（cdw0[9:8]）：1=FIRST(Compare)，2=SECOND(Write)。
     fuse: u8,
+    /// PSDT bits（cdw0[15:14]）：0=PRP，1=SGL inline，2=SGL Segment(PSDT=10)。
+    psdt: u8,
     cid: u16,
     nsid: u32,
     prp1: u64,
@@ -440,7 +442,10 @@ struct Sqe {
 impl Sqe {
     fn encode(&self) -> Vec<u8> {
         let mut b = vec![0u8; SQE_BYTES];
-        let cdw0 = self.opcode as u32 | ((self.fuse as u32 & 0x3) << 8) | ((self.cid as u32) << 16);
+        let cdw0 = self.opcode as u32
+            | ((self.fuse as u32 & 0x3) << 8)
+            | ((self.psdt as u32 & 0x3) << 14)
+            | ((self.cid as u32) << 16);
         b[0..4].copy_from_slice(&cdw0.to_le_bytes());
         b[4..8].copy_from_slice(&self.nsid.to_le_bytes());
         b[24..32].copy_from_slice(&self.prp1.to_le_bytes());
@@ -450,6 +455,27 @@ impl Sqe {
         b[48..52].copy_from_slice(&self.cdw12.to_le_bytes());
         b
     }
+}
+
+/// **Phase R2** — 构造一个 16-byte SGL descriptor（放进 guest-mem segment 页）。
+/// `id_byte` high nibble = type（0x00 Data Block / 0x30 Last Segment …），
+/// low nibble = sub type（0 = Address）。
+fn sgl_desc(address: u64, length: u32, id_byte: u8) -> [u8; 16] {
+    let mut d = [0u8; 16];
+    d[0..8].copy_from_slice(&address.to_le_bytes());
+    d[8..12].copy_from_slice(&length.to_le_bytes());
+    d[15] = id_byte;
+    d
+}
+
+/// **Phase R2** — 把 SGL1 (Last Segment 指针) 编进 SQE 的 prp1/prp2 字段位置
+/// （embedded_sgl_bytes：prp1=desc bytes 0..8，prp2=desc bytes 8..16）。
+/// 返回 (prp1, prp2) 供 `Sqe { psdt: 2, prp1, prp2, .. }`。
+fn sgl1_last_segment(seg_addr: u64, seg_len: u32) -> (u64, u64) {
+    // byte 15 = 0x30 → Last Segment (type 3), sub 0。length 在 bytes 8..12。
+    let prp1 = seg_addr;
+    let prp2 = (0x30u64 << 56) | seg_len as u64;
+    (prp1, prp2)
 }
 
 /// CQE 关键字段。
@@ -1278,6 +1304,215 @@ async fn openhcl_no_command_processing_after_shutdown() -> Result<()> {
         vid, 0,
         "关机后下发的命令不应被处理（Identify payload 不应写入）—— quiesce，实 vid={vid:#06x}"
     );
+
+    Ok(())
+}
+
+/// **Phase R2a** — SGL Segment **Read** scatter（PSDT=10，单 Last Segment 多 Data Block）。
+///
+/// 先用普通 PRP Write 把 distinct-per-512 pattern 写到 slba=6（backing 已知），再发
+/// PSDT=10 Read：SGL1=Last Segment 指向 segment 页，内含 3 个 Data Block 指向**非连续**
+/// 且**不等长**的 fragment（2048 / 1024 / 1024）。firmware 应把 4096 数据按 fragment
+/// 边界 scatter 到各自 GPA。
+///
+/// **差分独立 oracle**：① 每个 fragment 区落对自己的数据切片；② FRAG0 区 [2048..4096)
+/// 保持 sentinel 0x77（若 firmware 退化成"整 4096 连续写 FRAG0"会被覆盖）。
+///
+/// **revert-verify（已实测）**：把 completion.rs NvmSglFetch 的 `stream_offset: walk_offset`
+/// 改成 `stream_offset: 0`（所有 fragment 都从 data[0] 取）→ FRAG1/FRAG2 收到 data[0..len]
+/// 而非正确切片 → 本测试 FAIL。
+#[tokio::test]
+async fn openhcl_sgl_segment_read_scatter() -> Result<()> {
+    const SEG_GPA: u64 = 0xA_0000;
+    const FRAG0_GPA: u64 = 0xC_0000;
+    const FRAG1_GPA: u64 = 0xD_0000;
+    const FRAG2_GPA: u64 = 0xE_0000;
+
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (_admin, mut io) = setup_enabled_4k_io(&driver).await?;
+
+    // distinct-per-512 pattern（8 段 0xD0..0xD7）避免 uniform 掩盖偏移错。
+    let mut pattern = vec![0u8; 4096];
+    for i in 0..8 {
+        pattern[i * 512..(i + 1) * 512].fill(0xD0 + i as u8);
+    }
+    // 用普通 PRP Write 播种 backing@slba=6。
+    driver.write_guest(WRITE_BUF_GPA, pattern.clone());
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x01,
+                cid: 0x30,
+                nsid: 1,
+                prp1: WRITE_BUF_GPA,
+                cdw10: 6,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("seed Write")?;
+    assert_eq!(cqe.sc, 0, "seed Write sc 应=0，实={:#x}", cqe.sc);
+
+    // 放 segment 页：3 个 Data Block，非连续 + 不等长（2048/1024/1024 = 4096）。
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&sgl_desc(FRAG0_GPA, 2048, 0x00));
+    seg.extend_from_slice(&sgl_desc(FRAG1_GPA, 1024, 0x00));
+    seg.extend_from_slice(&sgl_desc(FRAG2_GPA, 1024, 0x00));
+    driver.write_guest(SEG_GPA, seg);
+
+    // sentinel：三个 fragment 区整页 0x77（FRAG0 只用前 2048，[2048..4096) 不该碰）。
+    driver.write_guest(FRAG0_GPA, vec![0x77; 4096]);
+    driver.write_guest(FRAG1_GPA, vec![0x77; 4096]);
+    driver.write_guest(FRAG2_GPA, vec![0x77; 4096]);
+
+    // SGL Read @ slba=6，PSDT=10。
+    let (p1, p2) = sgl1_last_segment(SEG_GPA, 3 * 16);
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02,
+                psdt: 2,
+                cid: 0x31,
+                nsid: 1,
+                prp1: p1,
+                prp2: p2,
+                cdw10: 6,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("SGL Read")?;
+    assert_eq!(cqe.sc, 0, "SGL Read sc 应=0，实={:#x}", cqe.sc);
+
+    // ★ 差分 oracle：各 fragment 落对自己的切片（非连续 + 不等长）。
+    let f0 = driver.read_guest(FRAG0_GPA, 2048).await?;
+    assert_eq!(f0, pattern[0..2048], "FRAG0 应=pattern[0..2048]");
+    let f1 = driver.read_guest(FRAG1_GPA, 1024).await?;
+    assert_eq!(
+        f1,
+        pattern[2048..3072],
+        "FRAG1 应=pattern[2048..3072]（非连续 scatter，偏移正确）"
+    );
+    let f2 = driver.read_guest(FRAG2_GPA, 1024).await?;
+    assert_eq!(f2, pattern[3072..4096], "FRAG2 应=pattern[3072..4096]");
+    // FRAG0 区 [2048..4096) 保持 sentinel（未被"整 4096 连续写 FRAG0"覆盖）。
+    let f0_tail = driver.read_guest(FRAG0_GPA + 2048, 2048).await?;
+    assert!(
+        f0_tail.iter().all(|&b| b == 0x77),
+        "FRAG0+2048 应仍 sentinel 0x77（firmware 未越界连续写整 buffer）"
+    );
+
+    Ok(())
+}
+
+/// **Phase R2a** — SGL Segment **Write** gather（PSDT=10）。
+///
+/// SGL1=Last Segment → 3 个 Data Block 指向**非连续**且**不等长**的 source fragment
+/// （2048/1024/1024），各填 distinct pattern。firmware 应按 fragment 边界 gather 成
+/// 连续 4096 写 backing@slba=7。
+///
+/// **直读 backing file 独立 oracle**（非 round-trip 自洽）：backing[7*4096..+4096] ==
+/// concat(frag0, frag1, frag2)。
+///
+/// **revert-verify（已实测）**：completion.rs NvmSglData 的 gather copy `stream_offset`
+/// 改 0 → 三个 fragment 都写进 data[0..]，backing 前段 = 错数据 + 尾段全 0 → FAIL。
+#[tokio::test]
+async fn openhcl_sgl_segment_write_gather() -> Result<()> {
+    const SEG_GPA: u64 = 0xA_0000;
+    const FRAG0_GPA: u64 = 0xC_0000;
+    const FRAG1_GPA: u64 = 0xD_0000;
+    const FRAG2_GPA: u64 = 0xE_0000;
+
+    let (stream, harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (_admin, mut io) = setup_enabled_4k_io(&driver).await?;
+
+    // 三段 source，各 distinct（0xA0 / 0xB0 / 0xC0），拼成期望 4096。
+    let f0 = vec![0xA0u8; 2048];
+    let f1 = vec![0xB0u8; 1024];
+    let f2 = vec![0xC0u8; 1024];
+    driver.write_guest(FRAG0_GPA, f0.clone());
+    driver.write_guest(FRAG1_GPA, f1.clone());
+    driver.write_guest(FRAG2_GPA, f2.clone());
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&f0);
+    expected.extend_from_slice(&f1);
+    expected.extend_from_slice(&f2);
+
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&sgl_desc(FRAG0_GPA, 2048, 0x00));
+    seg.extend_from_slice(&sgl_desc(FRAG1_GPA, 1024, 0x00));
+    seg.extend_from_slice(&sgl_desc(FRAG2_GPA, 1024, 0x00));
+    driver.write_guest(SEG_GPA, seg);
+
+    let (p1, p2) = sgl1_last_segment(SEG_GPA, 3 * 16);
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x01,
+                psdt: 2,
+                cid: 0x32,
+                nsid: 1,
+                prp1: p1,
+                prp2: p2,
+                cdw10: 7,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("SGL Write")?;
+    assert_eq!(cqe.sc, 0, "SGL Write sc 应=0，实={:#x}", cqe.sc);
+
+    // Flush → 直读 backing file 独立 oracle。
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x00,
+                cid: 0x33,
+                nsid: 1,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Flush")?;
+    assert_eq!(cqe.sc, 0, "Flush sc 应=0");
+    let file = std::fs::read(&harness.backing).context("读 backing")?;
+    let at = &file[7 * 4096..7 * 4096 + 4096];
+    assert_eq!(
+        at,
+        &expected[..],
+        "backing[7*4096] 应=gather 拼接（独立 oracle，非 round-trip 自洽）"
+    );
+
+    // 额外：普通 PRP Read 读回再验一次（round-trip 自洽，补充信号）。
+    driver.write_guest(READ_BUF_GPA, vec![0u8; 4096]);
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02,
+                cid: 0x34,
+                nsid: 1,
+                prp1: READ_BUF_GPA,
+                cdw10: 7,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("readback")?;
+    assert_eq!(cqe.sc, 0, "readback sc 应=0");
+    let rb = driver.read_guest(READ_BUF_GPA, 4096).await?;
+    assert_eq!(rb, expected, "PRP readback 应=gather 数据");
 
     Ok(())
 }

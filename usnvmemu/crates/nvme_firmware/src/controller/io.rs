@@ -306,26 +306,39 @@ pub(crate) fn advance_zns_wp(ns: &mut crate::controller::Namespace, lba: u64, nl
     }
 }
 
+/// **Phase R1/R2** — data pointer 解析结果。
+///
+/// PRP 路径（PSDT=00 / PSDT=01 inline 单 Data Block）返 `(prp1, prp2)`，复用
+/// 现有三档 PRP dispatch。SGL Segment 路径（PSDT=10）返 `SglSegment`，由 caller
+/// 路由到平行的 SGL scatter-gather 机件（embedded SGL1 在 bytes 24..40），**不**
+/// 复用 PRP dispatch。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DataPointer {
+    Prp { prp1: u64, prp2: u64 },
+    SglSegment,
+}
+
 /// **Phase R1** — 解析 SQE 的 data pointer：根据 PSDT 选 PRP 或 SGL。
 ///
-/// 返回 (prp1, prp2) 让 caller 复用现有 PRP 三档 dispatch（≤1 page 单 PRP，
-/// ≤2 page dual PRP，> 2 page PRP list）。
+/// 返回 `DataPointer::Prp { prp1, prp2 }` 让 caller 复用现有 PRP 三档 dispatch
+/// （≤1 page 单 PRP，≤2 page dual PRP，> 2 page PRP list），或返
+/// `DataPointer::SglSegment` 让 caller 走 SGL 数据路径（PSDT=10，见 Phase R2）。
 ///
 /// SGL 教学路径：
 /// - PSDT=00：直接返 raw prp1/prp2（标准 PRP 路径）
 /// - PSDT=01：解析 SQE 内嵌 16-byte SGL descriptor (bytes 24..40)
-///   * 单 Data Block + 长度 ≤ 1 page → 用 address 当 prp1，prp2=0
+///   * 单 Data Block + 长度 ≤ 1 page → 用 address 当 prp1，prp2=0（R1）
 ///   * 单 Data Block + 长度 > 1 page 或多 fragment → 当前不支持，返
-///     SGL_DESCRIPTOR_TYPE_INVALID（R2 时扩展 Segment 链式 walk）
+///     SGL_DESCRIPTOR_TYPE_INVALID（任意 scatter-gather 走 PSDT=10 R2）
 ///   * 其他 type (Bit Bucket / Segment / Keyed) → reject
-/// - PSDT=10 (SGL Segment pointer)：留 R2
+/// - PSDT=10 (SGL Segment pointer)：返 `SglSegment`，caller 走 R2 segment walk
 /// - PSDT=11 reserved → INVALID_FIELD
-pub(crate) fn resolve_data_pointers(sqe: &Sqe) -> Result<(u64, u64), u8> {
+pub(crate) fn resolve_data_pointers(sqe: &Sqe) -> Result<DataPointer, u8> {
     let psdt = sqe.psdt();
     let prp1 = sqe.prp1;
     let prp2 = sqe.prp2;
     match psdt {
-        0b00 => Ok((prp1, prp2)),
+        0b00 => Ok(DataPointer::Prp { prp1, prp2 }),
         0b01 => {
             // Inline SGL descriptor in bytes 24..40
             let bytes = sqe.embedded_sgl_bytes();
@@ -349,7 +362,10 @@ pub(crate) fn resolve_data_pointers(sqe: &Sqe) -> Result<(u64, u64), u8> {
                         );
                         return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID);
                     }
-                    Ok((desc.address, 0))
+                    Ok(DataPointer::Prp {
+                        prp1: desc.address,
+                        prp2: 0,
+                    })
                 }
                 crate::sgl::SglType::BitBucket => {
                     // Bit Bucket 在 Read = controller 不写 host (driver 丢弃)；
@@ -371,14 +387,44 @@ pub(crate) fn resolve_data_pointers(sqe: &Sqe) -> Result<(u64, u64), u8> {
             }
         }
         0b10 => {
-            // PSDT=10：bytes 24..40 是 SGL Segment descriptor 指向首段。
-            // R2 留：需 DMA-read 后递归 walk 各段。当前 reject 让 driver
-            // 回退 PSDT=00 / 01。
-            tracing::warn!("PSDT=10 (SGL Segment pointer) not yet supported; use PSDT=01");
-            Err(sc::SGL_DESCRIPTOR_TYPE_INVALID)
+            // PSDT=10：bytes 24..40 是 SGL Segment descriptor 指向首段 SGL list。
+            // **Phase R2** — 返 SglSegment，caller（dispatch_sgl_read/write）
+            // DMA-read 该 segment 页后递归 walk 各段 + 逐 fragment scatter/gather。
+            Ok(DataPointer::SglSegment)
         }
         _ => Err(sc::INVALID_FIELD),
     }
+}
+
+/// **Phase R2** — 解析 PSDT=10 的 embedded SGL1 descriptor（必须是 Segment /
+/// Last Segment，sub_type=0）。返 `(segment_addr, segment_len, is_last)`。
+///
+/// `is_last` = true 表示经 Last Segment 到达（被指向的 segment 全是 Data Block /
+/// Bit Bucket，无后续 chain）；false 表示 Segment（其末位 descriptor 是 continuation
+/// 指向下一段，见 R2b）。
+///
+/// segment_len 须为 16 的倍数、非零、≤ 1 page（教学单段上限；> 1 page segment
+/// 罕见，留作未来扩展）。
+fn parse_sgl1_segment(bytes: &[u8; 16]) -> Result<(u64, u32, bool), u8> {
+    let desc = crate::sgl::SglDescriptor::parse(bytes).ok_or(sc::SGL_DESCRIPTOR_TYPE_INVALID)?;
+    if desc.sub_type != 0 {
+        tracing::warn!(sub_type = desc.sub_type, "SGL1 sub_type 非 0 (仅 Address)");
+        return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID);
+    }
+    let is_last = match desc.sgl_type {
+        crate::sgl::SglType::LastSegment => true,
+        crate::sgl::SglType::Segment => false,
+        _ => {
+            tracing::warn!("PSDT=10 embedded SGL1 必须是 (Last)Segment descriptor");
+            return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID);
+        }
+    };
+    let len = desc.length;
+    if len == 0 || !len.is_multiple_of(16) || len as u64 > NVME_PAGE_SIZE {
+        tracing::warn!(len, "SGL segment length 非法（须 16 倍数、非零、≤1 page）");
+        return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID);
+    }
+    Ok((desc.address, len, is_last))
 }
 
 /// **Phase S1** — Write-protection guard：所有写类 IO (WRITE/WRITE_ZEROES/
@@ -406,6 +452,224 @@ pub(crate) fn check_ns_write_protection(
 }
 
 impl NvmeController {
+    /// **Phase R2a** — PSDT=10 SGL Segment **Read** 数据路径入口。
+    ///
+    /// 与 PRP 三档 dispatch 平行：SGL 数据是任意 (address, length) fragment 的
+    /// scatter-gather，无法映射成单 (prp1, prp2)。流程：
+    ///   1. backing 一次性读到 `data`（按 plain 扇区字节）。
+    ///   2. DMA-read embedded SGL1 指向的 segment 页 → `NvmSglFetch`。
+    ///   3. fetch 完成 parse descriptor → 构建 fragment plan → 逐 fragment
+    ///      `dma_write`（scatter）到 host → 全到齐 post CQE（见 completion.rs）。
+    ///
+    /// 仅 plain NS（无 PI/meta）；调用前 caller 已确认 is_plain。R2a 只支持
+    /// **单 segment**（SGL1 = Last Segment）；Segment chain 留 R2b。
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_sgl_read(
+        &mut self,
+        ctx: &mut DeviceCtx<'_>,
+        sqe: &Sqe,
+        sq_id: u16,
+        cid: u16,
+        sq_head: u16,
+        cq_id: u16,
+        nsid: u32,
+        slba: u64,
+        nlb: u32,
+        sector_bytes: u64,
+        phase: u8,
+    ) -> Option<Cqe> {
+        let bytes = nlb as u64 * sector_bytes;
+        // 用真实扇区字节复查 MDTS（与 plain READ 一致）。
+        if bytes > MDTS_MAX_BYTES {
+            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+        }
+        // LBA 边界校验（SGL 走独立分流，故此处自检，不复用 plain 路径的检查）。
+        let total_lba = self.ns(nsid).map(|n| n.total_lba).unwrap_or(0);
+        match slba.checked_add(nlb as u64) {
+            Some(end) if end <= total_lba => {}
+            _ => {
+                return Some(Cqe::error(
+                    cid,
+                    sq_id,
+                    sq_head,
+                    phase,
+                    sc::LBA_OUT_OF_RANGE,
+                    0,
+                ));
+            }
+        }
+        // ZNS Read 校验（Offline zone 拒读，与 plain READ 一致）。
+        if let Some(ns) = self.ns(nsid)
+            && let Some(cqe) = check_zns_read(ns, slba, cid, sq_id, sq_head, phase)
+        {
+            return Some(cqe);
+        }
+        // 解析 embedded SGL1 → 必须 Last Segment（R2a 单段）。
+        let (seg_addr, seg_len, is_last) = match parse_sgl1_segment(&sqe.embedded_sgl_bytes()) {
+            Ok(t) => t,
+            Err(sc_byte) => return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte, 0)),
+        };
+        if !is_last {
+            tracing::warn!("SGL Segment chain (R2b) 未实现，SGL1 须 Last Segment");
+            return Some(Cqe::error(
+                cid,
+                sq_id,
+                sq_head,
+                phase,
+                sc::SGL_DESCRIPTOR_TYPE_INVALID,
+                0,
+            ));
+        }
+        // 一次性把 backing 读到 data buffer（READ：先读盘再 scatter）。
+        let mut data = vec![0u8; bytes as usize];
+        let ns_mut = self.ns_mut(nsid).unwrap();
+        if let Err(e) = ns_mut.read_at(&mut data, slba * sector_bytes) {
+            tracing::warn!(error = %e, nsid, slba, nlb, "SGL READ backing 读失败");
+            return Some(Cqe::error(
+                cid,
+                sq_id,
+                sq_head,
+                phase,
+                sc::DATA_TRANSFER_ERROR,
+                0,
+            ));
+        }
+        let op_id = self.alloc_op_id();
+        self.sgl_ops.insert(
+            op_id,
+            crate::controller::SglOp {
+                sq_id,
+                cid,
+                sq_head,
+                cq_id,
+                nsid,
+                lba: slba,
+                num_blocks: nlb,
+                is_write: false,
+                sector_bytes,
+                expected_bytes: bytes,
+                data,
+                frags: Vec::new(),
+                walk_offset: 0,
+                transfers_done: 0,
+                transfers_total: 0,
+            },
+        );
+        let tok = ctx.dma_read(seg_addr, seg_len);
+        self.pending_ios.insert(
+            tok,
+            PendingIo {
+                sq_id,
+                cid,
+                sq_head,
+                cq_id,
+                nsid,
+                op: PendingOp::NvmSglFetch { op_id },
+            },
+        );
+        None
+    }
+
+    /// **Phase R2a** — PSDT=10 SGL Segment **Write** 数据路径入口。
+    ///
+    /// 镜像 `dispatch_sgl_read`，方向相反：
+    ///   1. 建空 `data` gather buffer（待按 fragment 填）。
+    ///   2. DMA-read embedded SGL1 指向的 segment 页 → `NvmSglFetch`。
+    ///   3. fetch 完成 parse descriptor → 逐 fragment `dma_read`（gather）自
+    ///      host 填 `data` → 全到齐后一次性 `write_at` backing → post CQE。
+    ///
+    /// 仅 plain NS；NS Write Protection 已在 caller 校验。R2a 仅单 segment。
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_sgl_write(
+        &mut self,
+        ctx: &mut DeviceCtx<'_>,
+        sqe: &Sqe,
+        sq_id: u16,
+        cid: u16,
+        sq_head: u16,
+        cq_id: u16,
+        nsid: u32,
+        slba: u64,
+        nlb: u32,
+        sector_bytes: u64,
+        phase: u8,
+    ) -> Option<Cqe> {
+        let bytes = nlb as u64 * sector_bytes;
+        if bytes > MDTS_MAX_BYTES {
+            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD, 0));
+        }
+        // LBA 边界校验。
+        let total_lba = self.ns(nsid).map(|n| n.total_lba).unwrap_or(0);
+        match slba.checked_add(nlb as u64) {
+            Some(end) if end <= total_lba => {}
+            _ => {
+                return Some(Cqe::error(
+                    cid,
+                    sq_id,
+                    sq_head,
+                    phase,
+                    sc::LBA_OUT_OF_RANGE,
+                    0,
+                ));
+            }
+        }
+        // ZNS Write 校验（SWR + state + 边界，与 plain WRITE 一致）。
+        if let Some(ns) = self.ns(nsid)
+            && let Some(cqe) = check_zns_write(ns, slba, nlb, cid, sq_id, sq_head, phase)
+        {
+            return Some(cqe);
+        }
+        let (seg_addr, seg_len, is_last) = match parse_sgl1_segment(&sqe.embedded_sgl_bytes()) {
+            Ok(t) => t,
+            Err(sc_byte) => return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte, 0)),
+        };
+        if !is_last {
+            tracing::warn!("SGL Segment chain (R2b) 未实现，SGL1 须 Last Segment");
+            return Some(Cqe::error(
+                cid,
+                sq_id,
+                sq_head,
+                phase,
+                sc::SGL_DESCRIPTOR_TYPE_INVALID,
+                0,
+            ));
+        }
+        let op_id = self.alloc_op_id();
+        self.sgl_ops.insert(
+            op_id,
+            crate::controller::SglOp {
+                sq_id,
+                cid,
+                sq_head,
+                cq_id,
+                nsid,
+                lba: slba,
+                num_blocks: nlb,
+                is_write: true,
+                sector_bytes,
+                expected_bytes: bytes,
+                data: vec![0u8; bytes as usize],
+                frags: Vec::new(),
+                walk_offset: 0,
+                transfers_done: 0,
+                transfers_total: 0,
+            },
+        );
+        let tok = ctx.dma_read(seg_addr, seg_len);
+        self.pending_ios.insert(
+            tok,
+            PendingIo {
+                sq_id,
+                cid,
+                sq_head,
+                cq_id,
+                nsid,
+                op: PendingOp::NvmSglFetch { op_id },
+            },
+        );
+        None
+    }
+
     /// IO command dispatch。Read/Write 走 DMA。
     pub(super) fn dispatch_io(
         &mut self,
@@ -457,14 +721,15 @@ impl NvmeController {
                 let nsid = sqe.nsid;
                 let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
                 let nlb = (cdw12 & 0xffff) as u32 + 1;
-                // **Phase R1** — PSDT (PRP or SGL) dispatch。
+                // **Phase R1/R2** — PSDT (PRP or SGL) dispatch。
                 // PSDT=00 (PRP) → 直接用 sqe.prp1/prp2
                 // PSDT=01 (SGL inline) → 把 SQE bytes 24..40 解 SGL，单
-                //   Data Block 时 address→prp1 复用现有 PRP 路径；否则
-                //   reject。
-                // PSDT=10/11 → reject (Segment chain 需 R2，reserved)。
-                let (prp1, prp2) = match resolve_data_pointers(&sqe) {
-                    Ok(p) => p,
+                //   Data Block 时 address→prp1 复用现有 PRP 路径；否则 reject。
+                // PSDT=10 (SGL Segment) → is_sgl=true，走平行 SGL scatter 路径。
+                // PSDT=11 → reject (reserved)。
+                let (prp1, prp2, is_sgl) = match resolve_data_pointers(&sqe) {
+                    Ok(DataPointer::Prp { prp1, prp2 }) => (prp1, prp2, false),
+                    Ok(DataPointer::SglSegment) => (0, 0, true),
                     Err(sc_byte) => {
                         return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte, 0));
                     }
@@ -560,6 +825,34 @@ impl NvmeController {
                         sc::INVALID_PROTECTION_INFO,
                         0,
                     ));
+                }
+                // **Phase R2** — SGL Segment（PSDT=10）走平行 scatter 路径。
+                // 仅 plain NS（无 PI/meta）；SGL × PI 组合 R2 未覆盖（plan 风险项）。
+                if is_sgl {
+                    if !is_plain {
+                        tracing::warn!(nsid, "SGL READ on non-plain NS unsupported (R2)");
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::INVALID_PROTECTION_INFO,
+                            0,
+                        ));
+                    }
+                    return self.dispatch_sgl_read(
+                        ctx,
+                        &sqe,
+                        sq_id,
+                        cid,
+                        sq_head,
+                        cq_id,
+                        nsid,
+                        slba,
+                        nlb,
+                        sector_bytes,
+                        phase,
+                    );
                 }
                 if is_pi_path && nlb != 1 {
                     // **Phase K4c** — 多 LBA PI Read：从 backing file 读
@@ -929,9 +1222,10 @@ impl NvmeController {
                 let nsid = sqe.nsid;
                 let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
                 let nlb = (cdw12 & 0xffff) as u32 + 1;
-                // **Phase R1** — PSDT dispatch（同 READ 路径，参 resolve_data_pointers）
-                let (prp1, prp2) = match resolve_data_pointers(&sqe) {
-                    Ok(p) => p,
+                // **Phase R1/R2** — PSDT dispatch（同 READ 路径，参 resolve_data_pointers）
+                let (prp1, prp2, is_sgl) = match resolve_data_pointers(&sqe) {
+                    Ok(DataPointer::Prp { prp1, prp2 }) => (prp1, prp2, false),
+                    Ok(DataPointer::SglSegment) => (0, 0, true),
                     Err(sc_byte) => {
                         return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte, 0));
                     }
@@ -1004,6 +1298,34 @@ impl NvmeController {
                         sc::INVALID_PROTECTION_INFO,
                         0,
                     ));
+                }
+                // **Phase R2** — SGL Segment（PSDT=10）走平行 gather 路径。
+                // 仅 plain NS（无 PI/meta）；NS Write Protection 已在上方校验。
+                if is_sgl {
+                    if !is_plain {
+                        tracing::warn!(nsid, "SGL WRITE on non-plain NS unsupported (R2)");
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::INVALID_PROTECTION_INFO,
+                            0,
+                        ));
+                    }
+                    return self.dispatch_sgl_write(
+                        ctx,
+                        &sqe,
+                        sq_id,
+                        cid,
+                        sq_head,
+                        cq_id,
+                        nsid,
+                        slba,
+                        nlb,
+                        sector_bytes,
+                        phase,
+                    );
                 }
                 if !is_plain {
                     // **Phase K4a** — PI 单 LBA Write 路径

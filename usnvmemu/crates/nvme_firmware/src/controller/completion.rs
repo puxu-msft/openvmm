@@ -185,6 +185,16 @@ impl NvmeController {
                             }
                         }
                     }
+                    PendingOp::NvmSglFetch { op_id } | PendingOp::NvmSglData { op_id, .. } => {
+                        // **Phase R2** — SGL 多 fragment op：清 sibling pending +
+                        // 累积器，保证只 post 一次 error CQE（同 C1 修复语义）。
+                        self.pending_ios.retain(|_, q| match q.op {
+                            PendingOp::NvmSglFetch { op_id: o }
+                            | PendingOp::NvmSglData { op_id: o, .. } => o != op_id,
+                            _ => true,
+                        });
+                        self.sgl_ops.remove(&op_id);
+                    }
                     _ => {}
                 }
                 self.stat_num_err_log_entries += 1;
@@ -1888,9 +1898,235 @@ impl NvmeController {
                         self.post_cqe(ctx, op.cq_id, cqe);
                     }
                 }
+                PendingOp::NvmSglFetch { op_id } => {
+                    // **Phase R2a** — SGL segment 页到达：parse descriptor →
+                    // 构建 fragment plan（每片 host address + 数据流偏移 + 长度）
+                    // → 启动逐 fragment 传输（READ scatter / WRITE gather）。
+                    //
+                    // R2a：经 Last Segment 到达（单段），全部 descriptor 应为
+                    // Data Block。Segment/LastSegment continuation → R2b；
+                    // Bit Bucket → R2c；其它 → reject。
+                    let descs = match crate::sgl::parse_sgl_list(&data) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::warn!(op_id, err = e, "SGL segment 解析失败");
+                            self.finish_sgl_error(ctx, op_id, sc::SGL_DESCRIPTOR_TYPE_INVALID);
+                            return;
+                        }
+                    };
+                    let mut walk_offset = match self.sgl_ops.get(&op_id) {
+                        Some(op) => op.walk_offset,
+                        None => {
+                            tracing::warn!(op_id, "NvmSglFetch unknown op_id");
+                            return;
+                        }
+                    };
+                    let mut frags: Vec<crate::controller::SglPlanFrag> =
+                        Vec::with_capacity(descs.len());
+                    let mut walk_err: Option<u8> = None;
+                    for d in &descs {
+                        if d.sub_type != 0 {
+                            tracing::warn!(sub_type = d.sub_type, "SGL fragment sub_type 非 0");
+                            walk_err = Some(sc::SGL_DESCRIPTOR_TYPE_INVALID);
+                            break;
+                        }
+                        match d.sgl_type {
+                            crate::sgl::SglType::DataBlock => {
+                                frags.push(crate::controller::SglPlanFrag {
+                                    address: d.address,
+                                    stream_offset: walk_offset,
+                                    length: d.length,
+                                });
+                                walk_offset = walk_offset.saturating_add(d.length as u64);
+                            }
+                            other => {
+                                // R2a 仅 Data Block：Bit Bucket(R2c) / Segment
+                                // chain(R2b) / Keyed 均未实现。
+                                tracing::warn!(
+                                    kind = ?other,
+                                    "SGL descriptor type R2a 未实现 (chain=R2b / bit bucket=R2c)"
+                                );
+                                walk_err = Some(sc::SGL_DESCRIPTOR_TYPE_INVALID);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(sc_byte) = walk_err {
+                        self.finish_sgl_error(ctx, op_id, sc_byte);
+                        return;
+                    }
+                    // fragment 覆盖须正好 == expected_bytes（不足/超出都是 driver
+                    // 编码错；R2d 进一步细分 SC，这里先用 INVALID_NUMBER_OF_DESCRIPTORS）。
+                    let expected = self
+                        .sgl_ops
+                        .get(&op_id)
+                        .map(|o| o.expected_bytes)
+                        .unwrap_or(0);
+                    if walk_offset != expected {
+                        tracing::warn!(
+                            op_id,
+                            got = walk_offset,
+                            expected,
+                            "SGL fragment 覆盖与传输大小不符"
+                        );
+                        self.finish_sgl_error(ctx, op_id, sc::SGL_INVALID_NUMBER_OF_DESCRIPTORS);
+                        return;
+                    }
+                    // 提交 plan + 进入 TRANSFER 阶段。
+                    let (sq_id, cid, sq_head, cq_id, nsid, is_write) = {
+                        let op = self.sgl_ops.get_mut(&op_id).unwrap();
+                        op.frags = frags.clone();
+                        op.walk_offset = walk_offset;
+                        op.transfers_total = frags.len() as u32;
+                        (op.sq_id, op.cid, op.sq_head, op.cq_id, op.nsid, op.is_write)
+                    };
+                    if frags.is_empty() {
+                        // 0 fragment（expected 也应为 0，已被上面 != expected 挡掉
+                        // 非零情形）→ 无数据传输，直接完成。
+                        self.finish_sgl_done(ctx, op_id);
+                        return;
+                    }
+                    for (idx, frag) in frags.iter().enumerate() {
+                        let frag_idx = idx as u32;
+                        let tok = if is_write {
+                            // WRITE gather：dma_read host → 后续填 data。
+                            ctx.dma_read(frag.address, frag.length)
+                        } else {
+                            // READ scatter：从 data 切片 dma_write 到 host。
+                            let off = frag.stream_offset as usize;
+                            let end = off + frag.length as usize;
+                            let slice = self.sgl_ops[&op_id].data[off..end].to_vec();
+                            ctx.dma_write(frag.address, slice)
+                        };
+                        self.pending_ios.insert(
+                            tok,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmSglData { op_id, frag_idx },
+                            },
+                        );
+                    }
+                }
+                PendingOp::NvmSglData { op_id, frag_idx } => {
+                    // **Phase R2a** — 一个数据 fragment DMA 完成。
+                    // WRITE：把 dma_read 回来的 host 数据拷进 gather buffer（按
+                    // 该 fragment 的 stream 偏移）。READ：scatter 已完成无需回写。
+                    let (done_all, bad) = if let Some(op) = self.sgl_ops.get_mut(&op_id) {
+                        let mut bad = false;
+                        if op.is_write {
+                            if let Some(frag) = op.frags.get(frag_idx as usize).copied() {
+                                let off = frag.stream_offset as usize;
+                                let end = off.saturating_add(frag.length as usize);
+                                if data.len() == frag.length as usize && end <= op.data.len() {
+                                    op.data[off..end].copy_from_slice(&data);
+                                } else {
+                                    tracing::warn!(
+                                        op_id,
+                                        frag_idx,
+                                        got = data.len(),
+                                        want = frag.length,
+                                        "SGL gather fragment 字节数异常"
+                                    );
+                                    bad = true;
+                                }
+                            } else {
+                                tracing::warn!(op_id, frag_idx, "SGL gather frag_idx 越界");
+                                bad = true;
+                            }
+                        }
+                        op.transfers_done += 1;
+                        (op.transfers_done >= op.transfers_total, bad)
+                    } else {
+                        tracing::warn!(op_id, frag_idx, "NvmSglData unknown op_id");
+                        (false, false)
+                    };
+                    if bad {
+                        self.finish_sgl_error(ctx, op_id, sc::DATA_TRANSFER_ERROR);
+                    } else if done_all {
+                        self.finish_sgl_done(ctx, op_id);
+                    }
+                }
             }
             return;
         }
         tracing::debug!(token, "DMA completion for unknown token (likely 2nd PRP)");
+    }
+
+    /// **Phase R2** — SGL op 全 fragment 传输完成 → 终结。
+    /// WRITE：把 gather buffer 一次性写 backing 再 post CQE；READ：data 已
+    /// scatter 到 host，直接 post success CQE。
+    fn finish_sgl_done(&mut self, ctx: &mut DeviceCtx<'_>, op_id: u64) {
+        let Some(op) = self.sgl_ops.remove(&op_id) else {
+            return;
+        };
+        let cq = self.cqs.get(&op.cq_id);
+        let phase = cq.map(|c| c.phase).unwrap_or(1);
+        if op.is_write {
+            let sector = op.sector_bytes;
+            let res = if let Some(ns) = self.namespaces.get_mut(&op.nsid) {
+                ns.write_at(&op.data, op.lba * sector)
+            } else {
+                Err(std::io::Error::other(format!("unknown NSID {}", op.nsid)))
+            };
+            let cqe = match res {
+                Ok(()) => {
+                    self.stat_host_writes += 1;
+                    self.stat_lba_written += op.num_blocks as u64;
+                    if let Some(ns) = self.namespaces.get_mut(&op.nsid) {
+                        crate::controller::io::advance_zns_wp(ns, op.lba, op.num_blocks);
+                    }
+                    Cqe::success(op.cid, op.sq_id, op.sq_head, phase)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, lba = op.lba, "SGL Write backing 写失败");
+                    self.stat_num_err_log_entries += 1;
+                    self.push_error_log(
+                        op.sq_id,
+                        op.cid,
+                        (sc::DATA_TRANSFER_ERROR as u16) << 1,
+                        op.lba,
+                        op.nsid,
+                    );
+                    Cqe::error(
+                        op.cid,
+                        op.sq_id,
+                        op.sq_head,
+                        phase,
+                        sc::DATA_TRANSFER_ERROR,
+                        0,
+                    )
+                }
+            };
+            self.post_cqe(ctx, op.cq_id, cqe);
+        } else {
+            self.stat_host_reads += 1;
+            self.stat_lba_read += op.num_blocks as u64;
+            let cqe = Cqe::success(op.cid, op.sq_id, op.sq_head, phase);
+            self.post_cqe(ctx, op.cq_id, cqe);
+        }
+    }
+
+    /// **Phase R2** — SGL op 出错：清同 op 的 sibling pending + 累积器 +
+    /// 记 error log + post 一次 error CQE（保证 spec § 4.6.1 "one CQE per
+    /// command"）。
+    fn finish_sgl_error(&mut self, ctx: &mut DeviceCtx<'_>, op_id: u64, sc_byte: u8) {
+        self.pending_ios.retain(|_, q| match q.op {
+            PendingOp::NvmSglFetch { op_id: o } | PendingOp::NvmSglData { op_id: o, .. } => {
+                o != op_id
+            }
+            _ => true,
+        });
+        if let Some(op) = self.sgl_ops.remove(&op_id) {
+            let cq = self.cqs.get(&op.cq_id);
+            let phase = cq.map(|c| c.phase).unwrap_or(1);
+            self.stat_num_err_log_entries += 1;
+            self.push_error_log(op.sq_id, op.cid, (sc_byte as u16) << 1, op.lba, op.nsid);
+            let cqe = Cqe::error(op.cid, op.sq_id, op.sq_head, phase, sc_byte, 0);
+            self.post_cqe(ctx, op.cq_id, cqe);
+        }
     }
 }

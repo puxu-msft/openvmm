@@ -363,6 +363,13 @@ pub(super) enum PendingOp {
     /// **Phase E** — NVM Read with PRP list, Step 2: per-page data DMA-write。
     /// `page_idx` 是 PRP 中第几个数据页。
     NvmReadPrpListData { op_id: u64, page_idx: u32 },
+    /// **Phase R2** — SGL Segment（PSDT=10）：embedded SGL1 指向的 segment 页
+    /// DMA-read 完成 → parse descriptor + 构建 fragment plan + 启动数据传输。
+    /// （R2b：末位 continuation descriptor → 递归 fetch 下一段。）
+    NvmSglFetch { op_id: u64 },
+    /// **Phase R2** — SGL 数据 fragment 传输完成（READ = scatter dma_write 到
+    /// host / WRITE = gather dma_read 自 host）。`frag_idx` 索引 `SglOp.frags`。
+    NvmSglData { op_id: u64, frag_idx: u32 },
     /// **Phase H3** — NVM Compare：DMA-read host buffer 完成后与 backing
     /// LBA 对比。`lba/num_blocks` 用于 file seek+read；对比失败返
     /// COMPARE_FAILURE (SC 0x85, SCT=0x02 Media/Data Integrity)。
@@ -581,8 +588,57 @@ pub(super) struct PrpListOp {
     pub(super) data_pages: Vec<Option<Vec<u8>>>,
 }
 
-/// **Phase H4 + K1** — 单个 namespace 状态。
+/// **Phase R2** — SGL Segment 数据路径累积器（PSDT=10）。
 ///
+/// 镜像 `PrpListOp`，但 SGL 数据是任意 (address, length) fragment 的
+/// scatter-gather，**无法**映射成单 (prp1, prp2)，需平行机件：
+/// - WALK 阶段：DMA-read embedded SGL1 指向的 segment 页 → parse descriptor
+///   →（R2b：末位 continuation descriptor → 递归 fetch 下一段）→ 累积
+///   fragment plan（每片记 host address + 在数据流中的偏移 + 长度）。
+/// - TRANSFER 阶段：walk 完成后逐 fragment DMA：
+///   * READ (controller→host)：`data` 已从 backing 读好，按 fragment 切片
+///     `dma_write` 到各 host 地址。
+///   * WRITE (host→controller)：按 fragment `dma_read` 填 `data`，全到齐后
+///     一次性写 backing。
+pub(super) struct SglOp {
+    pub(super) sq_id: u16,
+    pub(super) cid: u16,
+    pub(super) sq_head: u16,
+    pub(super) cq_id: u16,
+    pub(super) nsid: u32,
+    pub(super) lba: u64,
+    pub(super) num_blocks: u32,
+    /// true = WRITE (host→device)，false = READ。
+    pub(super) is_write: bool,
+    /// per-NS 扇区字节（1<<lbads）。WRITE 完成写 backing 时算偏移用。
+    pub(super) sector_bytes: u64,
+    /// 期望总传输字节 = num_blocks * sector_bytes。fragment 覆盖须正好等于它。
+    pub(super) expected_bytes: u64,
+    /// READ：backing 已读好的数据（待按 fragment scatter）。
+    /// WRITE：gather buffer（按 fragment dma_read 填，全到齐写 backing）。
+    pub(super) data: Vec<u8>,
+    /// segment walk 累积的数据 fragment（按 SGL 顺序，已计算 stream 偏移）。
+    pub(super) frags: Vec<SglPlanFrag>,
+    /// walk 中数据流累积偏移（下一个 fragment 在 `data` 流中的起点）。
+    pub(super) walk_offset: u64,
+    /// TRANSFER 阶段已完成的数据 fragment DMA 数。
+    pub(super) transfers_done: u32,
+    /// TRANSFER 阶段需完成的数据 fragment DMA 总数（walk 完成后 set）。
+    pub(super) transfers_total: u32,
+}
+
+/// **Phase R2** — 单个 SGL 数据 fragment 的传输计划（walk 阶段构建）。
+#[derive(Clone, Copy)]
+pub(super) struct SglPlanFrag {
+    /// host GPA（Data Block 目标 / 源）。
+    pub(super) address: u64,
+    /// 在 `SglOp.data` 流中的起点字节偏移。
+    pub(super) stream_offset: u64,
+    /// 本 fragment 字节数。
+    pub(super) length: u32,
+}
+
+/// **Phase H4 + K1** — 单个 namespace 状态。
 /// 每 NS 有独立 backing file + 容量 + LBA 格式 + Protection Information
 /// 配置。spec § 1.6 "An NSID maps to one namespace"。
 pub(super) struct Namespace {
@@ -892,6 +948,8 @@ pub struct NvmeController {
     next_op_id: u64,
     /// **Phase E** — PRP-list IO 累积（Write/Read > 2 page）。
     pub(super) prp_list_ops: HashMap<u64, PrpListOp>,
+    /// **Phase R2** — SGL Segment IO 累积（PSDT=10，scatter-gather）。
+    pub(super) sgl_ops: HashMap<u64, SglOp>,
     /// **Phase K2** — Compare > 1 page 累积（dual PRP / PRP list）。
     pub(super) compare_ops: HashMap<u64, CompareAccum>,
     /// **Phase K4c** — 多 LBA PI Write 累积。op_id → 全 data + 完成进度。
@@ -1926,6 +1984,7 @@ impl NvmeController {
             dual_prp_writes: HashMap::new(),
             next_op_id: 1,
             prp_list_ops: HashMap::new(),
+            sgl_ops: HashMap::new(),
             compare_ops: HashMap::new(),
             pi_writes: HashMap::new(),
             pi_reads: HashMap::new(),

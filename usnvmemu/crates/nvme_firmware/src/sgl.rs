@@ -99,8 +99,8 @@ impl SglDescriptor {
 ///
 /// 返 Err 描述哪里出错；调用方按 sc::SGL_* 转 CQE。
 ///
-/// 当前 R1 仅 inline single-Data-Block；本函数留给 R2 Segment chain 使用。
-#[allow(dead_code)]
+/// **Phase R2a** 起已 wire：`controller/completion.rs::NvmSglFetch` 用本函数
+/// 解析 PSDT=10 segment 页里的 descriptor 数组。
 pub(crate) fn parse_sgl_list(buf: &[u8]) -> Result<Vec<SglDescriptor>, &'static str> {
     if !buf.len().is_multiple_of(16) {
         return Err("SGL list bytes not multiple of 16");

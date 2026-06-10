@@ -1971,6 +1971,7 @@ fn devicectx_mock_captures_dma_read() {
 /// **Phase R1** — SGL inline single Data Block 解 prp1=address。
 #[test]
 fn sgl_inline_data_block_resolves_to_prp() {
+    use crate::controller::io::DataPointer;
     use crate::controller::io::resolve_data_pointers;
     // 构造 PSDT=01 SQE with SGL descriptor in bytes 24..40
     let zero = [0u8; 64];
@@ -1982,7 +1983,13 @@ fn sgl_inline_data_block_resolves_to_prp() {
     sqe.prp1 = address; // bytes 24..32
     sqe.prp2 = length as u64; // bytes 32..40: length lo + 0 reserved + 0x00 ID byte (Data Block, sub=0)
     assert_eq!(sqe.psdt(), 1);
-    let (resolved_prp1, resolved_prp2) = resolve_data_pointers(&sqe).unwrap();
+    let DataPointer::Prp {
+        prp1: resolved_prp1,
+        prp2: resolved_prp2,
+    } = resolve_data_pointers(&sqe).unwrap()
+    else {
+        panic!("inline single Data Block 应解析成 Prp");
+    };
     assert_eq!(resolved_prp1, address);
     assert_eq!(resolved_prp2, 0); // single Data Block 不需要 prp2
 }
@@ -1990,26 +1997,30 @@ fn sgl_inline_data_block_resolves_to_prp() {
 /// **Phase R1** — PSDT=00 (PRP) 路径不变。
 #[test]
 fn psdt_zero_passes_through_prp() {
+    use crate::controller::io::DataPointer;
     use crate::controller::io::resolve_data_pointers;
     let zero = [0u8; 64];
     let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
     sqe.cdw0 = 0x0042_0002; // PSDT=00
     sqe.prp1 = 0xBEEF_0000;
     sqe.prp2 = 0xBEEF_1000;
-    let (p1, p2) = resolve_data_pointers(&sqe).unwrap();
+    let DataPointer::Prp { prp1: p1, prp2: p2 } = resolve_data_pointers(&sqe).unwrap() else {
+        panic!("PSDT=00 应解析成 Prp");
+    };
     assert_eq!(p1, 0xBEEF_0000);
     assert_eq!(p2, 0xBEEF_1000);
 }
 
-/// **Phase R1** — PSDT=10 (Segment pointer) 当前不支持。
+/// **Phase R2** — PSDT=10 (Segment pointer) 现走 SGL segment 路径（返 SglSegment，
+/// 不再 Err）。embedded SGL1 的真伪在 dispatch 阶段（dispatch_sgl_read/write）校验。
 #[test]
-fn psdt_segment_pointer_rejected() {
+fn psdt_segment_pointer_routes_to_sgl() {
+    use crate::controller::io::DataPointer;
     use crate::controller::io::resolve_data_pointers;
     let zero = [0u8; 64];
     let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
     sqe.cdw0 = 0x0042_8002; // PSDT=10 (bits 15:14 = 10 = 0x8000)
-    let r = resolve_data_pointers(&sqe);
-    assert_eq!(r, Err(crate::cmd::sc::SGL_DESCRIPTOR_TYPE_INVALID));
+    assert_eq!(resolve_data_pointers(&sqe), Ok(DataPointer::SglSegment));
 }
 
 /// **advertise⟺implement** — inline Bit Bucket (Type 1) 被拒（故 SGLS 不 advertise bit16）。
