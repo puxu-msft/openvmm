@@ -639,3 +639,34 @@ pcie_remote_e2e.rs` 用 flat 16 MiB guest-mem `Vec`）、vfio `qemu_interop`、`
 **来源**: 真 Hyper-V guest e2e harness `scripts/hyperv_interop/` 首次跑当前 binary 即
 抓到；fix `controller/mmio.rs`（ASQ/ACQ/BPMBL size-aware）+ 单测 + revert-verify；
 rust-reviewer 确认无 sibling 截断点（PRP/IO 队列 base 走 SQE 的 u64，非 MMIO）。
+
+## 26. API footgun（每个调用点手填同一参数）→ 结构性修，让数据自带 (HIGH)
+
+**症状**: §25 校正 SGL SC 后，审计整个 `sc::` 模块发现错的不止字节——`Cqe::error(..,
+sc: u8, sct: u8)` 把 **SCT（status code type）当独立参数在 224 个调用点手填**，多处填错：
+`INVALID_PROTECTION_INFO` 当 Generic 发（driver 误读"Capacity Exceeded"）、
+`NAMESPACE_IS_WRITE_PROTECTED` 当 Cmd-Specific 发、PI verify fail 当 Generic（应 Media）、
+ZNS `INVALID_FIELD` fallback 被强制 Cmd-Specific、`RESERVATION_CONFLICT` 0x183、
+`LOCKDOWN` 0x123、AER limit 用 0x05(power-loss)……全是"在每个调用点重复做同一个易错决策"。
+
+**为什么 anchor 不够**: §25 的 byte-anchor 测试只锁**值**，锁不住"调用点把对的值配错
+SCT 发出去"。footgun 在 API 形状里：只要 SCT 是独立的手填参数，第 225 个调用点还会填错。
+
+**根治 = 改 API 让数据自带 SCT，不靠调用点决策**: `sc::` 常量改成**完整 u16 status**
+（SC + SCT<<8，精确镜像 nvme_spec::Status）；`Cqe::error(.., status: u16)` 单参，
+SC+SCT 由 `sf_of(status)` 自动派生。调用点再也不传 SCT → **整类 bug 从源头消失**，
+且 byte-anchor 顺带变成 full-status anchor（连 SCT 一起锁）。224 个调用点脚本化迁移
+（const 站点 drop SCT 参；运行期算 SC 的少数站点用 `sc::status(sc_byte, sct)` 显式拼）。
+
+**三条**:
+1. **同一个易错决策在 N 个调用点重复 = API footgun，不是 N 个独立 bug**。别逐点补
+   （补完还会有第 N+1 个）；把决策**移进数据/类型**，让调用点无从填错。这里是"SCT 从
+   status 高字节派生"，本质同 [[lesson §20]]"判据用协议字段不用自家约定"。
+2. **结构性重构改 200+ 调用点不是"改动太大"的理由**（[[user-values-long-term-correctness]]）。
+   脚本化迁移 + 编译器驱动（改签名→编译器标出每个站点）+ 全量测试 + anchor 锁，安全可控。
+3. **审计要顺藤摸瓜到 API 形状**：reviewer 第一轮只抓了撞 byte 的 SANITIZE；真问题是
+   SCT footgun。发现一个手填错值，要问"这个值/参数是不是每个调用点都在手填"，是就改结构。
+
+**来源**: sc 模块结构性重构（commit `2a6d71ec`）；anchored 测试 `sc_constants_match_nvme_spec`
+（全 sc:: == nvme_spec::Status）；rust-reviewer 2 轮（确认 4 处 intended SCT 校正 + 额外
+挖出 RESERVATION_CONFLICT/LOCKDOWN 2 处错值，HIGH-1 一处 PI error-log 漏 Media SCT）。
