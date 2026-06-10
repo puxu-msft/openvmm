@@ -20,12 +20,51 @@ impl NvmeController {
     pub(super) fn write_cc(&mut self, new_cc: u32) {
         let old_en = self.cc & cc::EN != 0;
         let new_en = new_cc & cc::EN != 0;
+        let old_shn = (self.cc & cc::SHN_MASK) >> cc::SHN_SHIFT;
+        let new_shn = (new_cc & cc::SHN_MASK) >> cc::SHN_SHIFT;
         self.cc = new_cc;
         if !old_en && new_en {
             self.enable();
         } else if old_en && !new_en {
             self.disable();
         }
+        // **Shutdown sequence (spec § 3.1.4.5)**：CC.SHN 由 00 → 01(normal)/10(abrupt)
+        // → controller flush volatile 数据到 NVM，再置 CSTS.SHST=10(complete) 让 driver
+        // 轮询确认可安全断电。此前忽略 SHN（直接走 CSTS.RDY=0）。
+        if old_shn == cc::SHN_NORMAL
+            && (new_shn == cc::SHN_NORMAL_SHUTDOWN || new_shn == cc::SHN_ABRUPT_SHUTDOWN)
+        {
+            self.process_shutdown(new_shn);
+        } else if old_shn != cc::SHN_NORMAL && new_shn == cc::SHN_NORMAL {
+            // **reviewer M-1**：CC.SHN 由 shutdown 清回 00 → CSTS.SHST 回 normal
+            // （spec：SHST 反映**当前** shutdown-processing 状态，不是粘滞历史）。
+            self.csts &= !csts::SHST_MASK;
+        }
+    }
+
+    /// **Shutdown 序列（spec § 3.1.4.5）**：flush 所有 NS 的 volatile 数据 →
+    /// CSTS.SHST = complete。normal(01) 与 abrupt(10) 都 flush（教学上一律持久化更安全；
+    /// spec 允许 abrupt 跳过以求快）。flush 失败仅 warn —— shutdown 不应卡死 driver。
+    ///
+    /// **教学边界（deliberate omission，reviewer M-2/M-3）**：
+    /// - 不 quiesce：完成后不拦截新命令的 doorbell（`on_sq_tail_doorbell` 不 gate
+    ///   SHST/RDY）。教学 driver 协作、shutdown 后不再敲门，故不建模。
+    /// - flush 失败仍报 complete：spec 无 "shutdown failed" 状态；production controller
+    ///   会在此置 `csts::CFS`（fatal）让 driver 知数据可能丢，教学版仅 warn。
+    fn process_shutdown(&mut self, shn_field: u32) {
+        tracing::info!(
+            shn = shn_field,
+            "NVMe: CC.SHN shutdown → flush all NS + CSTS.SHST=complete"
+        );
+        let nsids: Vec<u32> = self.namespaces.keys().collect();
+        for nsid in nsids {
+            if let Some(ns) = self.namespaces.get(&nsid)
+                && let Err(e) = ns.flush()
+            {
+                tracing::warn!(nsid, error = %e, "shutdown flush failed");
+            }
+        }
+        self.csts = (self.csts & !csts::SHST_MASK) | csts::SHST_COMPLETE;
     }
 
     pub(super) fn enable(&mut self) {
@@ -60,6 +99,8 @@ impl NvmeController {
         );
         self.state = CtrlState::Ready;
         self.csts |= csts::RDY;
+        // (重新) enable = normal operation：清 CSTS.SHST（上次 shutdown 的 complete 状态）。
+        self.csts &= !csts::SHST_MASK;
         tracing::info!(
             asqs,
             acqs,

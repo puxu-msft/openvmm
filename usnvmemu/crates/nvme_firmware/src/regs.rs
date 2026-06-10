@@ -7,8 +7,9 @@
 //! - CAP / VS / INTMS / INTMC / CC / CSTS / AQA / ASQ / ACQ
 //! - SQ0/CQ0 doorbell + SQ1/CQ1 doorbell（1 IO queue pair）
 //!
-//! 不实现：CMBLOC/CMBSZ（无 CMB）/ BPINFO（无 boot partition）/ CC.SHN
-//! shutdown notification 的多级（直接走 CSTS.RDY=0）。
+//! 不实现：CMBLOC/CMBSZ（无 CMB）/ BPINFO（无 boot partition）。
+//! CC.SHN shutdown notification + CSTS.SHST 已实现（spec § 3.1.4.5，2026-06-10）：
+//! CC.SHN=01/10 → flush 所有 NS → CSTS.SHST=complete。
 
 #![allow(dead_code)]
 
@@ -70,7 +71,12 @@ pub mod cc {
     pub const MPS_SHIFT: u32 = 7;
     pub const MPS_MASK: u32 = 0xf << MPS_SHIFT; // bits 10:7
     pub const AMS_RR: u32 = 0; // bits 13:11, Round Robin
-    pub const SHN_NORMAL: u32 = 0; // bits 15:14, 00 = not shutting down
+    // **Shutdown Notification (CC.SHN, bits 15:14)** — spec § 3.1.4.5。
+    pub const SHN_SHIFT: u32 = 14;
+    pub const SHN_MASK: u32 = 0b11 << SHN_SHIFT;
+    pub const SHN_NORMAL: u32 = 0; // 00 = not shutting down（field value）
+    pub const SHN_NORMAL_SHUTDOWN: u32 = 0b01; // 01 = normal shutdown（field value）
+    pub const SHN_ABRUPT_SHUTDOWN: u32 = 0b10; // 10 = abrupt shutdown（field value）
     pub const IOSQES_SHIFT: u32 = 16;
     pub const IOCQES_SHIFT: u32 = 20;
 }
@@ -79,7 +85,11 @@ pub mod cc {
 pub mod csts {
     pub const RDY: u32 = 1 << 0;
     pub const CFS: u32 = 1 << 1; // controller fatal status
-    pub const SHST_NORMAL: u32 = 0; // bits 3:2
+    // **Shutdown Status (CSTS.SHST, bits 3:2)** — spec § 3.1.4.5（含位移）。
+    pub const SHST_MASK: u32 = 0b11 << 2;
+    pub const SHST_NORMAL: u32 = 0; // 00 = normal operation
+    pub const SHST_OCCURRING: u32 = 0b01 << 2; // 01 = shutdown processing occurring
+    pub const SHST_COMPLETE: u32 = 0b10 << 2; // 10 = shutdown processing complete
 }
 
 /// CAP (Controller Capabilities) — 64 位 RO，启动期一次构造。

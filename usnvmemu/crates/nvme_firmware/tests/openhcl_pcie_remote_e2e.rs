@@ -1160,3 +1160,68 @@ async fn openhcl_get_log_page_prp_list() -> Result<()> {
 
     Ok(())
 }
+
+/// Shutdown 序列 —— CC.SHN → CSTS.SHST=complete（spec § 3.1.4.5）。
+///
+/// driver 清洁关机：写 CC.SHN=01(normal)，controller flush volatile 数据后置
+/// CSTS.SHST=10(complete) 让 driver 轮询确认可安全断电。此前 firmware 忽略 SHN
+/// （直接走 CSTS.RDY=0），driver 的 shutdown poll 永等不到 complete。
+///
+/// **revert-verify**：去掉 write_cc 的 SHN 处理 → CSTS.SHST 永停 00 → 本测试超时 FAIL。
+#[tokio::test]
+async fn openhcl_shutdown_sequence() -> Result<()> {
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    driver.enable_controller().await.context("enable")?;
+
+    // enable 后 CSTS.SHST 应 = 00(normal operation)。
+    let csts0 = driver.mmio_read(REG_CSTS, 4).await?;
+    assert_eq!(
+        (csts0 >> 2) & 0x3,
+        0,
+        "enable 后 CSTS.SHST 应=00(normal)，实 csts={csts0:#x}"
+    );
+
+    // 写 CC.SHN=01(normal shutdown)，保持 EN=1（典型清洁关机序列）。
+    // CC = EN | IOSQES=6<<16 | IOCQES=4<<20 | SHN=01<<14。
+    let cc = 1u64 | (6 << 16) | (4 << 20) | (0b01 << 14);
+    driver.mmio_write(REG_CC, 4, cc);
+
+    // 轮询 CSTS.SHST 到 10(complete)。
+    let mut shst = 0u64;
+    let mut complete = false;
+    for _ in 0..100 {
+        let csts = driver.mmio_read(REG_CSTS, 4).await?;
+        shst = (csts >> 2) & 0x3;
+        if shst == 0b10 {
+            complete = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        complete,
+        "CC.SHN=01 后 CSTS.SHST 应达 10(complete)，实={shst:#x}"
+    );
+
+    // 幂等（reviewer LOW-2）：再写一次 SHN=01，SHST 仍 10、无副作用。
+    driver.mmio_write(REG_CC, 4, cc);
+    let csts2 = driver.mmio_read(REG_CSTS, 4).await?;
+    assert_eq!(
+        (csts2 >> 2) & 0x3,
+        0b10,
+        "重复 SHN=01 应幂等，SHST 仍 10，实 csts={csts2:#x}"
+    );
+
+    // SHN 清回 00（reviewer M-1）：CSTS.SHST 回 00(normal)。
+    let cc_clear = 1u64 | (6 << 16) | (4 << 20); // EN + IOSQES + IOCQES，SHN=00
+    driver.mmio_write(REG_CC, 4, cc_clear);
+    let csts3 = driver.mmio_read(REG_CSTS, 4).await?;
+    assert_eq!(
+        (csts3 >> 2) & 0x3,
+        0,
+        "SHN 清回 00 后 CSTS.SHST 应回 normal，实 csts={csts3:#x}"
+    );
+
+    Ok(())
+}
