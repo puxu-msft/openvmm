@@ -180,39 +180,62 @@ mod addr_reg_tests {
         NvmeController::open(&[path.to_str().unwrap().to_string()], 0x1414, 0, &[]).unwrap()
     }
 
-    /// **Bug fix 2026-06-10 回归**：单条 8-byte（qword）写 ASQ/ACQ 到 4 GiB
-    /// 以上时高 32 位必须保留。原代码 `value & 0xffff_ffff` 会截断 → guest
-    /// admin 队列落在 4 GiB 以上时 SQE fetch 读错 GPA → 首条命令读成全 0。
-    /// 真 Hyper-V guest e2e（4 GiB RAM）发现；小内存 in-process harness 命不到。
+    /// **通用机制（回归 "64-bit 寄存器写/读无视 size 而截断" 这一整类 bug，由
+    /// 2026-06-10 ASQ/ACQ/BPMBL 写侧截断引出）**：每个 8-byte BAR0 寄存器都必须
+    /// round-trip 一个 4 GiB 以上的值——单条 qword 写、4-byte low/high 分写、
+    /// qword/dword 读全部一致，且写侧字段确实存了全 64 位。任一寄存器的写或读路径
+    /// 截断 → 对应行红。新增 8-byte 寄存器加进 `REGS_64` 即纳入回归；distinct 值
+    /// 同时 catch 寄存器互相串写。（背景：被截断的高 32 位让 guest 落在 4 GiB 以上
+    /// 的 admin 队列 SQE fetch 读错 GPA → init 挂；真 Hyper-V guest e2e 发现，小内存
+    /// in-process harness 的 GPA 永远 < 4 GiB 命不到。）
     #[test]
-    fn asq_acq_qword_write_above_4gib_not_truncated() {
+    fn all_64bit_registers_roundtrip_above_4gib() {
+        const REGS_64: &[(u64, &str)] = &[(0x28, "ASQ"), (0x30, "ACQ"), (0x48, "BPMBL")];
         let mut c = mk();
         let mut cap = pcie_device_core::CaptureTransport::with_start_token(0x100);
         let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
-        c.mmio_write_impl(&mut ctx, 0, 0x28, 8, 0x1_02eb_0000);
-        assert_eq!(c.asq, 0x1_02eb_0000, "ASQ 8-byte 写被截断（4 GiB 以上）");
-        // read 侧 size-aware round-trip（mmio_read_impl 是这个 bug 的镜像半边）
-        assert_eq!(c.mmio_read_impl(0, 0x28, 8), 0x1_02eb_0000, "ASQ qword 回读不全");
-        assert_eq!(c.mmio_read_impl(0, 0x28, 4), 0x02eb_0000, "ASQ low dword 回读错");
-        assert_eq!(c.mmio_read_impl(0, 0x2c, 4), 0x1, "ASQ high dword 回读错");
-        c.mmio_write_impl(&mut ctx, 0, 0x30, 8, 0x2_aaaa_5000);
-        assert_eq!(c.acq, 0x2_aaaa_5000, "ACQ 8-byte 写被截断（4 GiB 以上）");
-        // BPMBL 同 8-byte 寄存器
-        c.mmio_write_impl(&mut ctx, 0, 0x48, 8, 0x3_1234_0000);
-        assert_eq!(c.bpmbl, 0x3_1234_0000, "BPMBL 8-byte 写被截断");
-    }
 
-    /// 4-byte 分两次写（low @0x28/0x30, high @0x2c/0x34）仍正确组装 64 位。
-    #[test]
-    fn asq_acq_split_dword_write_still_works() {
-        let mut c = mk();
-        let mut cap = pcie_device_core::CaptureTransport::with_start_token(0x100);
-        let mut ctx = pcie_device_core::DeviceCtx::new(&mut cap);
-        c.mmio_write_impl(&mut ctx, 0, 0x28, 4, 0xbbbb_0000); // low dword
-        c.mmio_write_impl(&mut ctx, 0, 0x2c, 4, 0x1); // high dword
-        assert_eq!(c.asq, 0x1_bbbb_0000);
-        c.mmio_write_impl(&mut ctx, 0, 0x30, 4, 0xcccc_0000);
-        c.mmio_write_impl(&mut ctx, 0, 0x34, 4, 0x2);
-        assert_eq!(c.acq, 0x2_cccc_0000);
+        // ① 单条 qword 写 distinct 的 >4 GiB 值 → 全部写完再全部回读。
+        for &(off, _) in REGS_64 {
+            c.mmio_write_impl(&mut ctx, 0, off, 8, ((off + 1) << 32) | 0x5a5a_1234);
+        }
+        for &(off, name) in REGS_64 {
+            let v = ((off + 1) << 32) | 0x5a5a_1234;
+            // 字段 ground-truth：写侧没截断，且寄存器之间没串写
+            let stored = match off {
+                0x28 => c.asq,
+                0x30 => c.acq,
+                0x48 => c.bpmbl,
+                _ => unreachable!(),
+            };
+            assert_eq!(stored, v, "{name}: qword 写侧截断/串写");
+            // 读侧 size-aware round-trip（mmio_read_impl 是这个 bug 的镜像半边）
+            assert_eq!(c.mmio_read_impl(0, off, 8), v, "{name}: qword 回读不全");
+            assert_eq!(
+                c.mmio_read_impl(0, off, 4),
+                v & 0xffff_ffff,
+                "{name}: low dword 回读错"
+            );
+            assert_eq!(
+                c.mmio_read_impl(0, off + 4, 4),
+                v >> 32,
+                "{name}: high dword 回读错"
+            );
+        }
+
+        // ② 4-byte low/high 分写必须拼回完整 64 位。
+        for &(off, _) in REGS_64 {
+            let v = ((off + 2) << 32) | 0xa5a5_5678;
+            c.mmio_write_impl(&mut ctx, 0, off, 4, v & 0xffff_ffff);
+            c.mmio_write_impl(&mut ctx, 0, off + 4, 4, v >> 32);
+        }
+        for &(off, name) in REGS_64 {
+            let v = ((off + 2) << 32) | 0xa5a5_5678;
+            assert_eq!(
+                c.mmio_read_impl(0, off, 8),
+                v,
+                "{name}: split dword 未拼回 64 位"
+            );
+        }
     }
 }
