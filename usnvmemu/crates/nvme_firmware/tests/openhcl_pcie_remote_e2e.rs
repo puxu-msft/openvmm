@@ -1010,3 +1010,69 @@ async fn openhcl_fused_compare_and_write() -> Result<()> {
 
     Ok(())
 }
+
+/// P1 —— admin 数据 DMA 的**非连续 PRP** 正确性（修 latent silent corruption）。
+///
+/// 旧 `dma_write_then_complete` 把整 buf 连续写单个 PRP1、无视 PRP2 → > 4 KiB 的数据
+/// 在 PRP1/PRP2 **非连续**的 host 上把 page1 写到 `PRP1+4096` 而非 PRP2。本测试请求一个
+/// 6 KiB(1.5 page) Get Log Page，**故意给非连续 PRP1/PRP2**，在 `PRP1+4096` 与 PRP2 各
+/// 种 sentinel，断言：page1 落 PRP2、**不**碰 `PRP1+4096`。
+///
+/// **独立 oracle / revert-verify**：把 helper 退回"整 buf 连续写 PRP1"，本测试必 FAIL
+/// （page1 覆盖 PRP1+4096 的 sentinel）→ 证明测试有牙。
+#[tokio::test]
+async fn openhcl_get_log_page_noncontiguous_prp() -> Result<()> {
+    // 故意非连续：PRP1+4096 = 0xA1000 ≠ PRP2 = 0xC0000。
+    const LOG_PRP1: u64 = 0xA_0000;
+    const LOG_PRP2: u64 = 0xC_0000;
+    const BUG_GPA: u64 = LOG_PRP1 + 4096; // 0xA1000 —— 连续写 bug 会把 page1 写这
+    const LOG_BYTES: usize = 6144; // 1.5 page → 触发 2-page PRP1+PRP2 路径
+
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    driver.enable_controller().await.context("enable")?;
+    let mut admin = QueueState::admin();
+
+    // 种 sentinel：PRP1+4096 区 = 0x77（fix 下不该被碰）、PRP2 区 = 0x88（fix 下该被写）。
+    driver.write_guest(BUG_GPA, vec![0x77; 4096]);
+    driver.write_guest(LOG_PRP2, vec![0x88; 4096]);
+
+    // Get Log Page（opcode 0x02）LID=0x07 Telemetry Host-Initiated，6 KiB，非连续 PRP。
+    // NUMD = bytes/4 - 1（0-based dwords）；cdw10 bits31:16 = NUMDL，cdw11 = NUMDU。
+    let numd = (LOG_BYTES / 4 - 1) as u32;
+    let cdw10 = 0x07u32 | ((numd & 0xffff) << 16);
+    let cdw11 = numd >> 16;
+    let cqe = admin
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02,
+                cid: 0x50,
+                nsid: 0xffff_ffff, // controller-wide log
+                prp1: LOG_PRP1,
+                prp2: LOG_PRP2,
+                cdw10,
+                cdw11,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Get Log Page")?;
+    assert_eq!(cqe.sc, 0, "Get Log Page sc 应=0，实={:#x}", cqe.sc);
+
+    // ★ 独立 oracle：page1 落 PRP2，**不**碰 PRP1+4096。
+    let bug_region = driver.read_guest(BUG_GPA, 2048).await?;
+    assert!(
+        bug_region.iter().all(|&b| b == 0x77),
+        "PRP1+4096(0xA1000) 应仍是 sentinel 0x77（firmware 未越界连续写 page1）—— \
+         否则即 ×连续 PRP latent corruption"
+    );
+    let prp2_region = driver.read_guest(LOG_PRP2, 2048).await?;
+    assert!(
+        !prp2_region.iter().all(|&b| b == 0x88),
+        "PRP2 应被 firmware 写入 page1 数据（不再全 0x88 sentinel）"
+    );
+
+    Ok(())
+}

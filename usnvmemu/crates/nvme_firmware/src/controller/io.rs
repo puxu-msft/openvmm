@@ -2060,7 +2060,9 @@ impl NvmeController {
                 }
                 let start_zone_idx = (slba / zns.zone_size) as usize;
                 let buf = build_zone_report(zns, start_zone_idx, bytes);
-                self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, sq_id, sq_head, cq_id);
+                self.dma_write_then_complete(
+                    ctx, sqe.prp1, sqe.prp2, buf, cid, sq_id, sq_head, cq_id,
+                );
                 None
             }
             nvm_opc::ZONE_APPEND => {
@@ -2351,7 +2353,9 @@ impl NvmeController {
                     ));
                 };
                 let buf = super::reservation::build_reservation_report(ns, bytes);
-                self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, sq_id, sq_head, cq_id);
+                self.dma_write_then_complete(
+                    ctx, sqe.prp1, sqe.prp2, buf, cid, sq_id, sq_head, cq_id,
+                );
                 None
             }
             opc => {

@@ -2623,27 +2623,98 @@ impl NvmeController {
         }
     }
 
-    /// 帮助函数：DMA-write `data` 到 `gpa`，完成后构造 success CQE 提交。
-    /// 用 PendingOp::NvmReadDmaWrite 通用入口（Identify 也走这条）。
+    /// 帮助函数：把 `data` 经 **spec § 4.1.1 PRP** DMA-write 回 host，完成后提交
+    /// success CQE。Identify / Get Log Page / Get Features（admin）+ Zone Report /
+    /// Reservation Report（io.rs，可 > 8 KiB）都走这条。
+    ///
+    /// **P1（2026-06-10）—— 修 latent silent corruption**：原实现把整个 `data`
+    /// 连续写到单个 `prp1`，无视 PRP2。但 host 的 PRP1/PRP2 页 GPA **不保证连续**
+    /// （Linux/Windows 驱动常给非连续页）→ > 4 KiB 数据的 page 1 会被写到
+    /// `prp1 + 4096` 而非 PRP2 指向的 GPA，silent 写错地址。
+    ///
+    /// 现按 buf 大小分流（复用 IO read 的 dual-PRP 双 token 机件，零新状态）：
+    /// - **≤ 1 page**：单 PRP1 写（原行为，字节级不变 —— Identify(4K)/SMART 等回归安全）。
+    /// - **2 page**：page0→PRP1（`NvmReadDualPrpSiblingHalf`，success no-op）+
+    ///   page1→PRP2（`NvmReadDmaWrite{num_blocks:0}`，success post CQE）。completer
+    ///   是后发的 tok2 → transport in-order completion 下它触发时 sibling 已落，两页
+    ///   齐才 post CQE。DMA-fail 由 `on_dma_complete` 顶部 `!ok` 分支统一处理
+    ///   （含移除 sibling 防其后到 post success 覆盖 error）。
+    /// - **> 2 page**：PRP2 是 PRP list **指针**（非 page1 数据）→ dual 路径会写坏
+    ///   list，故**回退旧行为**（整 buf 连续写 PRP1）。PRP list 解析留 P2。命中者主要
+    ///   是 > 8 KiB 的 Zone Report / Reservation Report；回退路径与 P1 前完全相同 →
+    ///   无回归，P2 再彻底修。
     fn dma_write_then_complete(
         &mut self,
         ctx: &mut DeviceCtx<'_>,
-        gpa: u64,
+        prp1: u64,
+        prp2: u64,
         data: Vec<u8>,
         cid: u16,
         sq_id: u16,
         sq_head: u16,
         cq_id: u16,
     ) {
-        let tok = ctx.dma_write(gpa, data);
+        if data.len() as u64 <= NVME_PAGE_SIZE {
+            let tok = ctx.dma_write(prp1, data);
+            self.pending_ios.insert(
+                tok,
+                PendingIo {
+                    sq_id,
+                    cid,
+                    sq_head,
+                    cq_id,
+                    nsid: 0, // admin payload，无 NS 关联
+                    op: PendingOp::NvmReadDmaWrite { num_blocks: 0 },
+                },
+            );
+            return;
+        }
+        if data.len() as u64 > 2 * NVME_PAGE_SIZE {
+            // > 2 page：PRP2 = PRP list 指针，dual 会写坏 list。P2 补 list 解析；
+            // 此处回退连续写 PRP1（= P1 前行为，无回归）。
+            tracing::debug!(
+                bytes = data.len(),
+                "data > 2 page：PRP list 未实现(P2)，回退连续写 PRP1"
+            );
+            let tok = ctx.dma_write(prp1, data);
+            self.pending_ios.insert(
+                tok,
+                PendingIo {
+                    sq_id,
+                    cid,
+                    sq_head,
+                    cq_id,
+                    nsid: 0,
+                    op: PendingOp::NvmReadDmaWrite { num_blocks: 0 },
+                },
+            );
+            return;
+        }
+        let half = NVME_PAGE_SIZE as usize;
+        let (b1, b2) = data.split_at(half);
+        // page0 → PRP1（sibling 半，success no-op）。
+        let tok1 = ctx.dma_write(prp1, b1.to_vec());
         self.pending_ios.insert(
-            tok,
+            tok1,
             PendingIo {
                 sq_id,
                 cid,
                 sq_head,
                 cq_id,
-                nsid: 0, // admin payload，无 NS 关联
+                nsid: 0,
+                op: PendingOp::NvmReadDualPrpSiblingHalf,
+            },
+        );
+        // page1 → PRP2（completer，success post CQE）。后发 → in-order 下最后完成。
+        let tok2 = ctx.dma_write(prp2, b2.to_vec());
+        self.pending_ios.insert(
+            tok2,
+            PendingIo {
+                sq_id,
+                cid,
+                sq_head,
+                cq_id,
+                nsid: 0,
                 op: PendingOp::NvmReadDmaWrite { num_blocks: 0 },
             },
         );

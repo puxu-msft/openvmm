@@ -354,7 +354,7 @@ impl NvmeController {
                     }
                 };
                 // DMA write to PRP1
-                self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, 0, sq_head, cq_id);
+                self.dma_write_then_complete(ctx, sqe.prp1, sqe.prp2, buf, cid, 0, sq_head, cq_id);
                 None
             }
             admin_opc::CREATE_IO_CQ => {
@@ -635,7 +635,9 @@ impl NvmeController {
                         if exhid {
                             buf[8..16].copy_from_slice(&self.host_id_hi.to_le_bytes());
                         }
-                        self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, 0, sq_head, cq_id);
+                        self.dma_write_then_complete(
+                            ctx, sqe.prp1, sqe.prp2, buf, cid, 0, sq_head, cq_id,
+                        );
                         return None;
                     }
                     cmd::fid::NS_WRITE_PROTECTION => {
@@ -826,7 +828,7 @@ impl NvmeController {
                         vec![0u8; bytes]
                     }
                 };
-                self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, 0, sq_head, cq_id);
+                self.dma_write_then_complete(ctx, sqe.prp1, sqe.prp2, buf, cid, 0, sq_head, cq_id);
                 None
             }
             admin_opc::DELETE_IO_SQ => {
@@ -1403,7 +1405,9 @@ impl NvmeController {
                     if bytes > 8 {
                         buf[8] = 0x00;
                     }
-                    self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, 0, sq_head, cq_id);
+                    self.dma_write_then_complete(
+                        ctx, sqe.prp1, sqe.prp2, buf, cid, 0, sq_head, cq_id,
+                    );
                     None
                 } else {
                     Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD, 0))
@@ -1426,7 +1430,7 @@ impl NvmeController {
                 // **Phase L4** — Directive Receive (spec § 5.9)。返 PRP1 4 KiB
                 // 全 0 = "no directives currently enabled"。
                 let buf = vec![0u8; 4096];
-                self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, 0, sq_head, cq_id);
+                self.dma_write_then_complete(ctx, sqe.prp1, sqe.prp2, buf, cid, 0, sq_head, cq_id);
                 None
             }
             admin_opc::VIRTUALIZATION_MGMT => {
@@ -1447,7 +1451,7 @@ impl NvmeController {
                 // 教学：我们的 backing 没 'suspected error LBA' 概念，所以
                 // NLSD 永远 0；header 字段必须真填零（vec![0u8; 4096] 已满足）。
                 let buf = vec![0u8; 4096];
-                self.dma_write_then_complete(ctx, sqe.prp1, buf, cid, 0, sq_head, cq_id);
+                self.dma_write_then_complete(ctx, sqe.prp1, sqe.prp2, buf, cid, 0, sq_head, cq_id);
                 None
             }
             admin_opc::SANITIZE => {
