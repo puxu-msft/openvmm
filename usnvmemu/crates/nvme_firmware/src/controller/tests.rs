@@ -697,7 +697,192 @@ fn reservation_state_machine() {
     assert_eq!(c.namespaces[&nsid].reservation, None);
 }
 
-/// Phase K4a/b：PI Write interleave + Read 解析 round-trip。
+/// **B1（Reservation Acquire — Preempt, spec § 6.11）差分 oracle** — 真实现
+/// SPC-3 派生的 Preempt 算法（此前简化为"仅 holder==prkey 才替换"）。覆盖：
+///   案例1 抢占 holder（注销被抢占 host + 本 host 取新 reservation + notify 3）；
+///   案例2 抢占非-holder registrant（仅注销，reservation 不变 + notify 1）；
+///   案例3 PRKEY 无匹配 → Reservation Conflict（状态不变，不 bump gen）；
+///   案例4 PRKEY=0 + 非-all-registrants → Conflict；
+///   案例5 PRKEY=0 + all-registrants(5/6) → 抢占除本 host 外所有 registrant。
+///
+/// 独立 oracle：断言 registrants/reservation/gen/notification-log 的最终态（spec
+/// 规定的结果），非读自家中间变量。revert-verify：跳过 prkey 分支的 retain →
+/// 案例1/2 的"被抢占 host 已注销"断言转红。
+#[test]
+fn reservation_preempt_spec_semantics() {
+    fn reg(c: &mut NvmeController, nsid: u32, rkey: u64) {
+        let mut b = vec![0u8; 16];
+        b[8..16].copy_from_slice(&rkey.to_le_bytes()); // NRKEY
+        let cqe = c.apply_reservation_cmd(nsid, ReservationKind::Register, 0, 0, 0, &b, 0, 0, 0, 1);
+        assert_eq!(cqe_status(&cqe), 0, "Register {rkey:#x} OK");
+    }
+    fn acq(c: &mut NvmeController, nsid: u32, crkey: u64, rtype: u8) -> u16 {
+        let mut b = vec![0u8; 16];
+        b[0..8].copy_from_slice(&crkey.to_le_bytes());
+        cqe_status(&c.apply_reservation_cmd(
+            nsid,
+            ReservationKind::Acquire,
+            0,
+            rtype,
+            0,
+            &b,
+            0,
+            0,
+            0,
+            1,
+        ))
+    }
+    fn preempt(
+        c: &mut NvmeController,
+        nsid: u32,
+        crkey: u64,
+        prkey: u64,
+        rtype: u8,
+        abort: bool,
+    ) -> u16 {
+        let mut b = vec![0u8; 16];
+        b[0..8].copy_from_slice(&crkey.to_le_bytes());
+        b[8..16].copy_from_slice(&prkey.to_le_bytes());
+        let action = if abort { 2 } else { 1 };
+        cqe_status(&c.apply_reservation_cmd(
+            nsid,
+            ReservationKind::Acquire,
+            action,
+            rtype,
+            0,
+            &b,
+            0,
+            0,
+            0,
+            1,
+        ))
+    }
+    fn rkeys(c: &NvmeController, nsid: u32) -> Vec<u64> {
+        c.namespaces[&nsid]
+            .registrants
+            .iter()
+            .map(|&(k, _, _)| k)
+            .collect()
+    }
+    let nsid = 1u32;
+
+    // ── 案例 1：抢占 holder ──
+    {
+        let mut c = make_ctrl_with_tmp("preempt_holder");
+        reg(&mut c, nsid, 0xA);
+        reg(&mut c, nsid, 0xB);
+        reg(&mut c, nsid, 0xC);
+        assert_eq!(acq(&mut c, nsid, 0xA, 1), 0); // A holds (WriteExclusive)
+        let gen0 = c.namespaces[&nsid].reservation_gen;
+        let nlog0 = c.reservation_notification_log.len();
+        // B 抢占 A（holder），新 type=2（ExclusiveAccess）
+        assert_eq!(
+            preempt(&mut c, nsid, 0xB, 0xA, 2, false),
+            0,
+            "Preempt holder OK"
+        );
+        let ns = &c.namespaces[&nsid];
+        assert!(!rkeys(&c, nsid).contains(&0xA), "被抢占 holder A 已注销");
+        assert_eq!(rkeys(&c, nsid), vec![0xB, 0xC], "B/C 保留");
+        assert_eq!(
+            ns.reservation,
+            Some((0xB, 2)),
+            "B 以新 type 持有 reservation"
+        );
+        assert!(ns.reservation_gen > gen0, "gen 单调递增");
+        assert_eq!(
+            c.reservation_notification_log.len(),
+            nlog0 + 1,
+            "push 一条 notification"
+        );
+        assert_eq!(
+            c.reservation_notification_log.back().unwrap().log_page_type,
+            1,
+            "Reservation Preempted（spec Fig 162: 1=Reservation Preempted）"
+        );
+    }
+
+    // ── 案例 2：抢占非-holder registrant（reservation 不变）──
+    {
+        let mut c = make_ctrl_with_tmp("preempt_reg");
+        reg(&mut c, nsid, 0xA);
+        reg(&mut c, nsid, 0xB);
+        reg(&mut c, nsid, 0xC);
+        assert_eq!(acq(&mut c, nsid, 0xA, 1), 0); // A holds
+        // B 抢占 C（registrant，非 holder）
+        assert_eq!(
+            preempt(&mut c, nsid, 0xB, 0xC, 2, false),
+            0,
+            "Preempt registrant OK"
+        );
+        let ns = &c.namespaces[&nsid];
+        assert!(
+            !rkeys(&c, nsid).contains(&0xC),
+            "被抢占 registrant C 已注销"
+        );
+        assert_eq!(
+            ns.reservation,
+            Some((0xA, 1)),
+            "reservation 不变（A WriteExclusive）"
+        );
+        assert_eq!(
+            c.reservation_notification_log.back().unwrap().log_page_type,
+            3,
+            "Registration Preempted（spec Fig 162: 3=Registration Preempted）"
+        );
+    }
+
+    // ── 案例 3：PRKEY 无匹配 → Reservation Conflict，状态不变 ──
+    {
+        let mut c = make_ctrl_with_tmp("preempt_nomatch");
+        reg(&mut c, nsid, 0xA);
+        assert_eq!(acq(&mut c, nsid, 0xA, 1), 0);
+        let before = rkeys(&c, nsid);
+        let gen0 = c.namespaces[&nsid].reservation_gen;
+        assert_eq!(
+            preempt(&mut c, nsid, 0xA, 0x999, 2, false),
+            crate::cmd::sc::RESERVATION_CONFLICT,
+            "PRKEY 无匹配 → Conflict"
+        );
+        assert_eq!(rkeys(&c, nsid), before, "Conflict 不改 registrants");
+        assert_eq!(
+            c.namespaces[&nsid].reservation_gen, gen0,
+            "Conflict 不 bump gen"
+        );
+    }
+
+    // ── 案例 4：PRKEY=0 + 非-all-registrants → Conflict ──
+    {
+        let mut c = make_ctrl_with_tmp("preempt_zero_bad");
+        reg(&mut c, nsid, 0xA);
+        reg(&mut c, nsid, 0xB);
+        assert_eq!(acq(&mut c, nsid, 0xA, 1), 0); // type 1 非 all-registrants
+        assert_eq!(
+            preempt(&mut c, nsid, 0xB, 0, 2, false),
+            crate::cmd::sc::RESERVATION_CONFLICT,
+            "PRKEY=0 + 非 all-reg → Conflict"
+        );
+    }
+
+    // ── 案例 5：PRKEY=0 + all-registrants(type 5) → 抢占除本 host 外所有 registrant ──
+    {
+        let mut c = make_ctrl_with_tmp("preempt_zero_allreg");
+        reg(&mut c, nsid, 0xA);
+        reg(&mut c, nsid, 0xB);
+        reg(&mut c, nsid, 0xC);
+        assert_eq!(acq(&mut c, nsid, 0xA, 5), 0); // WriteExclusive All Registrants
+        // B 以 PRKEY=0 抢占，新 type=6
+        assert_eq!(
+            preempt(&mut c, nsid, 0xB, 0, 6, false),
+            0,
+            "PRKEY=0 all-reg OK"
+        );
+        let ns = &c.namespaces[&nsid];
+        assert_eq!(rkeys(&c, nsid), vec![0xB], "仅发起 host B 留存");
+        assert_eq!(ns.reservation, Some((0xB, 6)), "B 以 type 6 持有");
+    }
+}
+
 ///
 /// 单 LBA 4 KiB data + 8 byte T10 DIF tuple inline。verify 必须通过。
 #[test]

@@ -233,27 +233,83 @@ impl NvmeController {
                         tracing::info!(nsid, crkey, rtype, "Reservation Acquire OK");
                     }
                     1 | 2 => {
-                        // Preempt (+ optional Abort)。spec 复杂；简化：若
-                        // 当前 holder == prkey 则替换，否则失败。
-                        if let Some((holder, _)) = ns.reservation
-                            && holder != prkey
-                        {
-                            return Cqe::error(
-                                cid,
-                                sq_id,
-                                sq_head,
-                                phase,
-                                sc::RESERVATION_CONFLICT,
+                        // **B1（spec § 6.11 Reservation Acquire — Preempt /
+                        // Preempt and Abort）** — 真实现 SPC-3 派生的 Preempt 算法
+                        // （此前简化为"仅 holder==prkey 才替换"，漏了 registrant
+                        // 注销 / PRKEY=0 all-registrants / 无匹配 conflict）。
+                        // crkey 已验证为本 host 注册 key、rtype 已验证 1..=6（上方）。
+                        //   action 1 = Preempt；2 = Preempt and Abort（额外中止被
+                        //   抢占 host 的 in-flight 命令——见末尾教学边界）。
+                        let holder_key = ns.reservation.map(|(h, _)| h);
+                        let is_all_reg_resv =
+                            matches!(ns.reservation.map(|(_, t)| t), Some(5) | Some(6));
+
+                        if prkey == 0 {
+                            // PRKEY=0 仅在现 reservation 为 *All Registrants 类型
+                            // （5/6）时合法：抢占除本 host 外所有 registrant，本 host
+                            // 以 RTYPE 持有 reservation。否则（无 reservation / 非
+                            // all-registrants）按 SPC-3 = Reservation Conflict。
+                            if !is_all_reg_resv {
+                                return Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::RESERVATION_CONFLICT,
+                                );
+                            }
+                            ns.registrants.retain(|&(rk, _, _)| rk == crkey);
+                            ns.reservation = Some((crkey, rtype));
+                            ns.bump_gen();
+                            notify_types.push(1); // Reservation Preempted
+                        } else {
+                            // PRKEY != 0：必须匹配 holder 或 ≥1 个 registrant，
+                            // 否则 Reservation Conflict（不改任何状态）。
+                            let prkey_is_holder = holder_key == Some(prkey);
+                            let prkey_matches_reg = ns.has_rkey(prkey);
+                            if !prkey_is_holder && !prkey_matches_reg {
+                                return Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::RESERVATION_CONFLICT,
+                                );
+                            }
+                            // 注销所有 key==prkey 的 registrant；但**永不**注销发起
+                            // host 自己（prkey==crkey 自抢占边界 → holder 不会变成
+                            // 未注册的不一致态）。
+                            ns.registrants
+                                .retain(|&(rk, _, _)| rk != prkey || rk == crkey);
+                            if prkey_is_holder {
+                                // 抢占 reservation holder：本 host 以 RTYPE 取得新
+                                // reservation。
+                                ns.reservation = Some((crkey, rtype));
+                                notify_types.push(1); // Reservation Preempted
+                            } else {
+                                // 仅注销 registrant，reservation 不变。
+                                notify_types.push(3); // Registration Preempted
+                            }
+                            ns.bump_gen();
+                        }
+
+                        // **Preempt and Abort (action 2) 的中止分量——教学边界
+                        // (deliberate omission)**：spec 要求额外中止"被抢占 host"在本
+                        // NS 的所有 in-flight 命令。本 controller 是单 PCIe function /
+                        // 单 transport 连接，不维护 host→SQ→command 归属映射
+                        // （registrant 仅以 rkey + hostid 区分，无法定位其 SQE）。故
+                        // Preempt-and-Abort 的 *preempt* 分量与 action 1 完全一致且
+                        // spec-correct；*abort* 分量在单 host 模型下无独立可中止目标。
+                        // 真 multi-host（NVMe-oF 多 controller）落地时按 host→queue
+                        // 归属中止（届时可复用 A1 的 try_abort_inflight）。
+                        if action == 2 {
+                            tracing::debug!(
+                                nsid,
+                                prkey,
+                                "Preempt and Abort: 单 host 模型无被抢占-host 命令可中止（教学边界）"
                             );
                         }
-                        let had_prior = ns.reservation.is_some();
-                        ns.reservation = Some((crkey, rtype));
-                        ns.bump_gen();
-                        // **Phase S6** — 之前有 holder 被抢占 → log type=1
-                        if had_prior {
-                            notify_types.push(1);
-                        }
-                        tracing::info!(nsid, crkey, prkey, rtype, "Reservation Preempt OK");
+                        tracing::info!(nsid, crkey, prkey, rtype, action, "Reservation Preempt OK");
                     }
                     _ => return Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD),
                 }
