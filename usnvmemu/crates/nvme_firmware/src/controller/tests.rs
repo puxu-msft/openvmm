@@ -134,6 +134,30 @@ fn error_status_driven_matrix() {
         )
         .expect("未知 opcode 同步拒");
     assert_eq!(cqe_status(&cqe), crate::cmd::sc::INVALID_OPCODE);
+
+    // SANITIZE_IN_PROGRESS (Generic 0x001d)：sanitize 进行中，所有 IO 被 gate
+    // 在最前（R1 曾误填 0x12，§25 修正）。放最后做（它会拦截后续所有 IO）。
+    c.sanitize = Some(crate::controller::SanitizeState {
+        started_at: std::time::Instant::now(),
+        sanact: 1,
+        total_seconds: 10,
+        percent_complete: 0,
+    });
+    let cqe = c
+        .dispatch_io(
+            &mut ctx,
+            1,
+            io_sqe(READ, 1, 0, 1, 0x1000, false, 0x15),
+            0x15,
+            0,
+            1,
+        )
+        .expect("sanitize 进行中 IO 同步拒");
+    assert_eq!(
+        cqe_status(&cqe),
+        crate::cmd::sc::SANITIZE_IN_PROGRESS,
+        "sanitize 中 IO → 0x001d Generic（非 R1 误填的 0x12）"
+    );
 }
 
 /// Phase F：SMART log 关键 offset + counter 写入校验。
