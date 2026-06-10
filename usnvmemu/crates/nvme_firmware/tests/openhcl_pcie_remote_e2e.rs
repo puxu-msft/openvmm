@@ -107,6 +107,19 @@ const IO_Q_DEPTH: u16 = 8;
 const COMPARE_BUF_GPA: u64 = 0x8_0000;
 const WRITE_BUF2_GPA: u64 = 0x9_0000;
 
+// ── O4（DBBUF / shadow doorbells）shadow + event_idx buffer GPA ──
+//
+// 二者都 4K 对齐、远在 GUEST_MEM_BYTES(16 MiB) 内，故 pump 的 flat-guest 服务路径
+// 自动覆盖 controller 对它们的 ReadGpa（读 shadow tail/head）与 WriteGpa（写回
+// event_idx）—— **无需** pump 端任何 DBBUF 专用代码（见文件头 "并发 pump"）。
+// DSTRD=0 → 每队列 shadow slot = 8 字节：SQ tail 在 `qid*8`、CQ head 在 `qid*8+4`
+// （都 LE u32）。单页（4096 / 8 = 512 个 slot）足以覆盖所有 qid。admin qid 0 永不
+// 走 DBBUF（controller 排除，对位 Linux `nvme_dbbuf_init` 跳过 qid 0）。
+const SHADOW_DB_GPA: u64 = 0xA_0000;
+const EVENTIDX_GPA: u64 = 0xB_0000;
+/// Doorbell Buffer Config admin opcode（spec § 5.7；= firmware cmd::DOORBELL_BUFFER_CONFIG）。
+const DOORBELL_BUFFER_CONFIG: u8 = 0x7c;
+
 // ═══════════════════════════ 子进程 / 临时文件守卫 ═══════════════════════════
 
 /// 子进程 + 临时文件守卫：Drop 时 kill child + 删 backing/log；测试 panic 时打印
@@ -412,6 +425,65 @@ impl NvmeDriver {
         }
         Err(anyhow!("CC.EN 后 CSTS.RDY 始终未置位"))
     }
+
+    /// **O4（DBBUF）** — 激活 shadow doorbells：提交 Doorbell Buffer Config admin 命令
+    /// （opcode 0x7c，PRP1=shadow buffer GPA、PRP2=event_idx buffer GPA，无数据传输），
+    /// 断言 CQE 成功。激活后 controller 不再信任可能 stale 的 MMIO doorbell value，改
+    /// DMA-poll shadow buffer 拿真 tail/head 并写回 event_idx（spec § 5.7 + § 7.13）。
+    ///
+    /// **先 zero shadow + event_idx 两页**：保证 controller 首次读 event_idx 得 0（driver
+    /// 的初始 `old==event_idx==0`，`need_event` 对首条提交必真 → 首次 ring 行为确定），
+    /// 也保证 shadow tail/head 初值 0 与 firmware 侧新建队列一致。
+    async fn activate_dbbuf(&self, admin: &mut QueueState) -> Result<()> {
+        self.write_guest(SHADOW_DB_GPA, vec![0u8; 4096]);
+        self.write_guest(EVENTIDX_GPA, vec![0u8; 4096]);
+        let cqe = admin
+            .submit(
+                self,
+                Sqe {
+                    opcode: DOORBELL_BUFFER_CONFIG,
+                    cid: 0x1d,
+                    prp1: SHADOW_DB_GPA,
+                    prp2: EVENTIDX_GPA,
+                    ..Default::default()
+                }
+                .encode(),
+            )
+            .await
+            .context("Doorbell Buffer Config")?;
+        if cqe.sc != 0 {
+            return Err(anyhow!("Doorbell Buffer Config sc={:#x}", cqe.sc));
+        }
+        Ok(())
+    }
+
+    /// **O4（DBBUF）** — 把 SQ tail 写进 shadow buffer 的 `qid*8` slot（LE u32）。
+    /// 这是 driver 侧"我真的提交到这里了"的真相来源；controller poll 它拿真 tail。
+    fn write_sq_shadow(&self, qid: u16, tail: u16) {
+        self.write_guest(
+            SHADOW_DB_GPA + qid as u64 * 8,
+            (tail as u32).to_le_bytes().to_vec(),
+        );
+    }
+
+    /// **O4（DBBUF）** — 读 controller 写回的 SQ event_idx（`qid*8` slot）。driver 据它
+    /// 用 `need_event` 决定下次提交是否要 ring 真 doorbell。
+    async fn read_sq_eventidx(&self, qid: u16) -> Result<u16> {
+        let b = self.read_guest(EVENTIDX_GPA + qid as u64 * 8, 4).await?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    /// **O4（DBBUF）** — 把 CQ head 写进 shadow buffer 的 `qid*8+4` slot（LE u32）。
+    /// controller `post_cqe` 从不在 CQ-full 上阻塞（fire-and-forget），故本写**非**避免
+    /// 卡死所必需，纯为协议忠实（让 controller 能经 shadow 学到 driver 释放的完成槽）；
+    /// 真正释放槽的 MMIO cq_db 仍由 `poll_cqe` 照常敲。两个 DBBUF 测试 drain CQE 时调它，
+    /// 使 CQ shadow slot 也被真实行使（非 dead code）。
+    fn write_cq_shadow(&self, qid: u16, head: u16) {
+        self.write_guest(
+            SHADOW_DB_GPA + qid as u64 * 8 + 4,
+            (head as u32).to_le_bytes().to_vec(),
+        );
+    }
 }
 
 // ── doorbell offset（DSTRD=0 → stride 4；SQ=偶 idx，CQ=奇 idx）──
@@ -420,6 +492,20 @@ fn sq_db(qid: u16) -> u64 {
 }
 fn cq_db(qid: u16) -> u64 {
     DOORBELL_BASE + (2 * qid as u64 + 1) * 4
+}
+
+/// **O4（DBBUF）** — Linux `nvme_dbbuf_need_event` 逐字节同公式（unsigned 16-bit wrap）。
+///
+/// driver 把 SQ tail 从 `old` 推进到 `new`；`event_idx` 是 controller 经 DMA 写回 driver
+/// 的"何时该 ring"门槛。返 `true` ⇒ driver 必须 ring 真 MMIO doorbell；`false` ⇒ driver
+/// **跳过** ring（省一次 VM-exit），改靠 controller 的 shadow-poll 兜底学到新 tail。
+///
+/// 这把"driver 何时省 ring"建模进 harness：Test 2 据此**忠实**地只在 `need_event` 为真时
+/// 才敲 MMIO doorbell，从而真正制造"controller 落后 event_idx → 部分 ring 被跳过"的
+/// DBBUF 行使态（而非每条都 ring 的退化批处理）。与 firmware 单测里的 `need_event` 同源
+/// （`controller/mod.rs`），保证两端用同一门槛语义。
+fn need_event(event_idx: u16, new: u16, old: u16) -> bool {
+    (new.wrapping_sub(event_idx).wrapping_sub(1)) < (new.wrapping_sub(old))
 }
 
 /// NVMe Submission Queue Entry 构造器（64 字节，常用字段）。
@@ -583,6 +669,45 @@ impl QueueState {
         self.place_sqe(drv, sqe);
         self.ring_sq(drv);
         self.poll_cqe(drv).await
+    }
+
+    /// **O4（DBBUF）** — place 1 条 SQE 后**忠实**走 shadow doorbell 协议：把新 tail 写进
+    /// SQ shadow，读 controller 写回的 SQ event_idx，**仅当** `need_event(event_idx, new,
+    /// old)` 为真才敲真 MMIO doorbell（否则跳过 ring，靠 controller shadow-poll 兜底）。
+    /// 返回该条提交是否真敲了 MMIO doorbell（供 Test 2 统计 `rings_sent`）。
+    ///
+    /// 次序：shadow 写在 ring 之前（都走有序 cmd channel），保证 controller 被唤醒后读
+    /// shadow 必见新 tail。DBBUF active 后**必须**经本路径提交——光 `ring_sq` 不更新
+    /// shadow，controller 读旧 shadow 会看不到新 SQE（这正是 DBBUF 语义：shadow 是真相）。
+    async fn place_and_ring_dbbuf(&mut self, drv: &NvmeDriver, sqe: Vec<u8>) -> Result<bool> {
+        let old = self.sq_tail;
+        self.place_sqe(drv, sqe);
+        let new = self.sq_tail;
+        drv.write_sq_shadow(self.qid, new);
+        let event_idx = drv.read_sq_eventidx(self.qid).await?;
+        let ring = need_event(event_idx, new, old);
+        if ring {
+            drv.mmio_write(sq_db(self.qid), 4, new as u64);
+        }
+        Ok(ring)
+    }
+
+    /// **O4（DBBUF）** — 经 shadow doorbell 协议提交 1 条 SQE 并等其 CQE（faithful：
+    /// place → 写 shadow → 按 `need_event` 决定是否 ring → poll）。DBBUF active 后所有
+    /// 单条提交都应走本方法而非 `submit`。
+    async fn submit_dbbuf(&mut self, drv: &NvmeDriver, sqe: Vec<u8>) -> Result<CqeResult> {
+        self.place_and_ring_dbbuf(drv, sqe).await?;
+        self.poll_cqe_dbbuf(drv).await
+    }
+
+    /// **O4（DBBUF）** — drain 1 个 CQE 并**忠实**把更新后的 CQ head 也写进 CQ shadow slot
+    /// （`poll_cqe` 已照常敲 MMIO cq_db；本方法额外写 shadow 让 CQ 侧协议也完整行使）。
+    /// 返回该 CQE。DBBUF 测试 drain 时用，使 SQ+CQ 两个 shadow slot 都被真实驱动。
+    async fn poll_cqe_dbbuf(&mut self, drv: &NvmeDriver) -> Result<CqeResult> {
+        let res = self.poll_cqe(drv).await?;
+        // poll_cqe 已推进 self.cq_head 并敲了 MMIO cq_db；把同一 head 也写进 CQ shadow。
+        drv.write_cq_shadow(self.qid, self.cq_head);
+        Ok(res)
     }
 
     /// 提交**一对连续 SQE**（fused 用：FIRST+SECOND 必须同 SQ 相邻），1 次 doorbell，
@@ -2010,6 +2135,264 @@ async fn openhcl_sgl_length_mismatch_rejected() -> Result<()> {
         cqe.status, SC_DATA_SGL_LENGTH_INVALID,
         "覆盖不足应返 Data SGL Length Invalid (full status 0x000f，含 SCT)，实 status={:#x}",
         cqe.status
+    );
+
+    Ok(())
+}
+
+/// **O4（DBBUF / shadow doorbells）TEST 1** — shadow tail 领先于 stale MMIO doorbell。
+///
+/// 此前 DBBUF（shadow doorbells，spec § 5.7 + § 7.13）在 **pcie_remote 这条真异步 wire
+/// 上零 e2e 覆盖**——只有 controller 单测（deterministic CaptureTransport）验过。本测试在
+/// 跨进程真 wire 上行使 DBBUF 的核心语义：**controller 必须读 shadow buffer 拿真 tail，
+/// 而非信任可能 stale 的 MMIO doorbell value**。
+///
+/// 构造："driver" place 了 3 条 IO Write 进 SQ（tail 0→3），把 shadow_sq[qid]=3 写成真
+/// tail，但**故意**只把 MMIO SQ doorbell 敲成 1（模拟 driver 经 `need_event` 跳过了把真
+/// 值 3 写进 MMIO、只信号了 cmd1）。次序关键：**shadow 写在 ring 之前**（两者都走有序的
+/// cmd channel → controller 起 shadow-poll 链读 shadow 时必见 3）。
+///
+/// **独立 oracle ①（MMIO/shadow 分歧）**：3 条全完成。若 controller 错用了 MMIO 值(1) 而
+/// 非 shadow(3)，只有 cmd1 会完成，第 2 次 `poll_cqe` 必超时 panic。3 条全过 ⇒ controller
+/// 确实经真 wire 读到 shadow=3 > MMIO=1。这是**独立**的，因为判据来自 controller 对 shadow
+/// buffer 的真实 DMA 行为，而非 harness 自己的记账。
+///
+/// **独立 oracle ②（数据回读）**：再 IO Read 其中一个 LBA 回 fresh buffer，断言 round-trip
+/// 4K == 写入 pattern。这证 shadow-submit 的 Write **真的执行了**（数据落盘），而不只是
+/// post 了一个 CQE。两条 oracle 叠加：①证"命令被取到并完成"，②证"取到的是正确数据路径"。
+///
+/// **revert-verify（已实测）**：把 `controller/mod.rs` `on_sq_tail_doorbell` 的 DBBUF 分支
+/// 改成走 MMIO 路径（`self.advance_sq_to_tail(ctx, sq_id, new_tail)` 而非
+/// `start_shadow_sq_poll`）→ controller 只 fetch 到 MMIO=1 → cmd2/cmd3 永不完成 → 第 2 次
+/// `poll_cqe` 超时 → 本测试 FAIL。
+#[tokio::test]
+async fn openhcl_dbbuf_shadow_ahead_of_mmio_doorbell() -> Result<()> {
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (mut admin, mut io) = setup_enabled_4k_io(&driver).await?;
+    driver
+        .activate_dbbuf(&mut admin)
+        .await
+        .context("activate DBBUF")?;
+
+    // 3 条 IO Write：各写 DISTINCT 4K pattern 到 DISTINCT LBA(0/1/2)，PRP1 各指 distinct
+    // WRITE buffer GPA。先把数据 + SQE 都备好但**不**敲 doorbell（place_sqe 只推 tail）。
+    let lbas: [u32; 3] = [0, 1, 2];
+    let cids: [u16; 3] = [0x80, 0x81, 0x82];
+    let bufs: [u64; 3] = [WRITE_BUF_GPA, WRITE_BUF2_GPA, COMPARE_BUF_GPA];
+    let patterns: [u8; 3] = [0xC1, 0xC2, 0xC3];
+    for i in 0..3 {
+        driver.write_guest(bufs[i], vec![patterns[i]; 4096]);
+        io.place_sqe(
+            &driver,
+            Sqe {
+                opcode: 0x01, // Write
+                cid: cids[i],
+                nsid: 1,
+                prp1: bufs[i],
+                cdw10: lbas[i],
+                ..Default::default()
+            }
+            .encode(),
+        );
+    }
+    assert_eq!(io.sq_tail, 3, "place 3 条后 driver 侧 sq_tail 应=3");
+
+    // shadow_sq[qid] = 3（真 tail）写在 ring 之前；MMIO doorbell **故意**只敲 1（stale）。
+    driver.write_sq_shadow(IO_QID, 3);
+    driver.mmio_write(sq_db(IO_QID), 4, 1);
+
+    // ★ oracle ①：3 条 CQE 全完成。若 controller 用了 MMIO=1 而非 shadow=3，第 2 次
+    //   poll_cqe 必超时 panic（仅 cmd1 完成）。收齐三个 CID 证 controller 读了 shadow。
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..3 {
+        let cqe = io.poll_cqe_dbbuf(&driver).await.context(
+            "DBBUF: 期望 3 条全完成；若超时 = controller 错用 stale MMIO(1) 而非 shadow(3)",
+        )?;
+        assert_eq!(cqe.sc, 0, "shadow-submit Write sc 应=0，实={:#x}", cqe.sc);
+        assert!(seen.insert(cqe.cid), "CQE CID {:#x} 应唯一", cqe.cid);
+    }
+    for c in cids {
+        assert!(seen.contains(&c), "应收到 cid={c:#x} 的 CQE");
+    }
+
+    // ★ oracle ①续：confirm controller 经 shadow 把 SQ event_idx 写回到它 caught 的真
+    //   tail(3)。这把"controller 真读了 shadow=3 并据其推进 + 写回 event_idx"再钉一层
+    //   （driver 下次提交据此 event_idx 用 need_event 决定是否 ring）。必须在下方数据-oracle
+    //   read 推进队列**之前**断言（那条 Read 会把 tail/event_idx 推到 4）。
+    //   event_idx 写是与 CQE 独立的 DMA，可能比末条 CQE 稍晚落地 → 短轮询消除该 race（非
+    //   weakening：仍断言精确值 3，只是给异步写一点点时间）。
+    let mut ei = 0u16;
+    for _ in 0..100 {
+        ei = driver.read_sq_eventidx(IO_QID).await?;
+        if ei == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        ei, 3,
+        "controller 应把 SQ event_idx 写回 = 它经 shadow caught 的真 tail(3)，实={ei}"
+    );
+
+    // ★ oracle ②（数据回读）：IO Read lba=1 回 fresh READ buffer，验 round-trip == pattern。
+    //   证 shadow-submit 的 Write 真的执行（数据落盘），非仅 post CQE。DBBUF active 后回读
+    //   也必须经 shadow 协议提交（submit_dbbuf），否则 controller 读旧 shadow 看不到本 Read。
+    driver.write_guest(READ_BUF_GPA, vec![0u8; 4096]);
+    let cqe = io
+        .submit_dbbuf(
+            &driver,
+            Sqe {
+                opcode: 0x02, // Read
+                cid: 0x83,
+                nsid: 1,
+                prp1: READ_BUF_GPA,
+                cdw10: lbas[1], // 读回 cmd2 写的 LBA=1
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("IO Read 回读 shadow-submit 的 Write 数据")?;
+    assert_eq!(cqe.sc, 0, "回读 Read sc 应=0，实={:#x}", cqe.sc);
+    let readback = driver.read_guest(READ_BUF_GPA, 4096).await?;
+    assert!(
+        readback.iter().all(|&b| b == patterns[1]),
+        "LBA=1 回读应全为 {:#x}（shadow-submit 的 Write 真落盘，非仅 post CQE）",
+        patterns[1]
+    );
+
+    Ok(())
+}
+
+/// **O4（DBBUF / shadow doorbells）TEST 2** — 流水线 burst 须**及时**完成（覆盖 DBBUF
+/// shadow-poll **追平跳过-ring 命令** 的真 wire 路径，timing oracle）。
+///
+/// 背景：DBBUF active 后，driver 据 `need_event` 对**多数**提交**跳过**真 MMIO ring（实测
+/// 本 burst 32 条只 ring ~5 条，27 条无 ring），controller 必须靠 shadow-poll 追平那些无
+/// ring 的命令——一次成功的 ring 起一条 poll 链，链读**绝对** shadow tail（`issue_shadow_
+/// read` → `handle_shadow_sq` 的 `advance_sq_to_tail(shadow)`）把链起以来所有提交一并
+/// fetch。本测试在跨进程真 wire 上以真实流水线 burst 行使该追平路径。
+///
+/// **本 bin 的 tick 安全网周期 = 60s**（`main.rs` 设 `read_timeout: 60s`，SDK run-loop 用
+/// 它驱动 timer → 超时才 tick；`tick_interval` 字段在该 loop 里其实未用）。故若 shadow-poll
+/// 追平回归，无-ring 命令只能等 ≥ 60s 的 tick 兜底才 fetch，远超本测试 4s 上限——故 4s
+/// timing oracle 很有牙（注：早期 reviewer 误记 tick 为 SDK 默认 5s，本 bin 实为 60s）。
+///
+/// 构造：流水线 N=32 条 IO Write，**忠实**走 DBBUF 协议（每条 place→写 shadow→读
+/// event_idx→**仅** `need_event` 为真才 ring）。受 SQ 深度(8，最多 7 outstanding)约束，按
+/// "submit 一波 ≤7 条（紧 pipeline 让 controller 的 event_idx 落后 → 部分 ring 被跳过）→
+/// drain 该波 CQE" 的波形推进，全程不在 submit 间等 CQE（波内 pipeline）。
+///
+/// **timing oracle**：全部 N 完成后断言 elapsed < 4s。远低于**一次** 60s tick，故若 controller
+/// 的 shadow-poll 追平回归（无-ring 命令不被 fetch → strand 到 tick），某条 `poll_cqe` 超时
+/// / 整体 elapsed 远超 4s → FAIL。这是**独立**的：判据是墙钟时间，不依赖 controller 内部记账。
+///
+/// **DBBUF-行使 oracle**：断言 `rings_sent < N`——证 driver 真的跳过了若干 MMIO ring 而
+/// controller 经 shadow-poll 捕获了那些命令（即 DBBUF 被行使，而非每条都 ring 的退化批
+/// 处理）。实测 `rings_sent ≈ 5`（≪ 32，巨大余量，非 flaky）。若该断言在实践中 flaky
+/// （controller 太快、event_idx 始终同步 → 每条都 ring），应**收紧 pipeline**而非弱化断言。
+///
+/// **revert-verify（已实测，FAIL 于 ~3.3s）**：在 `controller/mod.rs` `handle_shadow_sq` 把
+/// `if shadow != processed {` 改成 `if false && shadow != processed {`（shadow-poll 链读
+/// shadow 却**永不** advance/fetch）→ 27 条无-ring 命令永不 fetch → `poll_cqe` 超时 → 本
+/// 测试 FAIL。这是与 TEST 1（doorbell 路由）**不同位置**、专打 shadow-poll 追平逻辑的 revert。
+///
+/// **诚实边界（已实测）**：另一种设想的 revert 是 HIGH-1 settle-窗口漏-ring 修复
+/// （`handle_shadow_sq` settle 分支删 `shadow_ring_pending` 续读）。该 revert 经本 harness
+/// **不**会让本测试 FAIL（实测仍 2.57s 通过）——根因是 harness pump 用 `biased` device-first
+/// select（见文件头），它**每次都把 controller 的 poll 链完整 drain 到 settle 后**才投递
+/// 测试下一个 ring，故"ring 落在 in-flight 链的 settle 窗口"这一 HIGH-1 触发条件经此 harness
+/// **结构性不可达**。HIGH-1 的精确触发由 controller 单测（`sq_poll_reread_catches_submit_
+/// during_window` 等，确定性 CaptureTransport 可任意编排帧交错）覆盖；本 e2e 改打它**能**
+/// 行使且有牙的更广 DBBUF 追平路径。
+#[tokio::test]
+async fn openhcl_dbbuf_burst_skipped_rings_caught_promptly() -> Result<()> {
+    const N: u16 = 32;
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (mut admin, mut io) = setup_enabled_4k_io(&driver).await?;
+    driver
+        .activate_dbbuf(&mut admin)
+        .await
+        .context("activate DBBUF")?;
+
+    // 一个可复用的 4K pattern（数据正确性非本测试焦点——焦点是"都完成 + 及时 + 行使了
+    // DBBUF"；用 distinct-per-512 仍避免 uniform 掩盖潜在偏移错）。
+    let mut pattern = vec![0u8; 4096];
+    for i in 0..8 {
+        pattern[i * 512..(i + 1) * 512].fill(0xE0 + i as u8);
+    }
+    driver.write_guest(WRITE_BUF_GPA, pattern);
+
+    // SQ 深度 8 → 最多 7 条 outstanding。波形推进：每波 submit 至多 WAVE 条（紧 pipeline，
+    // 不在波内等 CQE，让 controller 的 event_idx 落后 → 部分 ring 被 need_event 跳过），
+    // 然后 drain 这一波的 CQE。重复直到 N 条全发全收。
+    const WAVE: u16 = IO_Q_DEPTH - 1; // 7（IO_Q_DEPTH 已是 u16）
+    let mut rings_sent = 0u32;
+    let mut completed = 0u16;
+    let mut submitted = 0u16;
+    let start = std::time::Instant::now();
+
+    while completed < N {
+        // ── submit 一波（≤ WAVE，且不超过剩余）──
+        let this_wave = WAVE.min(N - submitted);
+        for k in 0..this_wave {
+            // 所有 Write 都打到 LBA 0（同 PRP1）——本测试不验数据落地差异，只验完成性 +
+            // 时延 + ring 跳过；同 LBA 让 backing/PRP 路径最简。
+            let cid = 0x100u16.wrapping_add(submitted + k);
+            let rang = io
+                .place_and_ring_dbbuf(
+                    &driver,
+                    Sqe {
+                        opcode: 0x01, // Write
+                        cid,
+                        nsid: 1,
+                        prp1: WRITE_BUF_GPA,
+                        cdw10: 0, // slba=0
+                        ..Default::default()
+                    }
+                    .encode(),
+                )
+                .await
+                .context("DBBUF burst submit")?;
+            if rang {
+                rings_sent += 1;
+            }
+        }
+        submitted += this_wave;
+
+        // ── drain 这一波（poll this_wave 个 CQE）──若 controller 的 shadow-poll 追平回归，
+        //   无-ring 命令永不被 fetch → 此 poll_cqe 超时（400×5ms=2s 单条上限）→ 整体 elapsed
+        //   也会爆 4s。
+        for _ in 0..this_wave {
+            let cqe = io
+                .poll_cqe_dbbuf(&driver)
+                .await
+                .context("DBBUF burst: 期望 CQE 及时到（若超时 = shadow-poll 追平回归 strand）")?;
+            assert_eq!(cqe.sc, 0, "burst Write sc 应=0，实={:#x}", cqe.sc);
+            completed += 1;
+        }
+    }
+
+    let elapsed = start.elapsed();
+
+    // (a) 全部完成。
+    assert_eq!(completed, N, "应完成全部 {N} 条 burst Write");
+    // (b) timing oracle：远低于**一次** 60s tick。shadow-poll
+    //     追平回归 → 无-ring 命令 strand 到 tick → elapsed 远超 4s → 此断言 FAIL。
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "burst 应在 4s 内完成（实 {:?}）——超时即 shadow-poll 追平回归（无-ring 命令 strand 到 \
+         60s tick 安全网）",
+        elapsed
+    );
+    // (c) DBBUF-行使 oracle：driver 真跳过了一些 MMIO ring（controller 经 shadow 捕获），
+    //     即 DBBUF 被行使而非每条都 ring 的退化批处理。
+    assert!(
+        (rings_sent as u16) < N,
+        "rings_sent({rings_sent}) 应 < N({N})：证 driver 经 need_event 跳过了部分真 ring，\
+         由 controller shadow-poll 捕获（DBBUF 真行使）。若恒等于 N 应收紧 pipeline 而非弱化断言",
     );
 
     Ok(())

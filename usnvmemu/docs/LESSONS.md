@@ -716,7 +716,8 @@ shadow buffer 拿真 SQ tail/CQ head + 写回 event_idx。因 `Transport::dma_re
 **3 层 HIGH bug 全在 async 边角，连真-QEMU-guest happy-path harness 都看不见**（vfio 同步 drain
 把整条链一次跑完 + 真 driver 行为良性，故这些 interleaving 永不自然发生），逐轮 reviewer 越挖越深：
 1. **dropped-ring strand**：poll 链在 drain 时到的 doorbell ring 被 inflight guard 丢弃；若
-   driver 的 submit 恰落在链最后一次 re-read 之后的 settle window，命令被漏 → 滞留到 5s tick。
+   driver 的 submit 恰落在链最后一次 re-read 之后的 settle window，命令被漏 → 滞留到下次 tick
+   （本 bin `read_timeout=60s`；早期误记为 SDK 默认 5s）。
    修：per-(qid,is_cq) one-shot `shadow_ring_pending` flag，settle 分支若置则再 re-read 一次。
 2. **wrap-saturation false-CFS**：cap 用绝对环索引做 high-water-mark，max-depth 队列 wrap 后
    饱和于 size-1 → 健康 controller 的合法 wrap 全被判"无进展" → 撞 CFS（reviewer 实测 size=
