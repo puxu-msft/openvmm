@@ -1978,12 +1978,27 @@ impl NvmeController {
                                     });
                                     op.walk_offset = op.walk_offset.saturating_add(d.length as u64);
                                 }
+                                crate::sgl::SglType::BitBucket => {
+                                    // **Phase R2c** — Bit Bucket（spec § 4.4.1）。
+                                    // READ (controller→host)：跳过 length 字节输出
+                                    //   ——advance stream offset（discard 这段 backing
+                                    //   数据，**不**发 dma_write），其后 fragment 的
+                                    //   stream 偏移据此前移。
+                                    // WRITE (host→controller)：spec 规定 Bit Bucket
+                                    //   length **视为 0**（如同不存在）——不 advance、
+                                    //   不 DMA。
+                                    // 两方向都不产生 transfer fragment。
+                                    if !op.is_write {
+                                        op.walk_offset =
+                                            op.walk_offset.saturating_add(d.length as u64);
+                                    }
+                                }
                                 other => {
                                     // 数据位置出现 (Last)Segment = 非法（chain 只能
-                                    // 在段末位）；Bit Bucket → R2c；Keyed → reject。
+                                    // 在段末位）；Keyed/Transport → reject (NVMe-oF)。
                                     tracing::warn!(
                                         kind = ?other,
-                                        "SGL 数据位置非 Data Block (chain 须末位 / bit bucket=R2c)"
+                                        "SGL 数据位置非 Data Block/Bit Bucket (chain 须末位)"
                                     );
                                     walk_err = Some(sc::SGL_DESCRIPTOR_TYPE_INVALID);
                                     break;

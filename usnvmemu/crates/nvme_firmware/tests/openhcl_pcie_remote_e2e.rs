@@ -1790,3 +1790,174 @@ async fn openhcl_sgl_zero_length_datablock_skipped() -> Result<()> {
 
     Ok(())
 }
+
+/// **Phase R2c** — SGL **Bit Bucket** Read（controller→host 丢弃区段，spec § 4.4.1）。
+///
+/// 单 Last Segment：[Data 1024 @FRAG0, **Bit Bucket 1024**, Data 2048 @FRAG1]，总流
+/// 4096。Bit Bucket 区在 READ 被 firmware 跳过（discard，不写 host），其后 Data 的
+/// stream 偏移**前移**越过被丢弃区。
+///
+/// **差分独立 oracle**：FRAG0 == pattern[0..1024]；FRAG1 == pattern[**2048**..4096]
+/// （证 Bit Bucket 推进了 stream 偏移：被丢弃的是 pattern[1024..2048]）。
+///
+/// **revert-verify（已实测）**：completion.rs BitBucket arm 去掉 `op.walk_offset +=`
+/// （READ 不再推进）→ FRAG1 收 pattern[1024..3072] ≠ [2048..4096] → FAIL。
+#[tokio::test]
+async fn openhcl_sgl_bit_bucket_read_discard() -> Result<()> {
+    const SEG_GPA: u64 = 0xA_0000;
+    const FRAG0_GPA: u64 = 0xC_0000;
+    const FRAG1_GPA: u64 = 0xE_0000;
+
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (_admin, mut io) = setup_enabled_4k_io(&driver).await?;
+
+    let mut pattern = vec![0u8; 4096];
+    for i in 0..8 {
+        pattern[i * 512..(i + 1) * 512].fill(0xD0 + i as u8);
+    }
+    driver.write_guest(WRITE_BUF_GPA, pattern.clone());
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x01,
+                cid: 0x60,
+                nsid: 1,
+                prp1: WRITE_BUF_GPA,
+                cdw10: 11,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("seed Write")?;
+    assert_eq!(cqe.sc, 0, "seed Write sc 应=0，实={:#x}", cqe.sc);
+
+    // 段：[Data 1024 @FRAG0, Bit Bucket 1024 (id 0x10), Data 2048 @FRAG1] = 48 byte。
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&sgl_desc(FRAG0_GPA, 1024, 0x00));
+    seg.extend_from_slice(&sgl_desc(0, 1024, 0x10)); // Bit Bucket (type 1)，address 忽略
+    seg.extend_from_slice(&sgl_desc(FRAG1_GPA, 2048, 0x00));
+    driver.write_guest(SEG_GPA, seg);
+    driver.write_guest(FRAG0_GPA, vec![0x77; 4096]);
+    driver.write_guest(FRAG1_GPA, vec![0x77; 4096]);
+
+    let (p1, p2) = sgl1_last_segment(SEG_GPA, 3 * 16);
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02,
+                psdt: 2,
+                cid: 0x61,
+                nsid: 1,
+                prp1: p1,
+                prp2: p2,
+                cdw10: 11,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("SGL Read bit bucket")?;
+    assert_eq!(cqe.sc, 0, "SGL Read(bit bucket) sc 应=0，实={:#x}", cqe.sc);
+
+    let f0 = driver.read_guest(FRAG0_GPA, 1024).await?;
+    assert_eq!(f0, pattern[0..1024], "FRAG0 应=pattern[0..1024]");
+    let f1 = driver.read_guest(FRAG1_GPA, 2048).await?;
+    assert_eq!(
+        f1,
+        pattern[2048..4096],
+        "FRAG1 应=pattern[2048..4096]（Bit Bucket 跳过 [1024..2048] 后偏移前移）"
+    );
+    // FRAG1 之后区保持 sentinel（只写 2048）。
+    let tail = driver.read_guest(FRAG1_GPA + 2048, 1024).await?;
+    assert!(tail.iter().all(|&b| b == 0x77), "FRAG1+2048 应仍 sentinel");
+
+    Ok(())
+}
+
+/// **Phase R2c** — SGL **Bit Bucket** Write（host→controller，spec § 4.4 视 length 为 0）。
+///
+/// 单 Last Segment：[Data 2048 @FRAG0, **Bit Bucket 5000**, Data 2048 @FRAG1]。WRITE
+/// 方向 Bit Bucket length 视为 0（如同不存在）→ 两 Data 块须正好覆盖 4096，gather 成
+/// 连续写盘。
+///
+/// **直读 backing 独立 oracle**：backing[12*4096..] == concat(f0, f1)。
+///
+/// **revert-verify（已实测）**：BitBucket arm 去掉 `if !op.is_write` 守卫（WRITE 也
+/// 推进 offset 5000）→ walk_offset 9096 ≠ 4096 → coverage mismatch → sc != 0 → FAIL。
+#[tokio::test]
+async fn openhcl_sgl_bit_bucket_write_ignored() -> Result<()> {
+    const SEG_GPA: u64 = 0xA_0000;
+    const FRAG0_GPA: u64 = 0xC_0000;
+    const FRAG1_GPA: u64 = 0xE_0000;
+
+    let (stream, harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (_admin, mut io) = setup_enabled_4k_io(&driver).await?;
+
+    let f0 = vec![0xA0u8; 2048];
+    let f1 = vec![0xB0u8; 2048];
+    driver.write_guest(FRAG0_GPA, f0.clone());
+    driver.write_guest(FRAG1_GPA, f1.clone());
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&f0);
+    expected.extend_from_slice(&f1);
+
+    // [Data 2048, Bit Bucket 5000 (WRITE 忽略), Data 2048] → 数据覆盖正好 4096。
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&sgl_desc(FRAG0_GPA, 2048, 0x00));
+    seg.extend_from_slice(&sgl_desc(0, 5000, 0x10));
+    seg.extend_from_slice(&sgl_desc(FRAG1_GPA, 2048, 0x00));
+    driver.write_guest(SEG_GPA, seg);
+
+    let (p1, p2) = sgl1_last_segment(SEG_GPA, 3 * 16);
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x01,
+                psdt: 2,
+                cid: 0x62,
+                nsid: 1,
+                prp1: p1,
+                prp2: p2,
+                cdw10: 12,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("SGL Write bit bucket")?;
+    assert_eq!(
+        cqe.sc, 0,
+        "SGL Write(bit bucket 忽略) sc 应=0，实={:#x}",
+        cqe.sc
+    );
+
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x00,
+                cid: 0x63,
+                nsid: 1,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Flush")?;
+    assert_eq!(cqe.sc, 0, "Flush sc 应=0");
+    let file = std::fs::read(&harness.backing).context("读 backing")?;
+    let at = &file[12 * 4096..12 * 4096 + 4096];
+    assert_eq!(
+        at,
+        &expected[..],
+        "backing[12*4096] 应=两 Data 块拼接（Bit Bucket 视为 0 忽略）"
+    );
+
+    Ok(())
+}
