@@ -640,7 +640,7 @@ pcie_remote_e2e.rs` 用 flat 16 MiB guest-mem `Vec`）、vfio `qemu_interop`、`
 抓到；fix `controller/mmio.rs`（ASQ/ACQ/BPMBL size-aware）+ 单测 + revert-verify；
 rust-reviewer 确认无 sibling 截断点（PRP/IO 队列 base 走 SQE 的 u64，非 MMIO）。
 
-## 26. API footgun（每个调用点手填同一参数）→ 结构性修，让数据自带 (HIGH)
+## 27. API footgun（每个调用点手填同一参数）→ 结构性修，让数据自带 (HIGH)
 
 **症状**: §25 校正 SGL SC 后，审计整个 `sc::` 模块发现错的不止字节——`Cqe::error(..,
 sc: u8, sct: u8)` 把 **SCT（status code type）当独立参数在 224 个调用点手填**，多处填错：
