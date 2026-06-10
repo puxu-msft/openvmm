@@ -1915,7 +1915,8 @@ impl NvmeController {
                         Ok(d) => d,
                         Err(e) => {
                             tracing::warn!(op_id, err = e, "SGL segment 解析失败");
-                            self.finish_sgl_error(ctx, op_id, sc::SGL_DESCRIPTOR_TYPE_INVALID);
+                            // segment 字节非 16 倍数等 = segment descriptor 本身非法。
+                            self.finish_sgl_error(ctx, op_id, sc::INVALID_SGL_SEGMENT_DESCRIPTOR);
                             return;
                         }
                     };
@@ -2114,7 +2115,8 @@ impl NvmeController {
                 expected,
                 "SGL fragment 覆盖与传输大小不符"
             );
-            self.finish_sgl_error(ctx, op_id, sc::SGL_INVALID_NUMBER_OF_DESCRIPTORS);
+            // **R2d** — 数据 SGL 总长度与命令传输大小不符 → Data SGL Length Invalid。
+            self.finish_sgl_error(ctx, op_id, sc::DATA_SGL_LENGTH_INVALID);
             return;
         }
         // 取出 plan + 上下文（clone plan 以脱离对 sgl_ops 的借用，便于循环内

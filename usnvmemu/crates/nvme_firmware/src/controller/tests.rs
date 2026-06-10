@@ -2054,11 +2054,10 @@ fn sgl_inline_data_block_over_one_page_rejected() {
     );
 }
 
-/// **2026-06-10 advertise⟺implement 一致** — IdentifyController.sgls 只 advertise R1 真
-/// 实现的 basic SGL Data Block（bits 1:0=01）。**不**置 Bit Bucket(bit16) / byte-aligned
-/// (bit17)，因为 `resolve_data_pointers` 显式拒绝它们（见上面 sgl_inline_* / psdt_* 测试）。
-/// 原值 0x0003_0001 over-advertise → 按 SGLS 用 Bit Bucket 的 driver 会收
-/// SGL_DESCRIPTOR_TYPE_INVALID。完整 advertise 需先实现 R2（segment chains + Bit Bucket）。
+/// **R2d advertise⟺implement 一致** — IdentifyController.sgls advertise basic SGL
+/// 支持（bits 1:0=01）+ Bit Bucket（bit16）。R2（PSDT=10 segment 路径）已完整实现
+/// Segment chain（R2a/b）+ Bit Bucket（R2c），故 bit16 重新置上（这次是真支持）。
+/// bit17（byte-alignment 等额外位）仍不置：未实现对应语义。
 #[test]
 fn identify_controller_sgls_matches_impl() {
     let buf = IdentifyController::build_v2_bytes(0x1414, 0xc0de, 1);
@@ -2067,17 +2066,69 @@ fn identify_controller_sgls_matches_impl() {
     assert_eq!(
         sgls & 0x0003,
         0x0001,
-        "bits 1:0=01 (R1 inline Data Block 支持)"
+        "bits 1:0=01 (SGL 支持，含 R2 segment chain)"
     );
     assert_eq!(
         sgls & (1 << 16),
-        0,
-        "Bit Bucket 不 advertise（impl 拒绝它）"
+        1 << 16,
+        "Bit Bucket advertise（R2c 已实现）"
     );
     assert_eq!(
         sgls & (1 << 17),
         0,
-        "byte-aligned 不 advertise（impl 拒 >1page）"
+        "byte-aligned 不 advertise（未实现对应语义）"
+    );
+}
+
+/// **R2d** — SGL Generic Command Status 码**锚定**到仓库内 canonical
+/// `nvme_spec::Status`（vm/devices/storage/nvme_spec），防 R1 那种手填错值
+/// （0x14-0x17 全错）再次发生。`sc::` 只存 SC 低字节；Generic SCT=0 时
+/// `nvme_spec::Status` 高字节为 0，故直接比 `.0 as u8`。
+#[test]
+fn sgl_status_codes_match_nvme_spec() {
+    use crate::cmd::sc;
+    use nvme_spec::Status;
+    assert_eq!(
+        sc::INVALID_SGL_SEGMENT_DESCRIPTOR,
+        Status::INVALID_SGL_SEGMENT_DESCRIPTOR.0 as u8
+    );
+    assert_eq!(
+        sc::SGL_INVALID_NUMBER_OF_DESCRIPTORS,
+        Status::INVALID_NUMBER_OF_SGL_DESCRIPTORS.0 as u8
+    );
+    assert_eq!(
+        sc::DATA_SGL_LENGTH_INVALID,
+        Status::DATA_SGL_LENGTH_INVALID.0 as u8
+    );
+    assert_eq!(
+        sc::SGL_DESCRIPTOR_TYPE_INVALID,
+        Status::SGL_DESCRIPTOR_TYPE_INVALID.0 as u8
+    );
+    assert_eq!(
+        sc::SGL_INVALID_USE_OF_CMB,
+        Status::INVALID_USE_OF_CONTROLLER_MEMORY_BUFFER.0 as u8
+    );
+    assert_eq!(
+        sc::SGL_DATA_BLOCK_GRANULARITY_INVALID,
+        Status::SGL_DATA_BLOCK_GRANULARITY_INVALID.0 as u8
+    );
+    // 相邻 Generic / Command-Specific 码也锚定（R2d 校正 SANITIZE 时与
+    // SGL_INVALID_USE_OF_CMB=0x12 撞 byte 暴露的 R1 手填错值）。Command-Specific
+    // 码 spec 值在 0x1xx，`sc::` 只存低字节，故 `& 0xff`。
+    assert_eq!(
+        sc::SANITIZE_IN_PROGRESS,
+        Status::SANITIZE_IN_PROGRESS.0 as u8,
+        "Sanitize In Progress 是 Generic 0x1d（非 R1 误填的 0x12）"
+    );
+    assert_eq!(
+        sc::SELF_TEST_IN_PROGRESS,
+        (Status::DEVICE_SELF_TEST_IN_PROGRESS.0 & 0xff) as u8,
+        "Self-Test In Progress SC byte = 0x1d（spec 0x11d，Command-Specific）"
+    );
+    assert_eq!(
+        sc::BOOT_PARTITION_WRITE_PROHIBITED,
+        (Status::BOOT_PARTITION_WRITE_PROHIBITED.0 & 0xff) as u8,
+        "Boot Partition Write Prohibited SC byte = 0x1e（spec 0x11e，Command-Specific）"
     );
 }
 

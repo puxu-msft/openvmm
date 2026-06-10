@@ -217,9 +217,14 @@ pub mod sc {
     pub const INTERNAL_ERROR: u8 = 0x06;
     /// LBA Out of Range (NVM CSD)
     pub const LBA_OUT_OF_RANGE: u8 = 0x80;
-    /// **Phase O** — 命名常量供 grep（之前 magic 0x12/0x1d/0x84 散落）。
-    /// Spec § 4.6.1.2 generic status codes：
-    pub const SANITIZE_IN_PROGRESS: u8 = 0x12;
+    /// **Phase O / R2d 校正** — 命名常量供 grep。值以 canonical
+    /// `nvme_spec::Status` 为准（见 tests.rs::sgl_status_codes_match_nvme_spec）。
+    /// - SANITIZE_IN_PROGRESS：Generic SC **0x1d**（R1 误填 0x12=Invalid Use of
+    ///   CMB，emit SCT=0 时 driver 误解为 CMB 错——R2d 校正）。
+    /// - SELF_TEST_IN_PROGRESS：SC byte 0x1d，但 spec 是 **Command-Specific**
+    ///   (0x11d)，故 emit 时须配 `SCT_COMMAND_SPECIFIC`（与 Generic 0x1d 的
+    ///   Sanitize 靠 SCT 区分）。
+    pub const SANITIZE_IN_PROGRESS: u8 = 0x1d;
     pub const SELF_TEST_IN_PROGRESS: u8 = 0x1d;
     pub const FORMAT_IN_PROGRESS: u8 = 0x84;
     /// **Phase L1** — ZNS Command Set Specific status codes (spec ZNS § 5)。
@@ -260,8 +265,6 @@ pub mod sc {
     /// **Phase Q7** — Command Prohibited by Command and Feature Lockdown
     /// (spec § 4.6.1.2.1 + § 5.18) — driver 已 lock 此 opcode 时返。
     pub const COMMAND_PROHIBITED_BY_LOCKDOWN: u8 = 0x23;
-    /// **Phase R1** — SGL_DESCRIPTOR_TYPE_INVALID — driver SGL 解析出未识别
-    /// type 时返。spec § 4.6.1.2.1 Generic SC 0x15。
     /// **Phase S1** — NAMESPACE_IS_WRITE_PROTECTED (spec § 4.6.1.2.1 SC 0x20)。
     /// Driver 对 write-protected NS 发 Write/Write Zeroes/DSM/Format 等
     /// 写入命令时返。配合 Feature 0x84 NS Write Protection 使用。
@@ -291,16 +294,25 @@ pub mod sc {
     /// **2026-06-09** — Namespace Identifier Unavailable (spec SC 0x16,
     /// Cmd-Specific)。NS Management Create 时无空闲 NSID（已达 NAMESPACE_SLOT_CAPACITY）。
     pub const NAMESPACE_ID_UNAVAILABLE: u8 = 0x16;
-    pub const SGL_DESCRIPTOR_TYPE_INVALID: u8 = 0x15;
-    /// **Phase R1** — INVALID_USE_OF_CONTROLLER_MEMORY_BUFFER — SGL Data Block
-    /// 指向无效 GPA / CMB 但 CMB 未启用时返。
-    pub const SGL_INVALID_USE_OF_CMB: u8 = 0x16;
-    /// **Phase R1** — PRP_OFFSET_INVALID — SGL Last Segment 必须最后一个；
-    /// 中途出现 Last 之后还有 descriptor 时返。
-    pub const SGL_DATA_BLOCK_GRANULARITY_INVALID: u8 = 0x17;
-    /// **Phase R1** — INVALID_NUMBER_OF_SGL_DESCRIPTORS — total length < cmd
-    /// 要求 transfer 字节数时返。
-    pub const SGL_INVALID_NUMBER_OF_DESCRIPTORS: u8 = 0x14;
+    // ── SGL Generic Command Status (SCT=0)。**值以仓库内 canonical
+    //    `nvme_spec::Status` 为准**（vm/devices/storage/nvme_spec/src/lib.rs
+    //    ~280-300），见 controller/tests.rs::sgl_status_codes_match_nvme_spec
+    //    anchored 测试。R1 原把这些手填成 0x14-0x17（全错：实为 ATOMIC_WRITE_
+    //    UNIT_EXCEEDED / OPERATION_DENIED / SGL_OFFSET_INVALID / RESERVED）——
+    //    SGL 极少被真驱动跑到，长期未暴露。R2d 按 spec 校正。──
+    /// SGL segment descriptor 本身非法（如 segment 字节数非 16 倍数）。spec 0x0d。
+    pub const INVALID_SGL_SEGMENT_DESCRIPTOR: u8 = 0x0d;
+    /// SGL descriptor 数量非法（如 segment chain 段数超上限）。spec 0x0e。
+    pub const SGL_INVALID_NUMBER_OF_DESCRIPTORS: u8 = 0x0e;
+    /// **Phase R2d** — Data SGL 总长度与命令传输大小不符（fragment 覆盖 ≠
+    /// NLB*sector）。spec 0x0f。
+    pub const DATA_SGL_LENGTH_INVALID: u8 = 0x0f;
+    /// driver SGL 解析出未识别 / 不该出现的 descriptor type 时返。spec 0x11。
+    pub const SGL_DESCRIPTOR_TYPE_INVALID: u8 = 0x11;
+    /// SGL Data Block 指向无效 CMB（CMB 未启用时返）。spec 0x12。
+    pub const SGL_INVALID_USE_OF_CMB: u8 = 0x12;
+    /// SGL Data Block granularity 非法。spec 0x1e。
+    pub const SGL_DATA_BLOCK_GRANULARITY_INVALID: u8 = 0x1e;
 }
 
 /// Submission Queue Entry — 64 bytes 固定。
@@ -637,18 +649,18 @@ impl IdentifyController {
         id.anacap = 0x0F; // optimized + non-opt + inaccessible + persistent loss states 都支持
         id.anagrpmax = 1; // 最多 1 ANA group
         id.nanagrpid = 1; // 当前 1 ANA group active
-        // **Phase R3 + 2026-06-10 advertise⟺implement 对齐** — SGLS (SGL Support)
-        // field (spec § 5.17.2.2)。
+        // **Phase R3 + R2d advertise⟺implement 对齐** — SGLS (SGL Support)
+        // field (spec § 5.17.2.2 Figure)。
         // bits 1:0 = 01 (SGL supported, no alignment requirements 不强制对齐)
+        // bit 16   = 1  (SGL Bit Bucket Descriptor Supported)
         //
-        // **修正**：原值 0x0003_0001 还置了 bit 16(Bit Bucket descriptor supported) +
-        // bit 17(byte-alignment / granularity 相关位，spec § 5.1.13.2)，但
-        // `io.rs::resolve_data_pointers` **显式拒绝** Bit Bucket、Segment、> 1 page Data
-        // Block（R1 只实现 inline 单 Data Block sub_type=0 ≤1page）。over-advertise 会让
-        // "按 SGLS 用 Bit Bucket"的 driver 收到 SGL_DESCRIPTOR_TYPE_INVALID。现只 advertise
-        // R1 真支持的 basic SGL Data Block（bits 1:0=01），bit 16/17 清零。完整 Bit Bucket +
-        // Segment 链(R2)见 docs/plans/2026-06-10-sgl-r2-segment-chains-detailed.md。
-        id.sgls = 0x0000_0001;
+        // **演进**：R1 曾把原值 0x0003_0001（bit16 Bit Bucket + bit17）清成 0x0001
+        // 以对齐"只实现 inline 单 Data Block"的现状（commit a7466b5b）。**R2** 经
+        // PSDT=10 segment 路径完整实现了 Segment chain（R2a/b）+ Bit Bucket（R2c），
+        // 故 R2d 把 bit16 加回——advertise⟺implement 重新对齐（这次是真支持）。
+        // bit17（byte-alignment 等额外位）仍不置：未实现对应语义。
+        // 注：Segment chain 属基础 SGL 支持（bits 1:0），无独立 SGLS bit。
+        id.sgls = 0x0001_0001;
         // **Phase S3** — Atomic Write Unit (NVMe spec § 5.15.2.2 + § 4.10)。
         // AWUN/AWUPF/ACWU 都是 0-based：值 N → N+1 LBAs。
         //   awun  = 全 NS power-loss safe atomic write 上限

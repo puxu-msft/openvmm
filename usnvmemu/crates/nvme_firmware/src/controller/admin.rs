@@ -1247,6 +1247,8 @@ impl NvmeController {
                     0x1 | 0x2 => {
                         if self.self_test_in_progress.is_some() {
                             // Spec：已在进行 → 0x1d Self-Test In Progress
+                            // (Command-Specific，SCT=1；与 Generic 0x1d 的
+                            // Sanitize In Progress 靠 SCT 区分)。
                             tracing::warn!(stc, "Self-Test rejected: already in progress");
                             return Some(Cqe::error(
                                 cid,
@@ -1254,7 +1256,7 @@ impl NvmeController {
                                 sq_head,
                                 phase,
                                 sc::SELF_TEST_IN_PROGRESS,
-                                0,
+                                sc::SCT_COMMAND_SPECIFIC,
                             ));
                         }
                         let total = if stc == 0x1 { 5 } else { 20 };

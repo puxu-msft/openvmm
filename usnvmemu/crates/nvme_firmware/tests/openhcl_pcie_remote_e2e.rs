@@ -1961,3 +1961,51 @@ async fn openhcl_sgl_bit_bucket_write_ignored() -> Result<()> {
 
     Ok(())
 }
+
+/// **Phase R2d** — SGL fragment 总长度与命令传输大小不符 → Data SGL Length Invalid
+/// (spec SC 0x0f)。单 Last Segment 只含 [Data 2048]，但命令是 1 个 4K LBA（4096）→
+/// 覆盖不足 → firmware 拒，返 0x0f（**非** R1 手填错的 0x14）。
+///
+/// **revert-verify（已实测）**：completion.rs start_sgl_transfer 去掉 `walk_offset !=
+/// expected` 检查 → 命令变 sc=0（只 scatter 2048）→ 本测试 assert sc==0x0f FAIL。
+#[tokio::test]
+async fn openhcl_sgl_length_mismatch_rejected() -> Result<()> {
+    const SEG_GPA: u64 = 0xA_0000;
+    const FRAG0_GPA: u64 = 0xC_0000;
+    const SC_DATA_SGL_LENGTH_INVALID: u8 = 0x0f;
+
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (_admin, mut io) = setup_enabled_4k_io(&driver).await?;
+
+    // 段只覆盖 2048，但 1 个 4K LBA = 4096 → 覆盖不足。
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&sgl_desc(FRAG0_GPA, 2048, 0x00));
+    driver.write_guest(SEG_GPA, seg);
+
+    let (p1, p2) = sgl1_last_segment(SEG_GPA, 16);
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02,
+                psdt: 2,
+                cid: 0x70,
+                nsid: 1,
+                prp1: p1,
+                prp2: p2,
+                cdw10: 13,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("SGL Read 覆盖不足")?;
+    assert_eq!(
+        cqe.sc, SC_DATA_SGL_LENGTH_INVALID,
+        "覆盖不足应返 Data SGL Length Invalid (0x0f)，实 sc={:#x}",
+        cqe.sc
+    );
+
+    Ok(())
+}
