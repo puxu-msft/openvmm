@@ -103,7 +103,10 @@ pub mod admin_opc {
     /// **Phase L5** — Virtualization Management (NVMe 1.3+，spec § 5.24)。
     pub const VIRTUALIZATION_MGMT: u8 = 0x1c;
     /// **Phase L5** — Get LBA Status (NVMe 1.4+，spec § 5.15)。
-    pub const GET_LBA_STATUS: u8 = 0x1e;
+    /// **2026-06-10 校正**：原误填 0x1e（= NVMe-MI Receive！），spec 实为 0x86。
+    /// 已 dispatch + 在 OACS 广告，0x1e 会让真 0x86 命令落 INVALID_OPCODE。
+    /// 由 `opcode_feature_register_constants_match_nvme_spec` anchored 测试守住。
+    pub const GET_LBA_STATUS: u8 = 0x86;
 }
 
 /// **Phase H1** — Feature Identifier (NVMe spec § 5.21.1 Table 134)。

@@ -2213,6 +2213,182 @@ fn sc_constants_match_nvme_spec() {
     assert_eq!(sc::sf_of(sc::INVALID_FIELD), 0x02 << 1);
 }
 
+/// **M1 锚定护栏（test-coverage followup）** — `admin_opc` / `nvm_opc` / `fid` /
+/// `regs::Reg` / Get-Log-Page LID / `pi::PiCheck::to_sc` 这些**整块复制 nvme_spec
+/// 的常量**全部锚到 canonical `nvme_spec`，drift 即测试红。
+///
+/// 把 `sc::` 的锚定纪律（[[LESSONS §25/§26]]）推广到所有 spec-derived 常量模块。
+/// **本测试一加上就抓出真 bug**：`admin_opc::GET_LBA_STATUS` 原误填 0x1e
+/// （= NVMe-MI Receive），spec 实为 0x86（已校正）。firmware-only 的 NVM CS /
+/// ZNS opcode、PMR register 等 nvme_spec 无对应枚举，不在此锚（注释标注）。
+#[test]
+fn opcode_feature_register_constants_match_nvme_spec() {
+    use crate::cmd::admin_opc;
+    use crate::cmd::fid;
+    use crate::cmd::nvm_opc;
+    use crate::regs::Reg;
+    use nvme_spec::AdminOpcode;
+    use nvme_spec::Feature;
+    use nvme_spec::LogPageIdentifier;
+    use nvme_spec::Register;
+    use nvme_spec::Status;
+    use nvme_spec::nvm::NvmOpcode;
+
+    // ── admin_opc vs nvme_spec::AdminOpcode（全 25 个有对应）──
+    assert_eq!(
+        admin_opc::DELETE_IO_SQ,
+        AdminOpcode::DELETE_IO_SUBMISSION_QUEUE.0
+    );
+    assert_eq!(
+        admin_opc::CREATE_IO_SQ,
+        AdminOpcode::CREATE_IO_SUBMISSION_QUEUE.0
+    );
+    assert_eq!(admin_opc::GET_LOG_PAGE, AdminOpcode::GET_LOG_PAGE.0);
+    assert_eq!(
+        admin_opc::DELETE_IO_CQ,
+        AdminOpcode::DELETE_IO_COMPLETION_QUEUE.0
+    );
+    assert_eq!(
+        admin_opc::CREATE_IO_CQ,
+        AdminOpcode::CREATE_IO_COMPLETION_QUEUE.0
+    );
+    assert_eq!(admin_opc::IDENTIFY, AdminOpcode::IDENTIFY.0);
+    assert_eq!(admin_opc::ABORT, AdminOpcode::ABORT.0);
+    assert_eq!(admin_opc::SET_FEATURES, AdminOpcode::SET_FEATURES.0);
+    assert_eq!(admin_opc::GET_FEATURES, AdminOpcode::GET_FEATURES.0);
+    assert_eq!(
+        admin_opc::ASYNC_EVENT_REQUEST,
+        AdminOpcode::ASYNCHRONOUS_EVENT_REQUEST.0
+    );
+    assert_eq!(
+        admin_opc::NS_MANAGEMENT,
+        AdminOpcode::NAMESPACE_MANAGEMENT.0
+    );
+    assert_eq!(admin_opc::FW_COMMIT, AdminOpcode::FIRMWARE_COMMIT.0);
+    assert_eq!(
+        admin_opc::FW_IMAGE_DOWNLOAD,
+        AdminOpcode::FIRMWARE_IMAGE_DOWNLOAD.0
+    );
+    assert_eq!(admin_opc::DEVICE_SELF_TEST, AdminOpcode::DEVICE_SELF_TEST.0);
+    assert_eq!(
+        admin_opc::NS_ATTACHMENT,
+        AdminOpcode::NAMESPACE_ATTACHMENT.0
+    );
+    assert_eq!(admin_opc::KEEP_ALIVE, AdminOpcode::KEEP_ALIVE.0);
+    assert_eq!(admin_opc::DIRECTIVE_SEND, AdminOpcode::DIRECTIVE_SEND.0);
+    assert_eq!(
+        admin_opc::DIRECTIVE_RECEIVE,
+        AdminOpcode::DIRECTIVE_RECEIVE.0
+    );
+    assert_eq!(
+        admin_opc::VIRTUALIZATION_MGMT,
+        AdminOpcode::VIRTUALIZATION_MANAGEMENT.0
+    );
+    assert_eq!(admin_opc::GET_LBA_STATUS, AdminOpcode::GET_LBA_STATUS.0); // 曾误填 0x1e
+    assert_eq!(admin_opc::LOCKDOWN, AdminOpcode::LOCKDOWN.0);
+    assert_eq!(
+        admin_opc::DOORBELL_BUFFER_CONFIG,
+        AdminOpcode::DOORBELL_BUFFER_CONFIG.0
+    );
+    assert_eq!(admin_opc::FORMAT_NVM, AdminOpcode::FORMAT_NVM.0);
+    assert_eq!(admin_opc::SECURITY_SEND, AdminOpcode::SECURITY_SEND.0);
+    assert_eq!(admin_opc::SECURITY_RECEIVE, AdminOpcode::SECURITY_RECEIVE.0);
+    assert_eq!(admin_opc::SANITIZE, AdminOpcode::SANITIZE.0);
+
+    // ── nvm_opc vs nvme_spec::nvm::NvmOpcode（仅 spec 含的 8 个；
+    //    WRITE_UNCORRECTABLE/COMPARE/WRITE_ZEROES/VERIFY/COPY/ZONE_* 是 NVM CS/
+    //    ZNS CS 专属，nvme_spec 无对应枚举，按 NVM CS 1.0c figure 取值）──
+    assert_eq!(nvm_opc::FLUSH, NvmOpcode::FLUSH.0);
+    assert_eq!(nvm_opc::WRITE, NvmOpcode::WRITE.0);
+    assert_eq!(nvm_opc::READ, NvmOpcode::READ.0);
+    assert_eq!(nvm_opc::DSM, NvmOpcode::DSM.0);
+    assert_eq!(
+        nvm_opc::RESERVATION_REGISTER,
+        NvmOpcode::RESERVATION_REGISTER.0
+    );
+    assert_eq!(nvm_opc::RESERVATION_REPORT, NvmOpcode::RESERVATION_REPORT.0);
+    assert_eq!(
+        nvm_opc::RESERVATION_ACQUIRE,
+        NvmOpcode::RESERVATION_ACQUIRE.0
+    );
+    assert_eq!(
+        nvm_opc::RESERVATION_RELEASE,
+        NvmOpcode::RESERVATION_RELEASE.0
+    );
+
+    // ── fid vs nvme_spec::Feature（全 17 个有对应）──
+    assert_eq!(fid::ARBITRATION, Feature::ARBITRATION.0);
+    assert_eq!(fid::POWER_MANAGEMENT, Feature::POWER_MANAGEMENT.0);
+    assert_eq!(fid::TEMP_THRESHOLD, Feature::TEMPERATURE_THRESHOLD.0);
+    assert_eq!(fid::ERROR_RECOVERY, Feature::ERROR_RECOVERY.0);
+    assert_eq!(fid::VOLATILE_WRITE_CACHE, Feature::VOLATILE_WRITE_CACHE.0);
+    assert_eq!(fid::NUMBER_OF_QUEUES, Feature::NUMBER_OF_QUEUES.0);
+    assert_eq!(fid::INTERRUPT_COALESCING, Feature::INTERRUPT_COALESCING.0);
+    assert_eq!(
+        fid::INTERRUPT_VECTOR_CONFIG,
+        Feature::INTERRUPT_VECTOR_CONFIG.0
+    );
+    assert_eq!(fid::WRITE_ATOMICITY, Feature::WRITE_ATOMICITY.0);
+    assert_eq!(fid::ASYNC_EVENT_CONFIG, Feature::ASYNC_EVENT_CONFIG.0);
+    assert_eq!(fid::TIMESTAMP, Feature::TIMESTAMP.0);
+    assert_eq!(fid::HCTM, Feature::HOST_CONTROLLED_THERMAL_MANAGEMENT.0);
+    assert_eq!(
+        fid::SW_PROGRESS_MARKER,
+        Feature::NVM_SOFTWARE_PROGRESS_MARKER.0
+    );
+    assert_eq!(fid::HOST_IDENTIFIER, Feature::NVM_HOST_IDENTIFIER.0);
+    assert_eq!(
+        fid::RESERVATION_NOTIFICATION_MASK,
+        Feature::NVM_RESERVATION_NOTIFICATION_MASK.0
+    );
+    assert_eq!(
+        fid::RESERVATION_PERSISTENCE,
+        Feature::NVM_RESERVATION_PERSISTENCE.0
+    );
+    assert_eq!(
+        fid::NS_WRITE_PROTECTION,
+        Feature::NVM_NAMESPACE_WRITE_PROTECTION_CONFIG.0
+    );
+
+    // ── regs::Reg vs nvme_spec::Register（PMR 0xe0x nvme_spec 无，跳过）──
+    assert_eq!(Reg::Cap as u64, Register::CAP.0);
+    assert_eq!(Reg::Vs as u64, Register::VS.0);
+    assert_eq!(Reg::Intms as u64, Register::INTMS.0);
+    assert_eq!(Reg::Intmc as u64, Register::INTMC.0);
+    assert_eq!(Reg::Cc as u64, Register::CC.0);
+    assert_eq!(Reg::Csts as u64, Register::CSTS.0);
+    assert_eq!(Reg::Aqa as u64, Register::AQA.0);
+    assert_eq!(Reg::Asq as u64, Register::ASQ.0);
+    assert_eq!(Reg::Acq as u64, Register::ACQ.0);
+    assert_eq!(Reg::Cmbloc as u64, Register::CMBLOC.0);
+    assert_eq!(Reg::Cmbsz as u64, Register::CMBSZ.0);
+    assert_eq!(Reg::Bpinfo as u64, Register::BPINFO.0);
+    assert_eq!(Reg::Bprsel as u64, Register::BPRSEL.0);
+    assert_eq!(Reg::Bpmbl as u64, Register::BPMBL.0);
+
+    // ── Get Log Page LID dispatch（仅 nvme_spec 含的 3 个 + dispatch 的）──
+    assert_eq!(0x01u8, LogPageIdentifier::ERROR_INFORMATION.0);
+    assert_eq!(0x02u8, LogPageIdentifier::HEALTH_INFORMATION.0);
+    assert_eq!(0x03u8, LogPageIdentifier::FIRMWARE_SLOT_INFORMATION.0);
+
+    // ── pi::to_sc 的 PI media SC byte（曾 cargo-mutants MISSED：to_sc→None/
+    //    Some(0)/Some(1) 全存活，因无测试锚这三个字节，§25 footgun 留在 pi.rs）──
+    use crate::pi::PiCheck;
+    assert_eq!(
+        PiCheck::GuardFail.to_sc(),
+        Some((Status::MEDIA_END_TO_END_GUARD_CHECK_ERROR.0 & 0xff) as u8)
+    );
+    assert_eq!(
+        PiCheck::AppTagFail.to_sc(),
+        Some((Status::MEDIA_END_TO_END_APPLICATION_TAG_CHECK_ERROR.0 & 0xff) as u8)
+    );
+    assert_eq!(
+        PiCheck::RefTagFail.to_sc(),
+        Some((Status::MEDIA_END_TO_END_REFERENCE_TAG_CHECK_ERROR.0 & 0xff) as u8)
+    );
+    assert_eq!(PiCheck::Ok.to_sc(), None);
+}
+
 /// **Phase S1** — `nswp == 0` 默认放行；`nswp != 0` 返
 /// NAMESPACE_IS_WRITE_PROTECTED (SC 0x20, Generic)。
 #[test]

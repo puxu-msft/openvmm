@@ -253,4 +253,40 @@ mod tests {
         }];
         assert!(flatten_data_blocks(&descs).is_err());
     }
+
+    /// **mutant-kill** — `from_byte` 的 Keyed(0x4)/Transport(0x5) 臂此前无测试
+    /// （cargo-mutants 删这两臂存活）。逐 high-nibble 锁死 type 解码。
+    #[test]
+    fn from_byte_decodes_all_types() {
+        assert_eq!(SglType::from_byte(0x00), Some(SglType::DataBlock));
+        assert_eq!(SglType::from_byte(0x1f), Some(SglType::BitBucket)); // low nibble 忽略
+        assert_eq!(SglType::from_byte(0x20), Some(SglType::Segment));
+        assert_eq!(SglType::from_byte(0x30), Some(SglType::LastSegment));
+        assert_eq!(SglType::from_byte(0x40), Some(SglType::KeyedDataBlock));
+        assert_eq!(SglType::from_byte(0x50), Some(SglType::TransportSpecific));
+        assert_eq!(SglType::from_byte(0x60), None);
+        assert_eq!(SglType::from_byte(0xf0), None);
+    }
+
+    /// **mutant-kill** — `parse_sgl_list` 的 16-倍数守卫 + descriptor 计数此前
+    /// 无直测（cargo-mutants 把守卫取反 / 返 `Ok(vec![])` 均存活）。
+    #[test]
+    fn parse_sgl_list_count_and_alignment() {
+        // 非 16 倍数 → Err（守卫取反会让本断言红）。
+        assert!(parse_sgl_list(&[0u8; 17]).is_err());
+        assert!(parse_sgl_list(&[0u8; 15]).is_err());
+        // 3 个合法 Data Block descriptor（48 字节）→ Ok 且 count==3（返 Ok(vec![])
+        // 的 mutant 会让 len 断言红）。
+        let mut buf = vec![0u8; 48];
+        buf[8..12].copy_from_slice(&512u32.to_le_bytes()); // desc0 length
+        buf[16 + 8..16 + 12].copy_from_slice(&1024u32.to_le_bytes()); // desc1 length
+        let descs = parse_sgl_list(&buf).unwrap();
+        assert_eq!(descs.len(), 3);
+        assert_eq!(descs[0].length, 512);
+        assert_eq!(descs[1].length, 1024);
+        // 含未知 type（high nibble 0x6）→ Err。
+        let mut bad = vec![0u8; 16];
+        bad[15] = 0x60;
+        assert!(parse_sgl_list(&bad).is_err());
+    }
 }
