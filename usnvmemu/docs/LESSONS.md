@@ -705,3 +705,57 @@ harness 看不见 >4 GiB）一个道理：便宜 harness 的 PASS 是结构性�
 4 bug；fix `vfio_user_transport/{session,dma,irq,framing}.rs` + `nvme_firmware/{cmd,controller/
 mmio,controller/mod,regs}.rs` + `pcie_device_sdk/run.rs`(MSI-X strip)；rust-reviewer 2 轮
 （核心 wire 逻辑 APPROVE + BLOCK 3 项 clippy/fmt/OpenHCL-MSI-X 回归全修）。
+
+## 29. 自馈 async poll 循环：3 层 bug 全在 happy-path harness 盲区 + cap 必须界定对的量 (HIGH)
+
+**背景**: DBBUF (shadow doorbell, spec § 5.7/§ 7.13) 从 stub（只存 shadow/event_idx GPA 不
+轮询、广告 OACS.DBBUF=0 规避，见 [[lesson §28]] bug #4）补成真实现：controller DMA-poll driver
+shadow buffer 拿真 SQ tail/CQ head + 写回 event_idx。因 `Transport::dma_read` 是 **token-异步**
+（无同步读，完成经 `on_dma_complete`），轮询只能实现成**跨完成回调的异步状态机**。
+
+**3 层 HIGH bug 全在 async 边角，连真-QEMU-guest happy-path harness 都看不见**（vfio 同步 drain
+把整条链一次跑完 + 真 driver 行为良性，故这些 interleaving 永不自然发生），逐轮 reviewer 越挖越深：
+1. **dropped-ring strand**：poll 链在 drain 时到的 doorbell ring 被 inflight guard 丢弃；若
+   driver 的 submit 恰落在链最后一次 re-read 之后的 settle window，命令被漏 → 滞留到 5s tick。
+   修：per-(qid,is_cq) one-shot `shadow_ring_pending` flag，settle 分支若置则再 re-read 一次。
+2. **wrap-saturation false-CFS**：cap 用绝对环索引做 high-water-mark，max-depth 队列 wrap 后
+   饱和于 size-1 → 健康 controller 的合法 wrap 全被判"无进展" → 撞 CFS（reviewer 实测 size=
+   65536 在第 131070 步必触发）。
+3. **vfio 同步 `dma_read` 让 poll 链自馈 `drain_dma_completions` 的 while 循环**：同步 drain 里
+   每次 `issue_shadow_read` 立刻 push 完成回正在 drain 的同一队列 → in-range 振荡 shadow 让链
+   永不 settle → **host 线程在一次 drain 内无限自旋**（guest-触发 DoS）。OpenHCL async 路径只
+   是软浪费（帧交错），vfio 同步路径是硬挂。
+
+**cap 度量的核心教训——"防御性 cap" 必须界定对的量**（三次试错）：
+- 界定 **advance**（推进多少命令）→ 真高吞吐 driver 稳态流水合法推进无界、永不 settle → 任何
+  有限 cap 都误伤真 driver。**错**（这正是 bug #2 原版）。
+- 界定 **ring 距离**（累计前向距离）→ 看似 wrap-safe，但振荡的 wrap-back 也算前向距离 → cap
+  单调不可触发=**dead**；且这是 bug #2 那类"环索引语义假设"的脆弱启发，reviewer 明确反对手搓
+  振荡检测器。**错**（且 dead cap 没人发现，直到 reviewer 追问"它真能 fire 吗"）。
+- 界定 **每链自续深度**（一条链总共 re-read 多少次，仅链起始重置）→ correct driver 链深仅 ~tens
+  （代码实测 ~14）≪ 上限；自馈死循环无界 → 撞 `MAX_SHADOW_POLL_ITERS` 置 CFS + 收链
+  （有限 ≤65536 往返终止）。这是 host-liveness 界，**对**。
+
+**怎么验这些盲区**: 全靠 **deterministic 单测手搓 interleaving + revert-verify**——CaptureTransport
+喂定值序列驱动状态机走过 reviewer 描述的精确交错（dropped-ring 落在 settle window / 振荡**有界**
+喂 MAX+8 次以免测试自身死循环），断言命令被救 / CFS 恰在第 MAX 步触发；revert（抽掉修复）必让
+该测试红。真 harness 只证 happy-path 通 + DBBUF 真被行使（shadow 领先 MMIO），证不了边角。
+
+**三条**:
+1. **token-异步 transport 上的轮询必是跨回调状态机**，不是同步 loop；其 race（submit-during-
+   window）/ liveness（自馈死循环）边角 happy-path e2e 结构性看不见，只能 deterministic 单测
+   reproduce + revert-verify。同 [[lesson §26]]/[[lesson §28]]：便宜/happy harness 的绿是假安心。
+2. **"防御性 cap" 必须界定对的量**：先问"要挡的坏情况和正常负载在哪个量上分得开"——挡 advance
+   误伤真负载、挡 ring 距离脆弱且 dead、挡自续深度才既不误伤又能终止。cap 写完要证它**真能
+   触发**（dead cap = 装了个永不响的保险）。
+3. **synchronous-drain transport 上设备自发的 DMA 会自馈 drain 循环**：任何"完成里再发请求"的
+   逻辑都可能把 host 线程卡死在一次 pump 内。要么有限深度 cap 兜底（本次），要么 drain 循环本身
+   设每-pump 让步（future hardening；该提示注在 mod.rs 的 `MAX_SHADOW_POLL_ITERS` 文档，指向
+   `session.rs` 的 drain 循环）。
+
+**来源**: DBBUF 真实现 commit `f35e5a71`；4 轮 rust-reviewer 逐层抓 HIGH-1(dropped-ring) →
+HIGH-2 wrap-saturation → point-3 vfio 自馈死锁（每轮修完下一轮挖更深，全在 vfio 同步 harness
+盲区）；单测 `dbbuf_tests`（`high1_dropped_ring_during_settle_window_is_recovered` /
+`high2_realistic_maxdepth_wrap_settles_never_trips_cfs` / `high2_inrange_oscillating_chain_
+trips_cfs_at_cap` 等，全 revert-verify）；真 QEMU 11 vfio 2-vCPU guest GREEN（19 次 shadow 领先
+MMIO，burst 0 CFS）。
