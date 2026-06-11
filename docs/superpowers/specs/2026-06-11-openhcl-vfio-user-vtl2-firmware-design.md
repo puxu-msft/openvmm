@@ -86,7 +86,7 @@ POC-1 已证它对非-QEMU client 的 fd-passing 零拷贝 DMA 可行。新工�
 
 - **W0**：✅ 完成（2026-06-11，commit b292aad5→5743c235）。
 - **W1**：`vfio_user_device` client wire + AF_UNIX + 握手（loopback 单测）。
-- **W2**：PCIe 呈现（复用 pcie_remote 层）+ REGION_RW。
+- **W2**：✅ client REGION wire（GET_INFO/GET_REGION_INFO/GET_IRQ_INFO/REGION_RW/RESET，loopback 对接真 server）。**scope ADR（2026-06-11，选项3）**：guest-facing PCIe 呈现拆独立 adapter crate（依赖上游 `pci_core`）推迟 W6——pci_core 重依赖会破坏 vfio_user_device 的 standalone Linux 可测，且"向 guest 呈现"本质需 openvmm/underhill partition 无法 standalone 测；server 已是 config/BAR 真值源，client 透传 REGION_RW 即可（不本地 pci_core 模拟）。spec §4 "复用 pcie_remote_device" 系 W0 audit 已纠的错误归因。
 - **W3**：DMA_MAP 导出 GuestMemory region fd → firmware 零拷贝（按 POC-1）+ JIT map。
 - **W4**：MSI-X eventfd → `Interrupt::deliver`（按 POC-2）。
 - **W5**：firmware-as-VTL2-进程 集成 + 降权——**三段递进**部署形态（POC-3/6 真机已证 VTL2
