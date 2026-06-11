@@ -1044,6 +1044,7 @@ impl NvmeController {
                                 total_pages,
                                 pages_done: 0,
                                 data_pages: prp_data_pages,
+                                list_pages_fetched: 0,
                                 sep_meta: Some(crate::controller::SepMetaPrp {
                                     data_bytes_total: nlb * data_bytes as u32,
                                     mptr,
@@ -1596,6 +1597,7 @@ impl NvmeController {
                             total_pages,
                             pages_done: 0,
                             data_pages,
+                            list_pages_fetched: 0,
                             sep_meta: None,
                         },
                     );
@@ -1885,6 +1887,7 @@ impl NvmeController {
                                 total_pages,
                                 pages_done: 0,
                                 data_pages,
+                                list_pages_fetched: 0,
                                 sep_meta: Some(crate::controller::SepMetaPrp {
                                     data_bytes_total: nlb * data_bytes as u32,
                                     mptr,
@@ -2315,6 +2318,7 @@ impl NvmeController {
                             total_pages,
                             pages_done: 0,
                             data_pages,
+                            list_pages_fetched: 0,
                             sep_meta: None,
                         },
                     );
@@ -2994,10 +2998,11 @@ impl NvmeController {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 };
                 let bytes = numd as usize * 4;
-                // **review M-1（2026-06-10）** — host 控的 NUMD→bytes 无上限会让 build_*
-                // 分配巨量内存（最坏 ~16 GiB DoS）。比照 Get Log Page 卡 2 MiB（单 PRP-list
-                // 页可服务范围）；超过 INVALID_FIELD 让 driver 分块。
-                if bytes > 2 * 1024 * 1024 {
+                // **review M-1（2026-06-10）+ C1② chaining 真激活（2026-06-11）** — host 控
+                // NUMD→bytes，无上限会让 build_* 分配巨量内存（最坏 ~16 GiB DoS）。原 2 MiB
+                // cap（单 PRP-list 页）已抬到 32 MiB（chain 多页激活）；真正深度防御在 chain
+                // walk arm 的 MAX_PRP_LIST_PAGES 上限。
+                if bytes > 32 * 1024 * 1024 {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 let zra = (sqe.cdw13 & 0xff) as u8;
@@ -3260,10 +3265,10 @@ impl NvmeController {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 let bytes = numd as usize * 4;
-                // **review M-1（2026-06-10）** — host 控的 NUMD→bytes 无上限会让 build_*
-                // 分配巨量内存（最坏 ~16 GiB DoS）。比照 Get Log Page 卡 2 MiB（单 PRP-list
-                // 页可服务范围）；超过 INVALID_FIELD 让 driver 分块。
-                if bytes > 2 * 1024 * 1024 {
+                // **review M-1（2026-06-10）+ C1② chaining 真激活（2026-06-11）** — 抬到
+                // 32 MiB（chain 多页激活）；真正深度防御在 chain walk arm 的
+                // MAX_PRP_LIST_PAGES 上限。
+                if bytes > 32 * 1024 * 1024 {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 let Some(ns) = self.ns(nsid) else {

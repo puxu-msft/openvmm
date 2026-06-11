@@ -791,15 +791,17 @@ impl NvmeController {
                 let bytes_req = numd * 4; // bytes
                 let lpo: u64 = (sqe.cdw12 as u64) | ((sqe.cdw13 as u64) << 32);
                 tracing::debug!(lid, bytes = bytes_req, lpo, "Get Log Page");
-                // **P2（2026-06-10）** — admin 数据 DMA 现支持 PRP list（`dma_write_then_complete`
-                // 复用 IO read 的 device→host list 机件）。单 PRP list 页装 512 entry → 最多
-                // 513 数据页 ≈ 2 MiB；上限设 2 MiB，再大需 list chaining（未实现）→ INVALID_FIELD
-                // 让 driver 用 LPO 分块拉。realistic log（Telemetry / Persistent Event）远小于此。
-                if bytes_req > 2 * 1024 * 1024 {
+                // **P2（2026-06-10）+ C1② chaining 真激活（2026-06-11）** — admin 数据
+                // DMA 经 `dma_write_then_complete` 复用 IO PRP-list 机件，含 chain pointer
+                // 跟随。原 2 MiB cap（单 PRP list 页 = 512 entry ≈ 2 MiB）已抬到
+                // MAX_PRP_LIST_PAGES × 511 entry × 4 KiB ≈ 32 MiB（chain 多页激活）。
+                // 真正的防御在 chain walk arm（NvmReadPrpListFetch）的深度上限。
+                // 此处仅做粗粒度合理性校验避免巨量 vec 提前分配 DoS。
+                if bytes_req > 32 * 1024 * 1024 {
                     tracing::warn!(
                         lid,
                         bytes = bytes_req,
-                        "Get Log Page: request > 2 MiB unsupported (PRP list chaining 未实现)"
+                        "Get Log Page: request > 32 MiB unsupported (chain depth cap)"
                     );
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }

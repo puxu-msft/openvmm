@@ -680,6 +680,10 @@ pub(super) struct PrpListOp {
     pub(super) total_pages: u32,
     /// 已完成的数据 sub-DMA 数。
     pub(super) pages_done: u32,
+    /// **C1② chaining 深度计数** —— 已 fetch 的 PRP-list 页数（每条 chain 链跟随一次 +1）。
+    /// 与 `MAX_PRP_LIST_PAGES` 共同封顶 host-malicious chain。初值 0；NvmReadPrpListFetch arm
+    /// 每次进入 +1，跟 chain 前检查不超过上限。
+    pub(super) list_pages_fetched: u32,
     /// （仅 Write）每页 data buffer，filled by sub-DMA-read 完成。
     /// 索引 0 = PRP1 数据；1..N = PRP list[0..N-1] 数据。
     pub(super) data_pages: Vec<Option<Vec<u8>>>,
@@ -722,6 +726,20 @@ pub(super) struct SepMetaPrp {
 /// Segment 自环导致无限 DMA-read）。教学路径：单段 ≤ 1 page = 256 descriptor，
 /// 64 段足够任何合法 MDTS 传输（远超真实驱动用量）。
 pub(super) const MAX_SGL_SEGMENTS: u32 = 64;
+
+/// **C1② PRP-list chaining depth cap** —— PRP list 经 chain pointer 可串多页（spec § 4.1.2），
+/// 但 controller 必须给 host-malicious chain（自环 / 极端长链）封顶，与 SGL `MAX_SGL_SEGMENTS`
+/// 同思路。上限 16 list 页 ≈ 16 × 511 = 8176 data entry ≈ 31.9 MiB transfer，远超本 controller
+/// 当前所有暴露的 read 方向 log/report 路径产物大小（教学 Error Info ≤ 几 KB，Zone Report
+/// 单次 ≤ MiB 级；NVMe 1.4+ Telemetry Host-Initiated 真要 >32 MiB 也由 driver 用 LPO
+/// 分块拉）。超限 → INVALID_FIELD。
+///
+/// **作用域注**：本 cap 仅在 read 方向（device→host）`NvmReadPrpListFetch` arm 维护
+/// `list_pages_fetched` 计数；write 方向（`NvmWritePrpListFetch`、`NvmComparePrpListFetch`）
+/// 当前不跟随 chain pointer，受 MDTS=5（IO Write/Compare 上限 128 KiB ≤ 32 pages，
+/// 远小于 511 entry/页）限制天然单页够。未来若给 admin 写方向（如 FW Image Download、
+/// Set Features Save）接 PRP-list chaining，须在对应 write fetch arm 同样维护本计数。
+pub(super) const MAX_PRP_LIST_PAGES: u32 = 16;
 
 /// **Phase R2** — SGL Segment 数据路径累积器（PSDT=10）。
 ///
@@ -3645,6 +3663,7 @@ impl NvmeController {
                     total_pages,
                     pages_done: 0,
                     data_pages,
+                    list_pages_fetched: 0,
                     sep_meta: None,
                 },
             );

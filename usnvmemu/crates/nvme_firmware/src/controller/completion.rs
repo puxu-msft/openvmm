@@ -2310,6 +2310,42 @@ impl NvmeController {
                     // entry 是指向下一 list 页的 **chain pointer**（spec § 4.1.2）。本臂做
                     // walk：累积 data-page GPA 到 `list_entries`，遇 chain 就再 DMA-read 下一
                     // list 页（重入本臂）；walk 集齐 (total_pages-1) 个 data GPA 后再 scatter。
+                    // **C1② 防御** —— host-malicious chain 自环 / 极端长链 → `MAX_PRP_LIST_PAGES`
+                    // 上限封顶（与 SGL `MAX_SGL_SEGMENTS` 同思路）；超限把命令 fail 掉，避免
+                    // 无限 DMA-read 链/累积巨量 entry DoS。**先于 `parse_prp_list` 检查**
+                    // （reviewer M-1：避免超限路径白做 4 KiB 解析分配）。
+                    let cap_exceeded = if let Some(op) = self.prp_list_ops.get_mut(&op_id) {
+                        op.list_pages_fetched = op.list_pages_fetched.saturating_add(1);
+                        op.list_pages_fetched > crate::controller::MAX_PRP_LIST_PAGES
+                    } else {
+                        false
+                    };
+                    if cap_exceeded {
+                        // fetch sibling sweep + accum 移除 + 单条 INVALID_FIELD CQE。
+                        let (sq_id, cid, sq_head, cq_id) = {
+                            let op = &self.prp_list_ops[&op_id];
+                            (op.sq_id, op.cid, op.sq_head, op.cq_id)
+                        };
+                        self.pending_ios.retain(|_, q| match q.op {
+                            PendingOp::NvmWritePrpListFetch { op_id: o }
+                            | PendingOp::NvmWritePrpListData { op_id: o, .. }
+                            | PendingOp::NvmReadPrpListFetch { op_id: o }
+                            | PendingOp::NvmReadPrpListData { op_id: o, .. }
+                            | PendingOp::NvmWritePrpListSepMeta { op_id: o }
+                            | PendingOp::NvmReadPrpListSepMeta { op_id: o } => o != op_id,
+                            _ => true,
+                        });
+                        self.prp_list_ops.remove(&op_id);
+                        let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+                        let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD);
+                        tracing::warn!(
+                            op_id,
+                            cap = crate::controller::MAX_PRP_LIST_PAGES,
+                            "PRP-list chain depth exceeded MAX_PRP_LIST_PAGES → INVALID_FIELD"
+                        );
+                        self.post_cqe(ctx, cq_id, cqe);
+                        return;
+                    }
                     let entries = parse_prp_list(&data);
                     let entries_per_page = (NVME_PAGE_SIZE / 8) as usize; // 512
                     let chain_ptr: Option<u64> = {

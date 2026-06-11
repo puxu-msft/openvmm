@@ -2642,7 +2642,246 @@ fn prp_list_chaining_device_to_host() {
     }
 }
 
-/// **D（CSTS.CFS on shutdown-flush 失败，spec § 3.1.4.5）差分 oracle** — 此前
+/// **C1② chaining 真激活 — 生产路径（Get Log Page > 2 MiB，spec § 5.16）差分 oracle** —
+/// 之前 admin Get Log Page > 2 MiB 被早退 INVALID_FIELD（防 chaining 未实现的 DoS）。
+/// 现 chaining walk 已上 `MAX_PRP_LIST_PAGES` 深度封顶，cap 抬到 32 MiB；本测试驱
+/// **真 dispatch_admin** 一条 numd=2.4 MiB 的 Get Log Page，证明 chaining 端到端真激活：
+///   - 不再早退 INVALID_FIELD（chaining cap 抬升生效）；
+///   - PRP-list 跨 2 张 list 页（pre-cap 单页≈2 MiB 不够），chain pointer 被跟随；
+///   - 完整 2.4 MiB 数据 scatter 到全部 600 个 host page GPA，没有漏页/mis-scatter。
+///
+/// 独立 oracle：scatter 后 capture DmaWrite 字节逐 GPA 覆盖校验（每页都被写、长度=PAGE）。
+/// revert-verify：把 admin cap 改回 2 MiB → numd 超阈 → 早退 INVALID_FIELD → 本测试
+/// 期望的 chaining scatter 不发生（pending_ios 为空、写计数 0）→ 红。
+#[test]
+fn c1_chaining_activated_get_log_page_2_mib_plus() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    const PAGE: u64 = crate::regs::NVME_PAGE_SIZE;
+    const TOTAL_PAGES: usize = 600; // 2.4 MiB，原 2 MiB cap 会拦
+    const PRP1: u64 = 0x10_0000;
+    const LIST0: u64 = 0x1000;
+    const LIST1: u64 = 0x2000;
+    const DATA_BASE: u64 = 0x20_0000;
+    let entries_per_page = (PAGE / 8) as usize;
+    let page_gpa = |i: usize| DATA_BASE + (i as u64) * PAGE;
+
+    let mut c = make_ctrl_with_tmp("c1_chain_glp");
+    // admin CQ0：admin CQE 也走 dma_write。
+    c.cqs.insert(
+        0,
+        crate::regs::CompletionQueue {
+            base_gpa: 0xF_0000,
+            size: 64,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        },
+    );
+    let mut cap = CaptureTransport::with_start_token(0x100);
+
+    // 准备 list 页：list0 装 PRP[1..512]，末位 chain → LIST1；list1 装 PRP[512..600]。
+    let mut list0 = vec![0u8; PAGE as usize];
+    for k in 0..(entries_per_page - 1) {
+        list0[k * 8..k * 8 + 8].copy_from_slice(&page_gpa(k + 1).to_le_bytes());
+    }
+    let last = entries_per_page - 1;
+    list0[last * 8..last * 8 + 8].copy_from_slice(&LIST1.to_le_bytes());
+    let n_list1 = (TOTAL_PAGES - 1) - (entries_per_page - 1);
+    let mut list1 = vec![0u8; PAGE as usize];
+    for k in 0..n_list1 {
+        list1[k * 8..k * 8 + 8].copy_from_slice(&page_gpa(entries_per_page + k).to_le_bytes());
+    }
+
+    // 构造 Get Log Page admin sqe：LID=0x01 (Error Info) 走 PRP-list build 路径。
+    // numd（dword zero-based）= TOTAL_PAGES * PAGE / 4 - 1。
+    let numd_total: u32 = (TOTAL_PAGES as u32 * PAGE as u32) / 4 - 1;
+    let numd_lo = numd_total & 0xffff;
+    let numd_hi = (numd_total >> 16) & 0xffff;
+    let zero = [0u8; 64];
+    let mut sqe: crate::cmd::Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+    sqe.cdw0 = 0x02 | (0x7Au32 << 16); // OPC=0x02 (Get Log Page admin), cid=0x7A
+    sqe.nsid = 0xFFFF_FFFF;
+    sqe.cdw10 = 0x01 | (numd_lo << 16); // LID=0x01 (Error Info) + NUMDL
+    sqe.cdw11 = numd_hi; // NUMDU
+    sqe.cdw12 = 0; // LPO low
+    sqe.cdw13 = 0; // LPO high
+    sqe.prp1 = PRP1;
+    sqe.prp2 = LIST0;
+
+    {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let r = c.dispatch_admin(&mut ctx, sqe, 0x7A, 0, 0);
+        assert!(
+            r.is_none(),
+            "chaining 激活后 GLP > 2 MiB 应走异步 PRP-list，**不再**早退 INVALID_FIELD"
+        );
+        // 驱 chaining：feed list0 → 触发 list1 fetch → feed list1 → scatter。
+        let tok_a = *c.pending_ios.keys().next().expect("应有 list0 fetch");
+        c.on_dma_complete_impl(&mut ctx, tok_a, true, list0);
+        let tok_b = *c
+            .pending_ios
+            .keys()
+            .next()
+            .expect("chaining 应触发 list1 fetch");
+        c.on_dma_complete_impl(&mut ctx, tok_b, true, list1);
+    }
+
+    // 独立 oracle：scatter 后每页 GPA 都有 capture 的 DmaWrite（admin Error Info log
+    // 内容为 zeros，我们只校验 scatter 覆盖：每个 GPA 都被写、且长度=PAGE）。
+    let mut wrote: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for e in cap.events() {
+        if let TransportEvent::DmaWrite { gpa, data, .. } = e
+            && (*gpa == PRP1 || (*gpa >= DATA_BASE && *gpa < DATA_BASE + TOTAL_PAGES as u64 * PAGE))
+            && data.len() == PAGE as usize
+        {
+            wrote.insert(*gpa);
+        }
+    }
+    assert_eq!(
+        wrote.len(),
+        TOTAL_PAGES,
+        "应 scatter {TOTAL_PAGES} 页（PRP1 + 599 个 list 项 = chaining 跨 2 list 页激活）"
+    );
+    assert!(wrote.contains(&PRP1), "page 0 → PRP1");
+    for i in 1..TOTAL_PAGES {
+        assert!(wrote.contains(&page_gpa(i)), "page {i} → page_gpa({i}) 漏");
+    }
+    // revert-verify（手动）：把 admin.rs Get Log Page cap 改回 `> 2 * 1024 * 1024` →
+    // numd_total 超阈 → dispatch_admin 返 INVALID_FIELD CQE → 上面 r.is_none() 断言
+    // 转红；即便绕过 cap，chain depth 防御仍兜底（见 c1_chain_depth_cap_rejects_malformed_chain）。
+}
+
+/// **C1② chaining 深度封顶（defense-in-depth）差分 oracle** — 抬 cap 后仍要给
+/// host-malicious / malformed chain 封顶。`MAX_PRP_LIST_PAGES=16` 上限：直接注入一个
+/// `total_pages` 超过 16 张 list 页能装下（8200 > 16×511=8176）的 PrpListOp，喂同一张
+/// chain-loop list 页反复触发 chain follow；第 17 次 fetch 触发 cap → INVALID_FIELD CQE
+/// + pending_ios sweep + accum 移除。
+///
+/// 独立 oracle：list_pages_fetched 计数 + accum 已被移除 + post 了一条 error CQE。
+/// revert-verify：把 cap 改回 `MAX_PRP_LIST_PAGES=u32::MAX` → 永不超限 → loop 永不
+/// 终止（feed 一次还 pending 下一次）→ "应 post error CQE"等不到 → 红。
+#[test]
+fn c1_chain_depth_cap_rejects_malformed_chain() {
+    use crate::controller::PendingIo;
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    const PAGE: u64 = crate::regs::NVME_PAGE_SIZE;
+    const PRP1: u64 = 0x10_0000;
+    const LIST_LOOP: u64 = 0x1000;
+    const DATA_BASE: u64 = 0x20_0000;
+    let entries_per_page = (PAGE / 8) as usize;
+
+    let mut c = make_ctrl_with_tmp("c1_chain_cap");
+    c.cqs.insert(
+        0,
+        crate::regs::CompletionQueue {
+            base_gpa: 0xF_0000,
+            size: 64,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        },
+    );
+    let mut cap = CaptureTransport::with_start_token(0x100);
+
+    // 自环 list 页：511 个 dummy data GPA + 末位 chain → LIST_LOOP（指回自己）。
+    // 每张 chain 页都用同一张，故 walk 每次拿到 511 个 data + 跟随 chain 再来。
+    let mut list_loop = vec![0u8; PAGE as usize];
+    for k in 0..(entries_per_page - 1) {
+        let g = DATA_BASE + (k as u64) * PAGE;
+        list_loop[k * 8..k * 8 + 8].copy_from_slice(&g.to_le_bytes());
+    }
+    let last = entries_per_page - 1;
+    list_loop[last * 8..last * 8 + 8].copy_from_slice(&LIST_LOOP.to_le_bytes());
+
+    // 直接注入 PrpListOp，total_pages=8200（需 ceil(8199/511)=17 张 chain 页 > cap=16）。
+    let op_id = c.alloc_op_id();
+    c.prp_list_ops.insert(
+        op_id,
+        crate::controller::PrpListOp {
+            sq_id: 0,
+            cid: 0x7B,
+            sq_head: 0,
+            cq_id: 0,
+            nsid: 0xFFFF_FFFF,
+            lba: 0,
+            num_blocks: 0, // admin payload，不计 SMART
+            is_write: false,
+            prp1_gpa: PRP1,
+            list_entries: None,
+            total_pages: 8200,
+            pages_done: 0,
+            data_pages: vec![None; 8200],
+            list_pages_fetched: 0,
+            sep_meta: None,
+        },
+    );
+    let pre_events = cap.events().len();
+    {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        // 起首条 chain fetch（模拟 dispatch 已发的 list page DMA-read）。
+        let tok0 = ctx.dma_read(LIST_LOOP, PAGE as u32);
+        c.pending_ios.insert(
+            tok0,
+            PendingIo {
+                sq_id: 0,
+                cid: 0x7B,
+                sq_head: 0,
+                cq_id: 0,
+                nsid: 0xFFFF_FFFF,
+                op: crate::controller::PendingOp::NvmReadPrpListFetch { op_id },
+            },
+        );
+        // Feed loop 直到 cap 触发（最多 20 轮 ceiling）。
+        for _round in 0..20 {
+            let toks: Vec<u64> = c.pending_ios.keys().copied().collect();
+            if toks.is_empty() {
+                break;
+            }
+            for t in toks {
+                c.on_dma_complete_impl(&mut ctx, t, true, list_loop.clone());
+            }
+        }
+    }
+    // 独立 oracle 1：accum 被移除（fail 清理）。
+    assert!(
+        c.prp_list_ops.is_empty(),
+        "cap 超限应清理 prp_list_ops accum"
+    );
+    assert!(
+        c.pending_ios.is_empty(),
+        "cap 超限应清理 sibling pending_ios"
+    );
+    // 独立 oracle 2：post 了 INVALID_FIELD（SC=0x02、SCT=0=Generic → status=0x0002）。
+    let err_status = cap
+        .events()
+        .iter()
+        .skip(pre_events)
+        .filter_map(|e| match e {
+            TransportEvent::DmaWrite { gpa, data, .. }
+                if *gpa >= 0xF_0000 && *gpa < 0xF_0000 + 64 * 16 && data.len() >= 16 =>
+            {
+                let dw3 = u32::from_le_bytes(data[12..16].try_into().unwrap());
+                Some((((dw3 >> 17) & 0xff) | (((dw3 >> 25) & 0x7) << 8)) as u16)
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("cap 超限应 post 1 条 error CQE");
+    assert_eq!(
+        err_status,
+        crate::cmd::sc::INVALID_FIELD,
+        "chain depth cap → INVALID_FIELD"
+    );
+}
+
 /// flush 失败仅 warn（教学边界），现按 spec 置 CSTS.CFS 让 driver 知数据可能丢失。
 ///   正例：NS flush 失败（test fault-injection）→ CSTS.CFS=1 + SHST=complete；
 ///   负例：flush 成功 → CFS=0 + SHST=complete。
