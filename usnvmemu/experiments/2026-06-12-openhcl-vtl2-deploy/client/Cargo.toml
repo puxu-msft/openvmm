@@ -1,0 +1,17 @@
+[package]
+name = "w5a_vtl2_client"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+# experiments 独立 crate（不进 workspace；自解析 deps）。
+[workspace]
+
+[dependencies]
+vfio_user_device = { path = "../../../crates/vfio_user_device" }
+vfio_user_wire = { path = "../../../crates/vfio_user_wire" }
+nix = { version = "0.30", features = ["socket", "uio", "mman"] }
+anyhow = "1.0"
+
+[profile.release]
+strip = true

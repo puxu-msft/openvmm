@@ -467,7 +467,14 @@ fn map_dma_fd(
     let end = offset
         .checked_add(size)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "offset+size 溢出"))?;
-    if end > file_len {
+    // **W5a real-VM 修复** — fstat `st_size` 上界（防 SIGBUS）仅对**普通文件**
+    // （memfd）有意义。真 OpenHCL guest RAM fd 是**字符设备** /dev/mshv_vtl_low
+    // （st_size=0），其 mmap 有效性由驱动的 GPA-range mmap handler 决定，非 st_size。
+    // 对字符/块设备施此上界会误拒（offset+size > 0）→ 零拷贝失效（W3 仅用 memfd 测，
+    // 漏了真目标）。故仅普通文件校验上界；设备 fd 跳过，由 mmap+驱动 enforce。
+    use nix::sys::stat::SFlag;
+    let is_regular = SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT == SFlag::S_IFREG;
+    if is_regular && end > file_len {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("DMA_MAP offset+size {end} 超出 fd 真实大小 {file_len}（防 SIGBUS）"),
@@ -482,6 +489,9 @@ fn map_dma_fd(
         // 不变量与外部依赖（已诚实列出，非自家 self-consistent 断言）：
         // 1. **有真实页 backing**：上面 `fstat` 已校验 `offset+size ≤ st_size`，
         //    故映射区间全程有文件页 backing，普通访问不会 SIGBUS（修 review C-1）。
+        //    ——对**字符设备**（mshv_vtl_low，st_size=0）此上界跳过（W5a 修），backing
+        //    由设备驱动的 GPA-range mmap handler 保证（映射真 guest 物理页，POC-6 验）；
+        //    越界 GPA 由驱动 mmap 失败 enforce，非 fstat。
         // 2. **fd 生命周期**：mmap 用 MAP_SHARED，映射独立于 fd 存续；caller 在
         //    map 后 drop fd 是安全的。munmap 随 `MmapMut` Drop。
         // 3. **slice 边界**：`mmap_read/write` 以真实映射长度 `bytes.len()`（非
@@ -498,8 +508,9 @@ fn map_dma_fd(
     } else {
         #[allow(unsafe_code)]
         // SAFETY: 同 RW 分支的不变量 1-5（只读映射，只读不写）。关键同样是：上面
-        // `fstat` 校验保证有真实页 backing（修 C-1）；`mmap_read` 以 `bytes.len()`
-        // 校验 slice 边界；F_SEAL_SHRINK 外部依赖同上；u8 读无 UB。
+        // `fstat` 校验保证有真实页 backing（修 C-1；字符设备如 mshv_vtl_low st_size=0
+        // 跳过上界，backing 由驱动 mmap handler 保证，W5a 修）；`mmap_read` 以
+        // `bytes.len()` 校验 slice 边界；F_SEAL_SHRINK 外部依赖同上；u8 读无 UB。
         let m = unsafe { opts.map(raw) }?;
         Ok(DmaMmap::Ro(m))
     }

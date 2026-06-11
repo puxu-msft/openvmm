@@ -92,14 +92,17 @@ POC-1 已证它对非-QEMU client 的 fd-passing 零拷贝 DMA 可行。新工�
 - **W5**：firmware-as-VTL2-进程 集成 + 降权——**三段递进**部署形态（POC-3/6 真机已证 VTL2
   是完整 Linux + busybox + base64 + 可写 /tmp + ohcldiag-dev run 转发 stdin，firmware ELF
   在 VTL2 内启停/更新等同普通用户态程序生命周期，无机制障碍，约束在治理）：
-  - **W5a (dev 期)**：`ohcldiag-dev run` + stdin base64 推送 ——POC-3/6 现成路径，**真"随时
-    启停/更新"**，不重启 VM、不重建 IGVM；无签名/审计，仅开发迭代用。
-  - **W5b (集成期)**：underhill `Command::new` 子进程 + supervisor（auto-restart + reconnect
-    握手）；与 underhill 同信任域生命周期，加 seccomp/userns/uid-drop 降权。`livedump.rs` 的
-    `Command::new("underhill-crash")` 是先例。**承接 §11 外部控制面：supervisor 同时是 host
-    控制命令的执行点。**
-  - **W5c (生产期)**：塞 IGVM initrd 出厂自带（签名链清晰、可重现），或加 A/B image 包管理；
-    更新走 VM 重启。
+  - **W5a (dev 期)**：✅ 完成（2026-06-12，真机 e2e PASS）。`ohcldiag-dev run`
+    + stdin base64 推真 nvme_firmware + test client 静态 musl ELF 进真 OpenHCL VTL2；client
+    经真 vfio_user_device API + DMA_MAP **真 guest RAM**(/dev/mshv_vtl_low) → firmware 零拷贝
+    DMA Identify → client 读回 MN `"OpenHCL Userspace NVMe v2.0"` 验证。committed harness
+    `usnvmemu/experiments/2026-06-12-openhcl-vtl2-deploy/`。**附带修 W3 真 bug**：map_dma_fd 的
+    fstat st_size 上界误拒字符设备（mshv_vtl_low st_size=0）→ 仅普通文件施上界（W3 只用 memfd
+    测漏了真目标，zero_copy 在真目标上首次工作）。
+  - **W5b (集成期)**：⏸ **≡ W6 推迟**（explore 2026-06-12 坐实：underhill `Command::new` supervisor
+    + reconnect + 降权全需改 underhill_core，standalone 测不了，本就"W5b 起依赖 W6"）。承接 §11
+    外部控制面。`livedump.rs` 的 `Command::new("underhill-crash")` 是先例。
+  - **W5c (生产期)**：⏸ 远期。IGVM initrd 出厂自带（签名链）/ A-B image 包管理；更新走 VM 重启。
 - **W6**：underhill_core 接入 + reconnect（firmware 重启重映射/重 SET_IRQS；W5b 起依赖此）。
 - **W7**：真 Hyper-V OpenHCL VM e2e（guest fio/4K IO；对照 host backing 独立 oracle）。
 
