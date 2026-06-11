@@ -32,6 +32,7 @@ use std::os::fd::OwnedFd;
 use std::os::fd::RawFd;
 use std::os::unix::net::UnixStream;
 use thiserror::Error;
+pub use vfio_user_wire::framing::WireMessage;
 
 /// framing 层错误。caller 用 `e.downcast_ref::<FramingError>()` 区分
 /// PeerClosed（正常断连）与其它 IO/protocol 错误。
@@ -50,21 +51,36 @@ pub enum FramingError {
 /// 这里给 ancillary buffer 留 256 fd headroom，足够任何合理场景。
 pub const MAX_MSG_FDS: usize = 256;
 
-/// 收到的一帧消息：header + payload + 任意附带的 fd 列表。
+/// 收到的一帧消息：sans-IO 线数据（[`WireMessage`]）+ 经 SCM_RIGHTS 收到的 fd。
+///
+/// `header` / `payload` 经 [`Deref`](std::ops::Deref) 透传到内层 `wire`，所有
+/// `msg.header` / `msg.payload` 访问零改动；`fds` 是 transport 专属外层字段
+/// （fd 是平台 IO 资源，sans-IO wire crate 不该见）。
 pub struct Message {
-    /// 已解析的 16-byte header。
-    pub header: Header,
-    /// payload 字节（不含 header）。
-    pub payload: Vec<u8>,
+    /// 纯数据部分（header + payload），sans-IO。
+    pub wire: WireMessage,
     /// 经 SCM_RIGHTS 收到的 owned fd。drop 时自动 close。
     pub fds: Vec<OwnedFd>,
+}
+
+impl std::ops::Deref for Message {
+    type Target = WireMessage;
+    fn deref(&self) -> &WireMessage {
+        &self.wire
+    }
+}
+
+impl std::ops::DerefMut for Message {
+    fn deref_mut(&mut self) -> &mut WireMessage {
+        &mut self.wire
+    }
 }
 
 impl std::fmt::Debug for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Message")
-            .field("header", &self.header)
-            .field("payload_len", &self.payload.len())
+            .field("header", &self.wire.header)
+            .field("payload_len", &self.wire.payload.len())
             .field("fd_count", &self.fds.len())
             .finish()
     }
@@ -184,8 +200,7 @@ pub fn read_message(stream: &mut UnixStream) -> anyhow::Result<Message> {
         );
     }
     Ok(Message {
-        header,
-        payload,
+        wire: WireMessage { header, payload },
         fds,
     })
 }

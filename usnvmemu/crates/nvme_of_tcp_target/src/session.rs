@@ -1103,13 +1103,13 @@ impl V2Session {
         };
         let ofst = pf.ofst;
         let value = pf.value;
-        // **review M2** — NoopTransport 只在 V2 验证安全（CC.EN=1 等 reg
-        // 写入路径不 invoke ctx.dma_*/fire_interrupt）。V5 真 IO 上线后
-        // 应换成完整 transport bridge。
-        let mut t = vfio_user_transport::NoopTransport;
+        // **review M2** — NoopTransport（pcie_device_core，panic 桩）只在 V2
+        // 验证安全（CC.EN=1 等 reg 写入路径不 invoke ctx.dma_*/fire_interrupt，
+        // 故 panic 不触发）。V5 真 IO 上线后应换成完整 transport bridge。
+        let mut t = pcie_device_core::NoopTransport;
         let mut ctx = pcie_device_core::DeviceCtx::new(&mut t);
         // **review H2** — 用 narrow wrapper；offset 不在白名单时返 false。
-        // **V8b** — 短锁；NoopTransport ctx.dma_* / fire_interrupt 都是 no-op，
+        // **V8b** — 短锁；NoopTransport ctx.dma_* / fire_interrupt 不被调用，
         // closure 内不会触发 read_pdu，安全持锁。
         let ok = self.with_controller(|c| c.nvme_property_set(&mut ctx, ofst, size, value));
         if !ok {

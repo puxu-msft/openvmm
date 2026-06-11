@@ -813,7 +813,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         let ofst = pf.ofst;
         let value = pf.value;
         let ok = {
-            let mut t = vfio_user_transport::NoopTransport;
+            let mut t = pcie_device_core::NoopTransport;
             let mut ctx = pcie_device_core::DeviceCtx::new(&mut t);
             self.controller
                 .controller

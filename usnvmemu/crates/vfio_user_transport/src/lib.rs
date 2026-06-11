@@ -47,7 +47,6 @@ pub mod irq;
 pub mod proto;
 pub mod server;
 pub mod session;
-pub mod transport;
 
 pub use config::ConfigSpace;
 pub use dma::BackingKind;
@@ -69,4 +68,3 @@ pub use proto::HeaderFlags;
 pub use proto::ProtoError;
 pub use server::serve_unix;
 pub use session::VfioUserSession;
-pub use transport::NoopTransport;

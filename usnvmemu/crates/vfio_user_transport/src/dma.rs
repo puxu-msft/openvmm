@@ -1276,8 +1276,7 @@ mod tests {
             size,
         };
         Message {
-            header: Header::command(1, Command::DmaMap, pl.as_bytes().len() as u32),
-            payload: pl.as_bytes().to_vec(),
+            wire: crate::framing::WireMessage { header: Header::command(1, Command::DmaMap, pl.as_bytes().len() as u32), payload: pl.as_bytes().to_vec() },
             fds: vec![fd],
         }
     }
@@ -1448,8 +1447,7 @@ mod tests {
             size: 64,
         };
         let mut msg = Message {
-            header: Header::command(1, Command::DmaMap, pl.as_bytes().len() as u32),
-            payload: pl.as_bytes().to_vec(),
+            wire: crate::framing::WireMessage { header: Header::command(1, Command::DmaMap, pl.as_bytes().len() as u32), payload: pl.as_bytes().to_vec() },
             fds: vec![fd],
         };
         handle_dma_map(&mut server, &mut table, 1, &mut msg, false).unwrap();

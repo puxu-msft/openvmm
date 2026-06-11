@@ -19,10 +19,10 @@ use crate::proto::Header;
 use crate::proto::HeaderFlags;
 use crate::proto::IrqSetPayload;
 use crate::proto::decode_payload;
-use crate::proto::irq_set;
 use anyhow::Context as _;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
+use vfio_user_wire::irq::{SetIrqsAction, decide_set_irqs_action};
 
 /// 单 IRQ 类型（如 MSI-X）的 eventfd 数组。
 ///
@@ -130,40 +130,29 @@ pub fn handle_set_irqs(
         fd_cnt = msg.fds.len(),
         "DEVICE_SET_IRQS"
     );
-    // 我们当前只 wire MSI-X (idx=2)；其它 idx 接受但 no-op。
-    if idx != crate::proto::pci_irq::MSIX {
-        tracing::debug!(idx, "SET_IRQS for non-MSIX idx: no-op (best-effort OK)");
-        return reply_ok(stream, msg_id, no_reply, "no-op");
-    }
-    // DATA_NONE + ACTION_TRIGGER + count=0 → disable all (清整个数组)。
-    let is_data_none = flags & irq_set::DATA_NONE != 0;
-    let is_data_eventfd = flags & irq_set::DATA_EVENTFD != 0;
-    let is_trigger = flags & irq_set::ACTION_TRIGGER != 0;
-    if is_data_none && count == 0 && is_trigger {
-        vectors.vectors.clear();
-        tracing::info!("SET_IRQS: cleared all MSI-X vectors");
-        return reply_ok(stream, msg_id, no_reply, "clear");
-    }
-    if is_data_eventfd && is_trigger {
-        let need = count as usize;
-        let upto = (start as usize) + need;
-        if vectors.vectors.len() < upto {
-            vectors.vectors.resize_with(upto, || None);
+
+    // 纯决策抽到 sans-IO wire crate（W0.5）；本函数只按决策结果分发 IO
+    // （vector mutation + eventfd drain + reply/err）。fd_count 灰区语义
+    // （fd==count assign / fd==0 deassign / 0<fd<count 非法）见 wire 决策。
+    match decide_set_irqs_action(idx, flags, start, count, msg.fds.len()) {
+        SetIrqsAction::BestEffortNonMsix => {
+            tracing::debug!(idx, "SET_IRQS for non-MSIX idx: no-op (best-effort OK)");
+            reply_ok(stream, msg_id, no_reply, "no-op")
         }
-        // **真 QEMU 11 vfio-user guest e2e 修复（2026-06-10）** — DATA_EVENTFD 的
-        // fd 数**未必** == count。VFIO spec：data 数组里 `-1` 表示"de-assign 已配置
-        // 的中断 / 跳过未配置项"；vfio-user 把 `-1` 编码为**不经 SCM_RIGHTS 传**该
-        // 槽位 fd。QEMU client（`vfio_user_device_io_set_irqs`）按 chunk 发送，且
-        // "一条消息要么全是有效 fd、要么全是 -1"（`arg_fds = fds[0]!=-1 ? .. : NULL`）。
-        // 合法情形只有两种：
-        //   - `fd_cnt == count`：每个 fd 赋给 [start, start+count) 槽位（assign）；
-        //   - `fd_cnt == 0`：[start, start+count) 全部 **de-assign**（清 None / 掩码）。
-        // 之前误用 `fds.len() != count → EINVAL`，把 QEMU 掩码向量（count=1 / fd_cnt=0）
-        // 当非法拒了 → QEMU `vfio_enable_vectors` 收 EINVAL → "failed to enable MSI-X,
-        // Invalid argument" → guest IO 中断永不路由 → IO 命令 30s timeout。仅
-        // `0 < fd_cnt < count`（部分 fd，QEMU 从不这么发）才视作非法。
-        if need > 0 && msg.fds.len() == need {
-            // assign：从 msg.fds drain 取走（OwnedFd 移交，不被 Message drop close）。
+        SetIrqsAction::ClearAll => {
+            vectors.vectors.clear();
+            tracing::info!("SET_IRQS: cleared all MSI-X vectors");
+            reply_ok(stream, msg_id, no_reply, "clear")
+        }
+        SetIrqsAction::Assign { start, count } => {
+            let need = count as usize;
+            let upto = (start as usize) + need;
+            if vectors.vectors.len() < upto {
+                vectors.vectors.resize_with(upto, || None);
+            }
+            // **真 QEMU 11 vfio-user guest e2e 修复（2026-06-10）** — DATA_EVENTFD 的
+            // fd 数 == count（assign）：从 msg.fds drain 取走（OwnedFd 移交，不被
+            // Message drop close），逐个赋给 [start, start+count) 槽位。
             let mut fd_iter = msg.fds.drain(..);
             for i in 0..need {
                 let slot = (start as usize) + i;
@@ -175,10 +164,15 @@ pub fn handle_set_irqs(
                 total = vectors.vectors.len(),
                 "SET_IRQS: MSI-X trigger eventfds assigned"
             );
-            return reply_ok(stream, msg_id, no_reply, "assign");
+            reply_ok(stream, msg_id, no_reply, "assign")
         }
-        if msg.fds.is_empty() {
-            // de-assign（所有 -1 / 掩码）：清 [start, start+count) 槽位为 None。
+        SetIrqsAction::Deassign { start, count } => {
+            let need = count as usize;
+            let upto = (start as usize) + need;
+            if vectors.vectors.len() < upto {
+                vectors.vectors.resize_with(upto, || None);
+            }
+            // fd_count==0（所有 -1 / 掩码）：清 [start, start+count) 槽位为 None。
             for i in 0..need {
                 let slot = (start as usize) + i;
                 vectors.vectors[slot] = None;
@@ -189,23 +183,27 @@ pub fn handle_set_irqs(
                 total = vectors.vectors.len(),
                 "SET_IRQS: MSI-X trigger eventfds de-assigned (all -1 / masked)"
             );
-            return reply_ok(stream, msg_id, no_reply, "deassign");
+            reply_ok(stream, msg_id, no_reply, "deassign")
         }
-        // 0 < fd_cnt < count：部分 fd，QEMU 不会这么发；拒以暴露非预期 client 行为。
-        tracing::warn!(
-            need,
-            fd_cnt = msg.fds.len(),
-            "SET_IRQS DATA_EVENTFD: 部分 fd（0<fd_cnt<count），非法"
-        );
-        send_err(stream, msg_id, libc::EINVAL as u32, no_reply)?;
-        return Ok(());
+        SetIrqsAction::InvalidPartialFds { need, got } => {
+            // 0 < fd_cnt < count：部分 fd，QEMU 不会这么发；拒以暴露非预期 client 行为。
+            tracing::warn!(
+                need,
+                fd_cnt = got,
+                "SET_IRQS DATA_EVENTFD: 部分 fd（0<fd_cnt<count），非法"
+            );
+            send_err(stream, msg_id, libc::EINVAL as u32, no_reply)?;
+            Ok(())
+        }
+        SetIrqsAction::BestEffortUnsupported => {
+            // MASK/UNMASK 等不处理；spec 允许 server 选择不实现。
+            tracing::debug!(
+                flags = format_args!("{flags:#x}"),
+                "SET_IRQS: unsupported flag combo — best-effort OK reply"
+            );
+            reply_ok(stream, msg_id, no_reply, "best-effort")
+        }
     }
-    // 其它 MASK/UNMASK 等不处理；spec 允许 server 选择不实现。
-    tracing::debug!(
-        flags = format_args!("{flags:#x}"),
-        "SET_IRQS: unsupported flag combo — best-effort OK reply"
-    );
-    reply_ok(stream, msg_id, no_reply, "best-effort")
 }
 
 /// **NO_REPLY 修复** — SET_IRQS 成功 reply 统一出口；posted（`no_reply`）时不发。
@@ -247,6 +245,7 @@ mod tests {
     use super::*;
     use crate::framing::read_message;
     use crate::framing::write_message as fw_write;
+    use crate::proto::irq_set;
     use crate::proto::pci_irq;
     use std::os::fd::AsFd;
     use std::os::fd::AsRawFd;
@@ -402,6 +401,43 @@ mod tests {
         let mut vectors = h.join().unwrap().unwrap();
         // vector 0 被清为 None → fire 返 false。
         assert!(!vectors.fire(0), "de-assign 后 vector 0 应无 eventfd");
+    }
+
+    /// **W0.5 回归**（architect B-5）— DATA_EVENTFD + TRIGGER + `count==0` + `fd_cnt==0`：
+    /// 走 Deassign 空范围分支（`for i in 0..0` no-op），不 panic / 不越界 / reply OK。
+    /// 防 decide_set_irqs_action 把 count==0 误归类到 Assign（need>0 不满足）或 Invalid。
+    #[test]
+    fn set_irqs_eventfd_count_zero_deassigns_empty_range() {
+        let (mut server, mut client) = pair();
+        let mut vectors = IrqVectors::default();
+        let h = thread::spawn(move || -> anyhow::Result<IrqVectors> {
+            let mut msg = read_message(&mut server)?;
+            handle_set_irqs(
+                &mut server,
+                &mut vectors,
+                msg.header.msg_id,
+                &mut msg,
+                false,
+            )?;
+            Ok(vectors)
+        });
+        let pl = IrqSetPayload {
+            argsz: 20,
+            flags: irq_set::DATA_EVENTFD | irq_set::ACTION_TRIGGER,
+            index: pci_irq::MSIX,
+            start: 0,
+            count: 0, // 空范围 de-assign
+        };
+        let hdr = Header::command(12, Command::DeviceSetIrqs, pl.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, pl.as_bytes(), &[]).unwrap();
+        let reply = read_message(&mut client).unwrap();
+        assert!(
+            !reply.header.flags().is_error(),
+            "count=0 空范围 de-assign 应回 OK"
+        );
+        let vectors = h.join().unwrap().unwrap();
+        // 空范围操作不改变 vector 数组（仍为空）。
+        assert!(vectors.is_empty());
     }
 
     /// **NO_REPLY 修复** — posted（NO_REPLY）SET_IRQS：执行副作用但**不发** reply。
