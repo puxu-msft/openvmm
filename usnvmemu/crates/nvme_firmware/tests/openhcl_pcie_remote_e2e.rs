@@ -4312,3 +4312,68 @@ async fn openhcl_ns_not_ready_then_format_makes_ready() -> Result<()> {
 
     Ok(())
 }
+
+/// **AWUN spec-completeness（ATOMIC_WRITE_UNIT_EXCEEDED 0x14）** — fused Compare-and-Write
+/// 超出 controller 原子能力（单 PRP = 1 page）时，spec NVM CS 允许 controller abort 并返
+/// ATOMIC_WRITE_UNIT_EXCEEDED（"controller MAY abort fused C&W larger than ACWU/NACWU"）。
+/// 本 controller 广告 ACWU=NACWU=0（1 LBA 保守值，实际原子做到 1 page）；fused C&W 超 1
+/// page 即超出原子能力。此前该路径返粗粒度 INVALID_FIELD(0x02)，现精确返 0x14。
+///
+/// 构造：4K NS（setup_enabled_4k_io Format LBAF2），fused C&W **nlb=2** → bytes=2×4096=8192
+/// > 1 page(4096) → 超原子能力。Compare(FIRST)+Write(SECOND) slba/nlb 匹配，唯一拒因 = 超
+/// 1 page（隔离变量：plain NS 排除格式拒因）。
+///
+/// **独立 oracle** = firmware 经真 wire 回的完整 16-bit CQE status，两条 fused CQE 都硬编码
+/// 期望 0x0014（Generic SCT=0, SC 0x14）。
+///
+/// **revert-verify（已实测）**：把 mod.rs `fused_cw_reject_sc` 的 `bytes > NVME_PAGE_SIZE`
+/// 臂改回返 INVALID_FIELD → 两条变 0x0002 → 本断言 FAIL；恢复后绿。
+#[tokio::test]
+async fn openhcl_fused_cw_exceeds_atomic_unit() -> Result<()> {
+    const SC_ATOMIC_WRITE_UNIT_EXCEEDED: u16 = 0x0014; // Generic SCT=0, SC 0x14
+
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (_admin, mut io) = setup_enabled_4k_io(&driver).await?;
+
+    // fused C&W，nlb=2（cdw12 nlb-1=1）→ 4K 上 bytes=8192 > 1 page → 超原子能力。
+    // 超尺寸在 dispatch_sqe 即拒（DMA 前），buffer 内容无关；slba/nlb 两条匹配。
+    let cmp = Sqe {
+        opcode: 0x05, // Compare
+        fuse: 1,      // FUSE_FIRST
+        cid: 0x50,
+        nsid: 1,
+        prp1: COMPARE_BUF_GPA,
+        cdw10: 0, // slba=0
+        cdw12: 1, // nlb-1=1 → nlb=2
+        ..Default::default()
+    }
+    .encode();
+    let wr = Sqe {
+        opcode: 0x01, // Write
+        fuse: 2,      // FUSE_SECOND
+        cid: 0x51,
+        nsid: 1,
+        prp1: WRITE_BUF_GPA,
+        cdw10: 0,
+        cdw12: 1,
+        ..Default::default()
+    }
+    .encode();
+    let (c_cmp, c_wr) = io
+        .submit_pair(&driver, cmp, wr)
+        .await
+        .context("fused C&W nlb=2 (over 1 page)")?;
+    assert_eq!(
+        c_cmp.status, SC_ATOMIC_WRITE_UNIT_EXCEEDED,
+        "超原子单元的 fused Compare 半边应返 ATOMIC_WRITE_UNIT_EXCEEDED (0x0014)，实={:#x}",
+        c_cmp.status
+    );
+    assert_eq!(
+        c_wr.status, SC_ATOMIC_WRITE_UNIT_EXCEEDED,
+        "超原子单元的 fused Write 半边应返 ATOMIC_WRITE_UNIT_EXCEEDED (0x0014)，实={:#x}",
+        c_wr.status
+    );
+
+    Ok(())
+}

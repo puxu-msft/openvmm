@@ -1100,6 +1100,27 @@ pub(super) fn try_mmap_file(file: &File) -> Option<memmap2::MmapMut> {
     }
 }
 
+/// **AWUN spec-completeness（ATOMIC_WRITE_UNIT_EXCEEDED 0x14）共享 classifier** — fused
+/// Compare-and-Write 的格式/尺寸 reject 判据，本地 PCIe（dispatch_sqe）与 fabric
+/// （nvme_fused_cas）两条 sibling 路径共用，避免同一条件跨路径返不同 SC（同 item-0 SGL
+/// classifier 的 drift 防护）。`bytes` = nlb × per-NS sector。
+///
+/// - 非 plain NS（PI/meta 交错格式）→ `INVALID_FIELD`（格式问题非原子单元）。
+/// - plain 但 `bytes > 1 page`（controller 单-PRP 原子能力上限）→
+///   `ATOMIC_WRITE_UNIT_EXCEEDED`：spec NVM CS — controller MAY abort 超 ACWU/NACWU 的
+///   fused C&W 返此 SC。本 controller 广告 ACWU=NACWU=0（1 LBA 保守值，实际原子做到 1
+///   page），故超 1 page 即超原子能力，精确返此码而非粗粒度 INVALID_FIELD。
+/// - 否则 `None`（放行）。
+fn fused_cw_reject_sc(is_plain: bool, bytes: u64) -> Option<u16> {
+    if !is_plain {
+        Some(sc::INVALID_FIELD)
+    } else if bytes > NVME_PAGE_SIZE {
+        Some(sc::ATOMIC_WRITE_UNIT_EXCEEDED)
+    } else {
+        None
+    }
+}
+
 /// NVMe Controller 主结构 — 实现 `PcieDevice`。
 pub struct NvmeController {
     // ----- Backing namespaces (NSID -> NS state) -----
@@ -1671,8 +1692,10 @@ impl NvmeController {
                 ns.meta_size == 0 && !ns.pi_enabled() && (ns.lbads == 9 || ns.lbads == 12);
             let sector = 1u64 << ns.lbads;
             let bytes = (nlb as u64 * sector) as usize;
-            if !is_plain || bytes > NVME_PAGE_SIZE as usize {
-                Outcome::Rej(sc::INVALID_FIELD)
+            // **AWUN spec-completeness** — 经共享 classifier 判（与 dispatch_sqe 本地 fused
+            // 路径同判据）：非 plain → INVALID_FIELD；超 1 page → ATOMIC_WRITE_UNIT_EXCEEDED。
+            if let Some(rej) = fused_cw_reject_sc(is_plain, bytes as u64) {
+                Outcome::Rej(rej)
             } else if compare_data.len() != bytes || write_data.len() != bytes {
                 // TOCTOU：lbads 在 R2T 取数后被 Format 改 → 长度不符 → abort。
                 tracing::warn!(
@@ -2966,13 +2989,13 @@ impl NvmeController {
                     // 时按结果决定是否真 dispatch Write（pass = dispatch；
                     // fail = post COMPARE_FAILURE for Write 不写盘）。
                     // 限制：教学路径只支持单 PRP Compare（≤ 1 page = 8 LBA at
-                    // 512B）。超过此尺寸 → abort 两条 INVALID_FIELD（spec 允许
-                    // controller 不支持任意尺寸的 fused）。
+                    // 512B）。**超过此尺寸 → ATOMIC_WRITE_UNIT_EXCEEDED**（超 controller 原子
+                    // 能力；见 `fused_cw_reject_sc`），非 plain 格式 → INVALID_FIELD。
                     // **2026-06-09 纯 4K** — fused Compare 仅支持 plain NS（512B
                     // LBAF[0] / 纯 4K LBAF[2]，无 meta/PI）且单 PRP（≤ 1 page）。
                     // 按 per-NS 扇区算字节：4K 时 1 LBA = 4096 = 1 page 仍 OK。
-                    // 非 plain（如 PI 交错格式）或 > 1 page → 两条 INVALID_FIELD
-                    // （spec 允许 controller 不支持任意尺寸/格式的 fused）。
+                    // 非 plain（如 PI 交错格式）→ INVALID_FIELD；plain 但 > 1 page →
+                    // ATOMIC_WRITE_UNIT_EXCEEDED（共享 classifier 判，与 fabric 路径一致）。
                     // ns 不存在时不在此拒，交由 dispatch_fused_compare_write 返
                     // INVALID_NAMESPACE，保持错误码语义。
                     if let Some((is_plain, sector_bytes)) = self.ns(first_nsid).map(|ns| {
@@ -2984,27 +3007,26 @@ impl NvmeController {
                         )
                     }) {
                         let bytes = first_nlb as u64 * sector_bytes;
-                        if !is_plain || bytes > NVME_PAGE_SIZE {
+                        // **AWUN spec-completeness** — 经共享 classifier 判（与 nvme_fused_cas
+                        // fabric 路径同判据）：非 plain → INVALID_FIELD；plain 但超 1 page（超
+                        // controller 单-PRP 原子能力）→ ATOMIC_WRITE_UNIT_EXCEEDED。两条 fused
+                        // CQE 都返同一 SC（spec § 6.2 fused 各 individual CQE）。
+                        if let Some(rej) = fused_cw_reject_sc(is_plain, bytes) {
                             tracing::warn!(
                                 slba = first_slba,
                                 nlb = first_nlb,
                                 bytes,
                                 is_plain,
-                                "Fused C+W: non-plain NS 或 > 1 page not supported"
+                                sc = rej,
+                                "Fused C+W rejected: 格式不支持或超原子单元(>1 page)"
                             );
                             let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
                             self.post_cqe(
                                 ctx,
                                 cq_id,
-                                Cqe::error(
-                                    first.cid(),
-                                    sq_id,
-                                    first_head,
-                                    phase,
-                                    sc::INVALID_FIELD,
-                                ),
+                                Cqe::error(first.cid(), sq_id, first_head, phase, rej),
                             );
-                            let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD);
+                            let cqe = Cqe::error(cid, sq_id, sq_head, phase, rej);
                             self.post_cqe(ctx, cq_id, cqe);
                             return;
                         }

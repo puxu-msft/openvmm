@@ -692,8 +692,12 @@ impl IdentifyController {
         //   acwu  = Compare-and-Write 原子上限
         // 教学：backing 是文件，page-level (4KiB) write 在多数 host fs 上
         // atomic；超出靠 NVM FLUSH 持久化。声明 AWUN=AWUPF=255 (=256 LBA)
-        // 让 driver 看到合理上限；ACWU=0 (=1 LBA) — Compare-and-Write
-        // 当前只允许 1 LBA，符合 K4 实现 (compare_ops 单条 LBA)。
+        // 让 driver 看到合理上限；ACWU=0 (=1 LBA) 是**保守广告**——controller 实际
+        // 把 fused Compare-and-Write 原子做到 1 page（单 PRP），但只承诺 1 LBA。
+        // **fused C&W 超 1 page**（超出该原子能力）→ 返 ATOMIC_WRITE_UNIT_EXCEEDED
+        // (0x14)（spec NVM CS：controller MAY abort 超 ACWU 的 fused C&W；见
+        // `controller/mod.rs::fused_cw_reject_sc`）。普通 Write 超 AWUN **不** reject
+        // （spec：仅"不保证原子"，非错误）。
         id.awun = 255;
         id.awupf = 255;
         id.acwu = 0;
