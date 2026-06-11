@@ -10,6 +10,7 @@ use anyhow::Context as _;
 use anyhow::anyhow;
 use std::os::fd::AsRawFd;
 use std::os::fd::BorrowedFd;
+use std::os::fd::RawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use vfio_user_wire::framing::WireMessage;
@@ -24,6 +25,7 @@ use vfio_user_wire::proto::DmaMapPayload;
 use vfio_user_wire::proto::DmaUnmapPayload;
 use vfio_user_wire::proto::Header;
 use vfio_user_wire::proto::IrqInfoPayload;
+use vfio_user_wire::proto::IrqSetPayload;
 use vfio_user_wire::proto::PROTOCOL_MAJOR;
 use vfio_user_wire::proto::PROTOCOL_MINOR;
 use vfio_user_wire::proto::RegionAccessPayload;
@@ -31,6 +33,7 @@ use vfio_user_wire::proto::RegionInfoPayload;
 use vfio_user_wire::proto::VersionPayload;
 use vfio_user_wire::proto::decode_payload;
 use vfio_user_wire::proto::dma_unmap_flags;
+use vfio_user_wire::proto::irq_set;
 use zerocopy::IntoBytes;
 
 /// vfio-user client 连接。持一条同步 `UnixStream` + msg_id 计数器。
@@ -349,6 +352,69 @@ impl VfioUserClient {
             size: 0,
         };
         let _reply = self.request(Command::DmaUnmap, &req)?;
+        Ok(())
+    }
+
+    // ── W4: MSI-X SET_IRQS eventfd ──
+
+    /// SET_IRQS assign：把 `eventfds` 配给 MSI-X 向量 `[start, start+len)`，server
+    /// 后续 fire 该向量时写对应 eventfd（8 字节 u64+=1）。多 fd 经 SCM_RIGHTS。
+    ///
+    /// `index` 通常 `pci_irq::MSIX`。reply 是 header-only OK。
+    pub fn set_irqs(
+        &mut self,
+        index: u32,
+        start: u32,
+        eventfds: &[BorrowedFd<'_>],
+    ) -> anyhow::Result<()> {
+        let raw: Vec<RawFd> = eventfds.iter().map(|fd| fd.as_raw_fd()).collect();
+        let req = IrqSetPayload {
+            argsz: core::mem::size_of::<IrqSetPayload>() as u32,
+            flags: irq_set::DATA_EVENTFD | irq_set::ACTION_TRIGGER,
+            index,
+            start,
+            count: eventfds.len() as u32,
+        };
+        self.send_set_irqs(&req, &raw)
+    }
+
+    /// SET_IRQS deassign：清 MSI-X 向量 `[start, start+count)` 的 eventfd（发 0 fd，
+    /// = vfio-user 全 `-1` 编码 / 掩码）。
+    pub fn set_irqs_deassign(&mut self, index: u32, start: u32, count: u32) -> anyhow::Result<()> {
+        let req = IrqSetPayload {
+            argsz: core::mem::size_of::<IrqSetPayload>() as u32,
+            flags: irq_set::DATA_EVENTFD | irq_set::ACTION_TRIGGER,
+            index,
+            start,
+            count,
+        };
+        self.send_set_irqs(&req, &[])
+    }
+
+    /// SET_IRQS clear：DATA_NONE + count=0，清整个 IRQ 向量数组。
+    pub fn set_irqs_clear(&mut self, index: u32) -> anyhow::Result<()> {
+        let req = IrqSetPayload {
+            argsz: core::mem::size_of::<IrqSetPayload>() as u32,
+            flags: irq_set::DATA_NONE | irq_set::ACTION_TRIGGER,
+            index,
+            start: 0,
+            count: 0,
+        };
+        self.send_set_irqs(&req, &[])
+    }
+
+    /// SET_IRQS 公共发送：payload = IrqSetPayload（无 trailing data），fd 经 SCM_RIGHTS。
+    fn send_set_irqs(&mut self, req: &IrqSetPayload, fds: &[RawFd]) -> anyhow::Result<()> {
+        let msg_id = self.alloc_msg_id();
+        let hdr = Header::command(
+            msg_id,
+            Command::DeviceSetIrqs,
+            core::mem::size_of::<IrqSetPayload>() as u32,
+        );
+        write_message_with_fds(&mut self.stream, &hdr, req.as_bytes(), fds)
+            .context("send SET_IRQS")?;
+        let reply = read_message(&mut self.stream).context("recv SET_IRQS reply")?;
+        Self::expect_reply(&reply, msg_id, Command::DeviceSetIrqs)?;
         Ok(())
     }
 }
