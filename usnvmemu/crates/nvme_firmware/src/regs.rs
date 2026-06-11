@@ -46,6 +46,20 @@ pub const NVME_PAGE_SIZE: u64 = 1 << NVME_PAGE_SHIFT;
 /// 完成 PRP list 后启用）。NVMe 2.0c § 5.17.2.2 MDTS 是 log2 of max
 /// data transfer in MPSMIN units。Windows nvme.sys 会按此拆大 IO 为
 /// 多 cmd。
+///
+/// **C1① MDTS 适用矩阵（spec § 5.17.2.2 + § 8.x）—— 全面审计**：
+/// MDTS 只约束**在 host 内存与 NVM 间真传数据**的命令；其传输大小对
+/// extended-LBA（内联 metadata）**计入 metadata**（separate-buffer 才排除）。
+///   - 受 MDTS 约束（已强制）：READ / WRITE（三档 PRP 路径都查）；READ/WRITE 的
+///     metadata 格式按 block_bytes(data+meta) 计（C1① 修正，旧版漏算 meta）。
+///     COMPARE 也查 MDTS，但仅支持 plain NS（PI/meta NS 直接 INVALID_FIELD），
+///     故其 MDTS = N×sector_bytes，无 extended-LBA metadata 计入路径。
+///   - ZONE_APPEND：理论受 MDTS（ZASL=0 → 走 MDTS），但教学版单-PRP 限制
+///     (≤1 page=4 KiB) 已把它钉在远低于 MDTS 处 → 不会越界，无需额外 gate。
+///   - **不受 MDTS**：FLUSH / WRITE_ZEROES / WRITE_UNCORRECTABLE（无 host 数据
+///     传输，只动 LBA 范围）、DSM（传 range list 非 LBA 数据）、COPY（设备内拷贝，
+///     受 MCL/MSRC/MSSRL 而非 MDTS）、VERIFY（不向 host 传数据）、所有 admin 命令
+///     （MDTS 仅 IO 命令；admin 有各自隐含上限）、reservation/zone-mgmt（控制面）。
 pub const MDTS_PAGES_LOG2: u8 = 5;
 pub const MDTS_MAX_BYTES: u64 = NVME_PAGE_SIZE << MDTS_PAGES_LOG2 as u64;
 

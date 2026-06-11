@@ -824,7 +824,11 @@ impl NvmeController {
                             ));
                         }
                     }
-                    if (data_bytes as u64 * nlb as u64) > MDTS_MAX_BYTES {
+                    // **C1① MDTS metadata 计入**：extended-LBA（内联 metadata）的
+                    // host 传输大小 = block_bytes（data+meta），MDTS 按 spec § 8.x
+                    // 须计入 metadata（仅 separate-buffer 才排除）。旧版用 data_bytes
+                    // 漏算 meta*nlb → 边界处少拒一档。
+                    if (block_bytes as u64 * nlb as u64) > MDTS_MAX_BYTES {
                         return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                     }
                     let mut interleaved = vec![0u8; block_bytes * nlb as usize];
@@ -1320,10 +1324,16 @@ impl NvmeController {
                                 ));
                             }
                         }
-                        let data_bytes_total = ns.data_bytes() as u64 * nlb as u64;
-                        if data_bytes_total > MDTS_MAX_BYTES {
+                        // **C1① MDTS 计入 inline metadata**：MDTS 门按 extended-LBA
+                        // 真实传输大小 block_bytes(data+meta) 判（spec § 8.x）。
+                        // **关键**：PRACT=1 时 host PRP 只传 data（N×4096），controller
+                        // 自动 generate PI tuple → 实际 DMA / PRP 路由 / buffer 仍用
+                        // data_bytes_total(data-only)；MDTS 门与传输大小**分开算**，
+                        // 不可混用（否则多 LBA 写 buffer/PRP 路由错乱 → hang/corruption）。
+                        if ns.block_bytes() * nlb as u64 > MDTS_MAX_BYTES {
                             return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                         }
+                        let data_bytes_total = ns.data_bytes() * nlb as u64;
                         let op_id = self.alloc_op_id();
                         let pages_total = data_bytes_total.div_ceil(NVME_PAGE_SIZE) as u32;
                         let prp_list_pending = data_bytes_total > 2 * NVME_PAGE_SIZE;

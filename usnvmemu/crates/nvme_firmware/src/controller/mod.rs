@@ -820,7 +820,6 @@ impl Namespace {
     }
     /// 仅数据部分字节数（不含 metadata）。
     #[inline]
-    #[allow(dead_code)] // Phase K4 真 PI/4K IO 路径会用
     pub(super) fn data_bytes(&self) -> u64 {
         1u64 << self.lbads
     }

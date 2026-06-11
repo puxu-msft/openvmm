@@ -967,6 +967,179 @@ fn format_mset_flbas_polarity() {
     }
 }
 
+/// **C1① MDTS 计入 inline metadata（spec § 5.17.2.2 / § 8.x）差分 oracle** —
+/// extended-LBA（内联 metadata）的 host 传输大小 = block_bytes(data+meta)，MDTS
+/// 须计入 metadata。PI 格式 4104 B/LBA，MDTS=128 KiB：
+///   - nlb=32：data-only 32×4096=131072=MDTS（旧版 data_bytes 检查放行）但
+///     32×4104=131328 > MDTS → **必须拒**（INVALID_FIELD）；
+///   - nlb=31：31×4104=127224 ≤ MDTS → 不被 MDTS 拒（走异步路径返 None）。
+///
+/// 独立 oracle：边界由 spec 的"含 metadata"语义决定（block_bytes 算术），非读
+/// 自家变量。revert-verify：把检查改回 data_bytes → nlb=32 不再被拒 → 案例转红。
+#[test]
+fn mdts_counts_inline_metadata() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx};
+    fn pi_ctrl() -> NvmeController {
+        let mut c = make_ctrl_with_tmp("mdts_meta");
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+        ns.pi_first = true;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / ns.block_bytes(); // 1 MiB / 4104 ≈ 255 LBA
+        c
+    }
+    let mut cap = CaptureTransport::with_start_token(0x100);
+    // READ PRACT=1 on PI NS（PI 读路径要求 PRACT=1）。
+    // nlb=32：data-only 恰 = MDTS、data+meta 超 MDTS → 必拒。
+    {
+        let mut c = pi_ctrl();
+        assert!(
+            c.namespaces[&1].total_lba >= 32,
+            "需 ≥32 LBA 才能下发 nlb=32"
+        );
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let r = c.dispatch_io(
+            &mut ctx,
+            1,
+            io_sqe(0x02, 1, 0, 32, 0x4000, true, 0x40),
+            0x40,
+            0,
+            1,
+        );
+        let cqe = r.expect("nlb=32 应被 MDTS（含 metadata）同步拒，返 CQE");
+        assert_eq!(
+            cqe_status(&cqe),
+            sc::INVALID_FIELD,
+            "32×4104 > MDTS（计入 metadata）→ INVALID_FIELD"
+        );
+    }
+    // nlb=31：含 metadata 仍 ≤ MDTS → 不被 MDTS 拒（通过 MDTS 门进入 PI 读路径；
+    // 因 backing 全零无有效 PI，返 Guard Check Error 0x282 而非 INVALID_FIELD——
+    // 关键是它**通过了 MDTS 门**，status != INVALID_FIELD）。
+    {
+        let mut c = pi_ctrl();
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let r = c.dispatch_io(
+            &mut ctx,
+            1,
+            io_sqe(0x02, 1, 0, 31, 0x4000, true, 0x41),
+            0x41,
+            0,
+            1,
+        );
+        if let Some(cqe) = r {
+            assert_ne!(
+                cqe_status(&cqe),
+                sc::INVALID_FIELD,
+                "31×4104 ≤ MDTS → 不应被 MDTS 拒（应通过 MDTS 门），实 status={:#x}",
+                cqe_status(&cqe)
+            );
+        }
+    }
+    // WRITE 方向 MDTS 门也计 metadata：nlb=32 PI WRITE → INVALID_FIELD（独立 gate，
+    // 与 host 传输 size data_bytes_total 分开算）。
+    {
+        let mut c = pi_ctrl();
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let r = c.dispatch_io(
+            &mut ctx,
+            1,
+            io_sqe(0x01, 1, 0, 32, 0x4000, true, 0x42),
+            0x42,
+            0,
+            1,
+        );
+        let cqe = r.expect("nlb=32 PI WRITE 应被 MDTS（含 metadata）同步拒");
+        assert_eq!(
+            cqe_status(&cqe),
+            sc::INVALID_FIELD,
+            "WRITE 32×4104 > MDTS（计入 metadata）→ INVALID_FIELD"
+        );
+    }
+}
+
+/// **C1① WRITE-site 守门（reviewer CRITICAL-1 回归保护）** — sub-MDTS 多 LBA PI
+/// WRITE 必须正确完成。PRACT=1 时 host PRP 只传 data（N×4096），controller 自动
+/// 插 PI tuple；MDTS 门用 block_bytes 但 host 传输 / PRP 路由 / buffer 必须用
+/// data-only。若误用 block_bytes 算传输大小 → 多 LBA 写 PRP 路由错乱 hang/corrupt。
+///
+/// 独立 oracle：直读 backing file，按 block_bytes(4104) + pi_first 偏移 8 拆出每
+/// LBA 的 data，断言 per-LBA distinct pattern round-trip（LBA1 corruption 会现形）。
+#[test]
+fn pi_write_multi_lba_round_trip_under_mdts() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx};
+    let mut c = make_ctrl_with_tmp("pi_write_multi");
+    {
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+        ns.pi_first = true;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / ns.block_bytes();
+    }
+    c.cqs.insert(
+        1,
+        crate::regs::CompletionQueue {
+            base_gpa: 0x1_0000,
+            size: 64,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        },
+    );
+    let mut cap = CaptureTransport::with_start_token(0x100);
+    // 2 LBA distinct data（per-LBA 不同，offset/路由 bug 会现形）。
+    let page0: Vec<u8> = (0..4096).map(|i| (0x10 + (i & 0x0f)) as u8).collect();
+    let page1: Vec<u8> = (0..4096).map(|i| (0xA0 + (i & 0x0f)) as u8).collect();
+    {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        // WRITE PRACT=1, nlb=2, dual-PRP（data-only 2×4096=8192=2 page）。
+        let mut sqe = io_sqe(0x01, 1, 0, 2, 0x4000, true, 0x50);
+        sqe.prp2 = 0x5000;
+        let r = c.dispatch_io(&mut ctx, 1, sqe, 0x50, 0, 1);
+        assert!(r.is_none(), "多 LBA PI 写应走异步 dual-PRP，返 None");
+        // 按 page_idx 配对喂两段 DMA completion。
+        let toks: Vec<(u64, u32)> = c
+            .pending_ios
+            .iter()
+            .map(|(&t, p)| match p.op {
+                PendingOp::NvmWritePiMulti { page_idx, .. } => (t, page_idx),
+                _ => panic!("应为 NvmWritePiMulti pending"),
+            })
+            .collect();
+        assert_eq!(
+            toks.len(),
+            2,
+            "dual-PRP 应有 2 条 pending（data-only N×4096）"
+        );
+        for (t, pidx) in toks {
+            let data = if pidx == 0 {
+                page0.clone()
+            } else {
+                page1.clone()
+            };
+            c.on_dma_complete_impl(&mut ctx, t, true, data);
+        }
+    }
+    // backing round-trip：每 LBA = block_bytes(4104)，pi_first 下 data 在偏移 8。
+    let ns = c.namespaces.get(&1).unwrap();
+    let mut buf = vec![0u8; 4104 * 2];
+    ns.read_at(&mut buf, 0).unwrap();
+    assert_eq!(&buf[8..8 + 4096], &page0[..], "LBA0 data round-trip");
+    assert_eq!(
+        &buf[4104 + 8..4104 + 8 + 4096],
+        &page1[..],
+        "LBA1 data round-trip（reviewer CRITICAL-1 corruption 守门）"
+    );
+}
+
 ///
 /// 单 LBA 4 KiB data + 8 byte T10 DIF tuple inline。verify 必须通过。
 #[test]
