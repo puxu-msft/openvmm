@@ -2089,6 +2089,288 @@ fn b6c_inline_meta_pi_first_false() {
     }
 }
 
+/// **B6b-4-N>2（separate metadata，PRACT=0，PRP-list-data）差分 oracle** —
+/// nlb=3 separate-meta：data 3 页经 PRP1 + PRP-list（PRP2 指向 list 页，含 page2/3 GPA），
+/// 3×8 PI tuple 经 MPTR 一条 DMA。
+///   WRITE 正例：3 块 host PI 都正确 → backing 3 块 interleave 落盘（逐块独立 round-trip）。
+///   WRITE 负例：仅 block 2 host PI guard 损坏 → Media 错误 + **全 3 块都不落盘**（原子）。
+///   READ 正例：盘上 3 块 PI 正确 → data 3 页回 PRP1+list / N×8 tuple concat 回 MPTR + success。
+///   READ 负例：仅 block 1 stored PI guard 损坏 → 同步 Media 错误 + **不发任何** host DMA-write。
+///
+/// 独立 oracle：backing file 字节 + PiTuple::compute + capture DmaWrite 字节。
+/// revert-verify：把 finalize / dispatch 的 verify 循环改为只查 block 0 → 负例不被拒 →
+/// 坏数据落盘 / 回送 host → 原子性断言转红。
+#[test]
+fn b6b_n_gt_2_prp_list_separate_meta() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    fn sep_ns() -> NvmeController {
+        let mut c = make_ctrl_with_tmp("b6b_n3_prp");
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+        ns.pi_first = true;
+        ns.meta_inline = false;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / ns.block_bytes();
+        c.cqs.insert(
+            1,
+            crate::regs::CompletionQueue {
+                base_gpa: 0x1_0000,
+                size: 64,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 0,
+                interrupt_enabled: false,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        c
+    }
+    // 3 块各 4096 byte data + 各自 tuple。
+    let datas: Vec<Vec<u8>> = (0..3)
+        .map(|b| {
+            (0..4096)
+                .map(|i| ((i * (b as usize + 1) * 7 + 11) & 0xff) as u8)
+                .collect()
+        })
+        .collect();
+    let tuples: Vec<[u8; 8]> = (0..3)
+        .map(|b| crate::pi::PiTuple::compute(&datas[b], b as u64, 1).to_bytes())
+        .collect();
+    let mut meta_concat = Vec::with_capacity(24);
+    for t in &tuples {
+        meta_concat.extend_from_slice(t);
+    }
+    // PRP layout: PRP1=0x4000 (page 0); PRP2=0x9000 → PRP list 页 (含 page1/2 GPA);
+    // page1=0x5000, page2=0x6000; MPTR=0x7000 (PI tuple concat).
+    let list_page_gpa: u64 = 0x9000;
+    let page_gpas: [u64; 3] = [0x4000, 0x5000, 0x6000];
+    let mptr_gpa: u64 = 0x7000;
+    // PRP list 页内容：2 个 u64 (page1, page2)。
+    let mut list_page_bytes = vec![0u8; 4096];
+    list_page_bytes[0..8].copy_from_slice(&page_gpas[1].to_le_bytes());
+    list_page_bytes[8..16].copy_from_slice(&page_gpas[2].to_le_bytes());
+
+    // ============ WRITE ============
+    fn drive_write(
+        c: &mut NvmeController,
+        cap: &mut CaptureTransport,
+        cid: u16,
+        datas: &[Vec<u8>],
+        meta: &[u8],
+        list_page: &[u8],
+        list_page_gpa: u64,
+        mptr_gpa: u64,
+    ) {
+        let mut ctx = DeviceCtx::new(cap);
+        let mut sqe = io_sqe(0x01, 1, 0, 3, 0x4000, false, cid); // WRITE PRACT=0 nlb=3
+        sqe.prp2 = list_page_gpa;
+        sqe.mptr = mptr_gpa;
+        let r = c.dispatch_io(&mut ctx, 1, sqe, cid, 0, 1);
+        assert!(r.is_none(), "N>2 WRITE 走异步 PRP-list 机件");
+        // 期望 3 条 pending：list-fetch + PRP1 data + MPTR meta。
+        assert_eq!(c.pending_ios.len(), 3);
+        assert_eq!(c.prp_list_ops.len(), 1);
+        // feed list page（DMA-read）→ 触发 page1/2 dma_read。
+        // PendingOp 不可 Clone/Copy → 用 token + 标签的方式而非 (tok, op) 拷贝。
+        enum InitTag {
+            List,
+            Data0,
+            Meta,
+        }
+        let toks_before: Vec<(u64, InitTag)> = c
+            .pending_ios
+            .iter()
+            .map(|(&t, p)| match p.op {
+                PendingOp::NvmWritePrpListFetch { .. } => (t, InitTag::List),
+                PendingOp::NvmWritePrpListData { page_idx: 0, .. } => (t, InitTag::Data0),
+                PendingOp::NvmWritePrpListSepMeta { .. } => (t, InitTag::Meta),
+                _ => unreachable!("unexpected initial op"),
+            })
+            .collect();
+        for (t, tag) in toks_before {
+            match tag {
+                InitTag::List => c.on_dma_complete_impl(&mut ctx, t, true, list_page.to_vec()),
+                InitTag::Data0 => c.on_dma_complete_impl(&mut ctx, t, true, datas[0].clone()),
+                InitTag::Meta => c.on_dma_complete_impl(&mut ctx, t, true, meta.to_vec()),
+            }
+        }
+        // 此时 list 已 walk + PRP1/meta 已到，page1/2 sub-DMA-read 已 issue。
+        let remaining: Vec<(u64, u32)> = c
+            .pending_ios
+            .iter()
+            .filter_map(|(&t, p)| match p.op {
+                PendingOp::NvmWritePrpListData { page_idx, .. } => Some((t, page_idx)),
+                _ => None,
+            })
+            .collect();
+        for (t, page_idx) in remaining {
+            c.on_dma_complete_impl(&mut ctx, t, true, datas[page_idx as usize].clone());
+        }
+    }
+
+    // 正例
+    {
+        let mut c = sep_ns();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        drive_write(
+            &mut c,
+            &mut cap,
+            0xA0,
+            &datas,
+            &meta_concat,
+            &list_page_bytes,
+            list_page_gpa,
+            mptr_gpa,
+        );
+        assert!(c.prp_list_ops.is_empty(), "WRITE 完成后 op 清理");
+        let ns = c.namespaces.get(&1).unwrap();
+        for i in 0..3 {
+            let mut buf = vec![0u8; 4104];
+            ns.read_at(&mut buf, i as u64 * 4104).unwrap();
+            assert_eq!(&buf[0..8], &tuples[i][..], "block {i} PI tuple 落前 8 字节");
+            assert_eq!(&buf[8..4104], &datas[i][..], "block {i} data interleaved");
+        }
+    }
+
+    // 负例（原子性）：block 2 PI guard 损坏 → 全不落盘
+    {
+        let mut c = sep_ns();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut bad_meta = meta_concat.clone();
+        bad_meta[16] ^= 0xff; // tuple2 在 meta[16..24]，第 0 字节是 guard 高字节
+        let pre = cap.events().len();
+        drive_write(
+            &mut c,
+            &mut cap,
+            0xA1,
+            &datas,
+            &bad_meta,
+            &list_page_bytes,
+            list_page_gpa,
+            mptr_gpa,
+        );
+        let ns = c.namespaces.get(&1).unwrap();
+        let mut all = vec![0u8; 4104 * 3];
+        ns.read_at(&mut all, 0).unwrap();
+        assert!(
+            all.iter().all(|&b| b == 0),
+            "任一块 PI 失败 → 全 3 块不落盘（含本来正确的 block 0/1）"
+        );
+        let status = cap
+            .events()
+            .iter()
+            .skip(pre)
+            .filter_map(|e| match e {
+                TransportEvent::DmaWrite { gpa, data, .. }
+                    if *gpa >= 0x1_0000 && *gpa < 0x1_0000 + 64 * 16 && data.len() >= 16 =>
+                {
+                    let dw3 = u32::from_le_bytes(data[12..16].try_into().unwrap());
+                    Some((((dw3 >> 17) & 0xff) | (((dw3 >> 25) & 0x7) << 8)) as u16)
+                }
+                _ => None,
+            })
+            .next_back()
+            .expect("应 post 错误 CQE");
+        assert_eq!(
+            status,
+            crate::cmd::sc::status(0x82, crate::cmd::sc::SCT_MEDIA_DATA_INTEGRITY),
+            "block 2 host PI guard 错 → Media GUARD_CHECK_ERR (0x0282)"
+        );
+    }
+
+    // ============ READ ============
+    fn seed_n3(c: &mut NvmeController, datas: &[Vec<u8>], tuples: &[[u8; 8]]) {
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        for i in 0..3 {
+            let mut block = vec![0u8; 4104];
+            block[0..8].copy_from_slice(&tuples[i]);
+            block[8..4104].copy_from_slice(&datas[i]);
+            ns.write_at(&block, i as u64 * 4104).unwrap();
+        }
+    }
+
+    // READ 正例
+    {
+        let mut c = sep_ns();
+        seed_n3(&mut c, &datas, &tuples);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x02, 1, 0, 3, 0x4000, false, 0xA2);
+            sqe.prp2 = list_page_gpa;
+            sqe.mptr = mptr_gpa;
+            let r = c.dispatch_io(&mut ctx, 1, sqe, 0xA2, 0, 1);
+            assert!(r.is_none(), "N>2 READ 走异步 PRP-list scatter");
+            // 起步：1 条 list-fetch（其它发 scatter 在 walk 完成后）。
+            assert_eq!(c.pending_ios.len(), 1);
+            // feed list page → 触发 PRP1+page1+page2 scatter + MPTR-write。
+            let t_list = *c.pending_ios.keys().next().unwrap();
+            c.on_dma_complete_impl(&mut ctx, t_list, true, list_page_bytes.clone());
+            // 现在 4 条 DMA-write pending（3 data + 1 meta）。
+            assert_eq!(c.pending_ios.len(), 4, "3 data scatter + 1 MPTR write");
+            let toks: Vec<u64> = c.pending_ios.keys().copied().collect();
+            for t in toks {
+                c.on_dma_complete_impl(&mut ctx, t, true, Vec::new());
+            }
+        }
+        let mut writes: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+        for e in cap.events() {
+            if let TransportEvent::DmaWrite { gpa, data, .. } = e {
+                writes.insert(*gpa, data.clone());
+            }
+        }
+        for i in 0..3 {
+            assert_eq!(
+                writes.get(&page_gpas[i]).map(|d| &d[..]),
+                Some(&datas[i][..]),
+                "block {i} data → page_gpas[{i}]"
+            );
+        }
+        assert_eq!(
+            writes.get(&mptr_gpa).map(|d| &d[..]),
+            Some(&meta_concat[..]),
+            "N×8 PI tuple concat → MPTR"
+        );
+        assert!(c.prp_list_ops.is_empty(), "READ 完成后 op 清理");
+    }
+
+    // READ 负例：仅 block 1 stored PI guard 损坏 → 同步 Media + 不回送 host
+    {
+        let mut c = sep_ns();
+        let mut bad_tuples = tuples.clone();
+        bad_tuples[1][0] ^= 0xff;
+        seed_n3(&mut c, &datas, &bad_tuples);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let cqe = {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x02, 1, 0, 3, 0x4000, false, 0xA3);
+            sqe.prp2 = list_page_gpa;
+            sqe.mptr = mptr_gpa;
+            c.dispatch_io(&mut ctx, 1, sqe, 0xA3, 0, 1)
+        };
+        let cqe = cqe.expect("block 1 stored PI 损坏 → 同步 Media 错误 CQE");
+        assert_eq!(
+            cqe_status(&cqe),
+            crate::cmd::sc::status(0x82, crate::cmd::sc::SCT_MEDIA_DATA_INTEGRITY)
+        );
+        let leaked = cap.events().iter().any(|e| matches!(e,
+            TransportEvent::DmaWrite { gpa, .. }
+                if *gpa == page_gpas[0] || *gpa == page_gpas[1] || *gpa == page_gpas[2] || *gpa == mptr_gpa));
+        assert!(
+            !leaked,
+            "verify-all 失败 → 不应回送 host（含本来正确的 block 0/2）"
+        );
+    }
+    // revert-verify（手动）：把 io.rs B6b-4 READ dispatch 的 verify 循环 `for i in 0..nlb`
+    // 改为 `for i in 0..1` → 负例（block 1 坏）漏过 → 回送 host → "不回送"断言转红。
+    // 把 completion.rs `prp_list_write_sep_meta_finalize` 的 verify 循环同样改 → WRITE
+    // 负例（block 2 坏）漏过 → 落盘 → "全不落盘"断言转红。两侧已实测，恢复后绿。
+}
+
 /// **C1① MDTS 计入 inline metadata（spec § 5.17.2.2 / § 8.x）差分 oracle** —
 /// extended-LBA（内联 metadata）的 host 传输大小 = block_bytes(data+meta)，MDTS
 /// 须计入 metadata。PI 格式 4104 B/LBA，MDTS=128 KiB：

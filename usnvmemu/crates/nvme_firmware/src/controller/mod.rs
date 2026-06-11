@@ -501,6 +501,16 @@ pub(super) enum PendingOp {
     InlineMetaReadDone {
         op_id: u64,
     },
+    /// **B6b-4-N>2 WRITE** — separate-meta PRP-list-data WRITE 的 MPTR PI tuple DMA-read 完成。
+    /// 填 `PrpListOp.sep_meta.meta`；与 data 全到齐双门控触发 verify-all-then-interleave-store-all。
+    NvmWritePrpListSepMeta {
+        op_id: u64,
+    },
+    /// **B6b-4-N>2 READ** — separate-meta PRP-list-data READ 的 MPTR PI tuple DMA-write 完成。
+    /// 标记 sep_meta.meta_pending=false；与 data scatter 全完成共同触发 success CQE。
+    NvmReadPrpListSepMeta {
+        op_id: u64,
+    },
     /// **Phase K4b** — PI Read sibling 占位（per-LBA file read + verify
     /// 在 dispatch 时同步完成，DMA-write 数据回 PRP1 在 PendingIo 路径）。
     NvmReadPiDmaWrite {
@@ -673,6 +683,39 @@ pub(super) struct PrpListOp {
     /// （仅 Write）每页 data buffer，filled by sub-DMA-read 完成。
     /// 索引 0 = PRP1 数据；1..N = PRP list[0..N-1] 数据。
     pub(super) data_pages: Vec<Option<Vec<u8>>>,
+    /// **B6b-4-N>2（separate metadata PRACT=0，PRP-list data）** —
+    /// 可选 separate-meta 描述符。`None` = 普通 plain/admin PRP-list 路径（与改造前
+    /// 行为**比特一致**，所有现有 caller 不受影响）；`Some` = 本命令是 PI separate-meta
+    /// N>2 路径，data 走 PRP-list（N 页 = N 个 LBA 的纯 data，因 data_bytes=4096=
+    /// NVME_PAGE_SIZE），N×8 PI tuple 经 MPTR 单条 DMA。WRITE finalize 须等 data 全到齐
+    /// **且** meta 到齐才触发，并做 verify-all-then-store-all。READ 在 scatter 前同步
+    /// verify-all stored PI（dispatch 时 backing 已读、stored tuple concat 已算）。
+    pub(super) sep_meta: Option<SepMetaPrp>,
+}
+
+/// **B6b-4-N>2** — `PrpListOp` 的 separate-meta 扩展描述符。WRITE 与 READ 用同一结构
+/// 但 `meta` 字段语义不同：
+/// - WRITE：dispatch 时 `meta = None`，MPTR DMA-read 到达后填；finalize 在
+///   `pages_done == total_pages && meta.is_some()` 时触发，做 verify-all → interleave-store-all。
+/// - READ：dispatch 时已从 backing 读 N 个 interleaved block + 同步 verify-all + 算好
+///   `meta` 为 N×8 tuple concat；scatter 时把 `meta` 写到 `mptr`（额外一条 DMA-write
+///   计入 `total_pages` 之外的"meta 子任务"，由 `meta_pending` 标记）。
+pub(super) struct SepMetaPrp {
+    /// 期望传输的纯 data 字节数（= N × data_bytes）。
+    pub(super) data_bytes_total: u32,
+    /// PI tuple buffer 的 host GPA（MPTR）。
+    pub(super) mptr: u64,
+    /// PI tuple 形态相关。
+    pub(super) pi_type: u8,
+    pub(super) pi_first: bool,
+    pub(super) data_bytes: u32,  // 4096
+    pub(super) block_bytes: u32, // 4104
+    /// PRCHK 逐项校验门控（dispatch 时从 cdw12 PRINFO 解析）。
+    pub(super) prchk: crate::pi::PrChk,
+    /// N×8 字节 PI tuple buffer。WRITE：MPTR DMA-read 填；READ：dispatch 时算好。
+    pub(super) meta: Option<Vec<u8>>,
+    /// READ 路径：meta DMA-write 是否仍 pending（true 表示还没完成）。WRITE 路径忽略。
+    pub(super) meta_pending: bool,
 }
 
 /// **Phase R2b** — SGL segment chain fetch 段数上限（防恶意 driver 构造
@@ -3602,6 +3645,7 @@ impl NvmeController {
                     total_pages,
                     pages_done: 0,
                     data_pages,
+                    sep_meta: None,
                 },
             );
             // DMA-read PRP list 页（在 prp2）；到达后 NvmReadPrpListFetch 解析 + per-page 写。

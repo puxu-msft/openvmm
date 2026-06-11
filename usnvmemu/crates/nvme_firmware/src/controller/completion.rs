@@ -292,6 +292,119 @@ impl NvmeController {
         };
         self.post_cqe(ctx, acc.cq_id, cqe);
     }
+
+    /// **B6b-4-N>2（separate metadata，PRACT=0，PRP-list-data）** — N>2 separate-meta
+    /// WRITE 收尾：data 全到齐（pages_done==total_pages）+ MPTR PI 全到齐 后调用。
+    /// 拼 N 个 data 页 → 按 `sm.prchk` 逐块 verify host PI → **任一失败则不落盘**
+    /// （原子，首个失败 Media SCT=2）→ 全通过才 interleave 逐块存盘 + success。
+    fn prp_list_write_sep_meta_finalize(&mut self, ctx: &mut DeviceCtx<'_>, op_id: u64) {
+        let Some(op) = self.prp_list_ops.remove(&op_id) else {
+            return;
+        };
+        let sm = match op.sep_meta {
+            Some(s) => s,
+            None => {
+                tracing::warn!(op_id, "PRP-list sep-meta finalize called without sep_meta");
+                return;
+            }
+        };
+        let meta = sm.meta.unwrap_or_default();
+        let num_blocks = op.num_blocks as usize;
+        let phase = self.cqs.get(&op.cq_id).map(|c| c.phase).unwrap_or(1);
+        let cqe = if let Some(ns) = self.namespaces.get_mut(&op.nsid) {
+            let pi_type = sm.pi_type;
+            let pi_first = sm.pi_first;
+            let block_bytes = sm.block_bytes as usize;
+            let data_bytes = sm.data_bytes as usize;
+            let all_data_ok = op.data_pages.len() == num_blocks
+                && op
+                    .data_pages
+                    .iter()
+                    .all(|p| p.as_ref().map(|d| d.len()) == Some(data_bytes));
+            if !all_data_ok || meta.len() < num_blocks * 8 {
+                tracing::warn!(
+                    num_blocks,
+                    meta_len = meta.len(),
+                    "PRP-list sep-meta WRITE DMA 长度不符"
+                );
+                Cqe::error(op.cid, op.sq_id, op.sq_head, phase, sc::DATA_TRANSFER_ERROR)
+            } else {
+                // ── ① verify 全部 N 块（任一失败 → 全不落盘，原子）──
+                let mut verify_err: Option<crate::pi::PiCheck> = None;
+                for i in 0..num_blocks {
+                    let data = op.data_pages[i].as_ref().unwrap();
+                    let tuple_arr: [u8; 8] = meta[i * 8..i * 8 + 8].try_into().unwrap();
+                    let host_tuple = crate::pi::PiTuple::from_bytes(&tuple_arr);
+                    match host_tuple.verify(data, op.lba + i as u64, pi_type, sm.prchk) {
+                        crate::pi::PiCheck::Ok => {}
+                        other => {
+                            verify_err = Some(other);
+                            break;
+                        }
+                    }
+                }
+                if let Some(other) = verify_err {
+                    let sc_byte = other
+                        .to_sc()
+                        .expect("non-Ok PiCheck always maps to an SC byte");
+                    tracing::warn!(
+                        nsid = op.nsid,
+                        lba = op.lba,
+                        ?other,
+                        "PRP-list sep-meta WRITE: host PI verify 失败（全块不落盘）"
+                    );
+                    Cqe::error(
+                        op.cid,
+                        op.sq_id,
+                        op.sq_head,
+                        phase,
+                        sc::status(sc_byte, sc::SCT_MEDIA_DATA_INTEGRITY),
+                    )
+                } else {
+                    // ── ② 全通过 → interleave 逐块存盘 ──
+                    let mut store_err = false;
+                    for i in 0..num_blocks {
+                        let data = op.data_pages[i].as_ref().unwrap();
+                        let tuple_arr: [u8; 8] = meta[i * 8..i * 8 + 8].try_into().unwrap();
+                        let mut block = vec![0u8; block_bytes];
+                        if pi_first {
+                            block[0..8].copy_from_slice(&tuple_arr);
+                            block[8..8 + data_bytes].copy_from_slice(data);
+                        } else {
+                            block[0..data_bytes].copy_from_slice(data);
+                            block[data_bytes..data_bytes + 8].copy_from_slice(&tuple_arr);
+                        }
+                        if let Err(e) =
+                            ns.write_at(&block, (op.lba + i as u64) * block_bytes as u64)
+                        {
+                            tracing::warn!(error = %e, nsid = op.nsid, lba = op.lba + i as u64,
+                                "PRP-list sep-meta WRITE backing fail");
+                            store_err = true;
+                            break;
+                        }
+                    }
+                    if store_err {
+                        Cqe::error(op.cid, op.sq_id, op.sq_head, phase, sc::DATA_TRANSFER_ERROR)
+                    } else {
+                        self.stat_host_writes += 1;
+                        self.stat_lba_written += num_blocks as u64;
+                        crate::controller::io::advance_zns_wp(ns, op.lba, num_blocks as u32);
+                        tracing::debug!(
+                            nsid = op.nsid,
+                            lba = op.lba,
+                            num_blocks,
+                            data_bytes_total = sm.data_bytes_total,
+                            "PRP-list sep-meta WRITE OK（host PI verified，N 块原子落盘）"
+                        );
+                        Cqe::success(op.cid, op.sq_id, op.sq_head, phase)
+                    }
+                }
+            }
+        } else {
+            Cqe::error(op.cid, op.sq_id, op.sq_head, phase, sc::INVALID_NAMESPACE)
+        };
+        self.post_cqe(ctx, op.cq_id, cqe);
+    }
     pub(super) fn on_dma_complete_impl(
         &mut self,
         ctx: &mut DeviceCtx<'_>,
@@ -356,12 +469,16 @@ impl NvmeController {
                     PendingOp::NvmWritePrpListFetch { op_id }
                     | PendingOp::NvmWritePrpListData { op_id, .. }
                     | PendingOp::NvmReadPrpListFetch { op_id }
-                    | PendingOp::NvmReadPrpListData { op_id, .. } => {
+                    | PendingOp::NvmReadPrpListData { op_id, .. }
+                    | PendingOp::NvmWritePrpListSepMeta { op_id }
+                    | PendingOp::NvmReadPrpListSepMeta { op_id } => {
                         self.pending_ios.retain(|_, q| match q.op {
                             PendingOp::NvmWritePrpListFetch { op_id: o }
                             | PendingOp::NvmWritePrpListData { op_id: o, .. }
                             | PendingOp::NvmReadPrpListFetch { op_id: o }
-                            | PendingOp::NvmReadPrpListData { op_id: o, .. } => o != op_id,
+                            | PendingOp::NvmReadPrpListData { op_id: o, .. }
+                            | PendingOp::NvmWritePrpListSepMeta { op_id: o }
+                            | PendingOp::NvmReadPrpListSepMeta { op_id: o } => o != op_id,
                             _ => true,
                         });
                         self.prp_list_ops.remove(&op_id);
@@ -854,6 +971,49 @@ impl NvmeController {
                         self.stat_lba_read += 1;
                         let cqe = Cqe::success(acc.cid, acc.sq_id, acc.sq_head, phase);
                         self.post_cqe(ctx, acc.cq_id, cqe);
+                    }
+                }
+                PendingOp::NvmWritePrpListSepMeta { op_id } => {
+                    // **B6b-4-N>2 WRITE** — MPTR PI tuple DMA-read 到齐。填 sep_meta.meta；
+                    // 若 data 也已全到齐 → finalize（verify-all-then-store-all）。
+                    let ready = if let Some(op) = self.prp_list_ops.get_mut(&op_id) {
+                        if let Some(sm) = op.sep_meta.as_mut() {
+                            sm.meta = Some(data);
+                        }
+                        op.pages_done == op.total_pages
+                    } else {
+                        tracing::warn!(op_id, "NvmWritePrpListSepMeta unknown op_id（已 abort?）");
+                        false
+                    };
+                    if ready {
+                        self.prp_list_write_sep_meta_finalize(ctx, op_id);
+                    }
+                }
+                PendingOp::NvmReadPrpListSepMeta { op_id } => {
+                    // **B6b-4-N>2 READ** — MPTR PI tuple DMA-write 完成。标记 meta_pending=false；
+                    // 与 data scatter 全完成（pages_done==total_pages）共同触发 success CQE。
+                    let done = if let Some(op) = self.prp_list_ops.get_mut(&op_id) {
+                        if let Some(sm) = op.sep_meta.as_mut() {
+                            sm.meta_pending = false;
+                        }
+                        let scatter_done = op.pages_done == op.total_pages;
+                        let meta_done = op
+                            .sep_meta
+                            .as_ref()
+                            .map(|s| !s.meta_pending)
+                            .unwrap_or(true);
+                        scatter_done && meta_done
+                    } else {
+                        tracing::warn!(op_id, "NvmReadPrpListSepMeta unknown op_id（已 abort?）");
+                        false
+                    };
+                    if done {
+                        let op = self.prp_list_ops.remove(&op_id).unwrap();
+                        let phase = self.cqs.get(&op.cq_id).map(|c| c.phase).unwrap_or(1);
+                        self.stat_host_reads += 1;
+                        self.stat_lba_read += op.num_blocks as u64;
+                        let cqe = Cqe::success(op.cid, op.sq_id, op.sq_head, phase);
+                        self.post_cqe(ctx, op.cq_id, cqe);
                     }
                 }
                 PendingOp::NvmReadDualPrpSiblingHalf => {
@@ -2055,17 +2215,29 @@ impl NvmeController {
                     }
                 }
                 PendingOp::NvmWritePrpListData { op_id, page_idx } => {
-                    // **Phase E**：单个数据页 DMA-read 到达。填入 data_pages，
-                    // 全部齐 → 合并写文件 → CQE。
-                    let done_all = if let Some(op) = self.prp_list_ops.get_mut(&op_id) {
-                        op.data_pages[page_idx as usize] = Some(data);
-                        op.pages_done += 1;
-                        op.pages_done == op.total_pages
-                    } else {
-                        tracing::warn!(op_id, page_idx, "PRP list data completion unknown");
-                        false
-                    };
-                    if done_all {
+                    // **Phase E**：单个数据页 DMA-read 到达。填入 data_pages；plain 路径全
+                    // 部齐 → 合并写文件 → CQE。**B6b-4-N>2**：sep_meta 路径需 data 全到齐
+                    // **且** meta 也到齐才 finalize；本 arm 只填数据 + 触发双门控检查。
+                    let (done_all, has_sep_meta, sep_meta_ready) =
+                        if let Some(op) = self.prp_list_ops.get_mut(&op_id) {
+                            op.data_pages[page_idx as usize] = Some(data);
+                            op.pages_done += 1;
+                            let data_done = op.pages_done == op.total_pages;
+                            let has_sm = op.sep_meta.is_some();
+                            let meta_ok = op
+                                .sep_meta
+                                .as_ref()
+                                .map(|s| s.meta.is_some())
+                                .unwrap_or(false);
+                            (data_done, has_sm, meta_ok)
+                        } else {
+                            tracing::warn!(op_id, page_idx, "PRP list data completion unknown");
+                            (false, false, false)
+                        };
+                    if done_all && has_sep_meta && sep_meta_ready {
+                        // sep_meta 路径双门控达成 → verify-all-then-store-all。
+                        self.prp_list_write_sep_meta_finalize(ctx, op_id);
+                    } else if done_all && !has_sep_meta {
                         let op = self.prp_list_ops.remove(&op_id).unwrap();
                         // 合并 data_pages → 一段连续 buffer
                         // **2026-06-09 纯 4K** — 按 per-NS 扇区算总字节/偏移。
@@ -2232,16 +2404,48 @@ impl NvmeController {
                             },
                         );
                     }
+                    // **B6b-4-N>2 READ**：sep_meta 路径还要把 N×8 PI tuple concat 写回 MPTR。
+                    // dispatch 时已 verify-all + 算好 meta concat 放在 op.sep_meta.meta，
+                    // 这里取出并发 DMA-write（占位 meta_pending=true，完成时由
+                    // NvmReadPrpListSepMeta arm 标记并门控 success CQE）。
+                    let mptr_write_args = self.prp_list_ops.get_mut(&op_id).and_then(|op| {
+                        op.sep_meta.as_mut().map(|sm| {
+                            sm.meta_pending = true;
+                            let meta = sm.meta.take().unwrap_or_default();
+                            (sm.mptr, meta)
+                        })
+                    });
+                    if let Some((mptr, meta)) = mptr_write_args {
+                        let tok_m = ctx.dma_write(mptr, meta);
+                        self.pending_ios.insert(
+                            tok_m,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmReadPrpListSepMeta { op_id },
+                            },
+                        );
+                    }
                 }
                 PendingOp::NvmReadPrpListData { op_id, page_idx } => {
                     // 一个数据页 dma_write 完成（PRP1 或 list 中某页）。
-                    let done_all = if let Some(op) = self.prp_list_ops.get_mut(&op_id) {
+                    // **B6b-4-N>2 READ**：sep_meta 路径还需等 MPTR PI tuple 写也完成；
+                    // 用 sep_meta.meta_pending 作第二门控。plain 路径 sep_meta=None，逻辑不变。
+                    let (done_all, has_sm) = if let Some(op) = self.prp_list_ops.get_mut(&op_id) {
                         op.pages_done += 1;
-                        // Read 路径：PRP1 + list 中 (total_pages-1) 个 = total_pages 个 dma_write。
-                        op.pages_done >= op.total_pages
+                        let scatter_done = op.pages_done >= op.total_pages;
+                        let meta_done = op
+                            .sep_meta
+                            .as_ref()
+                            .map(|s| !s.meta_pending)
+                            .unwrap_or(true);
+                        (scatter_done && meta_done, op.sep_meta.is_some())
                     } else {
                         tracing::warn!(op_id, page_idx, "ReadPrpListData unknown op_id");
-                        false
+                        (false, false)
                     };
                     let _ = data; // Read dma_write 完成 data 为空
                     if done_all {
@@ -2250,6 +2454,7 @@ impl NvmeController {
                             op_id,
                             lba = op.lba,
                             num_blocks = op.num_blocks,
+                            has_sep_meta = has_sm,
                             "NVM Read PRP-list: all pages dma'd, posting CQE"
                         );
                         let cq = self.cqs.get(&op.cq_id);
