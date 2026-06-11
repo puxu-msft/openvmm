@@ -471,11 +471,14 @@ pub(super) enum PendingOp {
         lba: u64,
         num_blocks: u32,
     },
-    /// **B6b-2（separate metadata，PRACT=0）** — separate-buffer PI Write 的两条
-    /// 子-DMA：host data 经 PRP、host PI tuple 经 MPTR 分别 DMA-read。两条都到齐后
-    /// `SepMetaWriteAccum` finalize：verify host PI vs data → interleave 存盘。
+    /// **B6b-2/B6b-4（separate metadata，PRACT=0）** — separate-buffer PI Write 的
+    /// 子-DMA：host data 经 PRP（多 LBA 时第 0 块 PRP1、第 1 块 PRP2）、host PI tuple
+    /// 经 MPTR（一条 N×8 字节）分别 DMA-read。N 条 data + 1 条 meta 都到齐后
+    /// `SepMetaWriteAccum` finalize：verify-all-then-store-all（原子）。
+    /// `page_idx` 标识本条 data 属于第几块（0..num_blocks）。
     SepMetaWriteData {
         op_id: u64,
+        page_idx: u32,
     },
     SepMetaWriteMeta {
         op_id: u64,
@@ -717,33 +720,42 @@ pub(super) struct SglPlanFrag {
     pub(super) length: u32,
 }
 
-/// **B6b-2（separate metadata，PRACT=0）** — separate-buffer PI Write 累积器。
-/// host 的 data（经 PRP）与 PI tuple（经 MPTR）分两条 DMA-read 到达；两条都到齐后
-/// verify host PI vs data（per pi_type），通过则 interleave [tuple][data] 存盘。
-/// 单 LBA（B6b-2 WRITE 起步；多 LBA 后续）。
+/// **B6b-2/B6b-4（separate metadata，PRACT=0）** — separate-buffer PI Write 累积器。
+/// host 的 data（经 PRP，N 条子-DMA）与 PI tuple（经 MPTR，1 条 N×8 字节）分别 DMA-read
+/// 到达；N 条 data + meta 都到齐后 **verify-all-then-store-all**：先逐块 verify host PI vs
+/// data（per pi_type），**任一失败则全不落盘（原子）**；全通过才 interleave [tuple][data]
+/// （per pi_first）逐块存盘。N≤2（dual-PRP）；N>2（PRP-list data）作为最终扩展 defer。
 pub(super) struct SepMetaWriteAccum {
     pub(super) sq_id: u16,
     pub(super) cid: u16,
     pub(super) sq_head: u16,
     pub(super) cq_id: u16,
     pub(super) nsid: u32,
+    /// 起始 LBA（slba）；第 i 块落在 `lba + i`。
     pub(super) lba: u64,
-    /// host data（PRP DMA-read 填）。
-    pub(super) data: Option<Vec<u8>>,
-    /// host PI tuple 8 字节（MPTR DMA-read 填）。
+    /// 本命令的 LBA 数（nlb，1..=2；N>2 走 PRP-list，待续）。
+    pub(super) num_blocks: u32,
+    /// host data，按 page_idx 填（len=num_blocks）。第 i 项 = 第 i 块的纯 data（无 tuple）。
+    pub(super) data_pages: Vec<Option<Vec<u8>>>,
+    /// 尚未到达的 data 子-DMA 数（初值 num_blocks，每条 SepMetaWriteData 减 1）。
+    pub(super) data_remaining: u32,
+    /// host PI tuple，N×8 字节（MPTR 一条 DMA-read 填）。第 i 个 tuple 在 `meta[i*8..i*8+8]`。
     pub(super) meta: Option<Vec<u8>>,
 }
 
-/// **B6b-3（separate metadata，PRACT=0）** — separate-buffer PI Read 累积器。
-/// dispatch 时已从 backing 读 interleaved block + verify PI + 发两条 DMA-write
-/// （data→PRP、tuple→MPTR）；两条都完成（remaining→0）后 post success CQE。
+/// **B6b-3/B6b-4（separate metadata，PRACT=0）** — separate-buffer PI Read 累积器。
+/// dispatch 时已从 backing 读 N 个 interleaved block + verify-all stored PI + 发 N+1 条
+/// DMA-write（N×data→PRP[1/2]、tuple concat→MPTR）；全部完成（remaining→0）后 post
+/// success CQE。`num_blocks` 仅供 stat 计数（LBA 读数）。
 pub(super) struct SepMetaReadAccum {
     pub(super) sq_id: u16,
     pub(super) cid: u16,
     pub(super) sq_head: u16,
     pub(super) cq_id: u16,
-    /// 尚未完成的 DMA-write 数（初值 2：data + meta）。
+    /// 尚未完成的 DMA-write 数（初值 N data + 1 meta = num_blocks + 1）。
     pub(super) remaining: u32,
+    /// 本命令的 LBA 数（stat 用）。
+    pub(super) num_blocks: u32,
 }
 
 // ═══════════════════════ A1（Abort, spec § 5.1）═══════════════════════

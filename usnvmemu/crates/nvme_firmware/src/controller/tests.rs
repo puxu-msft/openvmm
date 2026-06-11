@@ -1328,6 +1328,290 @@ fn b6b_separate_meta_read() {
     }
 }
 
+/// **B6b-4（多 LBA separate metadata WRITE，PRACT=0）差分 oracle** — N=2 separate NS：
+/// data 经 dual-PRP（block0→PRP1、block1→PRP2）、N×8 PI tuple 经 MPTR 一条 DMA；到齐后
+/// **verify-all-then-store-all**：
+///   正例：两块 host PI 都正确 → backing 两块都 interleave 落盘（逐块独立 round-trip）；
+///   负例：仅 block1 的 host PI guard 损坏 → Media 错误 + **两块都不落盘**（原子性）。
+///
+/// 独立 oracle：backing file 字节（read_at）+ PiTuple::compute 真相源，非自洽。
+/// revert-verify：把 finalize 的"verify 全部 N 块"改成只 verify block 0 → 负例（坏在
+/// block1）不再被拒 + corrupt 落盘 → "两块都不落盘"断言转红（见测试末注释）。
+#[test]
+fn b6b_separate_meta_write_multi() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    fn sep_ns() -> NvmeController {
+        let mut c = make_ctrl_with_tmp("b6b_sepwr_multi");
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+        ns.pi_first = true;
+        ns.meta_inline = false; // separate buffer
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / ns.block_bytes();
+        c.cqs.insert(
+            1,
+            crate::regs::CompletionQueue {
+                base_gpa: 0x1_0000,
+                size: 64,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 0,
+                interrupt_enabled: false,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        c
+    }
+    // 两块不同的 data（独立 oracle：tuple 由 PiTuple::compute 各自算）。
+    let data0: Vec<u8> = (0..4096).map(|i| (i & 0xff) as u8).collect();
+    let data1: Vec<u8> = (0..4096).map(|i| ((i * 7 + 3) & 0xff) as u8).collect();
+    let tuple0 = crate::pi::PiTuple::compute(&data0, 0, 1).to_bytes();
+    let tuple1 = crate::pi::PiTuple::compute(&data1, 1, 1).to_bytes();
+
+    // 驱动 N=2 WRITE：feed 2 data（按 page_idx）+ 1 meta（N×8 concat）。
+    // `meta` 是 16 字节的 tuple0++tuple1。
+    fn drive(
+        c: &mut NvmeController,
+        cap: &mut CaptureTransport,
+        cid: u16,
+        data0: &[u8],
+        data1: &[u8],
+        meta: &[u8],
+    ) {
+        let mut ctx = DeviceCtx::new(cap);
+        let mut sqe = io_sqe(0x01, 1, 0, 2, 0x4000, false, cid); // WRITE PRACT=0 nlb=2
+        sqe.prp2 = 0x6000; // block1 data
+        sqe.mptr = 0x5000; // N×8 PI
+        let r = c.dispatch_io(&mut ctx, 1, sqe, cid, 0, 1);
+        assert!(r.is_none(), "多 LBA separate WRITE 走异步 N+1 DMA");
+        assert_eq!(c.pending_ios.len(), 3, "2 data + 1 meta 三条子-DMA");
+        assert_eq!(c.sep_meta_writes.len(), 1, "1 个 SepMetaWriteAccum");
+        // 为每条子-DMA 喂正确的 buffer：data 按 page_idx，meta 喂 concat。
+        let items: Vec<(u64, Option<u32>)> = c
+            .pending_ios
+            .iter()
+            .map(|(&t, p)| match p.op {
+                PendingOp::SepMetaWriteData { page_idx, .. } => (t, Some(page_idx)),
+                PendingOp::SepMetaWriteMeta { .. } => (t, None),
+                _ => unreachable!("only sep-meta write sub-DMAs expected"),
+            })
+            .collect();
+        for (t, page) in items {
+            let d = match page {
+                Some(0) => data0.to_vec(),
+                Some(1) => data1.to_vec(),
+                Some(_) => unreachable!("N=2 仅 page_idx 0/1"),
+                None => meta.to_vec(),
+            };
+            c.on_dma_complete_impl(&mut ctx, t, true, d);
+        }
+    }
+
+    let mut meta_good = Vec::new();
+    meta_good.extend_from_slice(&tuple0);
+    meta_good.extend_from_slice(&tuple1);
+
+    // ── 正例：两块 host PI 正确 → 两块都 interleave 落盘 ──
+    {
+        let mut c = sep_ns();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        drive(&mut c, &mut cap, 0x70, &data0, &data1, &meta_good);
+        assert!(c.sep_meta_writes.is_empty(), "finalize 应移除 accum");
+        let ns = c.namespaces.get(&1).unwrap();
+        // block 0 @ offset 0：[tuple0][data0]
+        let mut b0 = vec![0u8; 4104];
+        ns.read_at(&mut b0, 0).unwrap();
+        assert_eq!(&b0[0..8], &tuple0[..], "block0 PI tuple 落前 8 字节");
+        assert_eq!(&b0[8..4104], &data0[..], "block0 data interleaved");
+        // block 1 @ offset 4104：[tuple1][data1]
+        let mut b1 = vec![0u8; 4104];
+        ns.read_at(&mut b1, 4104).unwrap();
+        assert_eq!(&b1[0..8], &tuple1[..], "block1 PI tuple 落前 8 字节");
+        assert_eq!(&b1[8..4104], &data1[..], "block1 data interleaved");
+    }
+
+    // ── 负例（原子性）：仅 block1 的 host PI guard 损坏 → Media 错误 + 两块都不落盘 ──
+    {
+        let mut c = sep_ns();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut meta_bad = meta_good.clone();
+        meta_bad[8] ^= 0xff; // 破坏 tuple1 的 guard（tuple1 在 meta[8..16]）
+        let pre = cap.events().len();
+        drive(&mut c, &mut cap, 0x71, &data0, &data1, &meta_bad);
+        // **原子性独立 oracle**：backing 两块都仍全 0（block0 PI 本来正确，但 block1 坏 →
+        // 全不落盘）。这是多 LBA 相对单 LBA 的关键新行为。
+        let ns = c.namespaces.get(&1).unwrap();
+        let mut buf = vec![0u8; 4104 * 2];
+        ns.read_at(&mut buf, 0).unwrap();
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "任一块 PI 失败 → 全不落盘（含本来正确的 block0）"
+        );
+        // CQE status = Media SCT=2 GUARD（首个失败类型）。
+        let status = cap
+            .events()
+            .iter()
+            .skip(pre)
+            .filter_map(|e| match e {
+                TransportEvent::DmaWrite { gpa, data, .. }
+                    if *gpa >= 0x1_0000 && *gpa < 0x1_0000 + 64 * 16 && data.len() >= 16 =>
+                {
+                    let dw3 = u32::from_le_bytes(data[12..16].try_into().unwrap());
+                    Some((((dw3 >> 17) & 0xff) | (((dw3 >> 25) & 0x7) << 8)) as u16)
+                }
+                _ => None,
+            })
+            .next_back()
+            .expect("应 post 错误 CQE");
+        assert_eq!(
+            status,
+            crate::cmd::sc::status(0x82, crate::cmd::sc::SCT_MEDIA_DATA_INTEGRITY),
+            "block1 host PI guard 错 → Media GUARD_CHECK_ERR (0x0282)"
+        );
+    }
+    // revert-verify（手动）：把 completion.rs `sep_meta_write_finalize` 的 verify 循环
+    // `for i in 0..num_blocks` 改成 `for i in 0..1`（只 verify block0），则负例中 block1 的
+    // 坏 PI 不再被拦 → 两块都落盘 → "全不落盘"断言转红。已实测转红，恢复后绿。
+}
+
+/// **B6b-4（多 LBA separate metadata READ，PRACT=0）差分 oracle** — N=2 separate NS：
+/// 盘上两个 interleaved [tuple][data] block → **verify-all stored PI** → data 回 PRP[1/2]
+/// + N×8 tuple concat 回 MPTR（N+1 条 DMA-write）：
+///   正例：两块盘上 PI 正确 → block0→PRP1、block1→PRP2、tuple concat→MPTR + success；
+///   负例：仅 block1 盘上 PI guard 损坏 → Media 错误（同步）+ **不** DMA-write 到 host。
+///
+/// 独立 oracle：从 capture 的 DmaWrite 取回送 host 的 data/tuple 字节比对。
+/// revert-verify：把 dispatch 的 verify 循环改成只 verify block0 → 负例不再被拒 + 坏数据
+/// 回送 host → 负例断言转红（见末注释）。
+#[test]
+fn b6b_separate_meta_read_multi() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    fn sep_ns() -> NvmeController {
+        let mut c = make_ctrl_with_tmp("b6b_seprd_multi");
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+        ns.pi_first = true;
+        ns.meta_inline = false;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / ns.block_bytes();
+        c.cqs.insert(
+            1,
+            crate::regs::CompletionQueue {
+                base_gpa: 0x1_0000,
+                size: 64,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 0,
+                interrupt_enabled: false,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        c
+    }
+    // 盘上 seed 第 lba 块（[tuple][data]）。
+    fn seed(c: &mut NvmeController, lba: u64, tuple: &[u8; 8], data: &[u8]) {
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        let mut block = vec![0u8; 4104];
+        block[0..8].copy_from_slice(tuple);
+        block[8..4104].copy_from_slice(data);
+        ns.write_at(&block, lba * 4104).unwrap();
+    }
+    let data0: Vec<u8> = (0..4096).map(|i| ((i * 3 + 1) & 0xff) as u8).collect();
+    let data1: Vec<u8> = (0..4096).map(|i| ((i * 5 + 2) & 0xff) as u8).collect();
+    let tuple0 = crate::pi::PiTuple::compute(&data0, 0, 1).to_bytes();
+    let tuple1 = crate::pi::PiTuple::compute(&data1, 1, 1).to_bytes();
+
+    // ── 正例：READ nlb=2 → block0→PRP1 + block1→PRP2 + (tuple0++tuple1)→MPTR + success ──
+    {
+        let mut c = sep_ns();
+        seed(&mut c, 0, &tuple0, &data0);
+        seed(&mut c, 1, &tuple1, &data1);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x02, 1, 0, 2, 0x4000, false, 0x72); // READ PRACT=0 nlb=2
+            sqe.prp2 = 0x6000;
+            sqe.mptr = 0x5000;
+            let r = c.dispatch_io(&mut ctx, 1, sqe, 0x72, 0, 1);
+            assert!(r.is_none(), "多 LBA separate READ 走异步 N+1 DMA-write");
+            assert_eq!(c.sep_meta_reads.len(), 1, "1 个 SepMetaReadAccum");
+            let toks: Vec<u64> = c.pending_ios.keys().copied().collect();
+            assert_eq!(toks.len(), 3, "2 data + 1 tuple-concat 三条 DMA-write");
+            for t in toks {
+                c.on_dma_complete_impl(&mut ctx, t, true, Vec::new());
+            }
+        }
+        let mut writes: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+        for e in cap.events() {
+            if let TransportEvent::DmaWrite { gpa, data, .. } = e {
+                writes.insert(*gpa, data.clone());
+            }
+        }
+        assert_eq!(
+            writes.get(&0x4000).map(|d| &d[..]),
+            Some(&data0[..]),
+            "block0 data → PRP1"
+        );
+        assert_eq!(
+            writes.get(&0x6000).map(|d| &d[..]),
+            Some(&data1[..]),
+            "block1 data → PRP2"
+        );
+        let mut tuple_concat = Vec::new();
+        tuple_concat.extend_from_slice(&tuple0);
+        tuple_concat.extend_from_slice(&tuple1);
+        assert_eq!(
+            writes.get(&0x5000).map(|d| &d[..]),
+            Some(&tuple_concat[..]),
+            "N×8 PI tuple concat → MPTR"
+        );
+        assert!(c.sep_meta_reads.is_empty(), "N+1 条完成后 accum 移除");
+    }
+
+    // ── 负例：仅 block1 盘上 PI guard 损坏 → Media 错误（同步），不回送 host ──
+    {
+        let mut c = sep_ns();
+        seed(&mut c, 0, &tuple0, &data0);
+        let mut bad1 = tuple1;
+        bad1[0] ^= 0xff; // 损坏 block1 stored guard
+        seed(&mut c, 1, &bad1, &data1);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let cqe = {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x02, 1, 0, 2, 0x4000, false, 0x73);
+            sqe.prp2 = 0x6000;
+            sqe.mptr = 0x5000;
+            c.dispatch_io(&mut ctx, 1, sqe, 0x73, 0, 1)
+        };
+        let cqe = cqe.expect("block1 stored PI 损坏 → 同步 Media 错误 CQE");
+        assert_eq!(
+            cqe_status(&cqe),
+            crate::cmd::sc::status(0x82, crate::cmd::sc::SCT_MEDIA_DATA_INTEGRITY),
+            "block1 盘上 guard 损坏 → Media GUARD_CHECK_ERR (0x0282)"
+        );
+        // 独立 oracle：verify-all 失败 → 一条 host DMA-write 都不发（含本来正确的 block0）。
+        let leaked = cap.events().iter().any(|e| {
+            matches!(e, TransportEvent::DmaWrite { gpa, .. }
+                if *gpa == 0x4000 || *gpa == 0x6000 || *gpa == 0x5000)
+        });
+        assert!(
+            !leaked,
+            "stored PI verify 失败不应 DMA-write 到 host（含 block0）"
+        );
+    }
+    // revert-verify（手动）：把 io.rs READ dispatch 的 verify 循环 `for i in 0..nlb`
+    // 改成 `for i in 0..1`（只 verify block0），则负例中 block1 坏 PI 漏过 → 坏数据回送
+    // host（0x6000 出现 DmaWrite）→ "不回送 host"断言转红。已实测转红，恢复后绿。
+}
+
 /// **C1① MDTS 计入 inline metadata（spec § 5.17.2.2 / § 8.x）差分 oracle** —
 /// extended-LBA（内联 metadata）的 host 传输大小 = block_bytes(data+meta)，MDTS
 /// 须计入 metadata。PI 格式 4104 B/LBA，MDTS=128 KiB：

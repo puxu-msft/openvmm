@@ -56,25 +56,32 @@ pub(crate) fn check_copy_range_conflict(sdlba: u64, dst_total: u64, ranges: &[(u
 }
 
 impl NvmeController {
-    /// **B6b-2（separate metadata，PRACT=0）** — separate-buffer PI Write 收尾：
-    /// host data（PRP）+ host PI tuple（MPTR）两条 DMA 都到齐后调用。verify host PI
-    /// vs data（per pi_type，spec § 8.3）→ 通过则 interleave [tuple][data]（pi_first）
-    /// 存盘 + success；guard/reftag 失配 → Media SCT=2 错误 CQE（host 供的 PI 不一致）。
+    /// **B6b-2/B6b-4（separate metadata，PRACT=0）** — separate-buffer PI Write 收尾：
+    /// N 条 host data（PRP）+ host PI tuple（MPTR，N×8）都到齐后调用。**verify-all-then-
+    /// store-all**：先逐块 verify host PI vs data（per pi_type，spec § 8.3）；**任一块失配则
+    /// 全不落盘（原子，返首个失败的 Media SCT=2 错误）**；全通过才 interleave [tuple][data]
+    /// （per pi_first）逐块存盘 + success。
     fn sep_meta_write_finalize(&mut self, ctx: &mut DeviceCtx<'_>, op_id: u64) {
         let Some(acc) = self.sep_meta_writes.remove(&op_id) else {
             return;
         };
-        let data = acc.data.unwrap_or_default();
         let meta = acc.meta.unwrap_or_default();
+        let num_blocks = acc.num_blocks as usize;
         let phase = self.cqs.get(&acc.cq_id).map(|c| c.phase).unwrap_or(1);
         let cqe = if let Some(ns) = self.namespaces.get_mut(&acc.nsid) {
             let pi_type = ns.pi_type;
             let pi_first = ns.pi_first;
             let block_bytes = ns.block_bytes() as usize;
             let data_bytes = ns.data_bytes() as usize;
-            if data.len() != data_bytes || meta.len() < 8 {
+            // 长度校验：N 块 data 都到齐且每块 = data_bytes，且 meta ≥ N×8。
+            let all_data_ok = acc.data_pages.len() == num_blocks
+                && acc
+                    .data_pages
+                    .iter()
+                    .all(|p| p.as_ref().map(|d| d.len()) == Some(data_bytes));
+            if !all_data_ok || meta.len() < num_blocks * 8 {
                 tracing::warn!(
-                    data = data.len(),
+                    num_blocks,
                     meta = meta.len(),
                     "separate-meta Write DMA 长度不符"
                 );
@@ -86,65 +93,87 @@ impl NvmeController {
                     sc::DATA_TRANSFER_ERROR,
                 )
             } else {
-                let tuple_arr: [u8; 8] = meta[..8].try_into().unwrap();
-                let host_tuple = crate::pi::PiTuple::from_bytes(&tuple_arr);
                 // **教学边界（reviewer B6b-2 MEDIUM）**：PRCHK（cdw12 bits 28:26，逐项
                 // 控制 Guard/AppTag/RefTag 是否校验）当前**未解析**——本路径一律校验
                 // Guard + RefTag(type 1/2)，与既有 PRACT=1 路径一致。后果是 **over-strict**
                 // （PRCHK=0 的合法 pass-through 会被多拒）而非 under-strict（绝不放过坏 PI），
                 // 对数据完整性是安全方向。AppTag 不校验（PiTuple::verify 设计如此），host
                 // 的 app_tag 原样存盘。真做 PRCHK 逐项门控时在此按 bit 解析。
-                match host_tuple.verify(&data, acc.lba, pi_type) {
-                    crate::pi::PiCheck::Ok => {
-                        // interleave host data + host PI tuple，存到 backing。
+                //
+                // ── ① verify 全部 N 块（任一失败 → 不落盘，原子）──
+                let mut verify_err: Option<crate::pi::PiCheck> = None;
+                for i in 0..num_blocks {
+                    let data = acc.data_pages[i].as_ref().unwrap();
+                    let tuple_arr: [u8; 8] = meta[i * 8..i * 8 + 8].try_into().unwrap();
+                    let host_tuple = crate::pi::PiTuple::from_bytes(&tuple_arr);
+                    match host_tuple.verify(data, acc.lba + i as u64, pi_type) {
+                        crate::pi::PiCheck::Ok => {}
+                        other => {
+                            verify_err = Some(other);
+                            break;
+                        }
+                    }
+                }
+                if let Some(other) = verify_err {
+                    // host 供的 PI 与 data 不一致 → Media/Data Integrity 错误（SCT=2，
+                    // 首个失败类型 via to_sc()）。一块都不落盘（原子）。
+                    let sc_byte = other.to_sc().unwrap_or(0x82);
+                    tracing::warn!(
+                        nsid = acc.nsid,
+                        lba = acc.lba,
+                        ?other,
+                        "separate-meta Write: host PI verify 失败（全块不落盘）"
+                    );
+                    Cqe::error(
+                        acc.cid,
+                        acc.sq_id,
+                        acc.sq_head,
+                        phase,
+                        sc::status(sc_byte, sc::SCT_MEDIA_DATA_INTEGRITY),
+                    )
+                } else {
+                    // ── ② 全通过 → interleave 逐块存盘 ──
+                    // 注：backing IO 错误（write_at fail）非 PI 问题，极罕见；若发生在中途，
+                    // 已落盘的前序块无法回滚（文件后端教学边界），返 DATA_TRANSFER_ERROR。
+                    let mut store_err = false;
+                    for i in 0..num_blocks {
+                        let data = acc.data_pages[i].as_ref().unwrap();
+                        let tuple_arr: [u8; 8] = meta[i * 8..i * 8 + 8].try_into().unwrap();
                         let mut block = vec![0u8; block_bytes];
                         if pi_first {
                             block[0..8].copy_from_slice(&tuple_arr);
-                            block[8..8 + data_bytes].copy_from_slice(&data);
+                            block[8..8 + data_bytes].copy_from_slice(data);
                         } else {
-                            block[0..data_bytes].copy_from_slice(&data);
+                            block[0..data_bytes].copy_from_slice(data);
                             block[data_bytes..data_bytes + 8].copy_from_slice(&tuple_arr);
                         }
-                        match ns.write_at(&block, acc.lba * block_bytes as u64) {
-                            Ok(()) => {
-                                self.stat_host_writes += 1;
-                                self.stat_lba_written += 1;
-                                crate::controller::io::advance_zns_wp(ns, acc.lba, 1);
-                                tracing::debug!(
-                                    nsid = acc.nsid,
-                                    lba = acc.lba,
-                                    "separate-meta PI Write OK（host PI verified）"
-                                );
-                                Cqe::success(acc.cid, acc.sq_id, acc.sq_head, phase)
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, nsid = acc.nsid, "separate-meta Write backing fail");
-                                Cqe::error(
-                                    acc.cid,
-                                    acc.sq_id,
-                                    acc.sq_head,
-                                    phase,
-                                    sc::DATA_TRANSFER_ERROR,
-                                )
-                            }
+                        if let Err(e) =
+                            ns.write_at(&block, (acc.lba + i as u64) * block_bytes as u64)
+                        {
+                            tracing::warn!(error = %e, nsid = acc.nsid, lba = acc.lba + i as u64, "separate-meta Write backing fail");
+                            store_err = true;
+                            break;
                         }
                     }
-                    other => {
-                        // host 供的 PI 与 data 不一致 → Media/Data Integrity 错误（SCT=2）。
-                        let sc_byte = other.to_sc().unwrap_or(0x82);
-                        tracing::warn!(
-                            nsid = acc.nsid,
-                            lba = acc.lba,
-                            ?other,
-                            "separate-meta Write: host PI verify 失败"
-                        );
+                    if store_err {
                         Cqe::error(
                             acc.cid,
                             acc.sq_id,
                             acc.sq_head,
                             phase,
-                            sc::status(sc_byte, sc::SCT_MEDIA_DATA_INTEGRITY),
+                            sc::DATA_TRANSFER_ERROR,
                         )
+                    } else {
+                        self.stat_host_writes += 1;
+                        self.stat_lba_written += num_blocks as u64;
+                        crate::controller::io::advance_zns_wp(ns, acc.lba, num_blocks as u32);
+                        tracing::debug!(
+                            nsid = acc.nsid,
+                            lba = acc.lba,
+                            num_blocks,
+                            "separate-meta PI Write OK（host PI verified，N 块原子落盘）"
+                        );
+                        Cqe::success(acc.cid, acc.sq_id, acc.sq_head, phase)
                     }
                 }
             }
@@ -589,12 +618,18 @@ impl NvmeController {
                     };
                     self.post_cqe(ctx, p.cq_id, cqe);
                 }
-                PendingOp::SepMetaWriteData { op_id } => {
-                    // **B6b-2** — separate-meta PI Write 的 data 段到达。填 accum；
-                    // 若 meta 也到齐 → finalize（verify + 存盘）。
+                PendingOp::SepMetaWriteData { op_id, page_idx } => {
+                    // **B6b-2/B6b-4** — separate-meta PI Write 的第 page_idx 块 data 到达。
+                    // 填 accum 对应 slot；N 块 data 全到齐（data_remaining→0）且 meta 也到齐
+                    // → finalize（verify-all-then-store-all）。
                     if let Some(acc) = self.sep_meta_writes.get_mut(&op_id) {
-                        acc.data = Some(data);
-                        if acc.meta.is_some() {
+                        if let Some(slot) = acc.data_pages.get_mut(page_idx as usize)
+                            && slot.is_none()
+                        {
+                            *slot = Some(data);
+                            acc.data_remaining = acc.data_remaining.saturating_sub(1);
+                        }
+                        if acc.data_remaining == 0 && acc.meta.is_some() {
                             self.sep_meta_write_finalize(ctx, op_id);
                         }
                     } else {
@@ -602,10 +637,10 @@ impl NvmeController {
                     }
                 }
                 PendingOp::SepMetaWriteMeta { op_id } => {
-                    // **B6b-2** — separate-meta PI Write 的 host PI tuple 段到达。
+                    // **B6b-2/B6b-4** — separate-meta PI Write 的 host PI tuple 段到达（N×8）。
                     if let Some(acc) = self.sep_meta_writes.get_mut(&op_id) {
                         acc.meta = Some(data);
-                        if acc.data.is_some() {
+                        if acc.data_remaining == 0 {
                             self.sep_meta_write_finalize(ctx, op_id);
                         }
                     } else {
@@ -613,8 +648,8 @@ impl NvmeController {
                     }
                 }
                 PendingOp::SepMetaReadDone { op_id } => {
-                    // **B6b-3** — separate-meta PI Read 的一条 DMA-write（data→PRP 或
-                    // tuple→MPTR）完成。两条都完成（remaining→0）→ success CQE。
+                    // **B6b-3/B6b-4** — separate-meta PI Read 的一条 DMA-write（data→PRP[1/2]
+                    // 或 tuple→MPTR）完成。全部 N+1 条完成（remaining→0）→ success CQE。
                     let done = if let Some(acc) = self.sep_meta_reads.get_mut(&op_id) {
                         acc.remaining = acc.remaining.saturating_sub(1);
                         acc.remaining == 0
@@ -626,7 +661,7 @@ impl NvmeController {
                         let acc = self.sep_meta_reads.remove(&op_id).unwrap();
                         let phase = self.cqs.get(&acc.cq_id).map(|c| c.phase).unwrap_or(1);
                         self.stat_host_reads += 1;
-                        self.stat_lba_read += 1;
+                        self.stat_lba_read += acc.num_blocks as u64;
                         let cqe = Cqe::success(acc.cid, acc.sq_id, acc.sq_head, phase);
                         self.post_cqe(ctx, acc.cq_id, cqe);
                     }

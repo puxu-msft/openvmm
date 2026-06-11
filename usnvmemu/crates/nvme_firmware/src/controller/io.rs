@@ -757,9 +757,10 @@ impl NvmeController {
                     ));
                 }
                 if !pract && is_pi_path {
-                    // **B6b-3（separate metadata，PRACT=0）** — separate NS：从 backing
-                    // 读 interleaved block → verify stored PI → data 回 PRP + PI tuple 回
-                    // MPTR（两条 DMA-write）。inline NS（extended LBA）的 PRACT=0 仍未实现。
+                    // **B6b-3/B6b-4（separate metadata，PRACT=0）** — separate NS：从 backing
+                    // 读 N 个 interleaved block → **verify-all stored PI** → N data 回 PRP[1/2]
+                    // + N×8 PI tuple concat 回 MPTR（N+1 条 DMA-write）。N≤2（dual-PRP）；N>2
+                    // （PRP-list data）defer。inline NS（extended LBA）的 PRACT=0 仍未实现。
                     if meta_inline_r {
                         tracing::warn!(
                             nsid,
@@ -773,12 +774,22 @@ impl NvmeController {
                             sc::INVALID_PROTECTION_INFO,
                         ));
                     }
-                    if nlb != 1 {
-                        tracing::warn!(nlb, "separate-meta READ 暂仅支持单 LBA（多 LBA 待续）");
+                    if nlb > 2 {
+                        // N>2 separate READ 需 PRP-list data（复用 PrpListOp 机件，量大）；
+                        // 作为最终扩展 defer（见 docs/plans/2026-06-11-b6b4-and-resume-plan.md §3）。
+                        tracing::warn!(
+                            nlb,
+                            "separate-meta READ N>2 需 PRP-list（待续）→ INVALID_FIELD"
+                        );
                         return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                     }
                     if sqe.mptr == 0 {
                         tracing::warn!(nsid, "separate-meta READ 需 MPTR（host PI buffer）");
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                    }
+                    if nlb == 2 && prp2 == 0 {
+                        // dual-PRP：第 1 块 data 回 PRP2，driver 必须提供。
+                        tracing::warn!(nsid, "separate-meta READ nlb=2 需 PRP2（第二块 data）");
                         return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                     }
                     let mptr = sqe.mptr;
@@ -787,13 +798,14 @@ impl NvmeController {
                     let block_bytes = ns.block_bytes() as usize; // 4104
                     let data_bytes = ns.data_bytes() as usize; // 4096
                     let total_lba = ns.total_lba;
-                    if slba >= total_lba {
+                    if slba + nlb as u64 > total_lba {
                         return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE));
                     }
-                    // 读 interleaved block（drop ns 不可变借用后用 ns_mut）。
-                    let mut block = vec![0u8; block_bytes];
+                    // 读 N 个连续 interleaved block（backing 上块连续：第 i 块在
+                    // `(slba+i)*block_bytes`）。drop ns 不可变借用后用 ns_mut。
+                    let mut blocks = vec![0u8; block_bytes * nlb as usize];
                     let ns_mut = self.ns_mut(nsid).unwrap();
-                    if let Err(e) = ns_mut.read_at(&mut block, slba * block_bytes as u64) {
+                    if let Err(e) = ns_mut.read_at(&mut blocks, slba * block_bytes as u64) {
                         tracing::warn!(error = %e, nsid, slba, "separate-meta READ backing fail");
                         return Some(Cqe::error(
                             cid,
@@ -803,56 +815,68 @@ impl NvmeController {
                             sc::DATA_TRANSFER_ERROR,
                         ));
                     }
-                    // 按 pi_first 拆 tuple + data。
-                    let (tuple_bytes, data_part): ([u8; 8], Vec<u8>) = if pi_first {
-                        (
-                            block[0..8].try_into().unwrap(),
-                            block[8..8 + data_bytes].to_vec(),
-                        )
-                    } else {
-                        (
-                            block[data_bytes..data_bytes + 8].try_into().unwrap(),
-                            block[0..data_bytes].to_vec(),
-                        )
-                    };
-                    // verify stored PI（检测 backing 损坏；over-strict 同 WRITE，PRCHK 未门控）。
-                    let stored_tuple = crate::pi::PiTuple::from_bytes(&tuple_bytes);
-                    match stored_tuple.verify(&data_part, slba, pi_type) {
-                        crate::pi::PiCheck::Ok => {}
-                        other => {
-                            // **reviewer M-1**：映射具体失败类型（Guard 0x82 / RefTag 0x84 /
-                            // AppTag 0x83）而非恒 0x82，与 WRITE 侧对称（spec § 4.6.1）。
-                            let sc_byte = other.to_sc().unwrap_or(0x82);
-                            tracing::warn!(
-                                nsid,
-                                slba,
-                                ?other,
-                                "separate-meta READ: stored PI verify 失败"
-                            );
-                            return Some(Cqe::error(
-                                cid,
-                                sq_id,
-                                sq_head,
-                                phase,
-                                sc::status(sc_byte, sc::SCT_MEDIA_DATA_INTEGRITY),
-                            ));
+                    // 逐块按 pi_first 拆 tuple + data 并 **verify-all stored PI**；任一失败 →
+                    // 同步 Media SCT=2 错误（首个失败类型 via to_sc()），不 DMA-write 到 host。
+                    let mut data_pages: Vec<Vec<u8>> = Vec::with_capacity(nlb as usize);
+                    let mut tuples: Vec<[u8; 8]> = Vec::with_capacity(nlb as usize);
+                    for i in 0..nlb as usize {
+                        let blk = &blocks[i * block_bytes..(i + 1) * block_bytes];
+                        let (tuple_bytes, data_part): ([u8; 8], &[u8]) = if pi_first {
+                            (blk[0..8].try_into().unwrap(), &blk[8..8 + data_bytes])
+                        } else {
+                            (
+                                blk[data_bytes..data_bytes + 8].try_into().unwrap(),
+                                &blk[0..data_bytes],
+                            )
+                        };
+                        let stored_tuple = crate::pi::PiTuple::from_bytes(&tuple_bytes);
+                        match stored_tuple.verify(data_part, slba + i as u64, pi_type) {
+                            crate::pi::PiCheck::Ok => {}
+                            other => {
+                                // **reviewer M-1**：映射具体失败类型（Guard 0x82 / RefTag 0x84 /
+                                // AppTag 0x83）而非恒 0x82，与 WRITE 侧对称（spec § 4.6.1）。
+                                let sc_byte = other.to_sc().unwrap_or(0x82);
+                                tracing::warn!(
+                                    nsid,
+                                    lba = slba + i as u64,
+                                    ?other,
+                                    "separate-meta READ: stored PI verify 失败"
+                                );
+                                return Some(Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::status(sc_byte, sc::SCT_MEDIA_DATA_INTEGRITY),
+                                ));
+                            }
                         }
+                        data_pages.push(data_part.to_vec());
+                        tuples.push(tuple_bytes);
                     }
-                    // data → PRP1，tuple → MPTR（两条 DMA-write，都完成后 success CQE）。
+                    // 全 OK → N data → PRP[0=prp1,1=prp2] + tuple concat（N×8）→ MPTR。
+                    // 共 N+1 条 DMA-write，全完成（remaining→0）后 success CQE。
                     let op_id = self.alloc_op_id();
-                    let tok_d = ctx.dma_write(prp1, data_part);
-                    self.pending_ios.insert(
-                        tok_d,
-                        PendingIo {
-                            sq_id,
-                            cid,
-                            sq_head,
-                            cq_id,
-                            nsid,
-                            op: PendingOp::SepMetaReadDone { op_id },
-                        },
-                    );
-                    let tok_m = ctx.dma_write(mptr, tuple_bytes.to_vec());
+                    let data_prps = [prp1, prp2];
+                    for (i, page) in data_pages.into_iter().enumerate() {
+                        let tok_d = ctx.dma_write(data_prps[i], page);
+                        self.pending_ios.insert(
+                            tok_d,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::SepMetaReadDone { op_id },
+                            },
+                        );
+                    }
+                    let mut meta_concat = Vec::with_capacity(nlb as usize * 8);
+                    for t in &tuples {
+                        meta_concat.extend_from_slice(t);
+                    }
+                    let tok_m = ctx.dma_write(mptr, meta_concat);
                     self.pending_ios.insert(
                         tok_m,
                         PendingIo {
@@ -871,7 +895,8 @@ impl NvmeController {
                             cid,
                             sq_head,
                             cq_id,
-                            remaining: 2,
+                            remaining: nlb + 1,
+                            num_blocks: nlb,
                         },
                     );
                     return None;
@@ -1356,10 +1381,11 @@ impl NvmeController {
                     ));
                 }
                 if !pract && is_pi_capable {
-                    // **B6b-2（separate metadata，PRACT=0）** — host 供 PI tuple via MPTR。
-                    // 仅 separate NS（meta_inline=false）：data 经 PRP、PI 经 MPTR 两条 DMA-read，
-                    // 到齐后 verify host PI vs data → interleave 存盘。inline NS（extended LBA）
-                    // 的 PRACT=0（host inline tuple）仍未实现 → 保持拒绝。单 LBA 起步。
+                    // **B6b-2/B6b-4（separate metadata，PRACT=0）** — host 供 PI tuple via MPTR。
+                    // 仅 separate NS（meta_inline=false）：N 条 data 经 PRP（第 0 块 PRP1、
+                    // 第 1 块 PRP2）、N×8 PI tuple 经 MPTR（一条）DMA-read，到齐后 verify-all-
+                    // then-store-all。inline NS（extended LBA）的 PRACT=0 仍未实现 → 拒绝。
+                    // N≤2（dual-PRP）；N>2（PRP-list data）作为最终扩展 defer。
                     if meta_inline {
                         tracing::warn!(
                             nsid,
@@ -1373,30 +1399,47 @@ impl NvmeController {
                             sc::INVALID_PROTECTION_INFO,
                         ));
                     }
-                    if nlb != 1 {
-                        // 多 LBA separate WRITE = B6b-2 后续增量；当前单 LBA。
-                        tracing::warn!(nlb, "separate-meta WRITE 暂仅支持单 LBA（多 LBA 待续）");
+                    if nlb > 2 {
+                        // N>2 separate WRITE 需 PRP-list data + MPTR（复用 PrpListOp 机件，量大）；
+                        // 作为最终扩展 defer（见 docs/plans/2026-06-11-b6b4-and-resume-plan.md §3）。
+                        tracing::warn!(
+                            nlb,
+                            "separate-meta WRITE N>2 需 PRP-list（待续）→ INVALID_FIELD"
+                        );
                         return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                     }
                     if sqe.mptr == 0 {
                         tracing::warn!(nsid, "separate-meta WRITE 需 MPTR（host PI buffer）");
                         return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                     }
+                    if nlb == 2 && prp2 == 0 {
+                        // dual-PRP：第 1 块 data 经 PRP2，driver 必须提供。
+                        tracing::warn!(nsid, "separate-meta WRITE nlb=2 需 PRP2（第二块 data）");
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                    }
                     let mptr = sqe.mptr;
                     let op_id = self.alloc_op_id();
-                    let tok_d = ctx.dma_read(prp1, sector_bytes as u32);
-                    self.pending_ios.insert(
-                        tok_d,
-                        PendingIo {
-                            sq_id,
-                            cid,
-                            sq_head,
-                            cq_id,
-                            nsid,
-                            op: PendingOp::SepMetaWriteData { op_id },
-                        },
-                    );
-                    let tok_m = ctx.dma_read(mptr, 8);
+                    // N 条 data 子-DMA：第 0 块 PRP1、第 1 块 PRP2（dual-PRP）。每条传输
+                    // sector_bytes（=data_bytes，纯 data，不含 tuple）。**切忌**用 block_bytes
+                    // 当 host 传输 size（reviewer C1① CRITICAL 教训：会多读/写 host buffer）。
+                    let data_prps = [prp1, prp2];
+                    for page_idx in 0..nlb {
+                        let prp = data_prps[page_idx as usize];
+                        let tok_d = ctx.dma_read(prp, sector_bytes as u32);
+                        self.pending_ios.insert(
+                            tok_d,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::SepMetaWriteData { op_id, page_idx },
+                            },
+                        );
+                    }
+                    // PI tuple：一条 DMA-read 取 N×8 字节（host MPTR buffer 连续 N 个 tuple）。
+                    let tok_m = ctx.dma_read(mptr, nlb * 8);
                     self.pending_ios.insert(
                         tok_m,
                         PendingIo {
@@ -1417,7 +1460,9 @@ impl NvmeController {
                             cq_id,
                             nsid,
                             lba: slba,
-                            data: None,
+                            num_blocks: nlb,
+                            data_pages: vec![None; nlb as usize],
+                            data_remaining: nlb,
                             meta: None,
                         },
                     );
