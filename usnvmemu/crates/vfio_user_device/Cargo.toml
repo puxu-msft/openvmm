@@ -10,9 +10,16 @@ description = "vfio-user client (underhill 侧)：connect AF_UNIX + VERSION 握�
 vfio_user_wire = { path = "../vfio_user_wire" }
 zerocopy = { version = "0.8", features = ["derive"] }
 anyhow = "1.0"
+# W3: DMA_MAP 发 fd 经 SCM_RIGHTS（sendmsg + ControlMessage::ScmRights，全 safe，
+# socket+uio feature；与 server framing 同源）。
+nix = { version = "0.30", features = ["socket", "uio"] }
 
 [dev-dependencies]
 # loopback 单测对接真 server_handshake + VfioUserSession。
 vfio_user_transport = { path = "../vfio_user_transport" }
-# loopback 测的 MockDev（PcieDevice 实现）。pcie_device_core 是零依赖 exclude crate，不破 standalone。
+# loopback 测的 MockDev / DmaTriggerDev（PcieDevice 实现）。零依赖 exclude crate，不破 standalone。
 pcie_device_core = { path = "../pcie_device_core" }
+# W3 loopback 测的 "guest RAM" backing file（避开 client 侧 mmap/unsafe，用 FileExt 读写）。
+tempfile = "3"
+# W3 loopback 测共享 DMA 完成回调数据（workspace lint 禁 std::sync::Mutex，用 parking_lot）。
+parking_lot = "0.12"

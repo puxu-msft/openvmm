@@ -5,8 +5,11 @@
 
 use crate::framing::read_message;
 use crate::framing::write_message;
+use crate::framing::write_message_with_fds;
 use anyhow::Context as _;
 use anyhow::anyhow;
+use std::os::fd::AsRawFd;
+use std::os::fd::BorrowedFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use vfio_user_wire::framing::WireMessage;
@@ -17,6 +20,8 @@ use vfio_user_wire::handshake::parse_caps_blob;
 use vfio_user_wire::handshake::verify_server_version_reply;
 use vfio_user_wire::proto::Command;
 use vfio_user_wire::proto::DeviceInfoPayload;
+use vfio_user_wire::proto::DmaMapPayload;
+use vfio_user_wire::proto::DmaUnmapPayload;
 use vfio_user_wire::proto::Header;
 use vfio_user_wire::proto::IrqInfoPayload;
 use vfio_user_wire::proto::PROTOCOL_MAJOR;
@@ -25,6 +30,7 @@ use vfio_user_wire::proto::RegionAccessPayload;
 use vfio_user_wire::proto::RegionInfoPayload;
 use vfio_user_wire::proto::VersionPayload;
 use vfio_user_wire::proto::decode_payload;
+use vfio_user_wire::proto::dma_unmap_flags;
 use zerocopy::IntoBytes;
 
 /// vfio-user client 连接。持一条同步 `UnixStream` + msg_id 计数器。
@@ -284,6 +290,65 @@ impl VfioUserClient {
         write_message(&mut self.stream, &hdr, &[]).context("send DEVICE_RESET")?;
         let reply = read_message(&mut self.stream).context("recv DEVICE_RESET reply")?;
         Self::expect_reply(&reply, msg_id, Command::DeviceReset)?;
+        Ok(())
+    }
+
+    // ── W3: DMA_MAP / DMA_UNMAP fd-passing 零拷贝 ──
+
+    /// DMA_MAP：把 `fd` 指向的内存（从 `fd_offset` 起 `size` 字节）映射到 IOVA
+    /// `[gpa, gpa+size)`，server mmap 它做零拷贝 DMA。`flags` = READABLE|WRITEABLE
+    /// （`vfio_user_wire::proto::dma_map_flags`）。
+    ///
+    /// fd 经 SCM_RIGHTS 单独传（vfio-user：单 region 单 fd）。reply 是 header-only OK。
+    pub fn dma_map(
+        &mut self,
+        gpa: u64,
+        size: u64,
+        flags: u32,
+        fd: BorrowedFd<'_>,
+        fd_offset: u64,
+    ) -> anyhow::Result<()> {
+        let req = DmaMapPayload {
+            argsz: core::mem::size_of::<DmaMapPayload>() as u32,
+            flags,
+            offset: fd_offset,
+            addr: gpa,
+            size,
+        };
+        let msg_id = self.alloc_msg_id();
+        let hdr = Header::command(
+            msg_id,
+            Command::DmaMap,
+            core::mem::size_of::<DmaMapPayload>() as u32,
+        );
+        write_message_with_fds(&mut self.stream, &hdr, req.as_bytes(), &[fd.as_raw_fd()])
+            .context("send DMA_MAP")?;
+        let reply = read_message(&mut self.stream).context("recv DMA_MAP reply")?;
+        Self::expect_reply(&reply, msg_id, Command::DmaMap)?;
+        Ok(())
+    }
+
+    /// DMA_UNMAP：精确撤销 `[gpa, gpa+size)` 的映射（含其 mmap）。
+    pub fn dma_unmap(&mut self, gpa: u64, size: u64) -> anyhow::Result<()> {
+        let req = DmaUnmapPayload {
+            argsz: core::mem::size_of::<DmaUnmapPayload>() as u32,
+            flags: 0,
+            addr: gpa,
+            size,
+        };
+        let _reply = self.request(Command::DmaUnmap, &req)?;
+        Ok(())
+    }
+
+    /// DMA_UNMAP（UNMAP_ALL flag）：撤销所有映射。
+    pub fn dma_unmap_all(&mut self) -> anyhow::Result<()> {
+        let req = DmaUnmapPayload {
+            argsz: core::mem::size_of::<DmaUnmapPayload>() as u32,
+            flags: dma_unmap_flags::UNMAP_ALL,
+            addr: 0,
+            size: 0,
+        };
+        let _reply = self.request(Command::DmaUnmap, &req)?;
         Ok(())
     }
 }

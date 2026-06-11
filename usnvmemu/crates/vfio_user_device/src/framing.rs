@@ -1,18 +1,25 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! client 端线消息收发（W1：纯 `UnixStream` read/write，无 fd）。
+//! client 端线消息收发。
 //!
-//! 握手不携带 fd，故 W1 用 `Read::read_exact` / `Write::write_all` 即可，无需
-//! recvmsg/SCM_RIGHTS（那是 W3 DMA_MAP fd 传递才需要）。保持本 crate
-//! `#![deny(unsafe_code)]` 干净。
+//! - W1/W2：纯 `UnixStream` read/write（无 fd）——握手 + region wire。
+//! - W3：`write_message_with_fds` 经 SCM_RIGHTS 发 fd（DMA_MAP）——**全 safe nix
+//!   `sendmsg`+`ScmRights`，无 unsafe**（收 fd 才需 `from_raw_fd` unsafe，client 只发
+//!   不收，DMA_MAP reply 无 fd）。保持本 crate `#![deny(unsafe_code)]` 干净。
 //!
 //! 字节布局与 server 端 `vfio_user_transport::framing` 一致（同一份
-//! `vfio_user_wire::proto` 编解码），仅收发原语不同（client connect / 无 fd）。
+//! `vfio_user_wire::proto` 编解码），仅收发原语不同（client connect）。
 
 use anyhow::Context as _;
+use nix::sys::socket::ControlMessage;
+use nix::sys::socket::MsgFlags;
+use nix::sys::socket::sendmsg;
+use std::io::IoSlice;
 use std::io::Read;
 use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::fd::RawFd;
 use std::os::unix::net::UnixStream;
 use vfio_user_wire::framing::WireMessage;
 use vfio_user_wire::proto::HEADER_LEN;
@@ -55,6 +62,48 @@ pub(crate) fn read_message(stream: &mut UnixStream) -> anyhow::Result<WireMessag
     Ok(WireMessage { header, payload })
 }
 
+/// 写一帧（header + payload）并经 SCM_RIGHTS 附带 `fds` 到 stream。
+///
+/// 用 `nix::sendmsg` + `ControlMessage::ScmRights`——**全 safe nix API，无 unsafe**
+/// （收 fd 才需 `OwnedFd::from_raw_fd` unsafe；本函数只发不收）。fd 必须随首字节
+/// 发出（vfio-user spec：所有 fd 跟首字节走），故单次 sendmsg 带 header+payload+cmsg。
+/// short-write 分支照搬 server `vfio_user_transport::framing::write_message`。
+pub(crate) fn write_message_with_fds(
+    stream: &mut UnixStream,
+    header: &Header,
+    payload: &[u8],
+    fds: &[RawFd],
+) -> anyhow::Result<()> {
+    let hdr_bytes = header.as_bytes();
+    let iov = [IoSlice::new(hdr_bytes), IoSlice::new(payload)];
+    let cmsgs: Vec<ControlMessage<'_>> = if fds.is_empty() {
+        Vec::new()
+    } else {
+        vec![ControlMessage::ScmRights(fds)]
+    };
+    // 首次 sendmsg 带 fd；fd 必须与首字节一并传递。
+    let first = sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsgs, MsgFlags::empty(), None)
+        .context("write_message_with_fds: sendmsg")?;
+    if first < hdr_bytes.len() {
+        // header 没写完 — 先补 header 尾，再写 payload。
+        stream
+            .write_all(&hdr_bytes[first..])
+            .context("write header tail after short sendmsg")?;
+        stream
+            .write_all(payload)
+            .context("write full payload after short header sendmsg")?;
+    } else {
+        let pay_off = first - hdr_bytes.len();
+        if pay_off < payload.len() {
+            stream
+                .write_all(&payload[pay_off..])
+                .context("write payload tail after short sendmsg")?;
+        }
+    }
+    stream.flush().context("write_message_with_fds: flush")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +132,21 @@ mod tests {
         let msg_id = got.header.msg_id; // packed 字段先 copy
         assert_eq!(msg_id, 1);
         assert!(got.payload.is_empty());
+    }
+
+    /// W3: write_message_with_fds 发 header+payload+1fd；对端用纯 read_message
+    /// 读回 header+payload（ancillary fd 被纯 read 忽略，字节流不受影响）。fd 真正
+    /// 传达由 loopback_dma 端到端证（server mmap 成功）。
+    #[test]
+    fn write_with_fds_sends_header_and_payload() {
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        let devnull = std::fs::File::open("/dev/null").unwrap();
+        let payload = b"dma-map-payload".to_vec();
+        let hdr = Header::command(3, Command::DmaMap, payload.len() as u32);
+        write_message_with_fds(&mut a, &hdr, &payload, &[devnull.as_raw_fd()]).unwrap();
+        let got = read_message(&mut b).unwrap();
+        let msg_id = got.header.msg_id; // packed 字段先 copy
+        assert_eq!(msg_id, 3);
+        assert_eq!(got.payload, payload);
     }
 }
