@@ -1,0 +1,14 @@
+[package]
+name = "vfio_user_wire"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Sans-IO vfio-user wire protocol (codec, version handshake decisions, region access chunking, PCI config space state machine). Used by vfio_user_transport (server IO) and forthcoming vfio_user_device (underhill client)."
+
+[dependencies]
+# 与 vfio_user_transport/Cargo.toml L10/L14 对齐版本; 不用 workspace.dependencies
+# 因为本 crate 与 vfio_user_transport 一样在 workspace exclude 列表 (workspace =
+# true 仅 member 可用).
+zerocopy = { version = "0.8", features = ["derive"] }
+thiserror = "1.0"
+pcie_device_core = { path = "../pcie_device_core" }

@@ -26,58 +26,14 @@ use crate::framing::write_message;
 use crate::proto::Command;
 use crate::proto::Header;
 use crate::proto::PROTOCOL_MAJOR;
-use crate::proto::PROTOCOL_MINOR;
-use crate::proto::ProtoError;
 use crate::proto::VersionPayload;
 use anyhow::Context as _;
 use anyhow::anyhow;
 use std::os::unix::net::UnixStream;
-use zerocopy::IntoBytes;
+use vfio_user_wire::handshake::build_version_reply_payload;
+use vfio_user_wire::handshake::parse_caps_blob;
 
-/// 本 server 广告的 `max_data_xfer_size`（字节）—— 单条 REGION/DMA 消息能携带的
-/// 最大数据量。
-///
-/// **vfio-spec 语义**：`max_data_xfer_size` 是 **per-receiver** 的——发送方不得
-/// 超过接收方广告的值。`REGION_READ/WRITE` 是 client→server（接收方 = 本 server），
-/// 故服务端用**本常量**作为 REGION 访问 `count` 的上限（不是与 client 协商的 min）。
-/// client 广告的值只对反方向（server→client 的 `DMA_READ/WRITE`）有意义。
-///
-/// 1 MiB = spec 默认，且 ≤ QEMU 64 MiB 上限。必须与 [`SERVER_CAPS_JSON`] 里广告的
-/// 数值一致（`server_caps_advertises_declared_max_xfer` 测试钉死，避免 drift）。
-pub const SERVER_MAX_DATA_XFER_SIZE: usize = 1_048_576;
-
-/// 本 server 默认 advertise 的 capabilities JSON（教学路径写死）。
-///
-/// **review (真 QEMU 11 oracle)** — `max_msg_fds` 须 ≤ 客户端可接受上限。QEMU
-/// v11.0.1 的 `VFIO_USER_MAX_MAX_FDS = 16`，server 广告 > 16 会被判 "malformed
-/// max_msg_fds" 握手失败（此前广告 128 直接挂 QEMU）。广告 8（= QEMU 默认
-/// `VFIO_USER_DEF_MAX_FDS`，对所有 client 安全）；我们 framing 实际能收
-/// [`crate::framing::MAX_MSG_FDS`]，但 NVMe 单 `SET_IRQS` 只需 msix_count(≤4) 个 fd、
-/// `DMA_MAP` 1 个，8 足够。其余 caps 值（max_data_xfer_size 1 MiB ≤ QEMU 64 MiB 上限 /
-/// max_dma_maps 65535 = QEMU 默认 / pgsizes 4096）均在 QEMU 限内。
-pub const SERVER_CAPS_JSON: &str = concat!(
-    "{",
-    "\"capabilities\":{",
-    "\"max_msg_fds\":8,",
-    "\"max_data_xfer_size\":1048576,",
-    "\"max_dma_maps\":65535,",
-    "\"pgsizes\":4096",
-    "}",
-    "}"
-);
-
-/// 握手后协商出的双方 capabilities 摘要（本 server 当前不主动按 client
-/// caps 调整行为，仅记录 + log）。
-#[derive(Debug, Clone)]
-pub struct Negotiated {
-    /// client 上报的 protocol major（与 [`PROTOCOL_MAJOR`] 必须相等）。
-    pub client_major: u16,
-    /// client 上报的 protocol minor。spec 允许 server.minor ≤ client.minor，
-    /// 故教学路径不强校验，仅记录；reply 时回 `min(client, PROTOCOL_MINOR)`。
-    pub client_minor: u16,
-    /// client 发来的原始 caps JSON 字符串（caller 自行 parse / 记录）。
-    pub client_caps_json: String,
-}
+pub use vfio_user_wire::handshake::{Negotiated, SERVER_CAPS_JSON, SERVER_MAX_DATA_XFER_SIZE};
 
 /// Server-side VERSION handshake 一轮：阻塞读 client `Version` cmd → 回 reply。
 ///
@@ -153,19 +109,8 @@ pub fn server_handshake(stream: &mut UnixStream) -> anyhow::Result<Negotiated> {
     // server caps JSON + NUL terminator
     let server_caps = SERVER_CAPS_JSON.as_bytes();
     // payload = VersionPayload(4) + caps_json + NUL byte
-    let payload_len = 4 + server_caps.len() + 1;
-    let mut reply_payload = Vec::with_capacity(payload_len);
-    let ver_reply = VersionPayload {
-        major: PROTOCOL_MAJOR,
-        // **review (真 QEMU 11 oracle)** — 协商 minor = min(client, server)。
-        // vfio-user spec：server reply 的 version 须 **≤** client 提议的；回比 client
-        // 高的 minor 会被 QEMU 判 "incompatible server version" 断开。此前硬编码
-        // PROTOCOL_MINOR(=1)，QEMU 11 提议 minor=0 → 我们回 1 > 0 → 握手失败。
-        minor: client_minor.min(PROTOCOL_MINOR),
-    };
-    reply_payload.extend_from_slice(ver_reply.as_bytes());
-    reply_payload.extend_from_slice(server_caps);
-    reply_payload.push(0); // NUL
+    let reply_payload = build_version_reply_payload(client_minor, server_caps);
+    let payload_len = reply_payload.len();
     let reply_hdr = Header::reply_ok(msg.header.msg_id, Command::Version, payload_len as u32);
     write_message(stream, &reply_hdr, &reply_payload, &[]).context("write VERSION reply")?;
 
@@ -174,15 +119,6 @@ pub fn server_handshake(stream: &mut UnixStream) -> anyhow::Result<Negotiated> {
         client_minor,
         client_caps_json: json_str,
     })
-}
-
-/// 把 VERSION JSON 字节段（可能带 trailing NUL + padding）转 String。
-fn parse_caps_blob(raw: &[u8]) -> Result<String, ProtoError> {
-    // 找首个 NUL；spec 说 NUL-terminated。
-    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-    let s =
-        std::str::from_utf8(&raw[..end]).map_err(|e| ProtoError::BadJson(format!("UTF-8: {e}")))?;
-    Ok(s.to_string())
 }
 
 /// Best-effort 发一个 error reply；任何 IO err 记 warn（caller 已在错误路径，
@@ -205,28 +141,13 @@ mod tests {
     use super::*;
     use crate::proto::Command;
     use crate::proto::Header;
+    use crate::proto::PROTOCOL_MINOR;
     use std::thread;
+    use zerocopy::IntoBytes;
 
     /// 两端 UnixStream — 一端跑 server_handshake，另一端作 client 发 VERSION。
     fn pair() -> (UnixStream, UnixStream) {
         UnixStream::pair().expect("socketpair")
-    }
-
-    /// **drift gate** — `SERVER_MAX_DATA_XFER_SIZE` 常量须与 `SERVER_CAPS_JSON`
-    /// 里广告的数值一致；任一改了忘改另一个，REGION 上限就和广告脱节。
-    #[test]
-    fn server_caps_advertises_declared_max_xfer() {
-        let needle = format!("\"max_data_xfer_size\":{SERVER_MAX_DATA_XFER_SIZE}");
-        assert!(
-            SERVER_CAPS_JSON.contains(&needle),
-            "SERVER_CAPS_JSON 须广告与 SERVER_MAX_DATA_XFER_SIZE 一致的值：{needle}"
-        );
-        // 字段只出现一次（防残留旧值 / 重复键造成子串匹配误判）。
-        assert_eq!(
-            SERVER_CAPS_JSON.matches("max_data_xfer_size").count(),
-            1,
-            "max_data_xfer_size 字段须恰好出现一次"
-        );
     }
 
     fn client_send_version(stream: &mut UnixStream, major: u16, minor: u16, caps_json: &str) {
@@ -263,25 +184,6 @@ mod tests {
         let server_json_end = reply.payload[4..].iter().position(|&b| b == 0).unwrap();
         let server_json = std::str::from_utf8(&reply.payload[4..4 + server_json_end]).unwrap();
         assert!(server_json.contains("max_msg_fds"));
-    }
-
-    /// **review (真 QEMU 11 oracle)** — client 提议 minor < server 时，reply 的
-    /// minor 须回 `min(client, server)`（≤ client）。QEMU 11 提议 minor=0；若 server
-    /// 回硬编码的 minor=1 会被判 "incompatible server version" 断开握手。
-    #[test]
-    fn handshake_replies_min_minor_not_higher_than_client() {
-        let (mut server, mut client) = pair();
-        let handle = thread::spawn(move || server_handshake(&mut server));
-        client_send_version(&mut client, 0, 0, "{\"capabilities\":{}}"); // minor=0 (QEMU 11)
-        let reply = read_message(&mut client).expect("read VERSION reply");
-        let neg = handle.join().unwrap().expect("server handshake ok");
-        assert_eq!(neg.client_minor, 0);
-        let ver: VersionPayload = crate::proto::decode_payload(&reply.payload[..4]).unwrap();
-        let minor = ver.minor;
-        assert_eq!(
-            minor, 0,
-            "server reply minor 须 ≤ client 提议（min(0,1)=0），否则 QEMU 判 incompatible"
-        );
     }
 
     /// **review L-1** — 反方向：client 提议 minor **高于** server，reply 须封顶到

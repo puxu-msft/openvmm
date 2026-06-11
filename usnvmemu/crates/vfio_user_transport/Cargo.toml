@@ -6,6 +6,7 @@ description = "vfio-user (Nutanix libvfio-user 协议) Transport backend for pci
 
 [dependencies]
 pcie_device_core = { path = "../pcie_device_core" }
+vfio_user_wire = { path = "../vfio_user_wire" }
 anyhow = "1.0.102"
 thiserror = "1.0"
 tracing = "0.1.44"

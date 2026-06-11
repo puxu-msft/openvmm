@@ -84,7 +84,7 @@ POC-1 已证它对非-QEMU client 的 fd-passing 零拷贝 DMA 可行。新工�
 
 ## 6. 分期（W0 起）
 
-- **W0**：抽 `vfio_user_wire`（主仓 sans-IO crate；framing 留 server；server 96 测试不破）。
+- **W0**：✅ 完成（2026-06-11，commit b292aad5→5743c235）。
 - **W1**：`vfio_user_device` client wire + AF_UNIX + 握手（loopback 单测）。
 - **W2**：PCIe 呈现（复用 pcie_remote 层）+ REGION_RW。
 - **W3**：DMA_MAP 导出 GuestMemory region fd → firmware 零拷贝（按 POC-1）+ JIT map。

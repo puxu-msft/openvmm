@@ -70,6 +70,7 @@ exclude = [
   "usnvmemu/crates/pcie_device_sdk",
   "usnvmemu/crates/nvme_firmware",
   "usnvmemu/crates/rng_device_example",
+  "usnvmemu/crates/vfio_user_wire",
   "usnvmemu/crates/vfio_user_transport",
   "usnvmemu/crates/nvme_of_tcp_target",
   "docs/superpowers/examples/vmrs_log_scanner",
