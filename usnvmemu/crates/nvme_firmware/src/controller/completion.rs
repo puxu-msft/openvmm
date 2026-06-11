@@ -93,12 +93,11 @@ impl NvmeController {
                     sc::DATA_TRANSFER_ERROR,
                 )
             } else {
-                // **教学边界（reviewer B6b-2 MEDIUM）**：PRCHK（cdw12 bits 28:26，逐项
-                // 控制 Guard/AppTag/RefTag 是否校验）当前**未解析**——本路径一律校验
-                // Guard + RefTag(type 1/2)，与既有 PRACT=1 路径一致。后果是 **over-strict**
-                // （PRCHK=0 的合法 pass-through 会被多拒）而非 under-strict（绝不放过坏 PI），
-                // 对数据完整性是安全方向。AppTag 不校验（PiTuple::verify 设计如此），host
-                // 的 app_tag 原样存盘。真做 PRCHK 逐项门控时在此按 bit 解析。
+                // **PRCHK 逐项门控（spec NVM CS PRINFO bits 28:26）**：`acc.prchk` 在
+                // dispatch 时从 cdw12 解析（Guard@28 / AppTag@27 / RefTag@26），逐块传给
+                // `PiTuple::verify`。PRCHK=0 → driver opt-out 校验 → 一律通过（spec 允许）。
+                // 早期"over-strict 一律校验"的教学边界已移除。AppTag 仍不校验（未接 App Tag
+                // Mask，host app_tag 原样存盘）。
                 //
                 // ── ① verify 全部 N 块（任一失败 → 不落盘，原子）──
                 let mut verify_err: Option<crate::pi::PiCheck> = None;
@@ -106,7 +105,7 @@ impl NvmeController {
                     let data = acc.data_pages[i].as_ref().unwrap();
                     let tuple_arr: [u8; 8] = meta[i * 8..i * 8 + 8].try_into().unwrap();
                     let host_tuple = crate::pi::PiTuple::from_bytes(&tuple_arr);
-                    match host_tuple.verify(data, acc.lba + i as u64, pi_type) {
+                    match host_tuple.verify(data, acc.lba + i as u64, pi_type, acc.prchk) {
                         crate::pi::PiCheck::Ok => {}
                         other => {
                             verify_err = Some(other);

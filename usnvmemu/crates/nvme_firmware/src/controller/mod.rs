@@ -741,6 +741,8 @@ pub(super) struct SepMetaWriteAccum {
     pub(super) data_remaining: u32,
     /// host PI tuple，N×8 字节（MPTR 一条 DMA-read 填）。第 i 个 tuple 在 `meta[i*8..i*8+8]`。
     pub(super) meta: Option<Vec<u8>>,
+    /// PRCHK 逐项校验门控（dispatch 时从 cdw12 PRINFO 解析，finalize 时用）。
+    pub(super) prchk: crate::pi::PrChk,
 }
 
 /// **B6b-3/B6b-4（separate metadata，PRACT=0）** — separate-buffer PI Read 累积器。
@@ -1470,7 +1472,11 @@ pub(super) struct SelfTestCompleted {
 ///   2 = Block Erase
 ///   3 = Overwrite
 ///   4 = Crypto Erase
-/// 我们简化：所有 sanact ≥ 2 触发"擦写"（backing file truncate-then-zero）。
+/// **教学边界（2026-06-11 reviewer 校正）**：本实现是**进度状态机模拟**——跑 tick
+/// 推进 percent_complete、完成时 fire AEN、SES=2(Crypto Erase) bump `crypto_gen` 代际；
+/// **但 backing 数据不真物理擦写**（无 truncate/zero/overwrite）。即 sanitize 命令
+/// driver-观察上"完成"，盘上数据未动。真擦写（SES=1 overwrite / SES=2 真 key 销毁）
+/// 是 out-of-scope（无加密层；见 SPEC_CONFORMANCE.md SANITIZE 行 ⊘）。
 /// 教学时长压缩到 3 秒；真硬件分钟到小时级。
 #[derive(Debug, Clone)]
 pub(super) struct SanitizeState {

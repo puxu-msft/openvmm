@@ -848,7 +848,12 @@ impl NvmeController {
                             )
                         };
                         let stored_tuple = crate::pi::PiTuple::from_bytes(&tuple_bytes);
-                        match stored_tuple.verify(data_part, slba + i as u64, pi_type) {
+                        match stored_tuple.verify(
+                            data_part,
+                            slba + i as u64,
+                            pi_type,
+                            crate::pi::PrChk::from_cdw12(cdw12),
+                        ) {
                             crate::pi::PiCheck::Ok => {}
                             other => {
                                 // **reviewer M-1**：映射具体失败类型（Guard 0x82 / RefTag 0x84 /
@@ -1010,7 +1015,12 @@ impl NvmeController {
                         };
                         let tuple_arr: [u8; 8] = tuple_slice.try_into().unwrap();
                         let pi = crate::pi::PiTuple::from_bytes(&tuple_arr);
-                        let check = pi.verify(data_slice, lba_i, pi_type);
+                        let check = pi.verify(
+                            data_slice,
+                            lba_i,
+                            pi_type,
+                            crate::pi::PrChk::from_cdw12(cdw12),
+                        );
                         if let Some(sc_byte) = check.to_sc() {
                             tracing::warn!(
                                 nsid,
@@ -1185,7 +1195,12 @@ impl NvmeController {
                     };
                     let tuple_arr: [u8; 8] = tuple_slice.try_into().unwrap();
                     let pi = crate::pi::PiTuple::from_bytes(&tuple_arr);
-                    let check = pi.verify(data_slice, slba, pi_type);
+                    let check = pi.verify(
+                        data_slice,
+                        slba,
+                        pi_type,
+                        crate::pi::PrChk::from_cdw12(cdw12),
+                    );
                     if let Some(sc) = check.to_sc() {
                         // PI 校验失败 → 返 Media/Data Integrity SC
                         tracing::warn!(nsid, slba, ?check, "PI READ verify FAIL");
@@ -1482,6 +1497,7 @@ impl NvmeController {
                             data_pages: vec![None; nlb as usize],
                             data_remaining: nlb,
                             meta: None,
+                            prchk: crate::pi::PrChk::from_cdw12(cdw12),
                         },
                     );
                     return None;
@@ -2323,7 +2339,12 @@ impl NvmeController {
                         };
                         let tuple_arr: [u8; 8] = tuple_slice.try_into().unwrap();
                         let pi = crate::pi::PiTuple::from_bytes(&tuple_arr);
-                        let check = pi.verify(data_slice, lba, pi_type);
+                        let check = pi.verify(
+                            data_slice,
+                            lba,
+                            pi_type,
+                            crate::pi::PrChk::from_cdw12(sqe.cdw12),
+                        );
                         if let Some(sc_code) = check.to_sc() {
                             tracing::warn!(nsid, lba, ?check, "Verify PI FAIL");
                             self.stat_num_err_log_entries += 1;

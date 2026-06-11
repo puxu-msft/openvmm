@@ -35,7 +35,10 @@ fn io_sqe(opc: u8, nsid: u32, slba: u64, nlb: u32, prp1: u64, pract: bool, cid: 
     sqe.nsid = nsid;
     sqe.cdw10 = slba as u32;
     sqe.cdw11 = (slba >> 32) as u32;
-    sqe.cdw12 = (nlb - 1) | if pract { 1 << 29 } else { 0 };
+    // PRINFO（bits 29:26）：PRACT@29 + 默认开 PRCHK Guard@28|RefTag@26（模拟请求全校验
+    // 的真 driver），保持既有 PI 测试"校验生效"语义。PRCHK=0（opt-out）路径由专门测试
+    // 手构 cdw12 覆盖。AppTag@27 不开（本实现未接 App Tag Mask）。
+    sqe.cdw12 = (nlb - 1) | if pract { 1 << 29 } else { 0 } | (1 << 28) | (1 << 26);
     sqe.prp1 = prp1;
     sqe
 }
@@ -1612,6 +1615,83 @@ fn b6b_separate_meta_read_multi() {
     // host（0x6000 出现 DmaWrite）→ "不回送 host"断言转红。已实测转红，恢复后绿。
 }
 
+/// **PRCHK 逐项门控 dispatch 接线（spec NVM CS PRINFO bits 28:26）差分 oracle** — 证明
+/// dispatch 真把 cdw12 的 PRCHK 解析并传给 verify（而非硬编码 all()）：separate NS READ，
+/// 盘上 PI guard 损坏，但命令 **PRCHK=0**（PRINFO 全 0）→ controller 不校验 → 照常把
+/// （损坏的）data 回送 host + success，**不**报 Media 错误。
+///
+/// 独立 oracle：对照 b6b_separate_meta_read 负例（io_sqe 默认 PRCHK guard|reftag → 报错），
+/// 此处手构 cdw12 PRCHK=0 → 不报错，差异**仅**来自 PRCHK 位。
+/// revert-verify：把 io.rs B6b READ 的 `PrChk::from_cdw12(cdw12)` 改成 `PrChk::all()` →
+/// PRCHK=0 不再被尊重 → 损坏 guard 被抓 → 本测试期望的 success 转成 Media 错误 → 红。
+#[test]
+fn prchk_zero_dispatch_skips_verify() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    let mut c = make_ctrl_with_tmp("prchk0_seprd");
+    {
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+        ns.pi_first = true;
+        ns.meta_inline = false;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / ns.block_bytes();
+    }
+    c.cqs.insert(
+        1,
+        crate::regs::CompletionQueue {
+            base_gpa: 0x1_0000,
+            size: 64,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        },
+    );
+    let data: Vec<u8> = (0..4096).map(|i| (i & 0xff) as u8).collect();
+    let mut bad_tuple = crate::pi::PiTuple::compute(&data, 0, 1).to_bytes();
+    bad_tuple[0] ^= 0xff; // 盘上 guard 损坏
+    {
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        let mut block = vec![0u8; 4104];
+        block[0..8].copy_from_slice(&bad_tuple);
+        block[8..4104].copy_from_slice(&data);
+        ns.write_at(&block, 0).unwrap();
+    }
+    let mut cap = CaptureTransport::with_start_token(0x100);
+    let r = {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        // 手构 READ sqe：PRACT=0 + PRCHK=0（cdw12 PRINFO 全 0，区别于 io_sqe 默认）。
+        let zero = [0u8; 64];
+        let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+        sqe.cdw0 = 0x02 | (0x66u32 << 16); // READ, cid=0x66
+        sqe.nsid = 1;
+        sqe.cdw12 = 0; // nlb_z=0 (1 LBA) + PRINFO=0（PRACT=0, PRCHK=0）
+        sqe.prp1 = 0x4000;
+        sqe.mptr = 0x5000;
+        c.dispatch_io(&mut ctx, 1, sqe, 0x66, 0, 1)
+    };
+    // PRCHK=0 → 不校验 → 走异步 DMA-write 回送路径（返 None），非同步 Media 错误。
+    assert!(
+        r.is_none(),
+        "PRCHK=0：盘上坏 PI 不应被校验，应照常异步回送（非同步错误 CQE）"
+    );
+    // 独立 oracle：损坏 PI 的 data 仍被 DMA-write 回 host PRP1（controller 未拦截）。
+    let prp1_write = cap.events().iter().find_map(|e| match e {
+        TransportEvent::DmaWrite { gpa, data, .. } if *gpa == 0x4000 => Some(data.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        prp1_write.as_deref(),
+        Some(&data[..]),
+        "PRCHK=0：坏 PI 的 data 照常回送 host（未被校验拦截）"
+    );
+}
+
 /// **C1① MDTS 计入 inline metadata（spec § 5.17.2.2 / § 8.x）差分 oracle** —
 /// extended-LBA（内联 metadata）的 host 传输大小 = block_bytes(data+meta)，MDTS
 /// 须计入 metadata。PI 格式 4104 B/LBA，MDTS=128 KiB：
@@ -2033,7 +2113,10 @@ fn pi_write_read_round_trip() {
     let tuple_arr: [u8; 8] = read_block[0..8].try_into().unwrap();
     let pi = crate::pi::PiTuple::from_bytes(&tuple_arr);
     let data_slice = &read_block[8..4104];
-    assert_eq!(pi.verify(data_slice, lba, 1), crate::pi::PiCheck::Ok);
+    assert_eq!(
+        pi.verify(data_slice, lba, 1, crate::pi::PrChk::all()),
+        crate::pi::PiCheck::Ok
+    );
     assert_eq!(data_slice, &data[..]);
 
     // 篡改 1 byte → guard fail
@@ -2042,7 +2125,7 @@ fn pi_write_read_round_trip() {
     let bad_pi = crate::pi::PiTuple::from_bytes(&bad[0..8].try_into().unwrap());
     let bad_data = &bad[8..4104];
     assert_eq!(
-        bad_pi.verify(bad_data, lba, 1),
+        bad_pi.verify(bad_data, lba, 1, crate::pi::PrChk::all()),
         crate::pi::PiCheck::GuardFail
     );
 }
@@ -3247,7 +3330,7 @@ fn k4c_multi_lba_pi_layout_round_trip() {
         let tuple_arr: [u8; 8] = blk[4096..4104].try_into().unwrap();
         let tuple = PiTuple::from_bytes(&tuple_arr);
         assert_eq!(
-            tuple.verify(data, i as u64, 1),
+            tuple.verify(data, i as u64, 1, crate::pi::PrChk::all()),
             crate::pi::PiCheck::Ok,
             "K4c per-LBA PI verify passes for lba={i}"
         );
@@ -3261,7 +3344,10 @@ fn k4c_multi_lba_pi_layout_round_trip() {
     let data = &blk[..4096];
     let tuple_arr: [u8; 8] = blk[4096..4104].try_into().unwrap();
     let tuple = PiTuple::from_bytes(&tuple_arr);
-    assert_eq!(tuple.verify(data, 2, 1), crate::pi::PiCheck::GuardFail);
+    assert_eq!(
+        tuple.verify(data, 2, 1, crate::pi::PrChk::all()),
+        crate::pi::PiCheck::GuardFail
+    );
 }
 
 /// **Phase O2** — Sqe::fuse() 解析 cdw0 bits 9:8。
@@ -5056,7 +5142,10 @@ proptest! {
         pi_type in 1u8..=3,
     ) {
         let tuple = crate::pi::PiTuple::compute(&data, lba, pi_type);
-        prop_assert!(matches!(tuple.verify(&data, lba, pi_type), crate::pi::PiCheck::Ok));
+        prop_assert!(matches!(
+            tuple.verify(&data, lba, pi_type, crate::pi::PrChk::all()),
+            crate::pi::PiCheck::Ok
+        ));
     }
 }
 
