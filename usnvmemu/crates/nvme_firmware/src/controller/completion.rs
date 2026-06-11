@@ -1757,49 +1757,72 @@ impl NvmeController {
                     }
                 }
                 PendingOp::NvmReadPrpListFetch { op_id } => {
-                    // PRP list 页到达 (Read 路径)。Parse + dma_write 已 cached
-                    // 的 per-page data 到 PRP1 + list 中每个 GPA。
-                    //
-                    // **C3 修复后**：dispatch_io 已按页切分 data_pages，这里
-                    // 不再 re-read file，直接 take 每页 buffer dma_write。
+                    // PRP list 页到达 (device→host：Read / Get Log Page / Zone+Reservation
+                    // Report)。**C1② PRP-list chaining**：列表可能跨多页——非末页的末位
+                    // entry 是指向下一 list 页的 **chain pointer**（spec § 4.1.2）。本臂做
+                    // walk：累积 data-page GPA 到 `list_entries`，遇 chain 就再 DMA-read 下一
+                    // list 页（重入本臂）；walk 集齐 (total_pages-1) 个 data GPA 后再 scatter。
                     let entries = parse_prp_list(&data);
-                    // 提取 op 关键字段 + take 全部页 buffer
-                    type ReadPrpListFetchInfo = (u32, u64, Vec<u64>, Vec<Vec<u8>>);
-                    let info: Option<ReadPrpListFetchInfo> =
-                        self.prp_list_ops.get_mut(&op_id).map(|op| {
-                            // M2 修复：parse_prp_list 现在不再 0 终止；用
-                            // total_pages-1 精确截 list 长度。
-                            // **P2 注（2026-06-10）**：单 list 页恰好装满（total_pages=513，
-                            // 512 entry）时全部 entry 当数据、**不**留末位作 chain pointer——
-                            // 已对 NVMe spec + 真 OpenVMM host driver `make_prp`（密集写满、
-                            // 不留 chain slot）双验 byte-compat。未来若加 list chaining，须在
-                            // 此区分"满页=继续链"。caller 已把 > 513 页挡在 dma_write_then_complete。
-                            let take = (op.total_pages - 1) as usize;
-                            let list: Vec<u64> = entries.into_iter().take(take).collect();
-                            // Take 全部页（含 PRP1 = idx 0）；data_pages 移空
-                            let pages: Vec<Vec<u8>> = op
-                                .data_pages
-                                .iter_mut()
-                                .map(|p| p.take().unwrap_or_default())
-                                .collect();
-                            (op.total_pages, op.prp1_gpa, list, pages)
-                        });
-                    let Some((total_pages, prp1_gpa, list, pages)) = info else {
-                        tracing::warn!(op_id, "ReadPrpListFetch unknown op_id");
-                        return;
+                    let entries_per_page = (NVME_PAGE_SIZE / 8) as usize; // 512
+                    let chain_ptr: Option<u64> = {
+                        let Some(op) = self.prp_list_ops.get_mut(&op_id) else {
+                            tracing::warn!(op_id, "ReadPrpListFetch unknown op_id");
+                            return;
+                        };
+                        let needed = (op.total_pages - 1) as usize; // data-page GPA 总数
+                        let acc = op.list_entries.get_or_insert_with(Vec::new);
+                        let remaining = needed - acc.len();
+                        // **panic-free（reviewer MEDIUM-1）**：截断的 DMA read 可能让
+                        // `entries.len()` < 预期，用 iter().take() 而非切片下标，避免越界 panic。
+                        if remaining > entries_per_page {
+                            // 满页 chained：前 (entries_per_page-1) 个是 data，末位是 chain。
+                            let n_data = entries_per_page - 1;
+                            acc.extend(entries.iter().take(n_data).copied());
+                            // 末位 chain pointer；若页被截断（短读）→ 无 chain，按最终页收尾。
+                            entries.get(entries_per_page - 1).copied()
+                        } else {
+                            // 最终 list 页：前 `remaining` 个全是 data，无 chain。
+                            acc.extend(entries.iter().take(remaining).copied());
+                            None
+                        }
                     };
-                    if let Some(op) = self.prp_list_ops.get_mut(&op_id) {
-                        op.list_entries = Some(list.clone());
-                    }
                     let (sq_id, cid, sq_head, cq_id, nsid) = {
                         let op = &self.prp_list_ops[&op_id];
                         (op.sq_id, op.cid, op.sq_head, op.cq_id, op.nsid)
                     };
-                    // 不变量校验：list.len() + 1 (PRP1) == total_pages
+                    if let Some(next_list_gpa) = chain_ptr {
+                        // 继续 walk：DMA-read 下一 list 页（重入 NvmReadPrpListFetch）。
+                        let tok = ctx.dma_read(next_list_gpa, NVME_PAGE_SIZE as u32);
+                        self.pending_ios.insert(
+                            tok,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmReadPrpListFetch { op_id },
+                            },
+                        );
+                        return;
+                    }
+                    // walk 完成 → scatter。take 全部页 buffer + list_entries。
+                    let (total_pages, prp1_gpa, list, pages) = {
+                        // op present：本调用上方 1768 行已确认、且本（非 chain）路径未移除。
+                        let op = self.prp_list_ops.get_mut(&op_id).unwrap();
+                        let list = op.list_entries.clone().unwrap_or_default();
+                        let pages: Vec<Vec<u8>> = op
+                            .data_pages
+                            .iter_mut()
+                            .map(|p| p.take().unwrap_or_default())
+                            .collect();
+                        (op.total_pages, op.prp1_gpa, list, pages)
+                    };
+                    // 不变量：list.len() + 1 (PRP1) == total_pages（chaining 后仍成立）。
                     debug_assert_eq!(
                         list.len() as u32 + 1,
                         total_pages,
-                        "PRP list size != total_pages-1"
+                        "PRP list (chained) size != total_pages-1"
                     );
                     // **Step 2a**: dma_write PRP1 数据（page idx 0）
                     let mut pages_iter = pages.into_iter();

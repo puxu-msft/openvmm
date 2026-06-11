@@ -1235,6 +1235,104 @@ fn pi_write_multi_lba_round_trip_under_mdts() {
     );
 }
 
+/// **C1② PRP-list chaining（device→host，spec § 4.1.2）差分 oracle** — >2 MiB
+/// device→host 传输（600 页 = 2.4 MiB）的 PRP list 跨 2 张 list 页：非末页末位
+/// entry 是 chain pointer 指向下一 list 页。`dma_write_then_complete` +
+/// `NvmReadPrpListFetch` 跟链 walk 集齐全部 data-page GPA 后 scatter。
+///
+/// 独立 oracle：从 capture 的 DmaWrite 重建 gpa→data，按 per-page distinct byte
+/// 校验每页散射到正确 GPA（mis-scatter / 漏页 / chain 跟错都现形）。revert-verify：
+/// 把"满页取 511+chain"改回"取 512 无 chain" → list page 1 永不 fetch → 漏页红。
+#[test]
+fn prp_list_chaining_device_to_host() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    const PAGE: u64 = crate::regs::NVME_PAGE_SIZE;
+    const TOTAL_PAGES: usize = 600; // 2.4 MiB > 单 list 页(513 页 ~2 MiB)
+    const PRP1: u64 = 0x10_0000;
+    const LIST0: u64 = 0x1000;
+    const LIST1: u64 = 0x2000;
+    const DATA_BASE: u64 = 0x20_0000;
+    let entries_per_page = (PAGE / 8) as usize; // 512
+    let page_gpa = |i: usize| DATA_BASE + (i as u64) * PAGE; // page i(≥1) 的目标 GPA
+
+    let mut c = make_ctrl_with_tmp("prp_chain");
+    c.cqs.insert(
+        1,
+        crate::regs::CompletionQueue {
+            base_gpa: 0x1_0000,
+            size: 64,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        },
+    );
+    let mut cap = CaptureTransport::with_start_token(0x100);
+
+    // distinct per-page 数据：page i 全填 (i & 0xff)。
+    let mut data = vec![0u8; TOTAL_PAGES * PAGE as usize];
+    for i in 0..TOTAL_PAGES {
+        data[i * PAGE as usize..(i + 1) * PAGE as usize].fill((i & 0xff) as u8);
+    }
+    // list page 0：entries[0..511] = page 1..511 的 GPA；entries[511] = chain → LIST1。
+    let mut list0 = vec![0u8; PAGE as usize];
+    for k in 0..(entries_per_page - 1) {
+        list0[k * 8..k * 8 + 8].copy_from_slice(&page_gpa(k + 1).to_le_bytes());
+    }
+    let last = entries_per_page - 1;
+    list0[last * 8..last * 8 + 8].copy_from_slice(&LIST1.to_le_bytes());
+    // list page 1：entries[0..88] = page 512..599 的 GPA（599 - 511 = 88）。
+    let n_list1 = (TOTAL_PAGES - 1) - (entries_per_page - 1);
+    let mut list1 = vec![0u8; PAGE as usize];
+    for k in 0..n_list1 {
+        list1[k * 8..k * 8 + 8].copy_from_slice(&page_gpa(entries_per_page + k).to_le_bytes());
+    }
+
+    // 驱 chaining：feed list page 0 → 触发 list page 1 fetch → feed it → scatter。
+    {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        c.dma_write_then_complete(&mut ctx, PRP1, LIST0, data, 0x70, 1, 0, 1);
+        let tok_a = *c.pending_ios.keys().next().expect("应有 list page 0 fetch");
+        c.on_dma_complete_impl(&mut ctx, tok_a, true, list0);
+        let tok_b = *c
+            .pending_ios
+            .keys()
+            .next()
+            .expect("chaining 应触发 list page 1 fetch");
+        c.on_dma_complete_impl(&mut ctx, tok_b, true, list1);
+    }
+
+    // 重建 gpa→data（scatter 的 DmaWrite 已在 cap.events）。
+    let mut writes: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+    for e in cap.events() {
+        if let TransportEvent::DmaWrite { gpa, data, .. } = e
+            && (*gpa == PRP1 || (*gpa >= DATA_BASE && *gpa < DATA_BASE + TOTAL_PAGES as u64 * PAGE))
+        {
+            writes.insert(*gpa, data.clone());
+        }
+    }
+    // page 0 → PRP1，全 0。
+    assert_eq!(
+        writes.get(&PRP1).map(|d| (d.len(), d[0])),
+        Some((PAGE as usize, 0u8)),
+        "page0 → PRP1（全 0）"
+    );
+    // page i (1..600) → page_gpa(i)，全 (i & 0xff)。
+    for i in 1..TOTAL_PAGES {
+        let g = page_gpa(i);
+        let w = writes
+            .get(&g)
+            .unwrap_or_else(|| panic!("page {i} 未散射到 {g:#x}（chaining 漏页？）"));
+        assert!(
+            w.len() == PAGE as usize && w.iter().all(|&b| b == (i & 0xff) as u8),
+            "page {i} 数据错（mis-scatter / chain 跟错）"
+        );
+    }
+}
+
 ///
 /// 单 LBA 4 KiB data + 8 byte T10 DIF tuple inline。verify 必须通过。
 #[test]

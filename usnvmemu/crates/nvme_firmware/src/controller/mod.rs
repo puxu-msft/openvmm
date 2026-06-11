@@ -3236,32 +3236,18 @@ impl NvmeController {
             // → 完成 arm parse list + 逐页 DMA-write（page0→PRP1，page1..→list entry）→ 全
             // 到齐 post CQE。
             //
-            // **容量上限**：单 PRP list 页装 `NVME_PAGE_SIZE/8 = 512` 个 entry → 最多 512
-            // 数据页 + PRP1 = 513 页（~2 MiB）。再大需 list **chaining**（末 entry 指下一
-            // list 页），未实现 → 回退连续写 PRP1（= status quo，不比 P1 前更坏）。caller
-            // 侧 Get Log Page 已把请求卡在 2 MiB 内；只有越界的 Zone/Reservation Report 命中。
+            // **容量**：单 PRP list 页装 `NVME_PAGE_SIZE/8 = 512` 个 entry → 513 数据页
+            // （~2 MiB）。**C1② chaining**：超过时 NvmReadPrpListFetch 跟随 chain pointer
+            // 跨多 list 页 walk（完成路径处理），dispatch 侧只需把 buf 按页切好入 op、
+            // DMA-read 第一张 list 页。data buffer 已由 caller 按需分配（无 OOM 风险）。
+            //
+            // **激活条件（forward scaffolding，§30）**：chaining 在此 device→host 活路径上
+            // **已就绪**，但只有当 payload 真 > 2 MiB（>513 页）时才触发。当前所有 caller
+            // 都把 payload 卡在 ≤ 2 MiB（Get Log Page admin / Zone+Reservation Report io，
+            // 防御性策略；IO Read 受 MDTS=128 KiB 限），故生产路径暂不触发——单测
+            // `prp_list_chaining_device_to_host` 直驱本函数验证。届时抬高 MDTS（IO Read
+            // >2 MiB）或放开 report cap 即自动启用，无需改本机件。
             let total_pages = data.len().div_ceil(NVME_PAGE_SIZE as usize) as u32;
-            let entries_per_list_page = (NVME_PAGE_SIZE / 8) as u32; // 512
-            if total_pages > entries_per_list_page + 1 {
-                tracing::debug!(
-                    bytes = data.len(),
-                    total_pages,
-                    "data > 单 PRP list 页容量(513)：list chaining 未实现，回退连续写 PRP1"
-                );
-                let tok = ctx.dma_write(prp1, data);
-                self.pending_ios.insert(
-                    tok,
-                    PendingIo {
-                        sq_id,
-                        cid,
-                        sq_head,
-                        cq_id,
-                        nsid: 0,
-                        op: PendingOp::NvmReadDmaWrite { num_blocks: 0 },
-                    },
-                );
-                return;
-            }
             // 按页切 buf（page0 = PRP1 数据，page1.. = list entry 数据）。
             let mut data_pages: Vec<Option<Vec<u8>>> = Vec::with_capacity(total_pages as usize);
             for i in 0..total_pages as usize {
