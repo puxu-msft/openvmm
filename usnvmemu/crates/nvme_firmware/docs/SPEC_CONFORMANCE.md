@@ -40,7 +40,7 @@
 | ASYNC_EVENT_REQUEST (0x0c) | ✅ | AER 队列 + AEN 注入 | §5.2 | admin.rs ASYNC_EVENT_REQUEST |
 | GET_LOG_PAGE (0x02) | ◐ | 上限 2 MiB（>2 MiB chaining 机制已在 device→host 路径就绪但 caller cap 未放开；真 log 都 <2 MiB）| §5.16 | admin.rs GET_LOG_PAGE |
 | ABORT (0x08) | ✅ [F] | 真定位 in-flight 命令并中止 + dw0 报真结果（A1；多-DMA 完整清理）| §5.1 | admin.rs ABORT |
-| FORMAT_NVM (0x80) | ✅ [F] | LBAF 0/1/2 + PI Type 0/1 + MSET 极性(B6a) + 接受 separate(B6b-1) | §5.14 | admin.rs FORMAT_NVM |
+| FORMAT_NVM (0x80) | ✅ [F] | LBAF 0/1/2 + PI Type 0/1 + MSET 极性(B6a) + 接受 separate(B6b-1) + 清 not_ready→ready(item-1[Q]) | §5.14 | admin.rs FORMAT_NVM |
 | FW_COMMIT (0x10) | ✅ | firmware slot commit | §5.12 | admin.rs FW_COMMIT |
 | FW_IMAGE_DOWNLOAD (0x11) | ✅ | chunk download（64 MiB defense cap）| §5.13 | admin.rs FW_IMAGE_DOWNLOAD |
 | DEVICE_SELF_TEST (0x14) | ✅ | short/extended，tick 推进 | §5.8 | admin.rs DEVICE_SELF_TEST |
@@ -89,9 +89,10 @@
 | **PRP** 单/双/单-list | ✅ | ≤513 页(~2 MiB) | io.rs + mod.rs PrpListOp |
 | **PRP-list chaining(>2 MiB) device→host** | ✅ [F] | 机制就绪(C1②)；**生产路径激活待 MDTS 抬高 / report cap 放开**(forward scaffolding §30) | completion.rs NvmReadPrpListFetch |
 | PRP-list chaining host→device(write) | ⏸ [F] | 不可达(MDTS=128KiB 锁死)，按 §30 不投机实现 | — |
-| **SGL** (PSDT=10) | ✅ [Q] | segment chain + Bit Bucket（R2d）；**sub_type 仅 Address**◐（CMB sub_type→正确 SC 拒，非支持 CMB）；SGL×PI ✗ | src/sgl.rs + io.rs SGL 路径 |
+| **SGL** (PSDT=10) | ✅ [Q] | segment chain + Bit Bucket（R2d）；**sub_type 仅 Address**◐（CMB sub_type=1→`SGL_INVALID_USE_OF_CMB`(0x12)，**3 路径经共享 `subtype_to_sc` 一致**，item-0，非支持 CMB）；SGL×PI ✗ | src/sgl.rs + io.rs SGL 路径 |
 | **MDTS** 强制 | ✅ [F] | 全数据命令；计入 inline metadata(C1①)；值=5(128 KiB) | src/regs.rs MDTS_MAX_BYTES + io.rs |
-| **Fused** Compare&Write | ✅ | 原子 | io.rs/completion.rs fused |
+| **Fused** Compare&Write | ✅ | 原子；**>1page(超原子能力)→ATOMIC_WRITE_UNIT_EXCEEDED(0x14)**（item-2[Q]，共享 `fused_cw_reject_sc`，本地+fabric 一致）| io.rs/completion.rs fused + mod.rs fused_cw_reject_sc |
+| **NS-not-ready 门** (0x82) | ✅ [Q] | not_ready NS 的 IO + fused C&W→NAMESPACE_NOT_READY；`--not-ready-nsid` 触发、Format 转 ready、Identify CNS 0x08 NSTAT.NRDY 跟随（item-1）| io.rs/mod.rs not_ready 门 + admin.rs NSTAT |
 | **DBBUF** shadow doorbell | ✅ | DMA-poll + event_idx + 自续深度 cap | mod.rs shadow poll |
 | **persistent features**(Save) | ✅ [F] | 跨 reset 回灌(含 mirror-backed live 字段)（D）| enable.rs + admin.rs |
 | **CSTS.CFS** on shutdown-flush 失败 | ✅ [F] | spec § 3.1.4.5（D）| enable.rs process_shutdown |
@@ -108,7 +109,10 @@
 | B6b-4 多 LBA separate metadata | ⏸ | 下一步；设计见 `plans/2026-06-11-b6b4-and-resume-plan.md` | [F] |
 | PRP-list chaining 真激活 | ⏸ | 抬 MDTS 让 IO Read >2 MiB（注意 nvme-of transport nlb cap 独立）| [F] |
 | inline NS PRACT=0 / PRCHK 门控 | ⏸ | host-PI 另一路径 / 按 bit 解析 | [F] |
-| NS-not-ready / AWUN / boot-partition / CMB-SC | ⏸ | spec-complete scaffolding 已锚 sc 常量；对应特性落地时 emit。见 `plans/2026-06-11-scaffolding-sc-spec-completeness.md` | [Q] |
+| CMB-SGL SC 一致 (0x12) | ✅ | item-0：`sgl.rs` 共享 `subtype_to_sc`，3 路径统一 emit（`fe30b715`）| [Q] |
+| NS-not-ready (0x82) | ✅ | item-1：per-NS `not_ready` + `--not-ready-nsid` 触发 + IO/fused 门 + Format-readiness + NSTAT.NRDY 跟随（`488ffaa8`）| [Q] |
+| AWUN (0x14) | ✅ | item-2：fused C&W >1page(超原子能力)→ATOMIC_WRITE_UNIT_EXCEEDED；普通 Write>AWUN 不 reject（spec：仅不保证原子）（`5b8dafa1`）| [Q] |
+| boot-partition (0x11e) | ⏸ | item-3：大特性，独立 plan `plans/2026-06-11-boot-partition-feature.md`；仍 anchored-only（BPSZ=0 stub，未 emit）| [Q] |
 | Reservation Report EDS=1(64-byte HOSTID) + ptpls@19 | ◐→⏸ | 多 host HOSTID 扩展 + builder 补字段 | [F] |
 | Security(TCG OPAL) / Virtualization(SR-IOV) | ✗ | 偏离教学核心，真实现工程量大；诚实 INVALID_FIELD 优于半吊子 | — |
 | Write Uncorrectable | ✗ | backing 无 ECC 概念 | — |
