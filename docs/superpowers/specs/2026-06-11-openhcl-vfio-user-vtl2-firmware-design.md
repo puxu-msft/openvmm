@@ -103,7 +103,11 @@ POC-1 已证它对非-QEMU client 的 fd-passing 零拷贝 DMA 可行。新工�
     + reconnect + 降权全需改 underhill_core，standalone 测不了，本就"W5b 起依赖 W6"）。承接 §11
     外部控制面。`livedump.rs` 的 `Command::new("underhill-crash")` 是先例。
   - **W5c (生产期)**：⏸ 远期。IGVM initrd 出厂自带（签名链）/ A-B image 包管理；更新走 VM 重启。
-- **W6**：underhill_core 接入 + reconnect（firmware 重启重映射/重 SET_IRQS；W5b 起依赖此）。
+- **W6**：underhill_core 接入 + reconnect（firmware 重启重映射/重 SET_IRQS；W5b 起依赖此）。**拆子阶段（explore 2026-06-12 定，不能一次性大爆炸）**：
+  - **W6a**：✅ client async 化（commit `571ad805`）。照搬 `vhost_user_protocol::socket` 混合范式：pal_async `PolledSocket` 管 readiness + 裸 libc `sendmsg`/`recvmsg`+`cmsghdr` 管 SCM_RIGHTS。unsafe 隔离到新 `async_socket.rs` 单模块（其余 deny）；framing 统一 `write_message(fds slice)`；client 全 `async fn`；nix 降 dev-dep。lib 7 + loopback 4 测 standalone PASS（async client ↔ sync server thread），clippy 0，transport/nvme_of 不退化，harness host+musl 构建过。**承重假设 POC 验证**：exclude crate path-dep pal_async 能 standalone 构建。**唯一 standalone 可测，是 W6b/c/d 前置**。用户拍板：用成熟高性能库 + 容许 unsafe（弃"不惜代价保 deny"）。
+  - **W6b**：⏸ underhill ChipsetDevice 骨架（新 crate 实现 `ChipsetDevice+PciConfigSpace+MmioIntercept`，用上游 pci_core `ConfigSpaceType0Emulator`/`MsixEmulator`/`DeviceBars`，照抄 `pcie_remote_device` resolver/worker pattern；MMIO 走 defer+worker 不可阻塞 chipset 线程）→ guest 枚举到 PCIe NVMe。**必须 IGVM 重建 + 真 VM**（第一个真机里程碑）。
+  - **W6c**：⏸ `Interrupt::deliver`（eventfd-wait task → `interrupts[i].deliver()` 注入 VTL0；pci_core+vmcore::interrupt 已封装，`EventProxy` 同构范本）。必须 IGVM+真 VM。
+  - **W6d**：⏸ reconnect supervisor + 降权（firmware 重启重 dma_map+重 set_irqs；§11 usnvmemu-ioctl reconnect）。必须 IGVM+真 VM。
 - **W7**：真 Hyper-V OpenHCL VM e2e（guest fio/4K IO；对照 host backing 独立 oracle）。
 
 ## 7. 测试

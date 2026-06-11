@@ -51,3 +51,15 @@ fw.log 关键证据（零拷贝命中真 guest RAM，wire 上无 server-initiate
 
 **结论**：firmware-in-VTL2（topology A）+ vfio_user_device 客户端 API（W1-W4）+ DMA_MAP
 真 guest RAM 零拷贝（W3 + 本 Stage 0 字符设备修复）在真 OpenHCL VM 首次端到端汇合。
+
+## W6a async 迁移注记（2026-06-12）
+
+`vfio_user_device` client 在 W6a 迁到 async（pal_async PolledSocket + SCM_RIGHTS）。本
+harness client 已同步更新为 async（`DefaultPool::run_with` 包裹 + `.await`），**host 与
+x86_64-unknown-linux-musl 静态构建均通过**（pal_async 在 musl 上 build clean）。
+
+**但上面记录的真机 e2e PASS 结果是 W5a（commit `6a633c4b`，pre-async）的**；async 版
+harness 仅验证了编译（host + musl），真 VM re-verify 随 W6b 真 underhill 集成一并重跑
+（W6b 会以 pcie_remote 风格 async worker 驱动 client，是更有代表性的真机验证点）。wire
+行为与 pre-async 一致（同 `vfio_user_wire` 编解码 + 同 SCM_RIGHTS 字节），async 只改收发
+调度，不改协议字节。

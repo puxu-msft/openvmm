@@ -7,9 +7,12 @@
 //!
 //! 注：`Interrupt::deliver`（注入 VTL0 guest）推迟 W6（需 underhill partition，
 //! 非 standalone）。本测只验"中断写到 client eventfd"半段。
+//!
+//! W6a：client 改 async；client 段包进 `DefaultPool::run_with`，server 半段仍同步。
 
 use nix::sys::eventfd::EfdFlags;
 use nix::sys::eventfd::EventFd;
+use pal_async::DefaultPool;
 use pcie_device_core::BarKind;
 use pcie_device_core::BarLayout;
 use pcie_device_core::DeviceCtx;
@@ -85,22 +88,32 @@ fn loopback_msix_fire_signals_eventfd() {
     let (server_end, client_end) = UnixStream::pair().unwrap();
     let server = spawn_server(server_end);
 
-    let mut client = VfioUserClient::from_stream(client_end);
-    client.handshake().expect("handshake");
+    DefaultPool::run_with(async |driver| {
+        let mut client =
+            VfioUserClient::from_stream(&driver, client_end).expect("wrap client stream");
+        client.handshake().await.expect("handshake");
 
-    // 1. SET_IRQS 配下 4 个 eventfd 给 MSI-X 向量 [0,4)。
-    client
-        .set_irqs(pci_irq::MSIX, 0, &borrowed)
-        .expect("set_irqs assign");
+        // 1. SET_IRQS 配下 4 个 eventfd 给 MSI-X 向量 [0,4)。
+        client
+            .set_irqs(pci_irq::MSIX, 0, &borrowed)
+            .await
+            .expect("set_irqs assign");
 
-    // 2. doorbell：BAR0 REGION_WRITE @ DOORBELL → server device ctx.fire_interrupt(FIRE_VEC)
-    //    → server 写 client eventfd[FIRE_VEC]。fire 在 mmio_write 内（reply 前同步），
-    //    故收到 region_write reply 时 eventfd 已 signaled。
-    client
-        .region_write(0, DOORBELL, &1u32.to_le_bytes())
-        .expect("doorbell region_write");
+        // 2. doorbell：BAR0 REGION_WRITE @ DOORBELL → server device ctx.fire_interrupt(FIRE_VEC)
+        //    → server 写 client eventfd[FIRE_VEC]。fire 在 mmio_write 内（reply 前同步），
+        //    故收到 region_write reply 时 eventfd 已 signaled。
+        client
+            .region_write(0, DOORBELL, &1u32.to_le_bytes())
+            .await
+            .expect("doorbell region_write");
 
-    // 3. 验 fire 的向量 eventfd 计数 == 1（中断送达）。
+        drop(client);
+    });
+
+    server.join().unwrap().expect("server loop");
+
+    // 3. 验 fire 的向量 eventfd 计数 == 1（中断送达；fire 在 server 处理 doorbell 时
+    //    同步发生，计数持久，join 后读取无误）。
     let mut buf = [0u8; 8];
     nix::unistd::read(&efds[FIRE_VEC as usize], &mut buf).expect("read fired eventfd");
     assert_eq!(u64::from_ne_bytes(buf), 1, "fire 的向量 eventfd 计数应 ==1");
@@ -125,7 +138,4 @@ fn loopback_msix_fire_signals_eventfd() {
             "向量 {i} 不应被触发（应 EAGAIN），got {r:?}"
         );
     }
-
-    drop(client);
-    server.join().unwrap().expect("server loop");
 }

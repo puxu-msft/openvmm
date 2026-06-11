@@ -5,7 +5,11 @@
 //! DmaTriggerDev doorbell → ctx.dma_read 命中 mmap（wire 上无 DMA_READ command
 //! = 零拷贝反证）→ on_dma_complete 拿到 marker + 零拷贝 dma_write 回写 GPA_DST。
 //! socketpair + tempfile，Linux 直跑，无需 VTL。对标 POC-1。
+//!
+//! W6a：client 改 async；client 段包进 `DefaultPool::run_with`，server 半段仍同步。
+//! **fd-passing 端到端 oracle**：server mmap client 经 SCM_RIGHTS 传的 fd 零拷贝命中。
 
+use pal_async::DefaultPool;
 use pcie_device_core::BarKind;
 use pcie_device_core::BarLayout;
 use pcie_device_core::DeviceCtx;
@@ -116,31 +120,37 @@ fn loopback_dma_map_zero_copy() {
     let read_back = Arc::new(Mutex::new(None));
     let server = spawn_server(server_end, read_back.clone());
 
-    let mut client = VfioUserClient::from_stream(client_end);
-    client.handshake().expect("handshake");
+    DefaultPool::run_with(async |driver| {
+        let mut client =
+            VfioUserClient::from_stream(&driver, client_end).expect("wrap client stream");
+        client.handshake().await.expect("handshake");
 
-    // 1. DMA_MAP 整段 [0, 4096) RW（READABLE|WRITEABLE = 0x1|0x2），fd = ram。
-    client
-        .dma_map(0, 4096, 0x1 | 0x2, ram.as_fd(), 0)
-        .expect("dma_map");
+        // 1. DMA_MAP 整段 [0, 4096) RW（READABLE|WRITEABLE = 0x1|0x2），fd = ram。
+        client
+            .dma_map(0, 4096, 0x1 | 0x2, ram.as_fd(), 0)
+            .await
+            .expect("dma_map");
 
-    // 2. doorbell：BAR0 REGION_WRITE @ 0x1000 → server device dma_read(GPA_SRC)
-    //    命中 mmap 零拷贝。若零拷贝失败（无 fd/miss），server 会发 server-initiated
-    //    DMA_READ command 回打 client，则 region_write reply 读到的会是 DMA_READ
-    //    (cmd=11) 而非 REGION_WRITE(cmd=10)，expect_reply cmd 校验失败 → 测挂。
-    //    故 region_write 成功本身 = 零拷贝反证。
-    client
-        .region_write(0, 0x1000, &1u32.to_le_bytes())
-        .expect("doorbell region_write（成功即证 wire 上无 DMA_READ = 零拷贝命中）");
+        // 2. doorbell：BAR0 REGION_WRITE @ 0x1000 → server device dma_read(GPA_SRC)
+        //    命中 mmap 零拷贝。若零拷贝失败（无 fd/miss），server 会发 server-initiated
+        //    DMA_READ command 回打 client，则 region_write reply 读到的会是 DMA_READ
+        //    (cmd=11) 而非 REGION_WRITE(cmd=10)，expect_reply cmd 校验失败 → 测挂。
+        //    故 region_write 成功本身 = 零拷贝反证。
+        client
+            .region_write(0, 0x1000, &1u32.to_le_bytes())
+            .await
+            .expect("doorbell region_write（成功即证 wire 上无 DMA_READ = 零拷贝命中）");
 
-    // 3. dma_unmap 撤销。
-    //    **时序注意**：server 在 region_write 的 reply **发出后**才 drain
-    //    completions → on_dma_complete 的 dma_write(GPA_DST) 发生在 reply 之后。
-    //    故 GPA_DST / read_back 的验证必须等 server 跑完（join 后），不能在收到
-    //    region_write reply 后立即读。
-    client.dma_unmap(0, 4096).expect("dma_unmap");
+        // 3. dma_unmap 撤销。
+        //    **时序注意**：server 在 region_write 的 reply **发出后**才 drain
+        //    completions → on_dma_complete 的 dma_write(GPA_DST) 发生在 reply 之后。
+        //    故 GPA_DST / read_back 的验证必须等 server 跑完（join 后），不能在收到
+        //    region_write reply 后立即读。
+        client.dma_unmap(0, 4096).await.expect("dma_unmap");
 
-    drop(client);
+        drop(client);
+    });
+
     server.join().unwrap().expect("server loop");
 
     // 4. 验 server dma_write 零拷贝落地（join 后 server 已 drain；MAP_SHARED 写经

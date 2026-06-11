@@ -10,9 +10,15 @@ description = "vfio-user client (underhill 侧)：connect AF_UNIX + VERSION 握�
 vfio_user_wire = { path = "../vfio_user_wire" }
 zerocopy = { version = "0.8", features = ["derive"] }
 anyhow = "1.0"
-# W3: DMA_MAP 发 fd 经 SCM_RIGHTS（sendmsg + ControlMessage::ScmRights，全 safe，
-# socket+uio feature；与 server framing 同源）。W4: event feature 建/读 MSI-X eventfd。
-nix = { version = "0.30", features = ["socket", "uio", "event"] }
+# W6a: async 收发走 pal_async PolledSocket（path-dep root workspace member；POC 已验
+# exclude crate 可 standalone 构建）。Mutex<PolledSocket> 用 parking_lot 保 future Send。
+pal_async = { path = "../../../support/pal/pal_async" }
+parking_lot = "0.12"
+
+# W6a: SCM_RIGHTS ancillary fd 收发走裸 libc sendmsg/recvmsg + cmsghdr（照搬
+# vhost_user_protocol::socket 金标准；unsafe 隔离在 async_socket.rs 一个模块）。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # loopback 单测对接真 server_handshake + VfioUserSession。
@@ -21,5 +27,5 @@ vfio_user_transport = { path = "../vfio_user_transport" }
 pcie_device_core = { path = "../pcie_device_core" }
 # W3 loopback 测的 "guest RAM" backing file（避开 client 侧 mmap/unsafe，用 FileExt 读写）。
 tempfile = "3"
-# W3 loopback 测共享 DMA 完成回调数据（workspace lint 禁 std::sync::Mutex，用 parking_lot）。
-parking_lot = "0.12"
+# W4 loopback 测建/读 MSI-X eventfd（client 只发 BorrowedFd，不再依赖 nix 收发 → nix 降为 dev）。
+nix = { version = "0.30", features = ["socket", "uio", "event"] }

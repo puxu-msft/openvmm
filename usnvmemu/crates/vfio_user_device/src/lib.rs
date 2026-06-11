@@ -13,13 +13,20 @@
 //! - **W4**：MSI-X SET_IRQS eventfd（`set_irqs` / `set_irqs_deassign` /
 //!   `set_irqs_clear`，多 fd 经 SCM_RIGHTS → server fire 写 eventfd）
 //!
-//! **同步阻塞**收发（loopback 单测对接真 server）；发 fd 全 safe nix（收 fd 才需
-//! unsafe，client 只发），保持 `#![deny(unsafe_code)]`。async 化留 W6；guest-facing
-//! PCIe 呈现（pci_core adapter）+ eventfd→`Interrupt::deliver` VTL0 注入留 W6
-//! （需 underhill partition，非 standalone 可测）。
+//! **async 收发**（W6a，2026-06-12）：迁到 pal_async `PolledSocket`，照搬
+//! `vhost_user_protocol::socket` 的 SCM_RIGHTS 混合范式（PolledSocket readiness + 裸
+//! libc cmsg fd 传递）。**unsafe 隔离在 [`async_socket`] 一个模块**；`framing`/`client`
+//! 模块级 `#![deny(unsafe_code)]` 维持纯 safe。**新增模块默认须加模块级
+//! `#![deny(unsafe_code)]`，仅 async_socket 例外**（crate 级 deny 已移除，防回归）。
+//! 为 W6b/c/d 真 underhill 集成（pcie_remote 风格 async worker）铺路。
+//!
+//! **W6b 前瞻**：当前 `AsyncSocket` 用 `Mutex<PolledSocket>`（request/reply 串行足够）。
+//! 若 W6b 需 server-initiated 消息（DMA_READ command）与 client request 并发收发，可改
+//! `PolledSocket::split()` 的读写半；W6a 不预置（YAGNI，W6b 真需求未定型）。
+//! guest-facing PCIe 呈现（pci_core adapter）+ eventfd→`Interrupt::deliver` VTL0 注入
+//! 留 W6b（需 underhill partition，非 standalone 可测）。
 
-#![deny(unsafe_code)]
-
+mod async_socket;
 mod client;
 mod framing;
 

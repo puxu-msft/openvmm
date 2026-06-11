@@ -4,7 +4,10 @@
 //! W2 loopback 集成测：真 `vfio_user_transport::VfioUserSession` + `MockDev` ⇄
 //! client region wire（GET_INFO / GET_REGION_INFO / GET_IRQ_INFO / REGION_RW /
 //! RESET）。socketpair，Linux 直跑，无需 VTL。剧本对标 interop_py enumerate_smoke。
+//!
+//! W6a：client 改 async；client 段包进 `DefaultPool::run_with`，server 半段仍同步。
 
+use pal_async::DefaultPool;
 use pcie_device_core::BarKind;
 use pcie_device_core::BarLayout;
 use pcie_device_core::DeviceCtx;
@@ -86,45 +89,49 @@ fn loopback_region_enumerate_and_rw() {
     let (server_end, client_end) = UnixStream::pair().unwrap();
     let server = spawn_server(server_end);
 
-    let mut client = VfioUserClient::from_stream(client_end);
-    client.handshake().expect("handshake");
+    DefaultPool::run_with(async |driver| {
+        let mut client =
+            VfioUserClient::from_stream(&driver, client_end).expect("wrap client stream");
+        client.handshake().await.expect("handshake");
 
-    // 1. DEVICE_GET_INFO：PCI 标准 num_regions=9 / num_irqs=5（常量，非 MockDev 派生）。
-    let info = client.get_device_info().expect("get_device_info");
-    let num_regions = info.num_regions; // packed copy
-    let num_irqs = info.num_irqs;
-    assert_eq!(num_regions, 9, "PCI num_regions");
-    assert_eq!(num_irqs, 5, "PCI num_irqs");
+        // 1. DEVICE_GET_INFO：PCI 标准 num_regions=9 / num_irqs=5（常量，非 MockDev 派生）。
+        let info = client.get_device_info().await.expect("get_device_info");
+        let num_regions = info.num_regions; // packed copy
+        let num_irqs = info.num_irqs;
+        assert_eq!(num_regions, 9, "PCI num_regions");
+        assert_eq!(num_irqs, 5, "PCI num_irqs");
 
-    // 2. GET_REGION_INFO(BAR0=0)：size=8192。
-    let bar0 = client.get_region_info(0).expect("get_region_info BAR0");
-    let bar0_size = bar0.size; // packed copy
-    assert_eq!(bar0_size, 8192, "BAR0 size");
+        // 2. GET_REGION_INFO(BAR0=0)：size=8192。
+        let bar0 = client.get_region_info(0).await.expect("get_region_info BAR0");
+        let bar0_size = bar0.size; // packed copy
+        assert_eq!(bar0_size, 8192, "BAR0 size");
 
-    // 3. GET_REGION_INFO(CONFIG=7)：size=4096。
-    let cfg = client.get_region_info(7).expect("get_region_info CONFIG");
-    let cfg_size = cfg.size; // packed copy
-    assert_eq!(cfg_size, 4096, "CONFIG size");
+        // 3. GET_REGION_INFO(CONFIG=7)：size=4096。
+        let cfg = client.get_region_info(7).await.expect("get_region_info CONFIG");
+        let cfg_size = cfg.size; // packed copy
+        assert_eq!(cfg_size, 4096, "CONFIG size");
 
-    // 4. GET_IRQ_INFO(MSIX=2)：count=8（MockDev msix_count）。
-    let irq = client.get_irq_info(2).expect("get_irq_info MSIX");
-    let irq_count = irq.count; // packed copy
-    assert_eq!(irq_count, 8, "MSIX vector count");
+        // 4. GET_IRQ_INFO(MSIX=2)：count=8（MockDev msix_count）。
+        let irq = client.get_irq_info(2).await.expect("get_irq_info MSIX");
+        let irq_count = irq.count; // packed copy
+        assert_eq!(irq_count, 8, "MSIX vector count");
 
-    // 5. CONFIG region READ @ offset 0：identity dword0 = vendor(LE)+device(LE)。
-    let id = client.region_read(7, 0, 4).expect("region_read CONFIG id");
-    assert_eq!(id, vec![0x34, 0x12, 0x78, 0x56], "config dword0 identity LE");
+        // 5. CONFIG region READ @ offset 0：identity dword0 = vendor(LE)+device(LE)。
+        let id = client.region_read(7, 0, 4).await.expect("region_read CONFIG id");
+        assert_eq!(id, vec![0x34, 0x12, 0x78, 0x56], "config dword0 identity LE");
 
-    // 6. BAR0 REGION_WRITE then READ roundtrip @ offset 0（8 字节，对标 server
-    //    region_write_then_read_roundtrip，避免 4-byte-in-u64-slot 巧合）。
-    let pat = 0xCAFE_BABE_DEAD_BEEF_u64.to_le_bytes();
-    client.region_write(0, 0, &pat).expect("region_write BAR0");
-    let got = client.region_read(0, 0, 8).expect("region_read BAR0");
-    assert_eq!(got, pat.to_vec(), "BAR0 8-byte write/read roundtrip");
+        // 6. BAR0 REGION_WRITE then READ roundtrip @ offset 0（8 字节，对标 server
+        //    region_write_then_read_roundtrip，避免 4-byte-in-u64-slot 巧合）。
+        let pat = 0xCAFE_BABE_DEAD_BEEF_u64.to_le_bytes();
+        client.region_write(0, 0, &pat).await.expect("region_write BAR0");
+        let got = client.region_read(0, 0, 8).await.expect("region_read BAR0");
+        assert_eq!(got, pat.to_vec(), "BAR0 8-byte write/read roundtrip");
 
-    // 7. DEVICE_RESET（FLR）：不报错即可。
-    client.reset().expect("reset");
+        // 7. DEVICE_RESET（FLR）：不报错即可。
+        client.reset().await.expect("reset");
 
-    drop(client); // 关 socket → server pump_one 返 Ok(false) 退出循环。
+        drop(client); // 关 socket → server pump_one 返 Ok(false) 退出循环。
+    });
+
     server.join().unwrap().expect("server loop");
 }

@@ -12,6 +12,8 @@ vfio_user_device = { path = "../../../crates/vfio_user_device" }
 vfio_user_wire = { path = "../../../crates/vfio_user_wire" }
 nix = { version = "0.30", features = ["socket", "uio", "mman"] }
 anyhow = "1.0"
+# W6a: client 改 async（pal_async PolledSocket）→ harness 用 DefaultPool::run_with 驱动。
+pal_async = { path = "../../../../support/pal/pal_async" }
 
 [profile.release]
 strip = true
