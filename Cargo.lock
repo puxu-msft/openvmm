@@ -8737,6 +8737,8 @@ dependencies = [
  "underhill_mem",
  "underhill_threadpool",
  "user_driver",
+ "vfio_user_pci_device",
+ "vfio_user_pci_resources",
  "vga_proxy",
  "video_core",
  "virt",

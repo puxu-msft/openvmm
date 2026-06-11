@@ -368,6 +368,8 @@ tpm_resources = { path = "vm/devices/tpm_resources" }
 pcie_remote_resources = { path = "vm/devices/pcie_remote_resources" }
 pcie_remote_protocol = { path = "vm/devices/pcie_remote_protocol" }
 pcie_remote_device = { path = "vm/devices/pcie_remote_device" }
+vfio_user_pci_resources = { path = "vm/devices/pci/vfio_user_pci_resources" }
+vfio_user_pci_device = { path = "vm/devices/pci/vfio_user_pci_device" }
 uidevices = { path = "vm/devices/uidevices" }
 uidevices_resources = { path = "vm/devices/uidevices_resources" }
 user_driver = { path = "vm/devices/user_driver" }

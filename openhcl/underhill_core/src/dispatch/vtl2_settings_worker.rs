@@ -1862,6 +1862,9 @@ impl InitialControllers {
         // pcie_remote 已通过 cmdline 注入的 instance（Path B/D）。
         // 这里同样以 PcieRemoteVmbusHandle 加入 vpci_devices。
         pcie_remote_cli_instances: &[crate::options::PcieRemoteCliConfig],
+        // vfio-user NVMe 已通过 cmdline 注入的 instance（W6b）。
+        // 同样以 VfioUserNvmeHandle 加入 vpci_devices。复用 cvm_skip_pcie_remote。
+        vfio_user_nvme_cli_instances: &[crate::options::VfioUserNvmeCliConfig],
         // CVM guard：is_hardware_isolated → 完全过滤所有 pcie_remote 路径。
         cvm_skip_pcie_remote: bool,
     ) -> anyhow::Result<Self> {
@@ -1916,6 +1919,17 @@ impl InitialControllers {
                         instance_id: cfg.instance_id,
                         vsock_port: cfg.vsock_port,
                         handshake_timeout_ms: cfg.handshake_timeout_ms,
+                    }
+                    .into_resource(),
+                });
+            }
+            // OPENHCL_VFIO_USER_NVME 注入的实例（W6b）。CVM / servicing 跳过。
+            for cfg in vfio_user_nvme_cli_instances {
+                vpci_devices.push(UhVpciDeviceConfig {
+                    instance_id: cfg.instance_id,
+                    resource: vfio_user_pci_resources::VfioUserNvmeHandle {
+                        instance_id: cfg.instance_id,
+                        unix_path: cfg.unix_path.clone(),
                     }
                     .into_resource(),
                 });

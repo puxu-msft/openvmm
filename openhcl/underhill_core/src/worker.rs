@@ -331,6 +331,8 @@ pub struct UnderhillEnvCfg {
     /// pcie_remote takeover GUIDs（spec v3.1 §3.1 path C）。匹配 vmwp 下发的
     /// NVMe controller GUID，OpenHCL 端改派为 pcie_remote。
     pub pcie_remote_takeover: Vec<crate::options::PcieRemoteCliConfig>,
+    /// vfio-user NVMe 实验设备实例（W6b）。env OPENHCL_VFIO_USER_NVME=<guid>:<unix_path>[;...]。
+    pub vfio_user_nvme: Vec<crate::options::VfioUserNvmeCliConfig>,
 }
 
 /// Bundle of config + runtime objects for hooking into the underhill remote
@@ -2255,6 +2257,7 @@ async fn new_underhill_vm(
             .map(|c| c.instance_id)
             .collect(),
         &env_cfg.pcie_remote_instance,
+        &env_cfg.vfio_user_nvme,
         isolation.is_hardware_isolated(),
     )
     .instrument(tracing::info_span!("new_initial_controllers", CVM_ALLOWED))
@@ -2388,6 +2391,80 @@ async fn new_underhill_vm(
         pcie_remote_prepared,
         pcie_remote_worker_tasks,
         pcie_remote_transport_swap_map,
+    ));
+
+    // vfio_user_nvme resolver（W6b）。CVM gate + env-gate + AbsentPcieDevice 兜底。
+    // 与 pcie_remote 不同：用 AF_UNIX 套接字路径，主动连接（spawn_vfio_user_connects），
+    // 无 transport-swap map（Phase 1 无 hotplug），无 takeover。
+    let vfio_user_nvme_prepared: vfio_user_pci_device::PreparedMap =
+        Arc::new(Mutex::new(HashMap::new()));
+    let vfio_user_nvme_worker_tasks: vfio_user_pci_device::WorkerTasks =
+        Arc::new(Mutex::new(Vec::new()));
+    let vfio_user_nvme_connect_tasks = if isolation.is_hardware_isolated() {
+        tracing::warn!(
+            CVM_ALLOWED,
+            "vfio_user_nvme: skipping all instances on hardware-isolated VM"
+        );
+        Vec::new()
+    } else {
+        let instances: Vec<(Guid, String, Duration)> = env_cfg
+            .vfio_user_nvme
+            .iter()
+            .map(|cfg| {
+                (
+                    cfg.instance_id,
+                    cfg.unix_path.clone(),
+                    Duration::from_millis(cfg.handshake_timeout_ms as u64),
+                )
+            })
+            .collect();
+        if instances.is_empty() {
+            Vec::new()
+        } else {
+            // boot grace period 同步等 prepared_map 填好（或超时），保证 resolver
+            // assemble_device 调用时 prep 已就位、不走 absent fallback。
+            let max_timeout = instances
+                .iter()
+                .map(|(_, _, t)| *t)
+                .max()
+                .unwrap_or(Duration::ZERO);
+            let expected = instances.len();
+            let tasks = vfio_user_pci_device::spawn_vfio_user_connects(
+                driver_source.simple(),
+                tp.clone(),
+                instances,
+                vfio_user_nvme_prepared.clone(),
+            );
+            // 同步等 prepared_map 满或超时（每 10ms 轮询）。
+            let deadline = std::time::Instant::now() + max_timeout;
+            while std::time::Instant::now() < deadline {
+                if vfio_user_nvme_prepared.lock().len() >= expected {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let got = vfio_user_nvme_prepared.lock().len();
+            tracing::info!(
+                CVM_ALLOWED,
+                expected,
+                got,
+                "vfio_user_nvme: boot grace period done"
+            );
+            tasks
+        }
+    };
+    // connect tasks 转入 detach；OpenHCL 进程退出时随 Spawn 一同终止。
+    for t in vfio_user_nvme_connect_tasks {
+        t.detach();
+    }
+    resolver.add_async_resolver::<
+        vm_resource::kind::PciDeviceHandleKind,
+        _,
+        vfio_user_pci_resources::VfioUserNvmeHandle,
+        _,
+    >(vfio_user_pci_device::VfioUserPciResolver::new(
+        vfio_user_nvme_prepared,
+        vfio_user_nvme_worker_tasks,
     ));
 
     let periodic_telemetry_task = tp.spawn(

@@ -328,6 +328,11 @@ pub struct Options {
     /// 该 GUID 必须是用户先通过 `Add-VMNvmeController` 注册的占位 controller，
     /// 这样 vmwp 才会 vpci OFFER。CVM 下被静默过滤。spec §3.1 path C。
     pub pcie_remote_takeover: Vec<PcieRemoteCliConfig>,
+
+    /// (OPENHCL_VFIO_USER_NVME=<guid>:<unix_path>[;...])
+    /// 可重复（用 ';' 分隔多个）。每项注入一个 vfio-user NVMe 实验设备实例（W6b）。
+    /// 主动连接到指定 AF_UNIX 套接字上的 vfio-user server。CVM 下被静默过滤。
+    pub vfio_user_nvme: Vec<VfioUserNvmeCliConfig>,
 }
 
 /// 单条 `--pcie-remote-instance` / `OPENHCL_PCIE_REMOTE_INSTANCE` 配置。
@@ -378,6 +383,65 @@ impl FromStr for PcieRemoteCliConfig {
             handshake_timeout_ms,
         })
     }
+}
+
+/// 单条 `OPENHCL_VFIO_USER_NVME` 配置（W6b）。
+/// 格式 `<guid>:<unix_path>`——主动连接到该 AF_UNIX 套接字上的 vfio-user server。
+/// 与 pcie_remote 不同：用 socket 路径（String）而非 vsock_port（u32），
+/// 没有 takeover 路径，也没有 per-entry kv 选项（套接字路径无额外参数）。
+#[derive(Clone, Debug, MeshPayload, Inspect)]
+pub struct VfioUserNvmeCliConfig {
+    /// 实例 GUID（也作为 vpci bus_instance_id 使用；必须 vmwp 已知）。
+    #[inspect(display)]
+    pub instance_id: guid::Guid,
+    /// vfio-user server 监听的 AF_UNIX 套接字路径。
+    pub unix_path: String,
+    /// 握手超时（毫秒，默认 5000）。
+    pub handshake_timeout_ms: u32,
+}
+
+impl FromStr for VfioUserNvmeCliConfig {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, anyhow::Error> {
+        // 只在第一个 ':' 处切分：guid 在前，路径在后（路径可含其他字符，
+        // 但通常不含 ':'）。无 ':' 则报错。
+        let (guid_s, path_s) = s
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("expected <guid>:<unix_path>"))?;
+        let instance_id: guid::Guid = guid_s
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid guid {guid_s}: {e}"))?;
+        if path_s.is_empty() {
+            anyhow::bail!("empty unix_path");
+        }
+        Ok(Self {
+            instance_id,
+            unix_path: path_s.to_string(),
+            handshake_timeout_ms: 5000,
+        })
+    }
+}
+
+/// 解析 `OPENHCL_VFIO_USER_NVME` 这种 ';' 分隔多项 + 内部 `<guid>:<unix_path>`
+/// 的环境变量，产出合法配置列表。非法项 `eprintln!` + `tracing::warn!` 后跳过，
+/// **不** boot fail（mirror parse_pcie_remote_entries）。
+/// 无端口黑名单校验——socket 路径不与 TCP 端口冲突，跳过 check_vsock_port 类比。
+fn parse_vfio_user_nvme_entries(
+    raw: &str,
+    env_name: &str,
+) -> anyhow::Result<Vec<VfioUserNvmeCliConfig>> {
+    let mut out = Vec::new();
+    for entry in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        match entry.parse::<VfioUserNvmeCliConfig>() {
+            Ok(cfg) => out.push(cfg),
+            Err(e) => {
+                eprintln!("vfio_user_nvme: {env_name} entry {entry:?} rejected ({e:#}); skipping.");
+                tracing::warn!(CVM_ALLOWED, error = %e, env = env_name, "vfio_user_nvme: skip invalid entry");
+                continue;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// 解析 `OPENHCL_PCIE_REMOTE_{INSTANCE,TAKEOVER}` 这种 ';' 分隔多项 + 内部
@@ -632,6 +696,13 @@ impl Options {
             config_timeout_in_seconds,
         )?;
 
+        let vfio_user_nvme: Vec<VfioUserNvmeCliConfig> = parse_vfio_user_nvme_entries(
+            read_legacy_openhcl_env("OPENHCL_VFIO_USER_NVME")
+                .and_then(|s| s.to_str())
+                .unwrap_or(""),
+            "OPENHCL_VFIO_USER_NVME",
+        )?;
+
         let mut args = std::env::args().chain(extra_args);
         // Skip our own filename.
         args.next();
@@ -700,6 +771,7 @@ impl Options {
             servicing_timeout_dump_collection_in_ms,
             pcie_remote_instance,
             pcie_remote_takeover,
+            vfio_user_nvme,
         })
     }
 
