@@ -180,3 +180,37 @@ audit CRITICAL 从"现有 API 不可行"转为"给 underhill 加原语"：
   用整设备 fd（POC-6 验过、纯本仓、零拷贝）功能上已足**；bounded 是 defense-in-depth 加固，
   须外部内核改动。三条路：① 整-GPA fd（本仓可落、符合已接受信任模型）② 改外部内核加 bounded
   fd（重、跨外部仓）③ bounce 拷贝（本仓但非零拷贝，自废武功）。
+
+**决定（用户 2026-06-11）**：威胁模型已了解，**采用 ①整-GPA fd，当前不做 bounded fd**。
+故外部 OHCL-Linux-Kernel 改动 track **搁置**（非阻塞、非必需）。§5 安全按"整-GPA + 进程
+隔离/seccomp/socketpair/kill-reap"重写即可，不依赖内核改动。
+
+### 10.2 host 直访 guest RAM 的完整性复核（2026-06-11，纠过宽结论 → POC 级闭环）
+
+**纠正**："host 进程够不到 guest RAM → firmware 必须在 VTL2" 此前是**代码研究 + 对抗性
+推理**得出，**未真 POC**，且过宽：WHP 无 open-by-id 是 WHP 的事实，但"任何 host 进程都够
+不到"未验——vmwp.exe 本身就是映着 guest RAM 的 host 进程。
+
+**两轮对抗性 subagent 穷尽 + 真机 POC 闭环（2026-06-11）**：
+
+- **POC-7a（RPM-on-vmwp，真 OpenHCL VM）**：admin OpenProcess(vmwp PID 57376) OK 不被
+  PPL 阻；VirtualQueryEx 遍历 1009 个 region，总 commit **仅 32.4 MiB**（远小于 GB 级
+  guest RAM），扫不到 marker 0x9E66...9E66（VTL2 readback 确认 marker 仍在）→
+  **OpenHCL 把 guest RAM 走 SLAT/GPA-direct，不映入 vmwp 用户态 VA**，LiveCloudKd 2010
+  私有区扫描模型对 OpenHCL **不适用**。
+- **POC-7b（livekd64 HvReadGpa，真 OpenHCL VM）**：`Unexpected failure from
+  VidGetPartitionIds` 立即被拒——**vid.sys EPROCESS 门禁**（vid.dll 这些函数要求调用
+  EPROCESS 是 vmwp，livekd 不是 → 拒）。补 `kd.exe` 后重跑同根因（KdVersionBlock 等
+  失败只是 partition session 没建起来的连锁报错）。
+- **两轮对抗 subagent 穷尽 12 条 host 路径**：WHP/HCS/VID/WMI/VBS/ETW/NtSystemDebug/
+  `\Device\PhysicalMemory`/livekd/LiveCloudKd/驱动+WinHvReadGpa/vmbus 等**全部否定
+  live 访问**（公开 API 不暴露内容；livekd/LiveCloudKd 撞 vid.sys EPROCESS 门禁或
+  依赖 hvmm.sys 未文档化内核内省扒法，且 paravisor 结构未保证；自写未签名第三方驱动
+  不可产品化）。
+- **唯一发现的新路径**：**B1 `Save-VM → .vmrs` snapshot**（仓内 `docs/superpowers/
+  examples/vmrs_log_scanner/` 已实测 OpenHCL 可行）——但**这是 frozen snapshot 不是
+  live access**，对 firmware data plane 无救，只对 oracle/取证/调试有用（可作 host 侧
+  独立 cross-check guest RAM 内容的工具，无需 VTL2 readback）。
+
+**结论加固**：firmware **必须在 VTL2** 才能 live 零拷贝访问 guest RAM——已有 POC 级
+（非推理级）背书。topology B 的"不可产品化"由 12 条路径全否 + 2 个真机 POC 失败实证。
