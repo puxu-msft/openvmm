@@ -60,6 +60,7 @@ use pcie_remote_protocol::codec;
 use pcie_remote_protocol::to_host::Body as HostBody;
 use pcie_remote_protocol::to_openhcl::Body as DevBody;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -260,6 +261,16 @@ enum Cmd {
     },
     /// 写 harness guest-mem（放 SQE / IO 写数据）。
     WriteGuest { gpa: u64, data: Vec<u8> },
+    /// **A1（Abort）opt-in DMA-hold** — 把命中 `gpa` 的设备 DMA（ReadGpa/WriteGpa）
+    /// **扣住不回 `DmaCompletion`**：stash 该帧，使发起该 DMA 的命令**停在 in-flight 态**
+    /// （firmware 侧坐在 `pending_ios` 等数据 DMA）。这是行使 Abort "真中止在飞命令" 唯一
+    /// 手段——见 `openhcl_abort_inflight_io_command` 文档。默认从不发 → `held_gpas` 恒空
+    /// → pump 行为与扣留前逐字节一致（既有测试零影响）。
+    HoldDma { gpa: u64 },
+    /// **A1（Abort）opt-in DMA-hold** — 解除对 `gpa` 的扣留并**补服务**所有 stash 的命中帧
+    /// （逐条回 `DmaCompletion`）。Abort 已把目标命令从 `pending_ios` 移除后调它 → 释放出的
+    /// 那条 stale DMA completion 经 `on_dma_complete` 的 unknown-token 路径被静默忽略。
+    ReleaseDma { gpa: u64 },
 }
 
 /// OpenHCL 侧 NVMe driver：握手后接管单条 wire，spawn (read-task + pump) 多路复用——
@@ -315,6 +326,12 @@ impl NvmeDriver {
             let mut guest = vec![0u8; GUEST_MEM_BYTES];
             let mut seq: u64 = 1;
             let mut pending_mmio: HashMap<u64, oneshot::Sender<u64>> = HashMap::new();
+            // **A1（Abort）opt-in DMA-hold 状态**：`held_gpas` 列出当前被扣住 DMA 的 gpa；
+            // `held_frames` 暂存命中扣留的设备 DMA 帧（保留 token / 方向 / 写数据，供 Release
+            // 时补回 DmaCompletion）。默认从不 HoldDma → `held_gpas` 恒空 → 下方两个
+            // `if held_gpas.contains(..)` 守卫恒 false → 与扣留前逐字节同行为（既有测试零影响）。
+            let mut held_gpas: HashSet<u64> = HashSet::new();
+            let mut held_frames: Vec<DevBody> = Vec::new();
             loop {
                 tokio::select! {
                     biased;
@@ -323,6 +340,13 @@ impl NvmeDriver {
                         let Some(frame) = maybe_frame else { break };
                         match frame.body {
                             Some(DevBody::ReadGpa(r)) => {
+                                // **A1 DMA-hold**：命中扣留 → stash 帧、**不**回 DmaCompletion。
+                                // 发起该 ReadGpa 的命令因此停在 in-flight（firmware 坐等数据 DMA）。
+                                // 默认 held_gpas 空 → 此守卫 false → 走原服务路径。
+                                if held_gpas.contains(&r.gpa) {
+                                    held_frames.push(DevBody::ReadGpa(r));
+                                    continue;
+                                }
                                 let start = r.gpa as usize;
                                 let end = start.saturating_add(r.len as usize);
                                 let ok = end <= guest.len();
@@ -335,6 +359,11 @@ impl NvmeDriver {
                                 if codec::write_frame(&mut wr, &reply).await.is_err() { break; }
                             }
                             Some(DevBody::WriteGpa(w)) => {
+                                // **A1 DMA-hold**：命中扣留 → stash 帧、**不**写 guest、**不**回执。
+                                if held_gpas.contains(&w.gpa) {
+                                    held_frames.push(DevBody::WriteGpa(w));
+                                    continue;
+                                }
                                 let start = w.gpa as usize;
                                 let end = start.saturating_add(w.data.len());
                                 let ok = end <= guest.len();
@@ -384,6 +413,48 @@ impl NvmeDriver {
                                 let end = start.saturating_add(data.len());
                                 if end <= guest.len() { guest[start..end].copy_from_slice(&data); }
                             }
+                            // **A1 DMA-hold**：标记 gpa 为扣留。此后命中该 gpa 的 ReadGpa/WriteGpa
+                            // 被 stash 而非回执（见上方两个守卫）。
+                            Cmd::HoldDma { gpa } => {
+                                held_gpas.insert(gpa);
+                            }
+                            // **A1 DMA-hold**：解扣 gpa 并**补服务**所有 stash 的命中帧（逐条回
+                            // DmaCompletion，与原服务路径同逻辑：Read 从 guest 取数据、Write 写 guest）。
+                            // 非命中的 stash 帧保留（罕见：同时扣多个 gpa）。
+                            Cmd::ReleaseDma { gpa } => {
+                                held_gpas.remove(&gpa);
+                                let mut still_held = Vec::new();
+                                for frame in held_frames.drain(..) {
+                                    match frame {
+                                        DevBody::ReadGpa(r) if r.gpa == gpa => {
+                                            let start = r.gpa as usize;
+                                            let end = start.saturating_add(r.len as usize);
+                                            let ok = end <= guest.len();
+                                            let data = if ok { guest[start..end].to_vec() } else { Vec::new() };
+                                            let reply = ToHost {
+                                                seq,
+                                                body: Some(HostBody::DmaCompletion(DmaCompletion { token: r.token, ok, data })),
+                                            };
+                                            seq += 1;
+                                            if codec::write_frame(&mut wr, &reply).await.is_err() { return; }
+                                        }
+                                        DevBody::WriteGpa(w) if w.gpa == gpa => {
+                                            let start = w.gpa as usize;
+                                            let end = start.saturating_add(w.data.len());
+                                            let ok = end <= guest.len();
+                                            if ok { guest[start..end].copy_from_slice(&w.data); }
+                                            let reply = ToHost {
+                                                seq,
+                                                body: Some(HostBody::DmaCompletion(DmaCompletion { token: w.token, ok, data: Vec::new() })),
+                                            };
+                                            seq += 1;
+                                            if codec::write_frame(&mut wr, &reply).await.is_err() { return; }
+                                        }
+                                        other => still_held.push(other),
+                                    }
+                                }
+                                held_frames = still_held;
+                            }
                         }
                     }
                 }
@@ -426,6 +497,22 @@ impl NvmeDriver {
             .send(Cmd::ReadGuest { gpa, len, resp: tx })
             .map_err(|_| anyhow!("pump 已退出"))?;
         rx.await.context("pump 丢了 resp")
+    }
+
+    /// **A1（Abort）opt-in DMA-hold** — 扣住命中 `gpa` 的设备 DMA（fire-and-forget，同
+    /// `write_guest` 风格）。此后 firmware 对该 gpa 发的 ReadGpa/WriteGpa 被 pump stash、
+    /// 不回执 → 发起该 DMA 的命令停在 in-flight，供 Abort 真中止。**必须在触发该 DMA 的命令
+    /// 提交之前调**（经同一有序 cmd channel，保证 hold 标记先于后续命令生效）。
+    fn hold_dma(&self, gpa: u64) {
+        let _ = self.cmd_tx.send(Cmd::HoldDma { gpa });
+    }
+
+    /// **A1（Abort）opt-in DMA-hold** — 解扣 `gpa` 并让 pump 补回 stash 帧的 DmaCompletion
+    /// （fire-and-forget）。经有序 cmd channel：本命令处理完（含把释放出的 stale completion
+    /// 送上 wire）后，调用方随后发的任何命令（如 admin fence）才会被处理 → 释放与后续 fence
+    /// 之间有确定次序，无需额外同步。
+    fn release_dma(&self, gpa: u64) {
+        let _ = self.cmd_tx.send(Cmd::ReleaseDma { gpa });
     }
 
     /// 等下一个 MSI-X 中断（返回 msix_index）。
@@ -3578,20 +3665,201 @@ async fn openhcl_delete_cq_with_associated_sq_rejected() -> Result<()> {
     Ok(())
 }
 
-// ═══════════════════════ Abort 调查 + DBBUF SQ-gone 边界（诚实记录）═══════════════════════
+/// **A1（Abort, spec § 5.1）** — 真中止一条**在飞** IO Write（经 pcie_remote 真 wire）。
+///
+/// ## 为何必须中止**在飞**命令（而非已完成 / 不存在的目标）
+///
+/// 本 harness 的 pump 用 `biased` device-first `select!`（见文件头）：它**先**把命令触发的
+/// 所有设备 DMA 服务完，**之后**才把测试的下一条 doorbell 送上 wire。故若不加干预，一条 IO
+/// 命令在 Abort doorbell 被处理时**早已完成** → Abort 的 `try_abort_inflight` 找不到目标 →
+/// 返 dw0 bit0=1（Could Not Abort）。但**旧 stub Abort 也恒返 dw0=1**，故"中止已完成目标"的
+/// 测试**无牙**（分不清真 Abort 与 stub）。唯一能区分的是**中止在飞命令**：dw0 bit0=0 +
+/// 目标被 post `COMMAND_ABORT_REQUESTED`——这两者旧 stub **都产生不了**。
+///
+/// 要让目标"停在在飞态"，唯一手段是**扣住它的数据 DMA**：单-DMA IO Write（PRP1）在其数据
+/// `ReadGpa` 在飞期间坐在 controller 的 `pending_ios`（已由 controller 单测
+/// `abort_inflight_command_real_cancel` 确证：`dispatch_io` 对该 Write 返 None 并入 1 条
+/// `pending_ios`）。本测试用 opt-in DMA-hold（`hold_dma`）扣住 `WRITE_BUF_GPA` 的数据 DMA，
+/// 把 Write 钉在 in-flight，然后 Abort 它。
+///
+/// ## 双重独立 oracle（均为真 Abort 在飞命令的**独占**可观测，旧 stub 产生不了）
+///
+/// 1. **Abort 自身 CQE**：`sc == 0` 且 `dw0 bit0 == 0`（=Aborted）。`admin.rs` 的 ABORT 臂
+///    读 cdw10 = SQID | CID<<16，调 `try_abort_inflight`，置 `cdw0 = !aborted`。命中在飞 →
+///    aborted=true → dw0 bit0=0。**旧 stub 恒置 dw0=1**，故 `bit0==0` 只能由真中止产生。
+/// 2. **目标的 CQE**：在 IO CQ 上 post，`cid == 0x30` 且**完整 16-bit** `status == 0x0007`
+///    (`COMMAND_ABORT_REQUESTED`，Generic SCT=0)。这条 CQE 由 `try_abort_inflight` 在移除
+///    目标后**主动 post**（`Cqe::error(cid, .., COMMAND_ABORT_REQUESTED)`）。**旧 stub 不碰
+///    目标**——目标会在数据 DMA 回执后正常完成成 `sc=0`（**非** abort-requested）。故
+///    `status == 0x0007` 也只能由真中止产生。
+///
+/// 为何**独立**：两条判据都来自 firmware 经真 wire emit 的 CQE 字节（Abort CQE 的 dw0 / 目标
+/// CQE 的 status），由 harness 从 guest-mem 解析，**非**读 firmware 自家变量、**非** harness
+/// 自造。两者叠加把"真中止了在飞命令"钉死，正是 could-not-abort 路径所缺的牙。
+///
+/// ## 释放扣留 + fence：controller 必须扛住 stale completion
+///
+/// Abort 已把目标从 `pending_ios` 移除。随后 `release_dma` 补回那条数据 `ReadGpa` 的
+/// `DmaCompletion` → firmware 的 `on_dma_complete` 收到一个**已无主**的 token →
+/// `on_dma_complete_impl` 遍历 `pending_eventidx_writes`/`pending_shadow_polls`/
+/// `pending_fetches`/`pending_ios` 全 miss → 落到 unknown-token 的 `tracing::debug!`，**静默
+/// 忽略**（不 post 第二条 CQE、不 panic、不 hang）。释放后做一次 admin Identify **fence** 证
+/// controller 仍存活、未被这条 stale completion 拖死。
+///
+/// ## revert-verify（已实测，见报告）：hold 是 load-bearing
+///
+/// 把本文件 `hold_dma` 临时改成 no-op（立即/不扣留）→ biased pump 先服务 Write 的数据 DMA →
+/// Write 在 Abort 处理前**完成**（post 正常 `sc=0` CQE 到 IO CQ slot 0）→ Abort 找不到在飞
+/// 目标，返 dw0 bit0=1；`io.poll_cqe` 读到的目标 CQE 是 Write 的正常完成 `status=0`。于是
+/// **两条断言都 FAIL**（`dw0 bit0==0` 与 `status==0x0007`）→ 证 hold 确实载重、本测试真打
+/// abort-in-flight 路径，而非自洽通过。
+///
+/// ## 诚实边界
+///
+/// - **could-not-abort 路径**（中止已完成 / 不存在的目标 → dw0 bit0=1）**故意不**单列测试：
+///   旧 stub 也恒返 dw0=1，该路径**与 stub 等价、无牙**（任意改坏 Abort 都不会让它 FAIL）。
+/// - **多-DMA 命令 partial-abort 清理**（accumulator 类命令被 Abort 须全清子-DMA + 累积器，
+///   只 post 一条 CQE）是另一会话的**单测**领域（确定性 `CaptureTransport` 可任意编排帧交错，
+///   见 `controller/tests.rs` 的 `abort_multi_dma_command_full_cleanup`）；本 e2e 只打跨进程真
+///   wire 上**能**行使且有牙的单-DMA 在飞中止。
+#[tokio::test]
+async fn openhcl_abort_inflight_io_command() -> Result<()> {
+    const TARGET_CID: u16 = 0x30;
+    const TARGET_LBA: u32 = 5;
+    const SC_COMMAND_ABORT_REQUESTED: u16 = 0x0007; // Generic SCT=0, SC 0x07（硬编码 spec 值）
+
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (mut admin, mut io) = setup_enabled_4k_io(&driver).await?;
+
+    // 1) **先**扣住 IO Write 的数据缓冲 DMA（经有序 cmd channel，保证在 Write 提交前生效）。
+    //    此后 firmware 对 WRITE_BUF_GPA 发的数据 ReadGpa 会被 pump stash、不回执。
+    driver.hold_dma(WRITE_BUF_GPA);
+
+    // 2) 写一个已知 pattern 到 WRITE_BUF_GPA（distinct-per-512，避免 uniform 掩盖），再 place +
+    //    ring 一条 IO Write（单 4K LBA，单 PRP1 → 单-DMA → 1 条 pending_ios）。**不** poll 其
+    //    CQE：数据 DMA 被扣 → 命令停在 in-flight（坐在 pending_ios 等数据 ReadGpa）。
+    let mut pattern = vec![0u8; 4096];
+    for i in 0..8 {
+        pattern[i * 512..(i + 1) * 512].fill(0xC0 + i as u8);
+    }
+    driver.write_guest(WRITE_BUF_GPA, pattern);
+    io.place_sqe(
+        &driver,
+        Sqe {
+            opcode: 0x01, // Write
+            cid: TARGET_CID,
+            nsid: 1,
+            prp1: WRITE_BUF_GPA,
+            cdw10: TARGET_LBA,
+            cdw12: 0, // nlb=0 → 1 个 4K LBA（单 PRP1 单-DMA）
+            ..Default::default()
+        }
+        .encode(),
+    );
+    io.ring_sq(&driver);
+
+    // 短 sleep 让 firmware 抵达"发数据 ReadGpa 并被扣住"的点。**注意这非 race**：hold 使该
+    // in-flight 态**稳定/持久**——命令在 release 前**绝不可能**完成，故任何 ≥ dispatch 时延的
+    // 等待都成立、更久也无害（不会偶发提前完成）。给足跨进程往返余量。
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // 3) 提交 Abort（admin，blocking）：cdw10 = IO_QID | (TARGET_CID << 16)。Abort 同步处理
+    //    （无数据 DMA）→ 找到 pending_ios 里的目标 → 移除 + post 目标的 COMMAND_ABORT_REQUESTED
+    //    CQE 到 IO CQ → 返 Abort 自身 CQE 到 ACQ。
+    let abort_cqe = admin
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x08, // Abort
+                cid: 0x99,
+                cdw10: IO_QID as u32 | ((TARGET_CID as u32) << 16),
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("submit Abort")?;
+
+    // ★ oracle ①（Abort 自身 CQE）：sc==0 且 dw0 bit0==0（Aborted）。旧 stub 恒 dw0=1。
+    assert_eq!(
+        abort_cqe.sc, 0,
+        "Abort CQE sc 应=0（命令本身成功），实={:#x}",
+        abort_cqe.sc
+    );
+    assert_eq!(
+        abort_cqe.dw0 & 1,
+        0,
+        "Abort dw0 bit0 应=0（=Aborted；旧 stub 恒返 1=Could Not Abort，故此断言只能由真中止在飞命令通过），实 dw0={:#x}",
+        abort_cqe.dw0
+    );
+
+    // ★ oracle ②（目标的 CQE）：在 IO CQ 上，cid=目标 + 完整 16-bit status==COMMAND_ABORT_REQUESTED
+    //   (0x0007)。目标尚未完成过（数据 DMA 被扣），故 IO CQ slot 0 的首条 CQE 必是 Abort 主动
+    //   post 的这条。旧 stub 不碰目标，目标会在 release 后正常完成成 sc=0（≠ 0x0007）。
+    let target_cqe = io.poll_cqe(&driver).await.context("poll 目标的 CQE")?;
+    assert_eq!(
+        target_cqe.cid, TARGET_CID,
+        "目标 CQE 的 cid 应=被中止命令的 cid(0x30)，实={:#x}",
+        target_cqe.cid
+    );
+    assert_eq!(
+        target_cqe.status, SC_COMMAND_ABORT_REQUESTED,
+        "目标 CQE 完整 status 应=COMMAND_ABORT_REQUESTED(0x0007)（含 SCT=0；旧 stub 下目标会正常 \
+         完成成 0，故此断言只能由真中止产生），实 status={:#x}",
+        target_cqe.status
+    );
+
+    // 4) 释放扣留 → pump 补回那条数据 ReadGpa 的 DmaCompletion → firmware 收到一个已无主
+    //    （目标已被 Abort 移除）的 token → on_dma_complete 走 unknown-token 静默忽略（不 post
+    //    第二条 CQE / 不 panic / 不 hang）。
+    driver.release_dma(WRITE_BUF_GPA);
+
+    // 5) fence：release 后做一次 admin Identify 往返，证 controller **仍存活**、未被 stale
+    //    completion 拖死（若它在此 wedge / panic，此 submit 会超时 → 测试失败暴露真 bug）。
+    //    经有序 cmd channel：fence 必在 ReleaseDma 处理完（含 stale completion 已上 wire）之后
+    //    才被处理，故 fence 成功 ⇒ controller 已平稳消化那条 stale completion。
+    let fence = admin
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x06, // Identify
+                cid: 0x9a,
+                prp1: IDENTIFY_GPA,
+                cdw10: 1, // CNS=1 Identify Controller
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("release 后 admin fence Identify（controller 应仍存活）")?;
+    assert_eq!(
+        fence.sc, 0,
+        "release stale completion 后 controller 应仍正常响应 admin（fence Identify sc 应=0），实={:#x}",
+        fence.sc
+    );
+
+    Ok(())
+}
+
+// ═══════════════════════ Abort 边界 + DBBUF SQ-gone 边界（诚实记录）═══════════════════════
 //
-// ## Abort（opcode 0x08）—— **stub，故意不写 e2e 测试**
+// ## Abort（opcode 0x08）—— **已真实现 + e2e 覆盖**（见上方 `openhcl_abort_inflight_io_command`）
 //
-// `controller/admin.rs` 的 `ABORT` 臂是 no-op stub：恒返 `Cqe::success` + `cdw0=1`
-// （bit 0 = "Could Not Abort"），**不**按 SQID+CID 查任何 in-flight 命令、不真中止任何东西、
-// 也无任何可观测副作用。NVMe Abort 的语义本应是"按 SQID|CID<<16 定位目标命令并尝试中止，
-// dw0 bit0 报是否中止成功"，但本 firmware 对**任何** Abort 输入都返同一结果。
+// `controller/admin.rs` 的 `ABORT` 臂**不再是 stub**：它读 cdw10 = SQID | CID<<16，调
+// `try_abort_inflight` 真定位并中止在飞命令，置 `cdw0 = !aborted`（bit0：0=Aborted /
+// 1=Could Not Abort）；命中时还给目标 post 一条 `COMMAND_ABORT_REQUESTED` CQE。上方 e2e 用
+// opt-in DMA-hold 把一条单-DMA IO Write 钉在 in-flight 再中止它，双重独立 oracle（Abort dw0
+// bit0=0 + 目标 status=0x0007）均为真中止的**独占**可观测——旧 stub 二者都产生不了，故测试
+// 有牙（revert-verify：hold 改 no-op → 两断言皆 FAIL，已实测）。
 //
-// 据 `docs/TEST_QUALITY.md` 三轴（reached / 独立 oracle / 有牙）与其**明令禁止"断言啥也没
-// 测"的无牙测试**（文中点名 `o3_fused_cw_dispatch_chain_smoke` "断言 events 空=啥也没测"
-// 为待修反例），给 stub 写 e2e 只能断言"返 success + dw0=1"——但那是 stub 的**恒定**输出，
-// 任意改坏 Abort 都不会让它 FAIL（无牙），且 oracle 就是被测代码自身（非独立）。故**SKIP**
-// Abort e2e，诚实记录其为 stub；待 Abort 真实现（真查命令、真中止 in-flight）时再写有牙测试。
+// **故意未单列的 Abort 子路径**（诚实记录）：
+//  - **could-not-abort**（中止已完成 / 不存在目标 → dw0 bit0=1）：与旧 stub 输出等价、**无牙**
+//    （任意改坏 Abort 都不会让它 FAIL，且 oracle 即被测代码自身），故不写独立 e2e。
+//  - **多-DMA 命令 partial-abort 全清**（accumulator 类被中止须 sweep 全部子-DMA + 累积器、
+//    只 post 一条 CQE）：属确定性单测领域（`controller/tests.rs` 的
+//    `abort_multi_dma_command_full_cleanup`，`CaptureTransport` 可任意编排帧交错）；本 e2e
+//    只打跨进程真 wire 上**能**行使且有牙的单-DMA 在飞中止。
 //
 // ## DBBUF "SQ 在轮询途中消失" 分支（`controller/mod.rs` `handle_shadow_sq`）—— **本 harness
 // 结构性不可达，unit-test 可拥有**
