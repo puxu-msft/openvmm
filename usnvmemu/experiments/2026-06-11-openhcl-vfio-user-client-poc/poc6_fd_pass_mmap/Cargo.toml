@@ -1,0 +1,19 @@
+[package]
+name = "poc6_fd_pass_mmap"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# POC-6（独立小 crate，非 workspace 成员）：验"经 SCM_RIGHTS 收到的 mshv_vtl_low fd
+# 能否在接收进程里 mmap 真 guest RAM"——audit 命中的核心 seam（POC-1 传自造 memfd、
+# POC-3 自开设备，都没验这条）。用 nix 把 socketpair/fork/sendmsg-ScmRights/mmap 写稳。
+#
+# cross-build 静态 musl（投递进真 VTL2 跑）：
+#   cargo build --release --target x86_64-unknown-linux-musl
+[dependencies]
+nix = { version = "0.30", features = ["socket", "uio", "mman", "process", "fs"] }
+
+[profile.release]
+strip = true
+
+[workspace]

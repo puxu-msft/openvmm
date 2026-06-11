@@ -85,17 +85,59 @@ impl PiTuple {
             ref_tag,
         }
     }
-    /// 校验 PI tuple 与 data + LBA 一致。Type 3 不查 RefTag。
-    pub(crate) fn verify(self, data: &[u8], lba: u64, pi_type: u8) -> PiCheck {
+    /// 校验 PI tuple 与 data + LBA 一致，按 PRCHK 逐项门控（spec § 8.3.1 + NVM CS
+    /// Cdw12ReadWrite.prinfo）。`prchk` 指示是否校验各字段：
+    /// - `prchk.guard`：校验 Guard（CRC16）；
+    /// - `prchk.ref_tag`：校验 Reference Tag（仅 Type 1/2，Type 3 本就不查）；
+    /// - `prchk.app_tag`：App Tag 校验**未实现**（需 cdw15 App Tag Mask 机件），
+    ///   即便置位也不校验（教学边界，host app_tag 原样保留）。
+    ///
+    /// PRCHK=0（无任何校验位）→ 一律 `Ok`：driver 显式 opt-out PI 校验（spec 允许，
+    /// controller 仍按 PRACT strip/insert，只是不验证）。这取代了早期"over-strict 一律
+    /// 校验 Guard+RefTag"的教学边界——现按 spec 真门控。
+    pub(crate) fn verify(self, data: &[u8], lba: u64, pi_type: u8, prchk: PrChk) -> PiCheck {
         let expected = Self::compute(data, lba, pi_type);
-        if self.guard != expected.guard {
+        if prchk.guard && self.guard != expected.guard {
             return PiCheck::GuardFail;
         }
-        if (pi_type == 1 || pi_type == 2) && self.ref_tag != expected.ref_tag {
+        if prchk.ref_tag && (pi_type == 1 || pi_type == 2) && self.ref_tag != expected.ref_tag {
             return PiCheck::RefTagFail;
         }
-        // AppTag 我们不强校验（spec 允许 driver 决定语义）
+        // AppTag：本实现未接 App Tag Mask（cdw15），即便 prchk.app_tag 置位也不校验
+        // （诚实标注的教学边界；host 的 app_tag 原样存盘/回送）。
         PiCheck::Ok
+    }
+}
+
+/// PRCHK（Protection Information Check）逐项校验门控。
+///
+/// 源自 cdw12 PRINFO 字段（spec NVM CS `Cdw12ReadWrite.prinfo`，4 bit @ bits 29:26）：
+/// `[bit29 PRACT][bit28 Guard][bit27 AppTag][bit26 RefTag]`（PRINFO[3..0]）。本结构只承载
+/// 3 个 PRCHK 位（PRACT 在调用方单独解析）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PrChk {
+    pub(crate) guard: bool,
+    pub(crate) app_tag: bool,
+    pub(crate) ref_tag: bool,
+}
+
+impl PrChk {
+    /// 从 cdw12 解析 PRCHK 3 位（Guard@28 / AppTag@27 / RefTag@26）。
+    pub(crate) fn from_cdw12(cdw12: u32) -> Self {
+        Self {
+            guard: (cdw12 >> 28) & 1 != 0,
+            app_tag: (cdw12 >> 27) & 1 != 0,
+            ref_tag: (cdw12 >> 26) & 1 != 0,
+        }
+    }
+    /// 全开（Guard+AppTag+RefTag 都校验）。供内部/测试用。
+    #[cfg(test)]
+    pub(crate) fn all() -> Self {
+        Self {
+            guard: true,
+            app_tag: true,
+            ref_tag: true,
+        }
     }
 }
 
@@ -143,15 +185,107 @@ mod tests {
         let data = b"hello world hello world hello wo".repeat(16); // 512 byte
         let lba = 42u64;
         let pi = PiTuple::compute(&data, lba, 1);
-        assert_eq!(pi.verify(&data, lba, 1), PiCheck::Ok);
+        assert_eq!(pi.verify(&data, lba, 1, PrChk::all()), PiCheck::Ok);
         // 改 data → guard fail
         let mut bad = data.clone();
         bad[0] ^= 0xff;
-        assert_eq!(pi.verify(&bad, lba, 1), PiCheck::GuardFail);
+        assert_eq!(pi.verify(&bad, lba, 1, PrChk::all()), PiCheck::GuardFail);
         // 改 lba → reftag fail
-        assert_eq!(pi.verify(&data, lba + 1, 1), PiCheck::RefTagFail);
+        assert_eq!(
+            pi.verify(&data, lba + 1, 1, PrChk::all()),
+            PiCheck::RefTagFail
+        );
         // Type 3 不查 reftag
-        assert_eq!(pi.verify(&data, lba + 1, 3), PiCheck::Ok);
+        assert_eq!(pi.verify(&data, lba + 1, 3, PrChk::all()), PiCheck::Ok);
+    }
+
+    /// PRCHK 逐项门控（spec NVM CS PRINFO bits 28:26）：PRCHK=0 → 即便 data/lba 改坏
+    /// 也一律 Ok（driver opt-out 校验）；单独开 Guard / RefTag 各自精确门控。
+    #[test]
+    fn pi_prchk_gating() {
+        let data = b"abcdefgh".repeat(64); // 512 byte
+        let lba = 7u64;
+        let pi = PiTuple::compute(&data, lba, 1);
+        let mut bad = data.clone();
+        bad[0] ^= 0xff; // 破坏 guard
+        let none = PrChk {
+            guard: false,
+            app_tag: false,
+            ref_tag: false,
+        };
+        // PRCHK=0：坏 guard + 错 lba 都放过。
+        assert_eq!(
+            pi.verify(&bad, lba, 1, none),
+            PiCheck::Ok,
+            "PRCHK=0 不校验 guard"
+        );
+        assert_eq!(
+            pi.verify(&data, lba + 1, 1, none),
+            PiCheck::Ok,
+            "PRCHK=0 不校验 reftag"
+        );
+        // 仅开 Guard：坏 guard 被抓，但错 lba（reftag）放过。
+        let guard_only = PrChk {
+            guard: true,
+            app_tag: false,
+            ref_tag: false,
+        };
+        assert_eq!(pi.verify(&bad, lba, 1, guard_only), PiCheck::GuardFail);
+        assert_eq!(
+            pi.verify(&data, lba + 1, 1, guard_only),
+            PiCheck::Ok,
+            "Guard-only 不查 reftag"
+        );
+        // 仅开 RefTag：错 lba 被抓，但坏 guard 放过。
+        let ref_only = PrChk {
+            guard: false,
+            app_tag: false,
+            ref_tag: true,
+        };
+        assert_eq!(pi.verify(&data, lba + 1, 1, ref_only), PiCheck::RefTagFail);
+        assert_eq!(
+            pi.verify(&bad, lba, 1, ref_only),
+            PiCheck::Ok,
+            "RefTag-only 不查 guard"
+        );
+    }
+
+    /// from_cdw12 锚定 PRINFO 位布局（PRACT@29 不属 PRCHK；Guard@28/AppTag@27/RefTag@26）。
+    #[test]
+    fn prchk_from_cdw12_bit_layout() {
+        assert_eq!(
+            PrChk::from_cdw12(1 << 28),
+            PrChk {
+                guard: true,
+                app_tag: false,
+                ref_tag: false
+            }
+        );
+        assert_eq!(
+            PrChk::from_cdw12(1 << 27),
+            PrChk {
+                guard: false,
+                app_tag: true,
+                ref_tag: false
+            }
+        );
+        assert_eq!(
+            PrChk::from_cdw12(1 << 26),
+            PrChk {
+                guard: false,
+                app_tag: false,
+                ref_tag: true
+            }
+        );
+        // PRACT(bit29) 不应被解析进任何 PRCHK 位。
+        assert_eq!(
+            PrChk::from_cdw12(1 << 29),
+            PrChk {
+                guard: false,
+                app_tag: false,
+                ref_tag: false
+            }
+        );
     }
 
     #[test]

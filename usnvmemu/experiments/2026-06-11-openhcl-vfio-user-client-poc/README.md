@@ -15,6 +15,7 @@ guest 内存零拷贝）的设计文档**之前**，先用 POC 验证它的承�
 | 3 | `poc3_guest_ram_fd.py` / `poc3_mshv_vtl_low_probe.rs` | OpenHCL VTL2 独立进程经 `/dev/mshv_vtl_low` mmap **真 guest RAM** | **真 OpenHCL VM** | **✅ PASSED**（活 VM `pcie-remote-exp`）|
 | 4 | `poc4_cvm_convert_revoke.py` | （Spec B/CVM）owner 无法单方面撤销他进程的共享映射 ⟹ 必须 revoke-before-convert | 本地（模型） | **✅ PASSED**（复现审计 CRITICAL 根因） |
 | 5 | （调查，见下 §POC-5） | OpenHCL VTL2 能否承载独立 firmware 进程 + AF_UNIX | 代码调查 | ✅ **可行（有先例）** |
+| 6 | `poc6_fd_pass_mmap/` | 进程 A open mshv_vtl_low → SCM_RIGHTS 传 fd → 进程 B（非自开）mmap 真 guest RAM | **真 OpenHCL VM** | ✅ **PASSED**（seam 成立，但传的是全-GPA 设备 fd）|
 
 公共逻辑在 `poclib.py`（build/spawn、SCM_RIGHTS fd 传递、DMA_MAP、SET_IRQS、NVMe
 bring-up），各 POC 复用；`poclib` 复用 interop_py 的 `vfio_proto` 作基础 wire。
@@ -107,6 +108,29 @@ munmap+ack）。证明 Spec B 的 RED 判断正确。（模型不复现硬件加
 **两种打包都可行**（独立进程有 crash/dump/vnc/gdb 先例 + diag 可 exec；in-process 则直接
 持 GuestMemory）。这是 VTL2 内的打包取舍，与"firmware 在 host 还是 VTL2"（见下 Topology
 总结）是正交两问。
+
+## POC-6：SCM_RIGHTS 传 mshv_vtl_low fd → 接收进程 mmap 真 guest RAM ✅ PASSED（真 VM）
+
+`poc6_fd_pass_mmap/`（nix crate，cross-build 静态 musl）。验 Spec A audit 命中的**核心
+未验 seam**：POC-1 传的是 client 自造 memfd、POC-3 是 firmware 自开设备，**都没验**
+"underhill 把它持有的 mshv_vtl_low fd 经 SCM_RIGHTS 传给 firmware，firmware 用该 fd mmap"。
+
+真机实测（活 VM `pcie-remote-exp`）：parent open `/dev/mshv_vtl_low` → socketpair +
+SCM_RIGHTS 传 fd → child（**从未自开设备**）以 `file_offset=GPA` mmap GPA 0x100000，读到
+`0x5a5a...5a5a`（**正是 POC-3 写入的 marker —— 跨 POC 一致性证明同一物理页**）+ 写回一致。
+
+→ **seam 成立**：underhill→firmware 的 fd-pass 零拷贝数据路径可行（解 architect CRITICAL-1）。
+→ **但坐实 security CRITICAL**：传过去的是**整个 mshv_vtl_low 设备 fd = 全 GPA 写权**，
+fd 粒度做不了 bounded/JIT/revoke。要 page 粒度 bounded sub-region 导出，**须改 OpenHCL**
+（underhill 切 memfd 窗口）—— 见 spec §10 OpenHCL 修改实验 track。
+
+跑：
+```bash
+cd poc6_fd_pass_mmap && cargo build --release --target x86_64-unknown-linux-musl
+base64 -w0 target/x86_64-unknown-linux-musl/release/poc6_fd_pass_mmap | \
+  /mnt/c/temp/pcie_remote_exp/ohcldiag-dev.exe pcie-remote-exp run /bin/sh -- -c \
+  'base64 -d >/tmp/p6; chmod +x /tmp/p6; POC_GPA=0x100000 POC_LEN=0x1000 /tmp/p6'
+```
 
 ## Topology 验证总结（firmware 该在哪 + 零拷贝机制）
 
