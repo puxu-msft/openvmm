@@ -1176,6 +1176,7 @@ impl NvmeController {
                                                 nswp: 0,
                                                 attached: true,
                                                 zns: None,
+                                                force_flush_err: false,
                                             },
                                         );
                                         let mut c = Cqe::success(p.cid, p.sq_id, p.sq_head, phase);

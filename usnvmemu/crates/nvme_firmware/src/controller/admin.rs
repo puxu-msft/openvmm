@@ -608,6 +608,15 @@ impl NvmeController {
                         );
                     }
                 }
+                // **D（persistent features，spec § 5.21.1）** — SV=1（cdw10 bit 31）
+                // → 把本 FID 的 current 值镜像进 saved_features（跨 reset 保留，
+                // enable 时回灌）。只镜像真存进 features map 的 FID（NUMBER_OF_QUEUES
+                // 等实时 FID 不入 map，不走持久化路径）。
+                let sv = (sqe.cdw10 >> 31) & 1 != 0;
+                if sv && let Some(&v) = self.features.get(&fid) {
+                    self.saved_features.insert(fid, v);
+                    tracing::debug!(fid, "Set Features SV=1 → saved (persistent across reset)");
+                }
                 Some(cqe)
             }
             admin_opc::GET_FEATURES => {
@@ -617,6 +626,21 @@ impl NvmeController {
                 let fid = (sqe.cdw10 & 0xff) as u8;
                 let sel = ((sqe.cdw10 >> 8) & 0x7) as u8;
                 let mut cqe = Cqe::success(cid, 0, sq_head, phase);
+                // **D（persistent features）** — SEL=2(saved) 返 saved_features 值
+                // （Set SV=1 持久化的）。未保存过的 FID 返 0（教学：spec 允许返 default，
+                // 0 即多数 FID 的 default）。SEL 0/1/3 仍走下方 current 计算。
+                // **reviewer M-2**：HOST_IDENTIFIER(0x81，DMA 输出)/NS_WRITE_PROTECTION
+                // (0x84，per-NS) 不走 scalar cdw0 路径，short-circuit 会返错形状结果 →
+                // 排除它们，让其落到下方正常处理。
+                if sel == 2
+                    && !matches!(
+                        fid,
+                        cmd::fid::HOST_IDENTIFIER | cmd::fid::NS_WRITE_PROTECTION
+                    )
+                {
+                    cqe.cdw0 = self.saved_features.get(&fid).copied().unwrap_or(0);
+                    return Some(cqe);
+                }
                 cqe.cdw0 = match fid {
                     cmd::fid::NUMBER_OF_QUEUES => {
                         // 实时返实际授予数（不查 features map）

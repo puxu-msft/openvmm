@@ -50,29 +50,42 @@ impl NvmeController {
     /// 在 CSTS.SHST=complete → 关机后下发的命令被忽略（SQ 仍在但不处理）；re-enable
     /// 清 SHST 后恢复。
     ///
-    /// **教学边界（deliberate omission）**：
-    /// - flush 失败仍报 complete（reviewer M-3）—— spec 无 "shutdown failed" 状态；
-    ///   production controller 会置 `csts::CFS`（fatal）让 driver 知数据可能丢，教学版仅 warn。
+    /// **flush 失败 → CSTS.CFS（D，spec § 3.1.4.5）**：任一 NS flush 失败即置
+    /// `csts::CFS`（Controller Fatal Status）+ 仍报 SHST=complete，让 driver 知
+    /// volatile 数据可能丢失（走 reset 恢复）。此前是教学边界（仅 warn 不置 CFS），
+    /// 现已按 spec 报 fatal。
+    ///
+    /// **仍保留的教学边界（deliberate omission，D 重审保留）**：
     /// - 只 quiesce **新命令**（`on_sq_tail_doorbell` gate SHST=complete），不停 async
     ///   AEN 源（reviewer M-1）：shutdown-complete 到下次 CC.EN=0 之间，in-flight 的
     ///   self-test / sanitize / error AEN + IRQ-coalesce flush 仍可能 fire。cooperative
     ///   driver 先停自己提交侧故可接受；CC.EN=0(disable) 才真正拆掉这些。
-    /// - 不 drain in-flight DMA（reviewer LOW-2）：CC.SHN 时正在飞的 write，其完成若落在
-    ///   flush 之后才写 backing，那一笔不会被再 flush（同上 flush 边界，教学可接受）。
+    /// - 不 drain in-flight DMA（reviewer LOW-2 / D-③）：CC.SHN 时正在飞的 write 不强 flush。
+    ///   **与 spec 一致**——NVMe reset/shutdown 终止 in-flight 命令、不承诺其数据持久化
+    ///   （spec § 5.2 "Implicit Aborts on Reset"），故此为**正当边界**而非缺陷。
     fn process_shutdown(&mut self, shn_field: u32) {
         tracing::info!(
             shn = shn_field,
             "NVMe: CC.SHN shutdown → flush all NS + CSTS.SHST=complete"
         );
         let nsids: Vec<u32> = self.namespaces.keys().collect();
+        let mut flush_failed = false;
         for nsid in nsids {
             if let Some(ns) = self.namespaces.get(&nsid)
                 && let Err(e) = ns.flush()
             {
                 tracing::warn!(nsid, error = %e, "shutdown flush failed");
+                flush_failed = true;
             }
         }
         self.csts = (self.csts & !csts::SHST_MASK) | csts::SHST_COMPLETE;
+        // **D（spec § 3.1.4.5）** — flush 失败 → 置 CSTS.CFS（Controller Fatal Status）
+        // 让 driver 知 volatile 数据可能未持久化（应走 controller reset 恢复）。此前
+        // 仅 warn（教学边界），现按 spec 报 fatal。与 DBBUF runaway 用同一 CFS 语义。
+        if flush_failed {
+            self.csts |= csts::CFS;
+            tracing::error!("shutdown flush failed → CSTS.CFS set（volatile 数据可能丢失）");
+        }
     }
 
     pub(super) fn enable(&mut self) {
@@ -109,6 +122,27 @@ impl NvmeController {
         self.csts |= csts::RDY;
         // (重新) enable = normal operation：清 CSTS.SHST（上次 shutdown 的 complete 状态）。
         self.csts &= !csts::SHST_MASK;
+        // **D（persistent features，spec § 5.21.1）** — Controller Reset 后 saved
+        // features 成为 current（disable 清了 current 但留了 saved）。此前 features
+        // 跨 reset 全丢、SV=1 形同虚设；现回灌 saved → current。
+        //
+        // **reviewer H-1**：部分 FID 的 current 真相不在 features map 而在专用 live
+        // 字段（POWER_MANAGEMENT→current_ps、INTERRUPT_COALESCING→irq_aggr_*），
+        // disable 把这些 live 字段重置了。光回灌 map 会让 Get SEL=0 / 真实行为与
+        // saved 不符——故 mirror-backed FID 必须**同步回灌其 live 字段**（与 Set
+        // 路径同一 cdw11→字段 推导）。
+        let restored: Vec<(u8, u32)> = self.saved_features.iter().map(|(&f, &v)| (f, v)).collect();
+        for (f, v) in restored {
+            self.features.insert(f, v);
+            match f {
+                crate::cmd::fid::POWER_MANAGEMENT => self.current_ps = (v & 0x1F) as u8,
+                crate::cmd::fid::INTERRUPT_COALESCING => {
+                    self.irq_aggr_threshold = (v & 0xff) as u8;
+                    self.irq_aggr_time = ((v >> 8) & 0xff) as u8;
+                }
+                _ => {}
+            }
+        }
         tracing::info!(
             asqs,
             acqs,
@@ -157,8 +191,9 @@ impl NvmeController {
         // 跨 reset 保留（spec § 5.16.1.1 / § 5.16.1.6 持久化，仅 power-
         // cycle 清空）。
         self.self_test_in_progress = None;
-        // Phase H1：features 跨 reset 不保留（spec § 5.21.1 'Save' bit
-        // 默认 0；我们暂不实现 NVM Subsystem persistent）。
+        // **D（persistent features）** — current features 跨 reset 不保留，但
+        // **saved_features（Set SV=1 持久化的）保留**，enable 时回灌为 current
+        // （spec § 5.21.1 'Save' bit）。此前 SV 被忽略、features 全丢。
         self.features.clear();
         self.granted_io_queues = self.io_queue_pairs;
         // K5: sanitize 跨 reset 撤回（spec § 5.26 'Sanitize Operation

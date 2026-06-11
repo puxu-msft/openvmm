@@ -1333,6 +1333,118 @@ fn prp_list_chaining_device_to_host() {
     }
 }
 
+/// **D（CSTS.CFS on shutdown-flush 失败，spec § 3.1.4.5）差分 oracle** — 此前
+/// flush 失败仅 warn（教学边界），现按 spec 置 CSTS.CFS 让 driver 知数据可能丢失。
+///   正例：NS flush 失败（test fault-injection）→ CSTS.CFS=1 + SHST=complete；
+///   负例：flush 成功 → CFS=0 + SHST=complete。
+/// revert-verify：删 process_shutdown 的 `csts |= CFS` → 正例转红。
+#[test]
+fn shutdown_flush_failure_sets_csts_cfs() {
+    use crate::regs::{cc, csts};
+    // 正例：flush 失败 → CSTS.CFS。
+    let mut c = make_ctrl_with_tmp("cfs_fail");
+    c.namespaces.get_mut(&1).unwrap().force_flush_err = true;
+    c.write_cc(cc::SHN_NORMAL_SHUTDOWN << cc::SHN_SHIFT);
+    assert_ne!(c.csts & csts::CFS, 0, "flush 失败应置 CSTS.CFS");
+    assert_eq!(
+        c.csts & csts::SHST_MASK,
+        csts::SHST_COMPLETE,
+        "仍报 SHST=complete（driver 可轮询确认）"
+    );
+    // 负例：flush 成功 → CFS 不置。
+    let mut c2 = make_ctrl_with_tmp("cfs_ok");
+    c2.write_cc(cc::SHN_NORMAL_SHUTDOWN << cc::SHN_SHIFT);
+    assert_eq!(c2.csts & csts::CFS, 0, "flush 成功不应置 CFS");
+    assert_eq!(c2.csts & csts::SHST_MASK, csts::SHST_COMPLETE);
+}
+
+/// **D（persistent features，spec § 5.21.1 'Save' bit）差分 oracle** — Set Features
+/// 带 SV=1 的 FID 值跨 Controller Reset 保留（saved→current 回灌）；SV=0 的丢失。
+///   Set SV=1 FID → reset → current 仍是该值 + SEL=2(saved) 也返该值；
+///   Set SV=0 FID → reset → current 丢（→ default 0）。
+/// revert-verify：删 enable() 的 saved→current 回灌 → "reset 后回灌"断言转红。
+#[test]
+fn persistent_features_save_bit_survives_reset() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx};
+    const SAVED_FID: u8 = 0x1d; // 未特殊处理 → 走 generic insert/get
+    const VOLATILE_FID: u8 = 0x1e;
+    fn set_feat(c: &mut NvmeController, cap: &mut CaptureTransport, fid: u8, val: u32, sv: bool) {
+        let mut ctx = DeviceCtx::new(cap);
+        let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&[0u8; 64][..]).unwrap();
+        sqe.cdw0 = (crate::cmd::admin_opc::SET_FEATURES as u32) | (0x10u32 << 16);
+        sqe.cdw10 = (fid as u32) | (if sv { 1 << 31 } else { 0 });
+        sqe.cdw11 = val;
+        let cqe = c
+            .dispatch_admin(&mut ctx, sqe, 0x10, 0, 0)
+            .expect("Set Features 返 CQE");
+        assert_eq!(cqe_status(&cqe), 0, "Set Features OK");
+    }
+    fn get_feat(c: &mut NvmeController, cap: &mut CaptureTransport, fid: u8, sel: u8) -> u32 {
+        let mut ctx = DeviceCtx::new(cap);
+        let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&[0u8; 64][..]).unwrap();
+        sqe.cdw0 = (crate::cmd::admin_opc::GET_FEATURES as u32) | (0x11u32 << 16);
+        sqe.cdw10 = (fid as u32) | ((sel as u32) << 8);
+        c.dispatch_admin(&mut ctx, sqe, 0x11, 0, 0)
+            .expect("Get Features 返 CQE")
+            .cdw0
+    }
+    let mut c = make_ctrl_with_tmp("persist_feat");
+    let mut cap = CaptureTransport::with_start_token(0x100);
+
+    set_feat(&mut c, &mut cap, SAVED_FID, 0xABCD, true); // SV=1 → 持久
+    set_feat(&mut c, &mut cap, VOLATILE_FID, 0x1234, false); // SV=0 → 易失
+    // **reviewer H-1 覆盖**：POWER_MANAGEMENT(0x02) 是 mirror-backed FID（current
+    // 真相在 self.current_ps 而非 features map）；SV=1 → reset 后必须回灌 live 字段。
+    set_feat(&mut c, &mut cap, crate::cmd::fid::POWER_MANAGEMENT, 3, true);
+    assert_eq!(
+        get_feat(&mut c, &mut cap, SAVED_FID, 0),
+        0xABCD,
+        "current(saved-fid)"
+    );
+    assert_eq!(
+        get_feat(&mut c, &mut cap, SAVED_FID, 2),
+        0xABCD,
+        "SEL=2 saved"
+    );
+    assert_eq!(
+        get_feat(&mut c, &mut cap, VOLATILE_FID, 0),
+        0x1234,
+        "current(volatile)"
+    );
+    assert_eq!(
+        get_feat(&mut c, &mut cap, VOLATILE_FID, 2),
+        0,
+        "SEL=2 未保存 → 0"
+    );
+
+    // Controller Reset：CC.EN 1→0→1（disable 清 current 留 saved，enable 回灌）。
+    c.disable();
+    c.enable();
+
+    assert_eq!(
+        get_feat(&mut c, &mut cap, SAVED_FID, 0),
+        0xABCD,
+        "reset 后 saved 回灌为 current"
+    );
+    assert_eq!(
+        get_feat(&mut c, &mut cap, SAVED_FID, 2),
+        0xABCD,
+        "saved 跨 reset 保留"
+    );
+    assert_eq!(
+        get_feat(&mut c, &mut cap, VOLATILE_FID, 0),
+        0,
+        "非 SV feature 跨 reset 丢失（→ default 0）"
+    );
+    // **H-1**：mirror-backed PM 的 live 字段(current_ps)也必须回灌（非仅 map）。
+    assert_eq!(
+        get_feat(&mut c, &mut cap, crate::cmd::fid::POWER_MANAGEMENT, 0),
+        3,
+        "reset 后 PM saved 回灌 live current_ps"
+    );
+    assert_eq!(c.current_ps, 3, "live current_ps 字段已回灌");
+}
+
 ///
 /// 单 LBA 4 KiB data + 8 byte T10 DIF tuple inline。verify 必须通过。
 #[test]

@@ -770,6 +770,10 @@ pub(super) struct Namespace {
     /// ZNS NS 的 CSI=0x02，Identify NS CNS=0x05 返 ZNS-specific 字段；
     /// Read/Write 必须遵循 SWR（Sequential Write Required）。
     pub(super) zns: Option<ZnsState>,
+    /// **D（test-only fault injection）** — 强制 `flush()` 返 Err，用来测
+    /// shutdown-flush 失败 → CSTS.CFS 路径（真 file sync_all 难在单测里失败）。
+    /// production 恒 false（仅 `#[cfg(test)]` 置位）。
+    pub(super) force_flush_err: bool,
 }
 
 /// **Phase L1** — ZNS (Zoned Namespace) 状态（spec ZNS CS § 4）。
@@ -932,6 +936,10 @@ impl Namespace {
     /// `mmap.flush()` 内部对 Unix = `msync(MS_SYNC)`，Windows = `FlushViewOfFile`
     /// + `FlushFileBuffers`。失败时回退 `file.sync_all()`。
     pub(super) fn flush(&self) -> std::io::Result<()> {
+        if self.force_flush_err {
+            // D（test-only）：强制失败，验 shutdown CSTS.CFS 路径。
+            return Err(std::io::Error::other("forced flush error (test)"));
+        }
         if let Some(mmap) = self.mmap.as_ref() {
             return mmap.flush();
         }
@@ -1080,6 +1088,12 @@ pub struct NvmeController {
     /// 路径。Set 后立即生效（spec 'persistent across reset' bit 默认 0，
     /// 所以 reset 时清掉）。
     pub(super) features: std::collections::HashMap<u8, u32>,
+    /// **D（persistent features，spec § 5.21.1 'Save' bit）** — Set Features 带
+    /// SV=1（cdw10 bit 31）的 FID 值持久化到此 map：**跨 controller reset 保留**
+    /// （disable 不清），enable 时回灌为 current；Get Features SEL=2(saved) 读它。
+    /// 此前 SV 被忽略、features 跨 reset 全丢（教学边界，D 重审修正）。
+    /// 注：教学版仅"跨 reset"持久（进程内），非真跨 power-cycle 写盘。
+    pub(super) saved_features: std::collections::HashMap<u8, u32>,
     /// **Phase H2** — Driver 通过 Set Features 0x07 请求的 IO queue 数；
     /// controller 在 enable() 时实际授予 `min(requested, io_queue_pairs)` 个 SQ/CQ。
     /// 默认 = 运行时上限 [`Self::io_queue_pairs`]；请求大于上限被限制到上限。
@@ -2045,6 +2059,7 @@ impl NvmeController {
                     nswp: 0,
                     attached: true,
                     zns: None,
+                    force_flush_err: false,
                 },
             );
         }
@@ -2120,6 +2135,7 @@ impl NvmeController {
             discovery_portals: Vec::new(),
             discovery_gen_ctr: 0,
             features: std::collections::HashMap::new(),
+            saved_features: std::collections::HashMap::new(),
             granted_io_queues: IO_QUEUE_SLOT_CAPACITY,
             // 运行时模拟上限默认 = 编译期槽位容量（即"不额外限制"）；CLI 可调低。
             io_queue_pairs: IO_QUEUE_SLOT_CAPACITY,
