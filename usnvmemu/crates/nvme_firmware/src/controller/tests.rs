@@ -1692,6 +1692,403 @@ fn prchk_zero_dispatch_skips_verify() {
     );
 }
 
+/// **B6c-1（inline metadata WRITE，PRACT=0，spec § 8.3）差分 oracle** — extended-LBA PI NS
+/// (meta_inline=true)：host 经 dual-PRP 提供完整 4104 byte block（PRP1=4096 head +
+/// PRP2=8 tail），controller 拼接 → 按 PRCHK verify host PI → 通过则原样存盘。
+///   正例：host PI 正确 → backing 落盘字节匹配 host 提供的完整 block（独立 oracle：
+///     直接 read_at backing 4104 byte vs host 输入字节）；
+///   负例：host PI guard 损坏 → Media SCT=2 错误 + backing 不落盘（全 0）。
+///
+/// 独立 oracle：backing file 字节 + PiTuple::compute 真相源。
+/// revert-verify：把 finalize 的 host_tuple.verify(...) 改成恒 Ok → 负例不被拒，
+/// 坏数据落盘 → "全 0 不落盘"断言转红（见测试末注释）。
+#[test]
+fn b6c_inline_meta_write() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    fn inline_ns() -> NvmeController {
+        let mut c = make_ctrl_with_tmp("b6c_inline_wr");
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+        ns.pi_first = true;
+        ns.meta_inline = true; // extended-LBA（inline metadata）
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / ns.block_bytes();
+        c.cqs.insert(
+            1,
+            crate::regs::CompletionQueue {
+                base_gpa: 0x1_0000,
+                size: 64,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 0,
+                interrupt_enabled: false,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        c
+    }
+    let data: Vec<u8> = (0..4096).map(|i| ((i * 11 + 5) & 0xff) as u8).collect();
+    let good_tuple = crate::pi::PiTuple::compute(&data, 0, 1).to_bytes();
+    // 构造完整 4104 byte extended block（pi_first=true → [tuple][data]）。
+    let mut full_block = Vec::with_capacity(4104);
+    full_block.extend_from_slice(&good_tuple);
+    full_block.extend_from_slice(&data);
+    // host buffer 切：前 4096 → PRP1，末 8 → PRP2。
+    let prp1_seg: Vec<u8> = full_block[..4096].to_vec();
+    let prp2_seg: Vec<u8> = full_block[4096..].to_vec();
+    assert_eq!(prp2_seg.len(), 8);
+
+    fn drive(
+        c: &mut NvmeController,
+        cap: &mut CaptureTransport,
+        cid: u16,
+        prp1_seg: &[u8],
+        prp2_seg: &[u8],
+    ) {
+        let mut ctx = DeviceCtx::new(cap);
+        let mut sqe = io_sqe(0x01, 1, 0, 1, 0x4000, false, cid); // WRITE PRACT=0 nlb=1
+        sqe.prp2 = 0x5000;
+        let r = c.dispatch_io(&mut ctx, 1, sqe, cid, 0, 1);
+        assert!(r.is_none(), "inline WRITE 走异步 dual-PRP DMA");
+        assert_eq!(c.pending_ios.len(), 2, "PRP1 + PRP2 两条子-DMA");
+        assert_eq!(c.inline_meta_writes.len(), 1, "1 个 InlineMetaWriteAccum");
+        let items: Vec<(u64, bool)> = c
+            .pending_ios
+            .iter()
+            .map(|(&t, p)| match p.op {
+                PendingOp::InlineMetaWriteSeg { is_prp1, .. } => (t, is_prp1),
+                _ => unreachable!("only inline-meta write sub-DMAs expected"),
+            })
+            .collect();
+        for (t, is_prp1) in items {
+            let d = if is_prp1 {
+                prp1_seg.to_vec()
+            } else {
+                prp2_seg.to_vec()
+            };
+            c.on_dma_complete_impl(&mut ctx, t, true, d);
+        }
+    }
+
+    // ── 正例：host PI 正确 → backing 落盘字节 = host 提供的完整 block ──
+    {
+        let mut c = inline_ns();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        drive(&mut c, &mut cap, 0x80, &prp1_seg, &prp2_seg);
+        assert!(c.inline_meta_writes.is_empty(), "finalize 应移除 accum");
+        let ns = c.namespaces.get(&1).unwrap();
+        let mut buf = vec![0u8; 4104];
+        ns.read_at(&mut buf, 0).unwrap();
+        assert_eq!(
+            &buf[..],
+            &full_block[..],
+            "backing 字节 = host 提供的完整 block（独立 oracle）"
+        );
+    }
+
+    // ── 负例：host PI guard 损坏 → Media 错误 + 不落盘 ──
+    {
+        let mut c = inline_ns();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut bad_prp1 = prp1_seg.clone();
+        bad_prp1[0] ^= 0xff; // 破坏 tuple 的 guard（pi_first=true，tuple 在 prp1 前 8 字节）
+        let pre = cap.events().len();
+        drive(&mut c, &mut cap, 0x81, &bad_prp1, &prp2_seg);
+        let ns = c.namespaces.get(&1).unwrap();
+        let mut buf = vec![0u8; 4104];
+        ns.read_at(&mut buf, 0).unwrap();
+        assert!(buf.iter().all(|&b| b == 0), "PI verify 失败不应落盘");
+        let status = cap
+            .events()
+            .iter()
+            .skip(pre)
+            .filter_map(|e| match e {
+                TransportEvent::DmaWrite { gpa, data, .. }
+                    if *gpa >= 0x1_0000 && *gpa < 0x1_0000 + 64 * 16 && data.len() >= 16 =>
+                {
+                    let dw3 = u32::from_le_bytes(data[12..16].try_into().unwrap());
+                    Some((((dw3 >> 17) & 0xff) | (((dw3 >> 25) & 0x7) << 8)) as u16)
+                }
+                _ => None,
+            })
+            .next_back()
+            .expect("应 post 错误 CQE");
+        assert_eq!(
+            status,
+            crate::cmd::sc::status(0x82, crate::cmd::sc::SCT_MEDIA_DATA_INTEGRITY),
+            "host PI guard 错 → Media GUARD_CHECK_ERR (0x0282)"
+        );
+    }
+    // revert-verify（手动）：把 completion.rs `inline_meta_write_finalize` 的
+    // `host_tuple.verify(...)` 改成恒 `PiCheck::Ok` → 负例落盘 → "全 0 不落盘"断言转红。
+    // 已实测转红，恢复后绿。
+}
+
+/// **B6c-2（inline metadata READ，PRACT=0，spec § 8.3）差分 oracle** — extended-LBA PI NS：
+/// backing 读 4104 byte block → 按 PRCHK verify stored PI → 整 block 切回 host
+/// （前 4096→PRP1、末 8→PRP2，两条 DMA-write）。
+///   正例：stored PI 正确 → host PRP1 收前 4096、PRP2 收末 8（独立 oracle：capture DmaWrite 字节）；
+///   负例：stored PI guard 损坏 → 同步 Media 错误 + 不发任何 host DMA-write。
+///
+/// revert-verify：把 dispatch 的 stored.verify(...) 改成恒 Ok → 负例不被拒、坏数据回送
+/// host → "不回送 host"断言转红。
+#[test]
+fn b6c_inline_meta_read() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    fn inline_ns() -> NvmeController {
+        let mut c = make_ctrl_with_tmp("b6c_inline_rd");
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+        ns.pi_first = true;
+        ns.meta_inline = true;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / ns.block_bytes();
+        c.cqs.insert(
+            1,
+            crate::regs::CompletionQueue {
+                base_gpa: 0x1_0000,
+                size: 64,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 0,
+                interrupt_enabled: false,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        c
+    }
+    fn seed(c: &mut NvmeController, tuple: &[u8; 8], data: &[u8]) {
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        let mut block = vec![0u8; 4104];
+        block[0..8].copy_from_slice(tuple);
+        block[8..4104].copy_from_slice(data);
+        ns.write_at(&block, 0).unwrap();
+    }
+    let data: Vec<u8> = (0..4096).map(|i| ((i * 13 + 7) & 0xff) as u8).collect();
+    let tuple = crate::pi::PiTuple::compute(&data, 0, 1).to_bytes();
+    let mut full_block = Vec::with_capacity(4104);
+    full_block.extend_from_slice(&tuple);
+    full_block.extend_from_slice(&data);
+
+    // ── 正例：PRP1 收前 4096、PRP2 收末 8 ──
+    {
+        let mut c = inline_ns();
+        seed(&mut c, &tuple, &data);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x02, 1, 0, 1, 0x4000, false, 0x82); // READ PRACT=0 nlb=1
+            sqe.prp2 = 0x5000;
+            let r = c.dispatch_io(&mut ctx, 1, sqe, 0x82, 0, 1);
+            assert!(r.is_none(), "inline READ 走异步 dual DMA-write");
+            assert_eq!(c.inline_meta_reads.len(), 1, "1 个 InlineMetaReadAccum");
+            let toks: Vec<u64> = c.pending_ios.keys().copied().collect();
+            assert_eq!(toks.len(), 2, "PRP1 + PRP2 两条 DMA-write");
+            for t in toks {
+                c.on_dma_complete_impl(&mut ctx, t, true, Vec::new());
+            }
+        }
+        let mut writes: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+        for e in cap.events() {
+            if let TransportEvent::DmaWrite { gpa, data, .. } = e {
+                writes.insert(*gpa, data.clone());
+            }
+        }
+        assert_eq!(
+            writes.get(&0x4000).map(|d| &d[..]),
+            Some(&full_block[..4096]),
+            "PRP1 收前 4096 字节"
+        );
+        assert_eq!(
+            writes.get(&0x5000).map(|d| &d[..]),
+            Some(&full_block[4096..]),
+            "PRP2 收末 8 字节（tuple 尾部）"
+        );
+        assert!(c.inline_meta_reads.is_empty(), "两条完成后 accum 移除");
+    }
+
+    // ── 负例：stored PI guard 损坏 → Media 同步错误，不回送 host ──
+    {
+        let mut c = inline_ns();
+        let mut bad = tuple;
+        bad[0] ^= 0xff;
+        seed(&mut c, &bad, &data);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let cqe = {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x02, 1, 0, 1, 0x4000, false, 0x83);
+            sqe.prp2 = 0x5000;
+            c.dispatch_io(&mut ctx, 1, sqe, 0x83, 0, 1)
+        };
+        let cqe = cqe.expect("stored PI 损坏 → 同步 Media 错误 CQE");
+        assert_eq!(
+            cqe_status(&cqe),
+            crate::cmd::sc::status(0x82, crate::cmd::sc::SCT_MEDIA_DATA_INTEGRITY),
+            "stored guard 损坏 → Media GUARD_CHECK_ERR (0x0282)"
+        );
+        let leaked = cap.events().iter().any(|e| {
+            matches!(e,
+            TransportEvent::DmaWrite { gpa, .. } if *gpa == 0x4000 || *gpa == 0x5000)
+        });
+        assert!(!leaked, "stored PI verify 失败不应 DMA-write 到 host");
+    }
+    // revert-verify（手动）：把 io.rs B6c-2 dispatch 的 stored.verify(...) 改成恒 Ok →
+    // 负例不被拒 → 坏数据写回 PRP1/PRP2 → "不回送 host"断言转红。已实测，恢复绿。
+}
+
+/// **B6c pi_first=false 覆盖（reviewer M-3）** — `pi_first=false` 时 block 布局为
+/// `[data][tuple]`（data 在前，tuple 在后 8 字节）。本测试单独覆盖该 arm，避免
+/// pi_first=false 路径在 b6c_inline_meta_write/read 中无回归门。
+#[test]
+fn b6c_inline_meta_pi_first_false() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    fn inline_ns_pi_last() -> NvmeController {
+        let mut c = make_ctrl_with_tmp("b6c_inline_pi_last");
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+        ns.pi_first = false; // PI 在 block 末尾
+        ns.meta_inline = true;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / ns.block_bytes();
+        c.cqs.insert(
+            1,
+            crate::regs::CompletionQueue {
+                base_gpa: 0x1_0000,
+                size: 64,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 0,
+                interrupt_enabled: false,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        c
+    }
+    let data: Vec<u8> = (0..4096).map(|i| ((i * 17 + 9) & 0xff) as u8).collect();
+    let tuple = crate::pi::PiTuple::compute(&data, 0, 1).to_bytes();
+    // pi_first=false：block = [data][tuple]。
+    let mut full_block = Vec::with_capacity(4104);
+    full_block.extend_from_slice(&data);
+    full_block.extend_from_slice(&tuple);
+    let prp1_seg: Vec<u8> = full_block[..4096].to_vec(); // data 前 4096
+    let prp2_seg: Vec<u8> = full_block[4096..].to_vec(); // data 末 0+tuple 末 8
+
+    // ── WRITE 正例：host PI 正确 → backing = [data][tuple] ──
+    {
+        let mut c = inline_ns_pi_last();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let mut sqe = io_sqe(0x01, 1, 0, 1, 0x4000, false, 0x90);
+        sqe.prp2 = 0x5000;
+        let r = c.dispatch_io(&mut ctx, 1, sqe, 0x90, 0, 1);
+        assert!(r.is_none());
+        let items: Vec<(u64, bool)> = c
+            .pending_ios
+            .iter()
+            .map(|(&t, p)| match p.op {
+                PendingOp::InlineMetaWriteSeg { is_prp1, .. } => (t, is_prp1),
+                _ => unreachable!(),
+            })
+            .collect();
+        for (t, is_prp1) in items {
+            let d = if is_prp1 {
+                prp1_seg.clone()
+            } else {
+                prp2_seg.clone()
+            };
+            c.on_dma_complete_impl(&mut ctx, t, true, d);
+        }
+        let ns = c.namespaces.get(&1).unwrap();
+        let mut buf = vec![0u8; 4104];
+        ns.read_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf[..4096], &data[..], "pi_first=false：data 在前 4096");
+        assert_eq!(&buf[4096..], &tuple[..], "pi_first=false：tuple 在末 8");
+    }
+
+    // ── READ 正例：seed [data][tuple] → PRP1 收前 4096、PRP2 收末 8 ──
+    {
+        let mut c = inline_ns_pi_last();
+        {
+            let ns = c.namespaces.get_mut(&1).unwrap();
+            let mut block = vec![0u8; 4104];
+            block[..4096].copy_from_slice(&data);
+            block[4096..].copy_from_slice(&tuple);
+            ns.write_at(&block, 0).unwrap();
+        }
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x02, 1, 0, 1, 0x4000, false, 0x91);
+            sqe.prp2 = 0x5000;
+            let r = c.dispatch_io(&mut ctx, 1, sqe, 0x91, 0, 1);
+            assert!(r.is_none());
+            let toks: Vec<u64> = c.pending_ios.keys().copied().collect();
+            for t in toks {
+                c.on_dma_complete_impl(&mut ctx, t, true, Vec::new());
+            }
+        }
+        let mut writes: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+        for e in cap.events() {
+            if let TransportEvent::DmaWrite { gpa, data, .. } = e {
+                writes.insert(*gpa, data.clone());
+            }
+        }
+        assert_eq!(
+            writes.get(&0x4000).map(|d| &d[..]),
+            Some(&data[..]),
+            "pi_first=false READ：PRP1 收 data 前 4096"
+        );
+        assert_eq!(
+            writes.get(&0x5000).map(|d| &d[..]),
+            Some(&tuple[..]),
+            "pi_first=false READ：PRP2 收 tuple 末 8"
+        );
+    }
+
+    // ── READ 负例（pi_first=false）：stored tuple 坏 → 同步 Media 错误，不回送 host ──
+    {
+        let mut c = inline_ns_pi_last();
+        {
+            let ns = c.namespaces.get_mut(&1).unwrap();
+            let mut block = vec![0u8; 4104];
+            block[..4096].copy_from_slice(&data);
+            let mut bad = tuple;
+            bad[0] ^= 0xff;
+            block[4096..].copy_from_slice(&bad);
+            ns.write_at(&block, 0).unwrap();
+        }
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let cqe = {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x02, 1, 0, 1, 0x4000, false, 0x92);
+            sqe.prp2 = 0x5000;
+            c.dispatch_io(&mut ctx, 1, sqe, 0x92, 0, 1)
+        };
+        let cqe = cqe.expect("pi_first=false stored PI 损坏 → 同步 Media 错误");
+        assert_eq!(
+            cqe_status(&cqe),
+            crate::cmd::sc::status(0x82, crate::cmd::sc::SCT_MEDIA_DATA_INTEGRITY)
+        );
+        let leaked = cap.events().iter().any(|e| {
+            matches!(e,
+            TransportEvent::DmaWrite { gpa, .. } if *gpa == 0x4000 || *gpa == 0x5000)
+        });
+        assert!(!leaked, "pi_first=false 校验失败不应回送 host");
+    }
+}
+
 /// **C1① MDTS 计入 inline metadata（spec § 5.17.2.2 / § 8.x）差分 oracle** —
 /// extended-LBA（内联 metadata）的 host 传输大小 = block_bytes(data+meta)，MDTS
 /// 须计入 metadata。PI 格式 4104 B/LBA，MDTS=128 KiB：

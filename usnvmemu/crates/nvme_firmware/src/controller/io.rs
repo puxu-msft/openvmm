@@ -758,12 +758,12 @@ impl NvmeController {
                     ns.meta_size == 0 && !ns.pi_enabled() && (ns.lbads == 9 || ns.lbads == 12);
                 let sector_bytes = 1u64 << ns.lbads;
                 let meta_inline_r = ns.meta_inline; // B6b-3：separate(false) 走 MPTR 路径
-                // **Phase Q1 + reviewer 12轮 H-Q1**:
+                // **Phase Q1 + B6b/B6c PRACT=0 路径分流**:
                 // - PRACT=1 + 非 PI NS = INVALID_PROTECTION_INFO（spec § 8.3.1）
-                // - PRACT=0 + PI NS = INVALID_PROTECTION_INFO 因 K4 路径**不支持**
-                //   driver-supplied inline tuple；spec PRACT=0 要求 driver 在 PRP
-                //   传 N×4104 byte，我们 dma_read 只 N×4096 会丢 tuple。
-                //   driver 必须 PRACT=1 (controller 自动 generate/strip)
+                // - PRACT=0 + PI NS：按 NS metadata 形态分两路：
+                //     · separate (meta_inline=false)：B6b host data→PRP / PI→MPTR；
+                //     · inline (meta_inline=true)：B6c host 经 dual-PRP 提供完整
+                //       extended block（PRP1=4096 + PRP2=8，nlb=1），nlb≥2 需 PRP-list 待续。
                 if pract && !is_pi_path {
                     tracing::warn!(nsid, "READ PRACT=1 on non-PI NS → INVALID_PROTECTION_INFO");
                     return Some(Cqe::error(
@@ -780,17 +780,136 @@ impl NvmeController {
                     // + N×8 PI tuple concat 回 MPTR（N+1 条 DMA-write）。N≤2（dual-PRP）；N>2
                     // （PRP-list data）defer。inline NS（extended LBA）的 PRACT=0 仍未实现。
                     if meta_inline_r {
-                        tracing::warn!(
-                            nsid,
-                            "READ PRACT=0 on inline(extended-LBA) PI NS unsupported (用 PRACT=1)"
+                        // **B6c-2（inline metadata，PRACT=0）READ** — nlb=1 dual-PRP 路径：
+                        // backing 读 4104 byte block → 按 PRCHK verify stored PI → 前 4096 → PRP1、
+                        // 末 8 → PRP2（两条 DMA-write）。nlb≥2 inline 需 PRP-list defer。
+                        if nlb != 1 {
+                            tracing::warn!(
+                                nlb,
+                                "inline-meta READ nlb≥2 需 PRP-list（待续）→ INVALID_FIELD"
+                            );
+                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                        }
+                        let pi_type = ns.pi_type;
+                        let pi_first = ns.pi_first;
+                        let block_bytes = ns.block_bytes() as usize;
+                        let data_bytes = ns.data_bytes() as usize;
+                        let total_lba = ns.total_lba;
+                        if block_bytes != NVME_PAGE_SIZE as usize + 8 {
+                            tracing::warn!(
+                                block_bytes,
+                                "inline-meta READ 仅支持标准 PI NS（block_bytes=4104）"
+                            );
+                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                        }
+                        if prp2 == 0 {
+                            tracing::warn!(nsid, "inline-meta READ 需 PRP2（block tail 8 字节）");
+                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                        }
+                        // **M-2**：本路径假设 PRP1/PRP2 都页对齐（教学简化，与 K4c/plain 一致）。
+                        if (prp1 & (NVME_PAGE_SIZE - 1)) != 0 || (prp2 & (NVME_PAGE_SIZE - 1)) != 0
+                        {
+                            tracing::warn!(
+                                prp1 = format_args!("{:#x}", prp1),
+                                prp2 = format_args!("{:#x}", prp2),
+                                "inline-meta READ 要求 PRP1/PRP2 页对齐（教学边界）"
+                            );
+                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                        }
+                        if slba >= total_lba {
+                            return Some(Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::LBA_OUT_OF_RANGE,
+                            ));
+                        }
+                        let mut block = vec![0u8; block_bytes];
+                        let ns_mut = self.ns_mut(nsid).unwrap();
+                        if let Err(e) = ns_mut.read_at(&mut block, slba * block_bytes as u64) {
+                            tracing::warn!(error = %e, nsid, slba, "inline-meta READ backing fail");
+                            return Some(Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::DATA_TRANSFER_ERROR,
+                            ));
+                        }
+                        // 按 pi_first 切 data / tuple，verify stored PI（按 PRCHK 门控）。
+                        let (data_slice, tuple_slice) = if pi_first {
+                            (&block[8..8 + data_bytes], &block[0..8])
+                        } else {
+                            (&block[0..data_bytes], &block[data_bytes..data_bytes + 8])
+                        };
+                        let tuple_arr: [u8; 8] = tuple_slice.try_into().unwrap();
+                        let stored = crate::pi::PiTuple::from_bytes(&tuple_arr);
+                        let prchk = crate::pi::PrChk::from_cdw12(cdw12);
+                        match stored.verify(data_slice, slba, pi_type, prchk) {
+                            crate::pi::PiCheck::Ok => {}
+                            other => {
+                                // **reviewer L-2**：PiCheck::Ok 已在上面 arm 排除，to_sc()
+                                // 对所有其他变体单射返 Some；用 expect 表达不变量，比
+                                // unwrap_or(0x82) 默认值更诚实（默认值不可达，但读者难辨）。
+                                let sc_byte = other
+                                    .to_sc()
+                                    .expect("non-Ok PiCheck always maps to an SC byte");
+                                tracing::warn!(
+                                    nsid,
+                                    slba,
+                                    ?other,
+                                    "inline-meta READ: stored PI verify 失败"
+                                );
+                                return Some(Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::status(sc_byte, sc::SCT_MEDIA_DATA_INTEGRITY),
+                                ));
+                            }
+                        }
+                        // 整个 block 原样回 host：前 4096 → PRP1、末 8 → PRP2（host buffer 同 backing
+                        // 一致是 interleaved 布局，不区分 pi_first 拆分——直接按页边界切回）。
+                        let head: Vec<u8> = block[..NVME_PAGE_SIZE as usize].to_vec();
+                        let tail: Vec<u8> = block[NVME_PAGE_SIZE as usize..].to_vec();
+                        let op_id = self.alloc_op_id();
+                        let tok1 = ctx.dma_write(prp1, head);
+                        self.pending_ios.insert(
+                            tok1,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::InlineMetaReadDone { op_id },
+                            },
                         );
-                        return Some(Cqe::error(
-                            cid,
-                            sq_id,
-                            sq_head,
-                            phase,
-                            sc::INVALID_PROTECTION_INFO,
-                        ));
+                        let tok2 = ctx.dma_write(prp2, tail);
+                        self.pending_ios.insert(
+                            tok2,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::InlineMetaReadDone { op_id },
+                            },
+                        );
+                        self.inline_meta_reads.insert(
+                            op_id,
+                            crate::controller::InlineMetaReadAccum {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                remaining: 2,
+                            },
+                        );
+                        return None;
                     }
                     if nlb > 2 {
                         // N>2 separate READ 需 PRP-list data（复用 PrpListOp 机件，量大）；
@@ -1393,10 +1512,12 @@ impl NvmeController {
                 if let Some(cqe) = check_ns_write_protection(ns, cid, sq_id, sq_head, phase) {
                     return Some(cqe);
                 }
-                // **Phase Q1 + 12轮 H-Q1**:
+                // **Phase Q1 + B6b/B6c PRACT=0 路径分流（WRITE）**:
                 // - PRACT=1 + 非 PI NS = INVALID_PROTECTION_INFO（spec § 8.3.1）
-                // - PRACT=0 + PI NS = INVALID_PROTECTION_INFO（K4 路径不支持
-                //   driver-supplied inline tuple；driver 必须用 PRACT=1）
+                // - PRACT=0 + PI NS：按 NS metadata 形态分两路：
+                //     · separate (meta_inline=false)：B6b host data→PRP / PI→MPTR；
+                //     · inline (meta_inline=true)：B6c host 经 dual-PRP 提供完整
+                //       extended block（PRP1=4096 + PRP2=8，nlb=1），nlb≥2 需 PRP-list 待续。
                 let is_pi_capable = ns.lbads == 12 && ns.meta_size == 8 && ns.pi_type == 1;
                 // **2026-06-09 纯 4K** — plain 格式 = 无 meta + 无 PI + lbads∈{9,12}。
                 let is_plain =
@@ -1417,20 +1538,110 @@ impl NvmeController {
                     // **B6b-2/B6b-4（separate metadata，PRACT=0）** — host 供 PI tuple via MPTR。
                     // 仅 separate NS（meta_inline=false）：N 条 data 经 PRP（第 0 块 PRP1、
                     // 第 1 块 PRP2）、N×8 PI tuple 经 MPTR（一条）DMA-read，到齐后 verify-all-
-                    // then-store-all。inline NS（extended LBA）的 PRACT=0 仍未实现 → 拒绝。
-                    // N≤2（dual-PRP）；N>2（PRP-list data）作为最终扩展 defer。
+                    // then-store-all。**B6c**：inline NS（extended LBA）的 PRACT=0 单 LBA（nlb=1）
+                    // 走 dual-PRP（PRP1=4096 head + PRP2=8 tail，因 block_bytes=4104 > NVME_PAGE_SIZE）；
+                    // nlb≥2 inline 需 PRP-list（与 N>2 separate 同走 PrpListOp 机件）作为最终扩展 defer。
                     if meta_inline {
-                        tracing::warn!(
-                            nsid,
-                            "WRITE PRACT=0 on inline(extended-LBA) PI NS unsupported (用 PRACT=1)"
+                        // **B6c-1（inline metadata，PRACT=0）WRITE** — nlb=1 dual-PRP 路径。
+                        if nlb != 1 {
+                            tracing::warn!(
+                                nlb,
+                                "inline-meta WRITE nlb≥2 需 PRP-list（待续）→ INVALID_FIELD"
+                            );
+                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                        }
+                        let block_bytes = ns.block_bytes() as usize;
+                        // 当前 inline 仅支持标准 PI NS（lbads=12 + meta_size=8 → 4104）；
+                        // 其它 inline 布局（如 lbads=9+meta=8=520）未覆盖，留待真做时扩展。
+                        if block_bytes != NVME_PAGE_SIZE as usize + 8 {
+                            tracing::warn!(
+                                block_bytes,
+                                "inline-meta WRITE 仅支持标准 PI NS（block_bytes=4104）"
+                            );
+                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                        }
+                        if prp2 == 0 {
+                            // dual-PRP：tail 8 字节经 PRP2，driver 必须提供。
+                            tracing::warn!(nsid, "inline-meta WRITE 需 PRP2（block tail 8 字节）");
+                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                        }
+                        // **M-2**：本路径假设 PRP1/PRP2 都页对齐（与 K4c / plain dual-PRP
+                        // 一致的教学简化）。非对齐 PRP1 会让 4096+8 切分错位 → silent PI
+                        // mismatch。把假设升为 enforced precondition，避免 future driver 真
+                        // 按 spec 非对齐 PRP 时的 silent breakage。
+                        if (prp1 & (NVME_PAGE_SIZE - 1)) != 0 || (prp2 & (NVME_PAGE_SIZE - 1)) != 0
+                        {
+                            tracing::warn!(
+                                prp1 = format_args!("{:#x}", prp1),
+                                prp2 = format_args!("{:#x}", prp2),
+                                "inline-meta WRITE 要求 PRP1/PRP2 页对齐（教学边界）"
+                            );
+                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                        }
+                        // **H-1**：与 READ 分支对称的 LBA 越界校验（即便当前 nlb 锁定 1，仍
+                        // 用 checked_add 风格为 nlb≥2 PRP-list 扩展铺路）。spec 要求
+                        // LBA_OUT_OF_RANGE 在 dispatch 期返回，不能让越界 write_at 默默扩展
+                        // backing。
+                        let total_lba = ns.total_lba;
+                        match slba.checked_add(nlb as u64) {
+                            Some(end) if end <= total_lba => {}
+                            _ => {
+                                return Some(Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::LBA_OUT_OF_RANGE,
+                                ));
+                            }
+                        }
+                        let op_id = self.alloc_op_id();
+                        // PRP1：前 4096 字节（head）；PRP2：末 8 字节（tail）。
+                        let tok1 = ctx.dma_read(prp1, NVME_PAGE_SIZE as u32);
+                        self.pending_ios.insert(
+                            tok1,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::InlineMetaWriteSeg {
+                                    op_id,
+                                    is_prp1: true,
+                                },
+                            },
                         );
-                        return Some(Cqe::error(
-                            cid,
-                            sq_id,
-                            sq_head,
-                            phase,
-                            sc::INVALID_PROTECTION_INFO,
-                        ));
+                        let tok2 = ctx.dma_read(prp2, 8);
+                        self.pending_ios.insert(
+                            tok2,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::InlineMetaWriteSeg {
+                                    op_id,
+                                    is_prp1: false,
+                                },
+                            },
+                        );
+                        self.inline_meta_writes.insert(
+                            op_id,
+                            crate::controller::InlineMetaWriteAccum {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                lba: slba,
+                                prp1_data: None,
+                                prp2_data: None,
+                                prchk: crate::pi::PrChk::from_cdw12(cdw12),
+                            },
+                        );
+                        return None;
                     }
                     if nlb > 2 {
                         // N>2 separate WRITE 需 PRP-list data + MPTR（复用 PrpListOp 机件，量大）；

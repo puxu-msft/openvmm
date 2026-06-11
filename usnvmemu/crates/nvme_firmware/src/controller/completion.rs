@@ -188,6 +188,110 @@ impl NvmeController {
         self.post_cqe(ctx, acc.cq_id, cqe);
     }
 
+    /// **B6c-1（inline metadata，PRACT=0）** — extended-LBA PI Write 收尾：
+    /// PRP1（4096 head）+ PRP2（8 tail）两段 DMA-read 都到齐后调用。拼成完整 4104 byte
+    /// extended block → 按 `pi_first` 切 data / tuple → 按 `acc.prchk` 逐项校验 host PI →
+    /// 通过则原样 `write_at`（host 与 backing 同 interleaved 布局）；失败 → Media SCT=2
+    /// （首个失败类型 via to_sc()），不落盘。
+    fn inline_meta_write_finalize(&mut self, ctx: &mut DeviceCtx<'_>, op_id: u64) {
+        let Some(acc) = self.inline_meta_writes.remove(&op_id) else {
+            return;
+        };
+        let prp1 = acc.prp1_data.unwrap_or_default();
+        let prp2 = acc.prp2_data.unwrap_or_default();
+        let phase = self.cqs.get(&acc.cq_id).map(|c| c.phase).unwrap_or(1);
+        let cqe = if let Some(ns) = self.namespaces.get_mut(&acc.nsid) {
+            let pi_type = ns.pi_type;
+            let pi_first = ns.pi_first;
+            let block_bytes = ns.block_bytes() as usize;
+            let data_bytes = ns.data_bytes() as usize;
+            if prp1.len() != crate::regs::NVME_PAGE_SIZE as usize || prp2.len() != 8 {
+                tracing::warn!(
+                    p1 = prp1.len(),
+                    p2 = prp2.len(),
+                    "inline-meta Write DMA 长度不符（期望 4096+8）"
+                );
+                Cqe::error(
+                    acc.cid,
+                    acc.sq_id,
+                    acc.sq_head,
+                    phase,
+                    sc::DATA_TRANSFER_ERROR,
+                )
+            } else {
+                // 拼回完整 extended block（host 提供的连续布局）。
+                let mut block = Vec::with_capacity(block_bytes);
+                block.extend_from_slice(&prp1);
+                block.extend_from_slice(&prp2);
+                debug_assert_eq!(block.len(), block_bytes);
+                // 按 pi_first 切 data / tuple。host buffer 已是 interleaved 布局。
+                let (data_slice, tuple_slice) = if pi_first {
+                    (&block[8..8 + data_bytes], &block[0..8])
+                } else {
+                    (&block[0..data_bytes], &block[data_bytes..data_bytes + 8])
+                };
+                let tuple_arr: [u8; 8] = tuple_slice.try_into().unwrap();
+                let host_tuple = crate::pi::PiTuple::from_bytes(&tuple_arr);
+                match host_tuple.verify(data_slice, acc.lba, pi_type, acc.prchk) {
+                    crate::pi::PiCheck::Ok => {
+                        // 原样存盘（block 已是 backing 期望的 interleaved 布局，无需重排）。
+                        match ns.write_at(&block, acc.lba * block_bytes as u64) {
+                            Ok(()) => {
+                                self.stat_host_writes += 1;
+                                self.stat_lba_written += 1;
+                                crate::controller::io::advance_zns_wp(ns, acc.lba, 1);
+                                tracing::debug!(
+                                    nsid = acc.nsid,
+                                    lba = acc.lba,
+                                    "inline-meta PI Write OK（host PI verified）"
+                                );
+                                Cqe::success(acc.cid, acc.sq_id, acc.sq_head, phase)
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, nsid = acc.nsid, "inline-meta Write backing fail");
+                                Cqe::error(
+                                    acc.cid,
+                                    acc.sq_id,
+                                    acc.sq_head,
+                                    phase,
+                                    sc::DATA_TRANSFER_ERROR,
+                                )
+                            }
+                        }
+                    }
+                    other => {
+                        // **reviewer L-2**：PiCheck::Ok 已被上一 arm 排除，to_sc 单射；
+                        // 用 expect 表达不变量。
+                        let sc_byte = other
+                            .to_sc()
+                            .expect("non-Ok PiCheck always maps to an SC byte");
+                        tracing::warn!(
+                            nsid = acc.nsid,
+                            lba = acc.lba,
+                            ?other,
+                            "inline-meta Write: host PI verify 失败"
+                        );
+                        Cqe::error(
+                            acc.cid,
+                            acc.sq_id,
+                            acc.sq_head,
+                            phase,
+                            sc::status(sc_byte, sc::SCT_MEDIA_DATA_INTEGRITY),
+                        )
+                    }
+                }
+            }
+        } else {
+            Cqe::error(
+                acc.cid,
+                acc.sq_id,
+                acc.sq_head,
+                phase,
+                sc::INVALID_NAMESPACE,
+            )
+        };
+        self.post_cqe(ctx, acc.cq_id, cqe);
+    }
     pub(super) fn on_dma_complete_impl(
         &mut self,
         ctx: &mut DeviceCtx<'_>,
@@ -355,6 +459,42 @@ impl NvmeController {
                             _ => true,
                         });
                         self.sgl_ops.remove(&op_id);
+                    }
+                    PendingOp::SepMetaWriteData { op_id, .. }
+                    | PendingOp::SepMetaWriteMeta { op_id } => {
+                        // **B6b 多-DMA cleanup**：partial fail（如 data 段失败、meta 段成功）
+                        // 必须清 sibling pending + accum，否则 sibling 到达后找不到 finalize 条件，
+                        // accum 永久 leak（reviewer M-4 同病修复，与 NvmWriteDualPrp 形态一致）。
+                        self.pending_ios.retain(|_, q| match q.op {
+                            PendingOp::SepMetaWriteData { op_id: o, .. }
+                            | PendingOp::SepMetaWriteMeta { op_id: o } => o != op_id,
+                            _ => true,
+                        });
+                        self.sep_meta_writes.remove(&op_id);
+                    }
+                    PendingOp::SepMetaReadDone { op_id } => {
+                        self.pending_ios.retain(|_, q| {
+                            !matches!(q.op,
+                                PendingOp::SepMetaReadDone { op_id: o } if o == op_id)
+                        });
+                        self.sep_meta_reads.remove(&op_id);
+                    }
+                    PendingOp::InlineMetaWriteSeg { op_id, .. } => {
+                        // **B6c-1 dual-PRP cleanup**：tok1/tok2 任一失败 → 清 sibling +
+                        // accum（reviewer M-4 修复）。
+                        self.pending_ios.retain(|_, q| {
+                            !matches!(q.op,
+                                PendingOp::InlineMetaWriteSeg { op_id: o, .. } if o == op_id)
+                        });
+                        self.inline_meta_writes.remove(&op_id);
+                    }
+                    PendingOp::InlineMetaReadDone { op_id } => {
+                        // **B6c-2 dual DMA-write cleanup**：partial fail 同上。
+                        self.pending_ios.retain(|_, q| {
+                            !matches!(q.op,
+                                PendingOp::InlineMetaReadDone { op_id: o } if o == op_id)
+                        });
+                        self.inline_meta_reads.remove(&op_id);
                     }
                     _ => {}
                 }
@@ -675,6 +815,43 @@ impl NvmeController {
                         let phase = self.cqs.get(&acc.cq_id).map(|c| c.phase).unwrap_or(1);
                         self.stat_host_reads += 1;
                         self.stat_lba_read += acc.num_blocks as u64;
+                        let cqe = Cqe::success(acc.cid, acc.sq_id, acc.sq_head, phase);
+                        self.post_cqe(ctx, acc.cq_id, cqe);
+                    }
+                }
+                PendingOp::InlineMetaWriteSeg { op_id, is_prp1 } => {
+                    // **B6c-1（inline metadata，PRACT=0）** — extended-LBA PI Write 的一段
+                    // host DMA-read 到达（PRP1=4096 head 或 PRP2=8 tail）。两段都到齐后
+                    // finalize：拼回 4104-byte block → 按 pi_first 切 data/tuple → 按 PRCHK
+                    // verify host PI → 通过则原样 write_at（host buffer 与 backing 同布局）。
+                    if let Some(acc) = self.inline_meta_writes.get_mut(&op_id) {
+                        if is_prp1 {
+                            acc.prp1_data = Some(data);
+                        } else {
+                            acc.prp2_data = Some(data);
+                        }
+                        if acc.prp1_data.is_some() && acc.prp2_data.is_some() {
+                            self.inline_meta_write_finalize(ctx, op_id);
+                        }
+                    } else {
+                        tracing::warn!(op_id, "InlineMetaWriteSeg unknown op_id（已 abort?）");
+                    }
+                }
+                PendingOp::InlineMetaReadDone { op_id } => {
+                    // **B6c-2** — extended-LBA PI Read 的一条 DMA-write（PRP1 head 或 PRP2
+                    // tail）完成。两条都完成（remaining→0）→ success CQE。
+                    let done = if let Some(acc) = self.inline_meta_reads.get_mut(&op_id) {
+                        acc.remaining = acc.remaining.saturating_sub(1);
+                        acc.remaining == 0
+                    } else {
+                        tracing::warn!(op_id, "InlineMetaReadDone unknown op_id（已 abort?）");
+                        false
+                    };
+                    if done {
+                        let acc = self.inline_meta_reads.remove(&op_id).unwrap();
+                        let phase = self.cqs.get(&acc.cq_id).map(|c| c.phase).unwrap_or(1);
+                        self.stat_host_reads += 1;
+                        self.stat_lba_read += 1;
                         let cqe = Cqe::success(acc.cid, acc.sq_id, acc.sq_head, phase);
                         self.post_cqe(ctx, acc.cq_id, cqe);
                     }

@@ -488,6 +488,19 @@ pub(super) enum PendingOp {
     SepMetaReadDone {
         op_id: u64,
     },
+    /// **B6c-1（inline metadata，PRACT=0）** — extended-LBA PI Write 的一段 host DMA-read
+    /// 到达（nlb=1 dual-PRP：PRP1 4096 head，PRP2 8 tail）。两段都到齐后 InlineMetaWriteAccum
+    /// 拼成完整 block → 按 pi_first 切 data/tuple → 按 PRCHK verify host PI → 通过则原样
+    /// write_at（host buffer 与 backing 同 interleaved 布局）。`is_prp1=true` 标第一段。
+    InlineMetaWriteSeg {
+        op_id: u64,
+        is_prp1: bool,
+    },
+    /// **B6c-2（inline metadata，PRACT=0）** — extended-LBA PI Read 的一条 DMA-write（PRP1 head
+    /// 或 PRP2 tail）完成。两条都完成后 InlineMetaReadAccum.remaining→0 post success CQE。
+    InlineMetaReadDone {
+        op_id: u64,
+    },
     /// **Phase K4b** — PI Read sibling 占位（per-LBA file read + verify
     /// 在 dispatch 时同步完成，DMA-write 数据回 PRP1 在 PendingIo 路径）。
     NvmReadPiDmaWrite {
@@ -760,6 +773,41 @@ pub(super) struct SepMetaReadAccum {
     pub(super) num_blocks: u32,
 }
 
+/// **B6c-1（inline metadata，PRACT=0）** — extended-LBA PI Write 累积器（nlb=1）。
+/// host 经 dual-PRP 提供完整 extended block（PRP1 head + PRP2 tail）：因 block_bytes=4104
+/// 超过 NVME_PAGE_SIZE=4096，单 LBA 跨页，PRP1 装前 4096，PRP2 装末 8。两段都到齐后按
+/// `pi_first` 切 data/tuple，按 PRCHK 逐项校验 host PI，通过才原样存盘（host buffer 与
+/// backing 都是 interleaved [tuple][data] 或 [data][tuple] 同一布局，验证后直接 write_at）。
+/// nlb≥2 inline PRACT=0 需 PRP-list（跨 nlb×4104 多页），与 N>2 separate 同走 PrpListOp
+/// 机件，作为最终扩展 defer。
+pub(super) struct InlineMetaWriteAccum {
+    pub(super) sq_id: u16,
+    pub(super) cid: u16,
+    pub(super) sq_head: u16,
+    pub(super) cq_id: u16,
+    pub(super) nsid: u32,
+    pub(super) lba: u64,
+    /// PRP1 段（前 4096 字节，包含 data + 可能的部分 tuple，取决于 pi_first 与 block_bytes 切分）。
+    /// 当前 lbads=12+meta_size=8 → block_bytes=4104，PRP1=4096，PRP2=8。
+    pub(super) prp1_data: Option<Vec<u8>>,
+    /// PRP2 段（末 8 字节）。
+    pub(super) prp2_data: Option<Vec<u8>>,
+    /// PRCHK 逐项校验门控（dispatch 时从 cdw12 PRINFO 解析）。
+    pub(super) prchk: crate::pi::PrChk,
+}
+
+/// **B6c-2（inline metadata，PRACT=0）** — extended-LBA PI Read 累积器（nlb=1）。
+/// dispatch 时已从 backing 读 4104 byte interleaved block + 按 PRCHK verify stored PI +
+/// 发两条 DMA-write（前 4096→PRP1、末 8→PRP2）；两条都完成（remaining→0）后 post success。
+pub(super) struct InlineMetaReadAccum {
+    pub(super) sq_id: u16,
+    pub(super) cid: u16,
+    pub(super) sq_head: u16,
+    pub(super) cq_id: u16,
+    /// 尚未完成的 DMA-write 数（初值 2：PRP1 + PRP2）。
+    pub(super) remaining: u32,
+}
+
 // ═══════════════════════ A1（Abort, spec § 5.1）═══════════════════════
 //
 // Abort 命令按 (SQID, CID) 定位一条 in-flight 命令并中止。本 controller 的
@@ -802,6 +850,8 @@ impl_abortable_op!(PrpListOp);
 impl_abortable_op!(SglOp);
 impl_abortable_op!(SepMetaWriteAccum);
 impl_abortable_op!(SepMetaReadAccum);
+impl_abortable_op!(InlineMetaWriteAccum);
+impl_abortable_op!(InlineMetaReadAccum);
 
 /// 在一张 DMA-pending 表里找 (sqid, cid) 匹配的累积器，命中则移除并返其
 /// (cq_id, sq_head)。移除后该 op 在飞的 DMA completion 会走 unknown-token
@@ -1199,6 +1249,10 @@ pub struct NvmeController {
     pub(super) sep_meta_writes: HashMap<u64, SepMetaWriteAccum>,
     /// **B6b-3** — separate-buffer PI Read 累积器（等 data+meta 两条 DMA-write 完成）。
     pub(super) sep_meta_reads: HashMap<u64, SepMetaReadAccum>,
+    /// **B6c-1** — inline (extended-LBA) PI Write 累积器（等 PRP1+PRP2 两段 DMA-read 到齐）。
+    pub(super) inline_meta_writes: HashMap<u64, InlineMetaWriteAccum>,
+    /// **B6c-2** — inline (extended-LBA) PI Read 累积器（等 PRP1+PRP2 两条 DMA-write 完成）。
+    pub(super) inline_meta_reads: HashMap<u64, InlineMetaReadAccum>,
     /// **Phase O2** — Fused operation state：per-SQ 缓存 FUSE_FIRST 的
     /// SQE，等待紧接其后的 FUSE_SECOND。spec § 6.2 要求：
     /// (a) 两条必须连续在同一 SQ；(b) 都 fused-marked；(c) 都同 nsid。
@@ -2305,6 +2359,8 @@ impl NvmeController {
             pi_reads: HashMap::new(),
             sep_meta_writes: HashMap::new(),
             sep_meta_reads: HashMap::new(),
+            inline_meta_writes: HashMap::new(),
+            inline_meta_reads: HashMap::new(),
             pending_fused: HashMap::new(),
             sqe_inbox: Vec::new(),
             stat_host_reads: 0,
@@ -3631,7 +3687,9 @@ impl NvmeController {
             .or_else(|| abort_scan(&mut self.prp_list_ops, sqid, cid))
             .or_else(|| abort_scan(&mut self.sgl_ops, sqid, cid))
             .or_else(|| abort_scan(&mut self.sep_meta_writes, sqid, cid))
-            .or_else(|| abort_scan(&mut self.sep_meta_reads, sqid, cid));
+            .or_else(|| abort_scan(&mut self.sep_meta_reads, sqid, cid))
+            .or_else(|| abort_scan(&mut self.inline_meta_writes, sqid, cid))
+            .or_else(|| abort_scan(&mut self.inline_meta_reads, sqid, cid));
         // 2) sweep `pending_ios`：移除该命令的所有（子-）DMA 条目；若无累积器
         //    （单-DMA 命令），从中取 target。
         let mut po_target: Option<(u16, u16)> = None;
