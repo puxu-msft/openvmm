@@ -337,16 +337,24 @@ pub(super) struct PendingIo {
 pub(super) enum PendingOp {
     /// 等 PRP1 内的 data DMA-read 完成 → 写文件 → success CQE。
     /// (单 PRP Write 路径)
-    NvmWriteDmaRead { lba: u64, num_blocks: u32 },
+    NvmWriteDmaRead {
+        lba: u64,
+        num_blocks: u32,
+    },
     /// 双 PRP Write：PRP1 段 DMA-read 完成 → 填到 `dual_prp_writes[op_id].prp1_data`，
     /// 两段都到了就触发 dispatch_dual_prp。**op_id 与 PRP2 共用**：靠
     /// `dual_prp_writes[op_id]` 中的状态决定何时写盘 + 发 CQE。
-    NvmWriteDualPrp { op_id: u64, is_prp1: bool },
+    NvmWriteDualPrp {
+        op_id: u64,
+        is_prp1: bool,
+    },
     /// 等 DMA-write 数据到 PRP1 完成 → success CQE。
     /// （NVM Read 路径 + Admin Identify / Get Log Page 共用入口）
     /// `num_blocks` = NVM Read 时 LBA 数；admin（Identify/Log）= 0，
     /// 用于 SMART 统计区分（Phase F：只算真 IO，不算 admin 元数据）。
-    NvmReadDmaWrite { num_blocks: u32 },
+    NvmReadDmaWrite {
+        num_blocks: u32,
+    },
     /// **H4 修复** — 双 PRP Read 的"非记账段" sibling（成功时静默；失败时
     /// 经过通用 DMA-fail 路径 post error CQE）。设计：tok2 走
     /// `NvmReadDmaWrite { num_blocks: nlb }` 负责真正 success CQE +
@@ -354,28 +362,47 @@ pub(super) enum PendingOp {
     NvmReadDualPrpSiblingHalf,
     /// **Phase E** — NVM Write with PRP list (> 2 page)。
     /// Step 1: DMA-read PRP list page itself（4 KiB u64 数组）。
-    NvmWritePrpListFetch { op_id: u64 },
+    NvmWritePrpListFetch {
+        op_id: u64,
+    },
     /// **Phase E** — NVM Write with PRP list, Step 2: per-page data DMA-read。
     /// `page_idx` 是 PRP 中第几个数据页（PRP1=0，PRP list[0]=1，list[1]=2，…）。
-    NvmWritePrpListData { op_id: u64, page_idx: u32 },
+    NvmWritePrpListData {
+        op_id: u64,
+        page_idx: u32,
+    },
     /// **Phase E** — NVM Read with PRP list, Step 1: fetch PRP list 数组本身。
-    NvmReadPrpListFetch { op_id: u64 },
+    NvmReadPrpListFetch {
+        op_id: u64,
+    },
     /// **Phase E** — NVM Read with PRP list, Step 2: per-page data DMA-write。
     /// `page_idx` 是 PRP 中第几个数据页。
-    NvmReadPrpListData { op_id: u64, page_idx: u32 },
+    NvmReadPrpListData {
+        op_id: u64,
+        page_idx: u32,
+    },
     /// **Phase R2** — SGL Segment（PSDT=10）：embedded SGL1 指向的 segment 页
     /// DMA-read 完成 → parse descriptor + 累积 fragment plan。`is_last` 标记本段
     /// 经 Last Segment(true) 还是 Segment(false) 到达：false 时末位 descriptor 是
     /// continuation → 递归 fetch 下一段（R2b chain）。
-    NvmSglFetch { op_id: u64, is_last: bool },
+    NvmSglFetch {
+        op_id: u64,
+        is_last: bool,
+    },
     /// **Phase R2** — SGL 数据 fragment 传输完成（READ = scatter dma_write 到
     /// host / WRITE = gather dma_read 自 host）。`frag_idx` 索引 `SglOp.frags`。
-    NvmSglData { op_id: u64, frag_idx: u32 },
+    NvmSglData {
+        op_id: u64,
+        frag_idx: u32,
+    },
     /// **Phase H3** — NVM Compare：DMA-read host buffer 完成后与 backing
     /// LBA 对比。`lba/num_blocks` 用于 file seek+read；对比失败返
     /// COMPARE_FAILURE (SC 0x85, SCT=0x02 Media/Data Integrity)。
     /// 单 PRP 路径（≤ 1 page）。
-    NvmCompareSinglePrp { lba: u64, num_blocks: u32 },
+    NvmCompareSinglePrp {
+        lba: u64,
+        num_blocks: u32,
+    },
     /// **Phase O3** — Fused Compare (single-PRP) 真 atomic chain：Compare
     /// 完成后**若 pass** → dispatch the captured Write SQE；若 fail → abort
     /// Write with COMPARE_FAILURE，不写盘。spec § 6.2 atomic CAS 语义。
@@ -389,7 +416,9 @@ pub(super) enum PendingOp {
     },
     /// **Phase H5** — Firmware Image Download chunk DMA-read 完成。
     /// `offset_bytes` = byte offset into fw_download_buf。
-    AdminFwDownloadChunk { offset_bytes: u32 },
+    AdminFwDownloadChunk {
+        offset_bytes: u32,
+    },
     /// **Phase H6 + P1 (PTPL)** — Reservation 命令 DMA-read 完成。
     /// `rrega/racqa/rrela` 是 spec cdw10 bits 2:0（Register/Acquire/Release
     /// Action）；`rtype` 是 cdw10 bits 15:8 reservation type。
@@ -408,28 +437,54 @@ pub(super) enum PendingOp {
     AdminNsCreate,
     /// **Phase K2** — Compare with dual PRP (≤ 2 page)。两段 DMA-read
     /// 共用 op_id 累积，全到齐后合并 → byte-compare backing。
-    NvmCompareDualPrp { op_id: u64, is_prp1: bool },
+    NvmCompareDualPrp {
+        op_id: u64,
+        is_prp1: bool,
+    },
     /// **Phase K2** — Compare PRP list (> 2 page)：先 fetch list 页本身。
-    NvmComparePrpListFetch { op_id: u64 },
+    NvmComparePrpListFetch {
+        op_id: u64,
+    },
     /// **Phase K2** — Compare PRP list per-page data DMA-read。
-    NvmComparePrpListData { op_id: u64, page_idx: u32 },
+    NvmComparePrpListData {
+        op_id: u64,
+        page_idx: u32,
+    },
     /// **Phase K9** — Set Features 0x81 Host Identifier DMA-read 完成。
     /// cdw11 bit 0 EXHID = 1 → 16 byte HOSTID；= 0 → 8 byte。
-    AdminSetHostIdentifier { exhid: bool },
+    AdminSetHostIdentifier {
+        exhid: bool,
+    },
     /// **Phase S4** — NS Attachment SEL Attach/Detach 的 Controller List
     /// (4 KiB DMA-read) 完成回调。`sel`: 0=Attach 1=Detach。读完后解析
     /// NumIDs + cntlid 列表，若包含本 controller cntlid (=1)，更新目标
     /// NSID 的 attached 状态。
-    AdminNsAttachmentList { sel: u8 },
+    AdminNsAttachmentList {
+        sel: u8,
+    },
     /// **Phase K4a** — PI Write 完成回调：DMA-read 完成后按 LBA 切 4KiB
     /// data，每 LBA 计算 T10 DIF tuple，interleave 写到 backing file
     /// (data + 8B tuple per LBA)。支持任意 nlb（≤ MDTS）。
     /// 限制：单 PRP 路径（bytes ≤ NVME_PAGE_SIZE = 4 KiB = 1 LBA when
     /// lbads=12）。多 LBA 需 dual-PRP / PRP list — 留 K4c。
-    NvmWritePi { lba: u64, num_blocks: u32 },
+    NvmWritePi {
+        lba: u64,
+        num_blocks: u32,
+    },
+    /// **B6b-2（separate metadata，PRACT=0）** — separate-buffer PI Write 的两条
+    /// 子-DMA：host data 经 PRP、host PI tuple 经 MPTR 分别 DMA-read。两条都到齐后
+    /// `SepMetaWriteAccum` finalize：verify host PI vs data → interleave 存盘。
+    SepMetaWriteData {
+        op_id: u64,
+    },
+    SepMetaWriteMeta {
+        op_id: u64,
+    },
     /// **Phase K4b** — PI Read sibling 占位（per-LBA file read + verify
     /// 在 dispatch 时同步完成，DMA-write 数据回 PRP1 在 PendingIo 路径）。
-    NvmReadPiDmaWrite { num_blocks: u32 },
+    NvmReadPiDmaWrite {
+        num_blocks: u32,
+    },
     /// **Phase L1+ (reviewer H1 修复)** — ZNS Zone Append 完成回调。
     ///
     /// Append 与 Write 不同：driver 不知 WP，controller 决定落点。所以必须
@@ -451,14 +506,21 @@ pub(super) enum PendingOp {
     /// **Phase K4c** — 多 LBA PI Write 数据段。op_id 索引 `pi_writes`
     /// 累积器；page_idx = 本回调对应 `received[page_idx*4096..]`
     /// （单 PRP=0；dual-PRP 0/1；PRP-list 0/1/2/.../N-1）。
-    NvmWritePiMulti { op_id: u64, page_idx: u32 },
+    NvmWritePiMulti {
+        op_id: u64,
+        page_idx: u32,
+    },
     /// **Phase K4c-list** — PI Write PRP-list fetch：PRP2 指向的 list 页
     /// 已 DMA-read 到 data；解析 u64 array → 逐页 DMA-read 数据。
-    NvmWritePiListFetch { op_id: u64 },
+    NvmWritePiListFetch {
+        op_id: u64,
+    },
     /// **Phase K4c-list** — PI Read PRP-list fetch：list 页 DMA-read 完成；
     /// 解析 u64 array → 把 backing 已 verified 的 data per-page DMA-write
     /// 到 host 各页。
-    NvmReadPiListFetch { op_id: u64 },
+    NvmReadPiListFetch {
+        op_id: u64,
+    },
     /// **Phase K4c-list** — PI Read PRP-list per-page DMA-write 完成。
     /// 全 page 完成 → post success CQE。`page_idx` 仅用于 trace/debug
     /// （完成路径只增 pages_done）。
@@ -470,7 +532,10 @@ pub(super) enum PendingOp {
     /// **Phase O1** — Simple Copy 范围表 DMA-read 完成。完成后 controller
     /// 解析 32-byte range descriptors → 按 src→dst 顺序 backing read+write。
     /// 不再有 host DMA：copy 全在 controller 侧 backing。
-    NvmCopyFetchRanges { sdlba: u64, num_ranges: u32 },
+    NvmCopyFetchRanges {
+        sdlba: u64,
+        num_ranges: u32,
+    },
 }
 
 /// **Phase K4c** — 多 LBA PI Write 累积器。每个 DMA-read 完成填一段
@@ -647,6 +712,23 @@ pub(super) struct SglPlanFrag {
     pub(super) length: u32,
 }
 
+/// **B6b-2（separate metadata，PRACT=0）** — separate-buffer PI Write 累积器。
+/// host 的 data（经 PRP）与 PI tuple（经 MPTR）分两条 DMA-read 到达；两条都到齐后
+/// verify host PI vs data（per pi_type），通过则 interleave [tuple][data] 存盘。
+/// 单 LBA（B6b-2 WRITE 起步；多 LBA 后续）。
+pub(super) struct SepMetaWriteAccum {
+    pub(super) sq_id: u16,
+    pub(super) cid: u16,
+    pub(super) sq_head: u16,
+    pub(super) cq_id: u16,
+    pub(super) nsid: u32,
+    pub(super) lba: u64,
+    /// host data（PRP DMA-read 填）。
+    pub(super) data: Option<Vec<u8>>,
+    /// host PI tuple 8 字节（MPTR DMA-read 填）。
+    pub(super) meta: Option<Vec<u8>>,
+}
+
 // ═══════════════════════ A1（Abort, spec § 5.1）═══════════════════════
 //
 // Abort 命令按 (SQID, CID) 定位一条 in-flight 命令并中止。本 controller 的
@@ -687,6 +769,7 @@ impl_abortable_op!(PiWriteAccum);
 impl_abortable_op!(PiReadAccum);
 impl_abortable_op!(PrpListOp);
 impl_abortable_op!(SglOp);
+impl_abortable_op!(SepMetaWriteAccum);
 
 /// 在一张 DMA-pending 表里找 (sqid, cid) 匹配的累积器，命中则移除并返其
 /// (cq_id, sq_head)。移除后该 op 在飞的 DMA completion 会走 unknown-token
@@ -1035,6 +1118,9 @@ pub struct NvmeController {
     /// **Phase K4c-list** — 多 LBA PI Read PRP-list 累积器。op_id → 已
     /// verified data + DMA-write to host 进度。
     pub(super) pi_reads: HashMap<u64, PiReadAccum>,
+    /// **B6b-2（separate metadata，PRACT=0）** — separate-buffer PI Write 累积器。
+    /// op_id → 等 data(PRP) + meta(MPTR) 两条 DMA 到齐 → verify host PI → 存盘。
+    pub(super) sep_meta_writes: HashMap<u64, SepMetaWriteAccum>,
     /// **Phase O2** — Fused operation state：per-SQ 缓存 FUSE_FIRST 的
     /// SQE，等待紧接其后的 FUSE_SECOND。spec § 6.2 要求：
     /// (a) 两条必须连续在同一 SQ；(b) 都 fused-marked；(c) 都同 nsid。
@@ -2129,6 +2215,7 @@ impl NvmeController {
             compare_ops: HashMap::new(),
             pi_writes: HashMap::new(),
             pi_reads: HashMap::new(),
+            sep_meta_writes: HashMap::new(),
             pending_fused: HashMap::new(),
             sqe_inbox: Vec::new(),
             stat_host_reads: 0,
@@ -3378,7 +3465,8 @@ impl NvmeController {
             .or_else(|| abort_scan(&mut self.pi_writes, sqid, cid))
             .or_else(|| abort_scan(&mut self.pi_reads, sqid, cid))
             .or_else(|| abort_scan(&mut self.prp_list_ops, sqid, cid))
-            .or_else(|| abort_scan(&mut self.sgl_ops, sqid, cid));
+            .or_else(|| abort_scan(&mut self.sgl_ops, sqid, cid))
+            .or_else(|| abort_scan(&mut self.sep_meta_writes, sqid, cid));
         // 2) sweep `pending_ios`：移除该命令的所有（子-）DMA 条目；若无累积器
         //    （单-DMA 命令），从中取 target。
         let mut po_target: Option<(u16, u16)> = None;

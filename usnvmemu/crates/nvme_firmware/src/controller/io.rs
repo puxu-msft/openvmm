@@ -1232,6 +1232,7 @@ impl NvmeController {
                 let is_plain =
                     ns.meta_size == 0 && !ns.pi_enabled() && (ns.lbads == 9 || ns.lbads == 12);
                 let sector_bytes = 1u64 << ns.lbads;
+                let meta_inline = ns.meta_inline; // B6b-2：separate(false) 走 MPTR 路径
                 if pract && !is_pi_capable {
                     tracing::warn!(nsid, "WRITE PRACT=1 on non-PI NS → INVALID_PROTECTION_INFO");
                     return Some(Cqe::error(
@@ -1243,17 +1244,72 @@ impl NvmeController {
                     ));
                 }
                 if !pract && is_pi_capable {
-                    tracing::warn!(
-                        nsid,
-                        "WRITE PRACT=0 on PI NS unsupported (driver must use PRACT=1)"
+                    // **B6b-2（separate metadata，PRACT=0）** — host 供 PI tuple via MPTR。
+                    // 仅 separate NS（meta_inline=false）：data 经 PRP、PI 经 MPTR 两条 DMA-read，
+                    // 到齐后 verify host PI vs data → interleave 存盘。inline NS（extended LBA）
+                    // 的 PRACT=0（host inline tuple）仍未实现 → 保持拒绝。单 LBA 起步。
+                    if meta_inline {
+                        tracing::warn!(
+                            nsid,
+                            "WRITE PRACT=0 on inline(extended-LBA) PI NS unsupported (用 PRACT=1)"
+                        );
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::INVALID_PROTECTION_INFO,
+                        ));
+                    }
+                    if nlb != 1 {
+                        // 多 LBA separate WRITE = B6b-2 后续增量；当前单 LBA。
+                        tracing::warn!(nlb, "separate-meta WRITE 暂仅支持单 LBA（多 LBA 待续）");
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                    }
+                    if sqe.mptr == 0 {
+                        tracing::warn!(nsid, "separate-meta WRITE 需 MPTR（host PI buffer）");
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                    }
+                    let mptr = sqe.mptr;
+                    let op_id = self.alloc_op_id();
+                    let tok_d = ctx.dma_read(prp1, sector_bytes as u32);
+                    self.pending_ios.insert(
+                        tok_d,
+                        PendingIo {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            nsid,
+                            op: PendingOp::SepMetaWriteData { op_id },
+                        },
                     );
-                    return Some(Cqe::error(
-                        cid,
-                        sq_id,
-                        sq_head,
-                        phase,
-                        sc::INVALID_PROTECTION_INFO,
-                    ));
+                    let tok_m = ctx.dma_read(mptr, 8);
+                    self.pending_ios.insert(
+                        tok_m,
+                        PendingIo {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            nsid,
+                            op: PendingOp::SepMetaWriteMeta { op_id },
+                        },
+                    );
+                    self.sep_meta_writes.insert(
+                        op_id,
+                        crate::controller::SepMetaWriteAccum {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            nsid,
+                            lba: slba,
+                            data: None,
+                            meta: None,
+                        },
+                    );
+                    return None;
                 }
                 // **Phase R2** — SGL Segment（PSDT=10）走平行 gather 路径。
                 // 仅 plain NS（无 PI/meta）；NS Write Protection 已在上方校验。

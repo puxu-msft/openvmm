@@ -1068,6 +1068,133 @@ fn format_mset_flbas_polarity() {
     }
 }
 
+/// **B6b-2（separate metadata，PRACT=0，spec § 8.3）差分 oracle** — separate NS
+/// (meta_inline=false) 上 host 经 MPTR 供 PI tuple 的 WRITE 闭环（单 LBA）：
+///   正例：host PI 正确 → data(PRP) + PI(MPTR) 两条 DMA 到齐 → verify 通过 →
+///     interleave [tuple][data] 落盘（pi_first）+ success；
+///   负例：host PI guard 错 → Media SCT=2 GUARD 错误 CQE，**不落盘**。
+///
+/// 独立 oracle：直读 backing（落盘的 interleaved 字节）+ 从 capture CQE 读 status。
+/// revert-verify：把 verify 结果忽略恒存盘 → 负例的"不落盘"断言转红。
+#[test]
+fn b6b_separate_meta_write_host_pi() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    fn sep_ns() -> NvmeController {
+        let mut c = make_ctrl_with_tmp("b6b_sepwr");
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+        ns.pi_first = true;
+        ns.meta_inline = false; // separate buffer
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / ns.block_bytes();
+        c.cqs.insert(
+            1,
+            crate::regs::CompletionQueue {
+                base_gpa: 0x1_0000,
+                size: 64,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 0,
+                interrupt_enabled: false,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        c
+    }
+    let data: Vec<u8> = (0..4096).map(|i| (i & 0xff) as u8).collect();
+    let good_tuple = crate::pi::PiTuple::compute(&data, 0, 1).to_bytes();
+    // 喂 separate WRITE 的两条子-DMA（data + 给定 PI tuple）。
+    fn drive(
+        c: &mut NvmeController,
+        cap: &mut CaptureTransport,
+        cid: u16,
+        data: &[u8],
+        tuple: &[u8],
+    ) {
+        let mut ctx = DeviceCtx::new(cap);
+        let mut sqe = io_sqe(0x01, 1, 0, 1, 0x4000, false, cid); // PRACT=0
+        sqe.mptr = 0x5000;
+        let r = c.dispatch_io(&mut ctx, 1, sqe, cid, 0, 1);
+        assert!(r.is_none(), "separate-meta WRITE 走异步 2-DMA");
+        assert_eq!(c.pending_ios.len(), 2, "data + meta 两条子-DMA");
+        assert_eq!(c.sep_meta_writes.len(), 1, "1 个 SepMetaWriteAccum");
+        let toks: Vec<(u64, bool)> = c
+            .pending_ios
+            .iter()
+            .map(|(&t, p)| (t, matches!(p.op, PendingOp::SepMetaWriteData { .. })))
+            .collect();
+        for (t, is_data) in toks {
+            let d = if is_data {
+                data.to_vec()
+            } else {
+                tuple.to_vec()
+            };
+            c.on_dma_complete_impl(&mut ctx, t, true, d);
+        }
+    }
+
+    // ── 正例：host PI 正确 → 落盘 interleaved + accum 清空 ──
+    {
+        let mut c = sep_ns();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        drive(&mut c, &mut cap, 0x60, &data, &good_tuple);
+        assert!(c.sep_meta_writes.is_empty(), "finalize 应移除 accum");
+        let ns = c.namespaces.get(&1).unwrap();
+        let mut buf = vec![0u8; 4104];
+        ns.read_at(&mut buf, 0).unwrap();
+        assert_eq!(
+            &buf[0..8],
+            &good_tuple[..],
+            "pi_first：host PI tuple 落在前 8 字节"
+        );
+        assert_eq!(
+            &buf[8..4104],
+            &data[..],
+            "data 跟在 tuple 后（interleaved）"
+        );
+    }
+
+    // ── 负例：host PI guard 错 → GUARD 错误 + 不落盘 ──
+    {
+        let mut c = sep_ns();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut bad = good_tuple;
+        bad[0] ^= 0xff; // 破坏 guard
+        let pre = cap.events().len();
+        drive(&mut c, &mut cap, 0x61, &data, &bad);
+        // backing 第 0 块仍全 0（未落盘）。
+        let ns = c.namespaces.get(&1).unwrap();
+        let mut buf = vec![0u8; 4104];
+        ns.read_at(&mut buf, 0).unwrap();
+        assert!(buf.iter().all(|&b| b == 0), "PI verify 失败不应落盘");
+        // CQE status = Media SCT=2 GUARD (0x0282)。
+        let status = cap
+            .events()
+            .iter()
+            .skip(pre)
+            .filter_map(|e| match e {
+                TransportEvent::DmaWrite { gpa, data, .. }
+                    if *gpa >= 0x1_0000 && *gpa < 0x1_0000 + 64 * 16 && data.len() >= 16 =>
+                {
+                    let dw3 = u32::from_le_bytes(data[12..16].try_into().unwrap());
+                    Some((((dw3 >> 17) & 0xff) | (((dw3 >> 25) & 0x7) << 8)) as u16)
+                }
+                _ => None,
+            })
+            .next_back()
+            .expect("应 post 错误 CQE");
+        assert_eq!(
+            status,
+            crate::cmd::sc::status(0x82, crate::cmd::sc::SCT_MEDIA_DATA_INTEGRITY),
+            "host PI guard 错 → Media GUARD_CHECK_ERR (0x0282)"
+        );
+    }
+}
+
 /// **C1① MDTS 计入 inline metadata（spec § 5.17.2.2 / § 8.x）差分 oracle** —
 /// extended-LBA（内联 metadata）的 host 传输大小 = block_bytes(data+meta)，MDTS
 /// 须计入 metadata。PI 格式 4104 B/LBA，MDTS=128 KiB：

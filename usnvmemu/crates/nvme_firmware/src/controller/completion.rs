@@ -56,6 +56,110 @@ pub(crate) fn check_copy_range_conflict(sdlba: u64, dst_total: u64, ranges: &[(u
 }
 
 impl NvmeController {
+    /// **B6b-2（separate metadata，PRACT=0）** — separate-buffer PI Write 收尾：
+    /// host data（PRP）+ host PI tuple（MPTR）两条 DMA 都到齐后调用。verify host PI
+    /// vs data（per pi_type，spec § 8.3）→ 通过则 interleave [tuple][data]（pi_first）
+    /// 存盘 + success；guard/reftag 失配 → Media SCT=2 错误 CQE（host 供的 PI 不一致）。
+    fn sep_meta_write_finalize(&mut self, ctx: &mut DeviceCtx<'_>, op_id: u64) {
+        let Some(acc) = self.sep_meta_writes.remove(&op_id) else {
+            return;
+        };
+        let data = acc.data.unwrap_or_default();
+        let meta = acc.meta.unwrap_or_default();
+        let phase = self.cqs.get(&acc.cq_id).map(|c| c.phase).unwrap_or(1);
+        let cqe = if let Some(ns) = self.namespaces.get_mut(&acc.nsid) {
+            let pi_type = ns.pi_type;
+            let pi_first = ns.pi_first;
+            let block_bytes = ns.block_bytes() as usize;
+            let data_bytes = ns.data_bytes() as usize;
+            if data.len() != data_bytes || meta.len() < 8 {
+                tracing::warn!(
+                    data = data.len(),
+                    meta = meta.len(),
+                    "separate-meta Write DMA 长度不符"
+                );
+                Cqe::error(
+                    acc.cid,
+                    acc.sq_id,
+                    acc.sq_head,
+                    phase,
+                    sc::DATA_TRANSFER_ERROR,
+                )
+            } else {
+                let tuple_arr: [u8; 8] = meta[..8].try_into().unwrap();
+                let host_tuple = crate::pi::PiTuple::from_bytes(&tuple_arr);
+                // **教学边界（reviewer B6b-2 MEDIUM）**：PRCHK（cdw12 bits 28:26，逐项
+                // 控制 Guard/AppTag/RefTag 是否校验）当前**未解析**——本路径一律校验
+                // Guard + RefTag(type 1/2)，与既有 PRACT=1 路径一致。后果是 **over-strict**
+                // （PRCHK=0 的合法 pass-through 会被多拒）而非 under-strict（绝不放过坏 PI），
+                // 对数据完整性是安全方向。AppTag 不校验（PiTuple::verify 设计如此），host
+                // 的 app_tag 原样存盘。真做 PRCHK 逐项门控时在此按 bit 解析。
+                match host_tuple.verify(&data, acc.lba, pi_type) {
+                    crate::pi::PiCheck::Ok => {
+                        // interleave host data + host PI tuple，存到 backing。
+                        let mut block = vec![0u8; block_bytes];
+                        if pi_first {
+                            block[0..8].copy_from_slice(&tuple_arr);
+                            block[8..8 + data_bytes].copy_from_slice(&data);
+                        } else {
+                            block[0..data_bytes].copy_from_slice(&data);
+                            block[data_bytes..data_bytes + 8].copy_from_slice(&tuple_arr);
+                        }
+                        match ns.write_at(&block, acc.lba * block_bytes as u64) {
+                            Ok(()) => {
+                                self.stat_host_writes += 1;
+                                self.stat_lba_written += 1;
+                                crate::controller::io::advance_zns_wp(ns, acc.lba, 1);
+                                tracing::debug!(
+                                    nsid = acc.nsid,
+                                    lba = acc.lba,
+                                    "separate-meta PI Write OK（host PI verified）"
+                                );
+                                Cqe::success(acc.cid, acc.sq_id, acc.sq_head, phase)
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, nsid = acc.nsid, "separate-meta Write backing fail");
+                                Cqe::error(
+                                    acc.cid,
+                                    acc.sq_id,
+                                    acc.sq_head,
+                                    phase,
+                                    sc::DATA_TRANSFER_ERROR,
+                                )
+                            }
+                        }
+                    }
+                    other => {
+                        // host 供的 PI 与 data 不一致 → Media/Data Integrity 错误（SCT=2）。
+                        let sc_byte = other.to_sc().unwrap_or(0x82);
+                        tracing::warn!(
+                            nsid = acc.nsid,
+                            lba = acc.lba,
+                            ?other,
+                            "separate-meta Write: host PI verify 失败"
+                        );
+                        Cqe::error(
+                            acc.cid,
+                            acc.sq_id,
+                            acc.sq_head,
+                            phase,
+                            sc::status(sc_byte, sc::SCT_MEDIA_DATA_INTEGRITY),
+                        )
+                    }
+                }
+            }
+        } else {
+            Cqe::error(
+                acc.cid,
+                acc.sq_id,
+                acc.sq_head,
+                phase,
+                sc::INVALID_NAMESPACE,
+            )
+        };
+        self.post_cqe(ctx, acc.cq_id, cqe);
+    }
+
     pub(super) fn on_dma_complete_impl(
         &mut self,
         ctx: &mut DeviceCtx<'_>,
@@ -484,6 +588,29 @@ impl NvmeController {
                         Cqe::error(p.cid, p.sq_id, p.sq_head, phase, sc::INVALID_NAMESPACE)
                     };
                     self.post_cqe(ctx, p.cq_id, cqe);
+                }
+                PendingOp::SepMetaWriteData { op_id } => {
+                    // **B6b-2** — separate-meta PI Write 的 data 段到达。填 accum；
+                    // 若 meta 也到齐 → finalize（verify + 存盘）。
+                    if let Some(acc) = self.sep_meta_writes.get_mut(&op_id) {
+                        acc.data = Some(data);
+                        if acc.meta.is_some() {
+                            self.sep_meta_write_finalize(ctx, op_id);
+                        }
+                    } else {
+                        tracing::warn!(op_id, "SepMetaWriteData unknown op_id（已 abort?）");
+                    }
+                }
+                PendingOp::SepMetaWriteMeta { op_id } => {
+                    // **B6b-2** — separate-meta PI Write 的 host PI tuple 段到达。
+                    if let Some(acc) = self.sep_meta_writes.get_mut(&op_id) {
+                        acc.meta = Some(data);
+                        if acc.data.is_some() {
+                            self.sep_meta_write_finalize(ctx, op_id);
+                        }
+                    } else {
+                        tracing::warn!(op_id, "SepMetaWriteMeta unknown op_id（已 abort?）");
+                    }
                 }
                 PendingOp::NvmReadDualPrpSiblingHalf => {
                     // **H4**：成功路径无 op — counter + success CQE 全由
