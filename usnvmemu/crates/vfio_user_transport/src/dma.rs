@@ -26,9 +26,10 @@
 //!   `EFAULT`（vfio-user 标准行为）。
 //!
 //! - **fd 处理（Phase W mmap 零拷贝）**：DMA_MAP 带 memfd 时，按 region 权限
-//!   `mmap` 进 `DmaTable.mmaps`，`dma_read/write` 走零拷贝 memcpy 不走 wire；
-//!   mmap 失败或不带 fd 时退回 message-mediated（功能不变）。映射用 MAP_SHARED
-//!   后独立于 fd 存续，fd 用完即 close，munmap 随映射 Drop。
+//!   `mmap`，把该 region 的 backing 升级为 `DmaBacking::Mmap`，`dma_read/write`
+//!   走零拷贝 memcpy 不走 wire；mmap 失败或不带 fd 时保持 `DmaBacking::Message`
+//!   退回 wire 路径（功能不变）。映射用 MAP_SHARED 后独立于 fd 存续，fd 用完即
+//!   close，munmap 随映射 Drop。
 //!
 //! ## TODO（spec follow-up，未来扩展前必读）
 //!
@@ -61,8 +62,8 @@ use zerocopy::IntoBytes;
 /// `dma_read`/`dma_write` 直接 memcpy 不走 wire round-trip。
 ///
 /// readable-only region → `Ro`（PROT_READ）；writeable region → `Rw`
-/// （PROT_READ|WRITE，兼容读）。client 不带 fd 的 region 不进此表，退回
-/// message-mediated 路径。
+/// （PROT_READ|WRITE，兼容读）。client 不带 fd 的 region 用
+/// [`DmaBacking::Message`] 而非本类型。
 #[derive(Debug)]
 pub(crate) enum DmaMmap {
     /// 只读映射（region 仅 readable）。
@@ -116,21 +117,62 @@ impl DmaRegion {
     }
 }
 
-/// DMA 映射表：addr → DmaRegion。BTreeMap 让按 addr 排序，便于 unmap_all 时
-/// 遍历有序输出。`mmaps` 是**并行**表（addr → 零拷贝映射），只存 DMA_MAP 带
-/// fd 且 mmap 成功的 region；`regions` 始终是真相源（权限/边界校验），`mmaps`
-/// 只是其上的零拷贝加速。`DmaRegion` 保持 Copy（纯元数据），mmap 不放进它。
+/// 一段已映射 DMA region 的**访问后端（DmaBacking）**：决定 `dma_read`/`dma_write`
+/// 如何兑现对该 region 的访问。
 ///
-/// **不 derive Clone**：`memmap2::MmapMut` 非 Clone，且映射独占 fd 资源不应被复制。
+/// 这是"region 如何被访问"的概念，**在 [`crate::Transport`] 之下一层**：
+/// `Transport` 是 device 朝外的原语（`dma_read`/`dma_write`/`fire_interrupt`，
+/// 一个 backend 一个）；`DmaBacking` 则逐 region 选定，决定一次 `dma_read` /
+/// `dma_write` 落到本地内存还是落到 wire。
+///
+/// - [`DmaBacking::Mmap`]：DMA_MAP 带可映射 memfd → 本地 memcpy 零拷贝。
+///   **QEMU 接管时的正常路径**（QEMU 给的 guest RAM 总是 memfd-backed）。
+/// - [`DmaBacking::Message`]：无 fd / mmap 失败 → 走 wire DMA_READ/WRITE 往返。
+///   **冷 fallback**：仅 non-mmappable 内存才走，QEMU 场景基本不触发。
+#[derive(Debug)]
+pub(crate) enum DmaBacking {
+    /// 零拷贝 mmap（QEMU 正常路径）。
+    Mmap(DmaMmap),
+    /// wire message-mediated（DMA_READ/WRITE 往返，冷 fallback）。
+    Message,
+}
+
+/// `DmaBacking` 的种类标签：不含资源句柄，`Copy`，供 metrics / 测试断言
+/// "这条 region 是零拷贝还是 wire"，把"wire 是冷路径"变成结构上可查。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackingKind {
+    /// 零拷贝 mmap。
+    Mmap,
+    /// wire message-mediated。
+    Message,
+}
+
+/// 一条 DMA 表项：region 元数据（`Copy` 真相源）+ 其访问后端 [`DmaBacking`]。
+///
+/// 把此前的两张并行 `BTreeMap`（`regions` + `mmaps`）合一，使"每个 region
+/// 恰有一个 backing"成为类型级不变量，消除并行表失步的一类 bug（remove/clear
+/// 漏删 mmap、mmap 孤儿项等）。
+#[derive(Debug)]
+struct RegionEntry {
+    region: DmaRegion,
+    backing: DmaBacking,
+}
+
+/// DMA 映射表：addr → `RegionEntry`（region 元数据 + 访问后端）。`BTreeMap`
+/// 按 addr 排序，便于 `unmap_all` 时有序遍历。`region` 字段是权限/边界校验的
+/// 真相源；`backing` 决定零拷贝 mmap 还是 wire message。
+///
+/// **不 derive Clone**：`backing` 内的 `memmap2::MmapMut` 非 Clone，且映射
+/// 独占 fd 资源不应被复制。
 #[derive(Debug, Default)]
 pub struct DmaTable {
-    regions: BTreeMap<u64, DmaRegion>,
-    mmaps: BTreeMap<u64, DmaMmap>,
+    regions: BTreeMap<u64, RegionEntry>,
 }
 
 impl DmaTable {
-    /// 加一条 region；同 addr 已存在 → `Exists`；与已有 region 有
-    /// 任意 *字节级* 重叠（不同 addr）→ `Overlap`（**review M1** 新增校验）。
+    /// 加一条 region（初始 backing = `DmaBacking::Message`，带 fd 时由
+    /// `attach_mmap` 升级为零拷贝）；同 addr 已存在 →
+    /// `Exists`；与已有 region 有任意 *字节级* 重叠（不同 addr）→ `Overlap`。
     pub fn insert(&mut self, r: DmaRegion) -> Result<(), DmaError> {
         if self.regions.contains_key(&r.addr) {
             return Err(DmaError::Exists);
@@ -138,73 +180,108 @@ impl DmaTable {
         // O(log n) 查左右邻居 + 校验是否相交。
         let r_end = r.addr.saturating_add(r.size);
         if let Some((_, prev)) = self.regions.range(..r.addr).next_back() {
-            let p_end = prev.addr.saturating_add(prev.size);
+            let p_end = prev.region.addr.saturating_add(prev.region.size);
             if p_end > r.addr {
                 return Err(DmaError::Overlap);
             }
         }
         if let Some((_, next)) = self.regions.range(r.addr..).next()
-            && r_end > next.addr
+            && r_end > next.region.addr
         {
             return Err(DmaError::Overlap);
         }
-        self.regions.insert(r.addr, r);
+        self.regions.insert(
+            r.addr,
+            RegionEntry {
+                region: r,
+                backing: DmaBacking::Message,
+            },
+        );
         Ok(())
     }
     /// 移除 (addr, size) 必须精确匹配一条已存在 region；否则 EINVAL。
-    /// 同步丢弃该 addr 的零拷贝映射（munmap 随 `DmaMmap` Drop）。
+    /// backing（含 mmap）随表项 Drop 一并释放（munmap）。
     pub fn remove_exact(&mut self, addr: u64, size: u64) -> Result<(), DmaError> {
         match self.regions.get(&addr) {
-            Some(r) if r.size == size => {
+            Some(e) if e.region.size == size => {
                 self.regions.remove(&addr);
-                self.mmaps.remove(&addr);
                 Ok(())
             }
             _ => Err(DmaError::NotFound),
         }
     }
-    /// 撤销所有 region（DMA_UNMAP flags=UNMAP_ALL）+ 所有零拷贝映射。
+    /// 撤销所有 region（DMA_UNMAP flags=UNMAP_ALL）+ 所有 backing。
     pub fn clear(&mut self) {
         self.regions.clear();
-        self.mmaps.clear();
     }
-    /// **Phase W (mmap 零拷贝)** — 给已入表的 region 附加零拷贝映射。caller
-    /// （`handle_dma_map`）在 region `insert` 成功后、mmap fd 成功时调。
+    /// **Phase W (mmap 零拷贝)** — 把已入表 region 的 backing 升级为零拷贝
+    /// [`DmaBacking::Mmap`]。caller（`handle_dma_map`）在 region `insert` 成功
+    /// 后、mmap fd 成功时调；此时 addr 必已存在（insert 在前）。addr 不存在
+    /// 时静默 no-op（不再制造孤儿 mmap 项）。
     pub(crate) fn attach_mmap(&mut self, addr: u64, mmap: DmaMmap) {
-        self.mmaps.insert(addr, mmap);
+        // **契约**：caller 必须先 `insert(region)` 再 attach（handle_dma_map 即如此）。
+        // debug 构建下把这个隐式前提变成会炸的断言——若将来新 caller 违反顺序，
+        // 立即暴露，而非静默走 no-op 让该 region 退回 wire（"wire 是冷路径需可查"）。
+        debug_assert!(
+            self.regions.contains_key(&addr),
+            "attach_mmap({addr:#x}) before insert — region 必须先入表"
+        );
+        if let Some(e) = self.regions.get_mut(&addr) {
+            e.backing = DmaBacking::Mmap(mmap);
+        }
     }
-    /// **Phase W (mmap 零拷贝)** — 零拷贝读：若 `[gpa, gpa+len)` 落在某带 mmap
-    /// 的 readable region 内，返回其字节副本（无 wire round-trip）；否则 `None`
-    /// （caller 退回 message-mediated 路径）。
+    /// 内部：查包含 `[gpa, gpa+len)` 的表项（不可变借）。
+    fn entry_for(&self, gpa: u64, len: u64) -> Option<&RegionEntry> {
+        self.regions
+            .range(..=gpa)
+            .next_back()
+            .map(|(_, e)| e)
+            .filter(|e| e.region.contains(gpa, len))
+    }
+    /// 内部：查包含 `[gpa, gpa+len)` 的表项（可变借）。
+    fn entry_for_mut(&mut self, gpa: u64, len: u64) -> Option<&mut RegionEntry> {
+        self.regions
+            .range_mut(..=gpa)
+            .next_back()
+            .map(|(_, e)| e)
+            .filter(|e| e.region.contains(gpa, len))
+    }
+    /// **Phase W (mmap 零拷贝)** — 零拷贝读：若 `[gpa, gpa+len)` 落在某
+    /// [`Mmap`](DmaBacking::Mmap)-backed 的 readable region 内，返回其字节副本
+    /// （无 wire round-trip）；否则 `None`（`Message` backing / 不可读 / 越界 →
+    /// caller 退回 message-mediated 路径）。
     pub(crate) fn mmap_read(&self, gpa: u64, len: u32) -> Option<Vec<u8>> {
-        let region = self.find(gpa, len as u64)?;
-        if !region.readable {
+        let e = self.entry_for(gpa, len as u64)?;
+        if !e.region.readable {
             return None;
         }
-        let addr = region.addr;
-        let m = self.mmaps.get(&addr)?;
-        let off = (gpa - addr) as usize;
+        let DmaBacking::Mmap(m) = &e.backing else {
+            return None;
+        };
+        let off = (gpa - e.region.addr) as usize;
         let end = off.checked_add(len as usize)?;
         let bytes = m.as_bytes();
         // **review H-2** — 防御校验以**真实映射长度** `bytes.len()` 为准，不依赖
-        // "region.size == mmap 长度" 这个等式（虽当前 map_dma_fd 用同一 size，但
-        // 不把它当判据）；保证 Rust slice 层永不越界。
+        // "region.size == mmap 长度" 这个等式；保证 Rust slice 层永不越界。
         if end > bytes.len() {
             return None;
         }
         Some(bytes[off..end].to_vec())
     }
-    /// **Phase W (mmap 零拷贝)** — 零拷贝写：若 `[gpa, gpa+len)` 落在某带 RW
-    /// mmap 的 writeable region 内，原地写入并返 `Some(())`（无 wire round-trip）；
-    /// 否则 `None`（无 mmap / RO 映射 / 越界 → caller 退回 message 路径）。
+    /// **Phase W (mmap 零拷贝)** — 零拷贝写：若 `[gpa, gpa+len)` 落在某
+    /// [`Mmap`](DmaBacking::Mmap)(RW)-backed 的 writeable region 内，原地写入并
+    /// 返 `Some(())`（无 wire round-trip）；否则 `None`（无 mmap / RO 映射 /
+    /// `Message` backing / 越界 → caller 退回 message 路径）。
     pub(crate) fn mmap_write(&mut self, gpa: u64, data: &[u8]) -> Option<()> {
-        let region = *self.find(gpa, data.len() as u64)?;
-        if !region.writeable {
+        let e = self.entry_for_mut(gpa, data.len() as u64)?;
+        if !e.region.writeable {
             return None;
         }
-        let m = self.mmaps.get_mut(&region.addr)?;
+        let off = (gpa - e.region.addr) as usize;
+        let DmaBacking::Mmap(m) = &mut e.backing else {
+            return None;
+        };
         let dst = m.as_bytes_mut()?;
-        let off = (gpa - region.addr) as usize;
         let end = off.checked_add(data.len())?;
         if end > dst.len() {
             return None;
@@ -212,14 +289,18 @@ impl DmaTable {
         dst[off..end].copy_from_slice(data);
         Some(())
     }
-    /// 查找包含 `[gpa, gpa+len)` 的 region；返 readable/writeable 用于权限校验。
+    /// 查找包含 `[gpa, gpa+len)` 的 region 元数据；返 readable/writeable 用于权限校验。
     pub fn find(&self, gpa: u64, len: u64) -> Option<&DmaRegion> {
-        // 找最大的 addr ≤ gpa。
-        self.regions
-            .range(..=gpa)
-            .next_back()
-            .map(|(_, r)| r)
-            .filter(|r| r.contains(gpa, len))
+        self.entry_for(gpa, len).map(|e| &e.region)
+    }
+    /// 包含 `gpa` 的 region 的访问后端种类（`Mmap`=零拷贝 / `Message`=wire）；
+    /// 无此 region → `None`。供 metrics / 测试断言"这条 region 走哪条路径"。
+    pub fn backing_kind(&self, gpa: u64) -> Option<BackingKind> {
+        let e = self.entry_for(gpa, 1)?;
+        Some(match e.backing {
+            DmaBacking::Mmap(_) => BackingKind::Mmap,
+            DmaBacking::Message => BackingKind::Message,
+        })
     }
     /// 当前注册的 region 数（仅日志/调试）。
     pub fn len(&self) -> usize {
@@ -1377,5 +1458,79 @@ mod tests {
             table.mmap_read(0xA000, marker.len() as u32).as_deref(),
             Some(marker)
         );
+    }
+
+    // ── DmaBacking 概念：backing_kind 可观测 + 单表不失步 ──────────────────
+
+    /// `backing_kind` 反映 region 的访问后端：不带 fd → `Message`（wire）；
+    /// `attach_mmap` 后 → `Mmap`（零拷贝）；未映射 gpa → `None`。
+    #[test]
+    fn backing_kind_reflects_message_then_mmap() {
+        let mut t = DmaTable::default();
+        t.insert(DmaRegion {
+            addr: 0x1000,
+            size: 0x1000,
+            readable: true,
+            writeable: true,
+        })
+        .unwrap();
+        // 初始 backing = Message（wire fallback），region 内任意 gpa 都报 Message。
+        assert_eq!(t.backing_kind(0x1000), Some(BackingKind::Message));
+        assert_eq!(t.backing_kind(0x1800), Some(BackingKind::Message));
+        // region 外 → None。
+        assert_eq!(t.backing_kind(0x9999), None);
+
+        // 附加 mmap → 升级为零拷贝 Mmap backing。
+        let fd = memfd_with(&[0u8; 0x1000]);
+        let mmap = map_dma_fd(&fd, 0, 0x1000, true).unwrap();
+        t.attach_mmap(0x1000, mmap);
+        assert_eq!(t.backing_kind(0x1000), Some(BackingKind::Mmap));
+        assert_eq!(t.backing_kind(0x1fff), Some(BackingKind::Mmap));
+    }
+
+    /// **单表不失步**：`remove_exact` 一次性删 region + 其 backing（含 mmap）；
+    /// 旧的两张并行表设计下，"漏删 mmaps" 会留下孤儿映射 —— 合一后类型上
+    /// 不可能发生。本测试锁住该不变量。
+    #[test]
+    fn remove_exact_drops_region_and_backing_atomically() {
+        let mut t = DmaTable::default();
+        t.insert(DmaRegion {
+            addr: 0x2000,
+            size: 0x1000,
+            readable: true,
+            writeable: true,
+        })
+        .unwrap();
+        let fd = memfd_with(&[7u8; 0x1000]);
+        t.attach_mmap(0x2000, map_dma_fd(&fd, 0, 0x1000, true).unwrap());
+        assert_eq!(t.backing_kind(0x2000), Some(BackingKind::Mmap));
+        assert!(t.mmap_read(0x2000, 4).is_some());
+
+        t.remove_exact(0x2000, 0x1000).unwrap();
+        // region 与 backing 同时消失：无孤儿 mmap 残留。
+        assert_eq!(t.backing_kind(0x2000), None);
+        assert!(t.find(0x2000, 4).is_none());
+        assert!(t.mmap_read(0x2000, 4).is_none(), "remove 后不应有孤儿 mmap");
+    }
+
+    /// `clear`（UNMAP_ALL）丢弃所有 region 及其 backing。
+    #[test]
+    fn clear_drops_all_backings() {
+        let mut t = DmaTable::default();
+        t.insert(DmaRegion {
+            addr: 0x3000,
+            size: 0x1000,
+            readable: true,
+            writeable: true,
+        })
+        .unwrap();
+        t.attach_mmap(
+            0x3000,
+            map_dma_fd(&memfd_with(&[1u8; 0x1000]), 0, 0x1000, true).unwrap(),
+        );
+        assert_eq!(t.backing_kind(0x3000), Some(BackingKind::Mmap));
+        t.clear();
+        assert!(t.is_empty());
+        assert_eq!(t.backing_kind(0x3000), None);
     }
 }

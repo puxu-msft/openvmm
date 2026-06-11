@@ -50,6 +50,7 @@ pub mod session;
 pub mod transport;
 
 pub use config::ConfigSpace;
+pub use dma::BackingKind;
 pub use dma::DmaError;
 pub use dma::DmaRegion;
 pub use dma::DmaTable;
