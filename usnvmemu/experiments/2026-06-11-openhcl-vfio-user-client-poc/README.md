@@ -103,11 +103,30 @@ munmap+ack）。证明 Spec B 的 RED 判断正确。（模型不复现硬件加
 > grep 过度过滤（漏了 `livedump.rs` 的 `Command::new`）造成的错误结论。实测代码证明：
 > **firmware 作 VTL2 独立进程 + AF_UNIX 可行且有先例**，并不与 OpenHCL 架构相抵。
 
-**结论**：A（in-process 链接）vs B（独立进程 + vfio-user）**两者都可行**，不是"B 被阻塞"，
-而是真实的设计取舍（in-process 最简、无协议开销 / 独立进程得统一 vfio-user 协议 + 进程隔离）。
-该取舍 + 真 VTL2 的 POC-3（guest RAM fd 导出）是定 Spec A 形态前要补的两块。
+**结论**：firmware 在 VTL2 时，"链进 underhill 进程（in-process）"与"独立 VTL2 进程"
+**两种打包都可行**（独立进程有 crash/dump/vnc/gdb 先例 + diag 可 exec；in-process 则直接
+持 GuestMemory）。这是 VTL2 内的打包取舍，与"firmware 在 host 还是 VTL2"（见下 Topology
+总结）是正交两问。
 
----
+## Topology 验证总结（firmware 该在哪 + 零拷贝机制）
+
+**Q1：firmware 在 host 还是 VTL2？**（零拷贝直访 guest RAM 的承重前提）
+
+| firmware 位置 | 零拷贝机制 | 结论 |
+|---|---|---|
+| OpenHCL **VTL2** 内 | open `/dev/mshv_vtl_low` + mmap GPA | **✅ 真机 PASSED**（POC-3，活 VM 拿到真 guest 数据）|
+| **Windows host** 进程 | WHP/VID/HCS 映射外部 VM guest RAM | **❌ 不可行**（代码研究 + 对抗性 subagent 独立确认）|
+
+host 不可行的逐机制证据（subagent 对抗性穷尽、未找到反例）：WHP `WHvCreatePartition`
+只创建**自有** partition、无 open-by-id；VID/vmwp 私有不开放；HCS 仅生命周期；
+membacking/virt_whp 只接**自分配** section / 自有 partition；`mshv_vtl_low` 是 **VTL2 侧**
+下行设备。排除伪反例 vmrs（离线 dump）。CVM 下 host 更硬性够不到（加密）。
+
+→ **要零拷贝，firmware 必须在 VTL2。** 现有 pcie_remote 用 host→VTL2 vsock 转发，正因
+host 够不到 guest RAM（真正访问在 VTL2 侧）。
+
+**Q2：firmware 在 VTL2 内怎么打包？** 链进 underhill（in-process，直接持 GuestMemory）
+或独立 VTL2 进程（POC-5：两者都可行）——这是后续设计取舍。
 
 ## 净结论
 
@@ -116,6 +135,7 @@ munmap+ack）。证明 Spec B 的 RED 判断正确。（模型不复现硬件加
 - **真 guest RAM 直访**（POC-3）—— ✅ **真 OpenHCL VM 实测 PASSED**：独立 VTL2 进程
   mmap `/dev/mshv_vtl_low` 拿到真 guest 数据 + 写回。topology A（firmware-in-VTL2）证实可行。
 - **CVM**（POC-4）—— 审计 RED 判断**实测验证**，naive 直访不安全。
-- **架构前提**（POC-5）—— ✅ 独立进程 + AF_UNIX 在 VTL2 **可行且有先例**（underhill
-  已 spawn crash/dump/vnc/gdb 进程；diag 可 exec）。A（in-process）vs B（独立进程）是
-  真实设计取舍、非阻塞。**写 Spec A 前需定 A/B + 补真 VTL2 的 POC-3。**
+- **架构前提**（POC-5）—— ✅ VTL2 内独立进程可行且有先例（underhill 已 spawn
+  crash/dump/vnc/gdb；diag 可 exec）。
+- **Topology**（POC-3 + B 调查）—— ✅ **已定**：firmware 必须在 **VTL2**（host 直访经
+  对抗性 subagent 确认不可行）。VTL2 内打包（in-process vs 独立进程）是后续设计取舍。
