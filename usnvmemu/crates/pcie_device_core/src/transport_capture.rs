@@ -48,7 +48,7 @@ pub struct CaptureTransport {
 }
 
 impl CaptureTransport {
-    /// 默认 token 起点 `1<<40`（与 `OpenhclVsockTransport::new` 的 owned 默认
+    /// 默认 token 起点 `1<<40`（与 `PcieRemoteTransport::new` 的 owned 默认
     /// 一致，便于日志区分；token 值不保证跨 transport 可比）。
     pub fn new() -> Self {
         Self::with_start_token(1u64 << 40)

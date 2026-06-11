@@ -14,8 +14,21 @@ use crate::describe::DeviceDescribe;
 /// **Phase T** — 设备原语 trait：所有 `DeviceCtx` 方法最终落到的"后端"。
 ///
 /// 一个 backend 实现 `Transport` 即可承载任意 [`PcieDevice`]。当前仓库内
-/// 有 [`OpenhclVsockTransport`](crate::OpenhclVsockTransport)（pcie_remote
-/// 协议）；Phase U/V 会新增 vfio-user 与 NVMe-oF TCP 的 impl。
+/// 有 `PcieRemoteTransport`（pcie_remote 协议，在 `pcie_device_sdk`）与
+/// vfio-user / NVMe-oF TCP 的 impl。
+///
+/// **命名语义**：这里的 `Transport` 指**设备朝 guest 的原语层**（中断注入 +
+/// guest 内存 DMA），对齐 NVMe "transport" 语义（controller↔host 的承载：
+/// vsock / TCP / vfio-user）。**它不是 PCI bridge / 拓扑元件**。两类 impl
+/// 兑现方式不同：
+/// - *转发器*（pcie_remote vsock / NVMe-oF TCP）：`dma_read`/`fire_interrupt`
+///   字面生成 wire 消息、经传输到另一端，由对端访问 guest 内存——名副其实。
+/// - *访问器*（vfio-user）：自己访问 guest 内存（DMA_MAP 带 fd 时 mmap 零拷贝，
+///   见 vfio-user backend 的 `DmaBacking`），mmap 命中时**不传输任何东西**；
+///   此处 "transport" 取其引申义（设备 I/O 的承载层），非字面 wire 传输。
+///
+/// device 只依赖统一契约（见 `dma_read` / `on_dma_complete`），不感知自己跑在
+/// 转发器还是访问器之上。
 ///
 /// 设计要点：
 /// - **保持 object-safe**（无 `Self` 返回、无 generic method），允许

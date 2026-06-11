@@ -20,7 +20,7 @@
 //! - **Reconnect 友好**：transport EOF / error 时 `run` 返回；调用方可外
 //!   层 reconnect。这对应 OpenHCL 侧 K-20 hotplug。
 //! - **Phase T transport 抽象**：[`DeviceCtx`] 内部持 `&mut dyn Transport`，
-//!   pcie_remote 协议路径走 [`OpenhclVsockTransport`]；Phase U/V 加
+//!   pcie_remote 协议路径走 [`PcieRemoteTransport`]；Phase U/V 加
 //!   vfio-user / NVMe-oF TCP 时只需新增 `impl Transport`，controller 0 改动。
 //!
 //! # 用法
@@ -57,16 +57,15 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-mod openhcl_transport;
+mod pcie_remote_transport;
 mod run;
 mod transport;
 
 // **Phase W2 (ADR-010)** — device 模型移到 `pcie_device_core`（零 wire / 零 runtime
 // 依赖）。本 crate 现在是 **openhcl (pcie_remote vsock) transport adapter**：实现
-// `OpenhclVsockTransport` + 主循环 + connect。re-export core 类型让 openhcl bin
+// `PcieRemoteTransport` + 主循环 + connect。re-export core 类型让 openhcl bin
 // 单路径 import；wire 类型（pcie_remote_protocol）**不再** pub —— 撤掉了泄漏，
 // adapter 内部仍用它做 wire 编码。
-pub use openhcl_transport::OpenhclVsockTransport;
 pub use pcie_device_core::BarKind;
 pub use pcie_device_core::BarLayout;
 pub use pcie_device_core::Capability;
@@ -77,6 +76,7 @@ pub use pcie_device_core::PcieDevice;
 pub use pcie_device_core::Transport;
 pub use pcie_device_core::TransportEvent;
 pub use pcie_device_core::describe;
+pub use pcie_remote_transport::PcieRemoteTransport;
 pub use run::RunOptions;
 pub use run::run;
 pub use transport::WireStream;

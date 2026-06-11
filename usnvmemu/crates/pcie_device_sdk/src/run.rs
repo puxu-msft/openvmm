@@ -7,12 +7,12 @@
 //! 不需要 import `pcie_remote_protocol` 的 ToHost/ToOpenhcl 等底层类型。
 //!
 //! **Phase T**：本文件不再手攒 `outbound: Vec<ToOpenhcl>` + seq/token 分配器，
-//! 改为持一个 [`OpenhclVsockTransport`] 把这些状态封进 backend；
+//! 改为持一个 [`PcieRemoteTransport`] 把这些状态封进 backend；
 //! `DeviceCtx` 在每次回调里以 `&mut dyn Transport` 形式借给 device。
 
 use crate::DeviceCtx;
-use crate::OpenhclVsockTransport;
 use crate::PcieDevice;
+use crate::PcieRemoteTransport;
 use crate::WireStream;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -155,8 +155,8 @@ pub async fn run<D: PcieDevice>(
 
     // ─── 2. 主循环 ───
     //
-    // Phase T：seq 与 dma_token 分配由 OpenhclVsockTransport 接管。
-    let mut backend = OpenhclVsockTransport::new();
+    // Phase T：seq 与 dma_token 分配由 PcieRemoteTransport 接管。
+    let mut backend = PcieRemoteTransport::new();
     let mut flush_buf: Vec<ToOpenhcl> = Vec::with_capacity(16);
     let mut timer = PolledTimer::new(driver);
 
@@ -197,7 +197,7 @@ pub async fn run<D: PcieDevice>(
 fn dispatch_inbound<D: PcieDevice>(
     device: &mut D,
     req: ToHost,
-    backend: &mut OpenhclVsockTransport<'_>,
+    backend: &mut PcieRemoteTransport<'_>,
 ) -> Result<()> {
     let seq = req.seq;
     match req.body {
@@ -343,8 +343,7 @@ mod tests {
         let mut seq = 0u64;
         let mut tok = 0u64;
         {
-            let mut t =
-                crate::OpenhclVsockTransport::with_buffers(&mut outbound, &mut seq, &mut tok);
+            let mut t = crate::PcieRemoteTransport::with_buffers(&mut outbound, &mut seq, &mut tok);
             let mut ctx = crate::DeviceCtx::new(&mut t);
             ctx.fire_interrupt(0);
             let t1 = ctx.dma_read(0x1000, 4096);
@@ -366,8 +365,7 @@ mod tests {
         let mut seq = 0u64;
         let mut tok = 0u64;
         {
-            let mut t =
-                crate::OpenhclVsockTransport::with_buffers(&mut outbound, &mut seq, &mut tok);
+            let mut t = crate::PcieRemoteTransport::with_buffers(&mut outbound, &mut seq, &mut tok);
             let mut ctx = crate::DeviceCtx::new(&mut t);
             ctx.fire_interrupt(3);
         }
@@ -386,8 +384,7 @@ mod tests {
         let mut tok = 0u64;
         let returned_token;
         {
-            let mut t =
-                crate::OpenhclVsockTransport::with_buffers(&mut outbound, &mut seq, &mut tok);
+            let mut t = crate::PcieRemoteTransport::with_buffers(&mut outbound, &mut seq, &mut tok);
             let mut ctx = crate::DeviceCtx::new(&mut t);
             returned_token = ctx.dma_read(0xdead_beef, 8192);
         }
@@ -410,8 +407,7 @@ mod tests {
         let payload = vec![1, 2, 3, 4, 5];
         let returned_token;
         {
-            let mut t =
-                crate::OpenhclVsockTransport::with_buffers(&mut outbound, &mut seq, &mut tok);
+            let mut t = crate::PcieRemoteTransport::with_buffers(&mut outbound, &mut seq, &mut tok);
             let mut ctx = crate::DeviceCtx::new(&mut t);
             returned_token = ctx.dma_write(0xcafe_babe, payload.clone());
         }
@@ -479,7 +475,7 @@ mod tests {
     }
 
     /// **Phase T 重构后** — 单测改用 with_buffers backend，drain 进 sink 后断言。
-    fn drain(backend: &mut OpenhclVsockTransport<'_>) -> Vec<ToOpenhcl> {
+    fn drain(backend: &mut PcieRemoteTransport<'_>) -> Vec<ToOpenhcl> {
         let mut sink = Vec::new();
         backend.drain(&mut sink);
         sink
@@ -492,7 +488,7 @@ mod tests {
             mmio_read_return: 0xDEAD_BEEF_CAFE_BABE,
             ..Default::default()
         };
-        let mut backend = OpenhclVsockTransport::new();
+        let mut backend = PcieRemoteTransport::new();
         let req = make_req(
             42,
             HostBody::MmioRead(pcie_remote_protocol::MmioAccess {
@@ -519,7 +515,7 @@ mod tests {
     #[test]
     fn dispatch_inbound_mmio_read_rejects_bad_size() {
         let mut dev = CaptureDevice::default();
-        let mut backend = OpenhclVsockTransport::new();
+        let mut backend = PcieRemoteTransport::new();
         let req = make_req(
             1,
             HostBody::MmioRead(pcie_remote_protocol::MmioAccess {
@@ -540,7 +536,7 @@ mod tests {
     #[test]
     fn dispatch_inbound_mmio_write_no_outbound() {
         let mut dev = CaptureDevice::default();
-        let mut backend = OpenhclVsockTransport::new();
+        let mut backend = PcieRemoteTransport::new();
         let req = make_req(
             7,
             HostBody::MmioWrite(pcie_remote_protocol::MmioAccess {
@@ -559,7 +555,7 @@ mod tests {
     #[test]
     fn dispatch_inbound_cfg_write_side_effect() {
         let mut dev = CaptureDevice::default();
-        let mut backend = OpenhclVsockTransport::new();
+        let mut backend = PcieRemoteTransport::new();
         let req = make_req(
             5,
             HostBody::CfgWriteSideEffect(pcie_remote_protocol::CfgAccess {
@@ -576,7 +572,7 @@ mod tests {
     #[test]
     fn dispatch_inbound_reset() {
         let mut dev = CaptureDevice::default();
-        let mut backend = OpenhclVsockTransport::new();
+        let mut backend = PcieRemoteTransport::new();
         let req = make_req(9, HostBody::Reset(pcie_remote_protocol::Reset { kind: 2 }));
         super::dispatch_inbound(&mut dev, req, &mut backend).unwrap();
         assert_eq!(dev.last_reset, Some(2));
@@ -586,7 +582,7 @@ mod tests {
     #[test]
     fn dispatch_inbound_dma_completion() {
         let mut dev = CaptureDevice::default();
-        let mut backend = OpenhclVsockTransport::new();
+        let mut backend = PcieRemoteTransport::new();
         let req = make_req(
             11,
             HostBody::DmaCompletion(pcie_remote_protocol::DmaCompletion {
@@ -604,7 +600,7 @@ mod tests {
     #[test]
     fn dispatch_inbound_dma_completion_failure() {
         let mut dev = CaptureDevice::default();
-        let mut backend = OpenhclVsockTransport::new();
+        let mut backend = PcieRemoteTransport::new();
         let req = make_req(
             13,
             HostBody::DmaCompletion(pcie_remote_protocol::DmaCompletion {
@@ -621,7 +617,7 @@ mod tests {
     #[test]
     fn dispatch_inbound_empty_body_is_ignored() {
         let mut dev = CaptureDevice::default();
-        let mut backend = OpenhclVsockTransport::new();
+        let mut backend = PcieRemoteTransport::new();
         let req = ToHost { seq: 0, body: None };
         let r = super::dispatch_inbound(&mut dev, req, &mut backend);
         assert!(r.is_ok());

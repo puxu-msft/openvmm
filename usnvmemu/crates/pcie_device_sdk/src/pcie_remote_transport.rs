@@ -19,13 +19,13 @@ use pcie_remote_protocol::to_openhcl::Body;
 
 /// pcie_remote 协议 backend。两种构造方式：
 ///
-/// 1. [`OpenhclVsockTransport::new`]：自带 owned buffer，SDK [`crate::run`]
+/// 1. [`PcieRemoteTransport::new`]：自带 owned buffer，SDK [`crate::run`]
 ///    主循环每 iter 调 [`Self::drain`] 把 buffer flush 到 wire。
-/// 2. [`OpenhclVsockTransport::with_buffers`]：借用外部 buffer + seq/token
+/// 2. [`PcieRemoteTransport::with_buffers`]：借用外部 buffer + seq/token
 ///    分配器，配 [`crate::DeviceCtx::new`] 用于 adapter 的 wire 单测 —— 调用方
 ///    在 ctx 借用结束后直接读 outbound vec 断言 protobuf 帧（见 run.rs 的
 ///    `device_ctx_*_body` 测试）。
-pub struct OpenhclVsockTransport<'a> {
+pub struct PcieRemoteTransport<'a> {
     outbound: BufferRef<'a>,
     next_seq: U64Ref<'a>,
     next_dma_token: U64Ref<'a>,
@@ -77,7 +77,7 @@ impl U64Ref<'_> {
     }
 }
 
-impl OpenhclVsockTransport<'_> {
+impl PcieRemoteTransport<'_> {
     /// SDK 主循环用的构造：owned buffer + 默认 seq=1<<32 / dma_token=1<<40
     /// （避免与 OpenHCL 侧 seq 撞，便于日志区分）。
     pub fn new() -> Self {
@@ -107,14 +107,14 @@ impl OpenhclVsockTransport<'_> {
     }
 }
 
-impl Default for OpenhclVsockTransport<'_> {
+impl Default for PcieRemoteTransport<'_> {
     /// 同 [`Self::new`]。
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<'a> OpenhclVsockTransport<'a> {
+impl<'a> PcieRemoteTransport<'a> {
     /// 测试用构造：把 outbound buffer + seq/token 分配器外置，让
     /// 调用方读 outbound vec 做断言。
     pub fn with_buffers(
@@ -130,7 +130,7 @@ impl<'a> OpenhclVsockTransport<'a> {
     }
 }
 
-impl Transport for OpenhclVsockTransport<'_> {
+impl Transport for PcieRemoteTransport<'_> {
     fn fire_interrupt(&mut self, msix_index: u32) {
         let seq = self.next_seq.alloc();
         self.outbound.push(ToOpenhcl {
@@ -168,14 +168,14 @@ mod tests {
     /// `&mut dyn Transport` 字段编译失败，整个 Phase T 抽象崩塌。
     #[test]
     fn transport_is_object_safe() {
-        let mut t = OpenhclVsockTransport::new();
+        let mut t = PcieRemoteTransport::new();
         let _dyn_ref: &mut dyn Transport = &mut t;
     }
 
     /// seq / token 分配单调递增，wrap_around 不 panic。
     #[test]
     fn alloc_monotonic_and_wraps() {
-        let mut t = OpenhclVsockTransport::new();
+        let mut t = PcieRemoteTransport::new();
         let s0 = t.next_seq.alloc();
         let s1 = t.next_seq.alloc();
         assert_eq!(s1, s0.wrapping_add(1));
@@ -192,7 +192,7 @@ mod tests {
         let mut outbound = Vec::new();
         let mut seq = 0u64;
         let mut tok = 0u64;
-        let mut t = OpenhclVsockTransport::with_buffers(&mut outbound, &mut seq, &mut tok);
+        let mut t = PcieRemoteTransport::with_buffers(&mut outbound, &mut seq, &mut tok);
         let returned = t.dma_read(0xCAFE, 4096);
         assert_eq!(returned, 0);
         assert_eq!(outbound.len(), 1);
@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn owned_and_borrowed_paths_produce_identical_bytes() {
         // owned 路径：默认起点 (1<<32, 1<<40)
-        let mut t_owned = OpenhclVsockTransport::new();
+        let mut t_owned = PcieRemoteTransport::new();
         t_owned.fire_interrupt(7);
         let _ = t_owned.dma_read(0xCAFE, 4096);
         let _ = t_owned.dma_write(0xBEEF, vec![0xab; 16]);
@@ -225,7 +225,7 @@ mod tests {
         let mut tok = 1u64 << 40;
         {
             let mut t_borrowed =
-                OpenhclVsockTransport::with_buffers(&mut outbound, &mut seq, &mut tok);
+                PcieRemoteTransport::with_buffers(&mut outbound, &mut seq, &mut tok);
             t_borrowed.fire_interrupt(7);
             let _ = t_borrowed.dma_read(0xCAFE, 4096);
             let _ = t_borrowed.dma_write(0xBEEF, vec![0xab; 16]);
@@ -241,7 +241,7 @@ mod tests {
     /// `next_seq`（避免 alloc 与 inbound seq 撞）。
     #[test]
     fn push_mmio_read_result_reuses_inbound_seq() {
-        let mut t = OpenhclVsockTransport::new();
+        let mut t = PcieRemoteTransport::new();
         let seq_before = match &t.next_seq {
             U64Ref::Owned(s) => *s,
             U64Ref::Borrowed(_) => unreachable!(),
