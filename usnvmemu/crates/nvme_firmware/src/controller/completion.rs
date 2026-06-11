@@ -1359,6 +1359,9 @@ impl NvmeController {
                                                 zns: None,
                                                 meta_inline: true,
                                                 force_flush_err: false,
+                                                // NS Mgmt Create 出的 NS 默认 ready
+                                                // （not-ready 仅经 --not-ready-nsid 触发）。
+                                                not_ready: false,
                                             },
                                         );
                                         let mut c = Cqe::success(p.cid, p.sq_id, p.sq_head, phase);

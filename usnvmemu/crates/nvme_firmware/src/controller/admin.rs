@@ -253,10 +253,17 @@ impl NvmeController {
                         // § 5.17.2.8)。这才是 NS-level command-set-agnostic
                         // descriptor，含 NSFEAT/NMIC/RESCAP/FPI/NSTAT。
                         // （之前 commit 误用 CNS 0x06。）
-                        if self.ns(nsid).is_none() {
+                        let Some(ns) = self.ns(nsid) else {
                             return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_NAMESPACE));
-                        }
-                        build_cs_indep_ns_identify()
+                        };
+                        // **NS-not-ready spec-completeness** — NSTAT.NRDY（byte 13 bit 0）
+                        // 跟随 NS 真状态：not_ready=true → NRDY=1（与 io.rs IO 门返
+                        // NAMESPACE_NOT_READY 一致，广告⟺门不矛盾）。builder 默认 NRDY=0
+                        // （ready），此处按 live 状态覆盖。
+                        let not_ready = ns.not_ready;
+                        let mut buf = build_cs_indep_ns_identify();
+                        buf[13] = not_ready as u8;
+                        buf
                     }
                     0x19 => {
                         // **Phase P1** — CNS 0x19 = Endurance Group List (spec
@@ -1096,6 +1103,10 @@ impl NvmeController {
                         ns.mmap = crate::controller::try_mmap_file(&ns.file);
                         // **Phase K1** — 应用新 LBAF + PI 配置
                         ns.lbads = new_lbads;
+                        // **NS-not-ready spec-completeness** — Format NVM 初始化 media →
+                        // NS 转 ready（清 not_ready）；后续 IO 不再返 NAMESPACE_NOT_READY，
+                        // Identify NS NSTAT.NRDY 也随之变 0。
+                        ns.not_ready = false;
                         ns.meta_size = new_meta_size;
                         ns.pi_type = new_pi_type;
                         ns.pi_first = new_pi_first;
@@ -1149,6 +1160,9 @@ impl NvmeController {
                         let ns = self.namespaces.get_mut(&target_nsid).unwrap();
                         let size = ns.file.metadata().map(|m| m.len()).unwrap_or(0);
                         ns.lbads = new_lbads;
+                        // **NS-not-ready spec-completeness** — 同 SES≠0 路径：Format
+                        // 初始化 NS → 转 ready（清 not_ready）。
+                        ns.not_ready = false;
                         ns.meta_size = new_meta_size;
                         ns.pi_type = new_pi_type;
                         ns.pi_first = new_pi_first;

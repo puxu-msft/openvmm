@@ -893,6 +893,14 @@ pub(super) struct Namespace {
     /// shutdown-flush 失败 → CSTS.CFS 路径（真 file sync_all 难在单测里失败）。
     /// production 恒 false（仅 `#[cfg(test)]` 置位）。
     pub(super) force_flush_err: bool,
+    /// **NS-not-ready spec-completeness（NAMESPACE_NOT_READY 0x82）** — NS 已 attach
+    /// 但 media 尚未初始化、当前不可用（NSTAT.NRDY=1）。true 时对该 NS 的所有 IO
+    /// 返 NAMESPACE_NOT_READY（io.rs dispatch 早期门），且 Identify NS CNS 0x08 的
+    /// NSTAT.NRDY 跟随此位（广告与门一致）。教学触发：bin `--not-ready-nsid` 让指定
+    /// NS 开机即 not-ready，模拟"media 初始化未完成"；Format NVM 初始化该 NS 后清此位
+    /// （→ ready）。spec § generic status 0x82：DNR=0，driver 重试。默认 false（既有
+    /// NS 开机即 ready）。
+    pub(super) not_ready: bool,
 }
 
 /// **Phase L1** — ZNS (Zoned Namespace) 状态（spec ZNS CS § 4）。
@@ -2185,6 +2193,7 @@ impl NvmeController {
                     zns: None,
                     meta_inline: true,
                     force_flush_err: false,
+                    not_ready: false,
                 },
             );
         }
@@ -2305,6 +2314,26 @@ impl NvmeController {
             ssvid,
             msix_count: 4, // admin (vec 0) + IO (vec 1) + 2 spare
         })
+    }
+
+    /// **NS-not-ready spec-completeness（NAMESPACE_NOT_READY 0x82）** — 把 `nsids`
+    /// 列表中的 NS 标记为 not-ready（`not_ready=true`）：其 IO 返 NAMESPACE_NOT_READY、
+    /// Identify NS CNS 0x08 NSTAT.NRDY=1，直到 Format NVM 初始化该 NS 清此位。bin 经
+    /// `--not-ready-nsid` 调用，模拟"media 初始化未完成"的冷启动 NS。不存在的 NSID 仅
+    /// warn（与 `--zns-nsid` 同语义）。
+    ///
+    /// **为何用追加 setter 而非 `open()` 入参**：`open()` 已有 20+ 调用点（含 tests.rs
+    /// 的 M1/M4 矩阵），改签名会全线破坏；setter 对既有调用点零回归（不调即全 ready）。
+    pub fn set_namespaces_not_ready(&mut self, nsids: &[u32]) {
+        for &nsid in nsids {
+            match self.namespaces.get_mut(&nsid) {
+                Some(ns) => {
+                    ns.not_ready = true;
+                    tracing::info!(nsid, "NS 标记为 not-ready（待 Format 初始化）");
+                }
+                None => tracing::warn!(nsid, "--not-ready-nsid 指定了不存在的 NSID"),
+            }
+        }
     }
 
     /// 计算 doorbell offset 是 SQ 还是 CQ + queue id。
@@ -3069,6 +3098,36 @@ impl NvmeController {
                     write_sq_head,
                     phase,
                     sc::INVALID_NAMESPACE,
+                ),
+            );
+            return;
+        }
+        // **NS-not-ready spec-completeness（reviewer HIGH-1）** — fused C&W 在 dispatch_sqe
+        // 的 fuse==2 分支直接进本函数，**绕过 dispatch_io 的 not-ready 门**。若不在此再设门，
+        // not-ready NS 上的 fused C&W 会让 Compare 半边照常读盘返 success/COMPARE_FAILURE、
+        // 仅 Write 半边经 dispatch_io 才被拦 → driver 看到非原子、不自洽结果。故此处对 not-ready
+        // NS 的 fused 两条都返 NAMESPACE_NOT_READY，与 io.rs 门一致（同 INVALID_NAMESPACE 双-CQE 模式）。
+        if self.ns(nsid).map(|n| n.not_ready).unwrap_or(false) {
+            self.post_cqe(
+                ctx,
+                cq_id,
+                Cqe::error(
+                    compare_cid,
+                    sq_id,
+                    compare_sq_head,
+                    phase,
+                    sc::NAMESPACE_NOT_READY,
+                ),
+            );
+            self.post_cqe(
+                ctx,
+                cq_id,
+                Cqe::error(
+                    write_sqe.cid(),
+                    sq_id,
+                    write_sq_head,
+                    phase,
+                    sc::NAMESPACE_NOT_READY,
                 ),
             );
             return;

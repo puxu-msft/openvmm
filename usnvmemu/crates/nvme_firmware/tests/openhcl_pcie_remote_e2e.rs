@@ -188,6 +188,12 @@ impl Drop for Harness {
 /// 起 TCP listener（127.0.0.1:0 取空闲端口）→ 起真 `nvme_firmware --tcp-addr`（它作为
 /// client 连过来，自带 connect 重试）→ accept。返回**裸 `TcpStream`** + 守卫。
 async fn spawn_and_accept() -> Result<(TcpStream, Harness)> {
+    spawn_and_accept_with_args(&[]).await
+}
+
+/// 同 `spawn_and_accept`，但向 `nvme_firmware` bin 追加额外 CLI 参数（如
+/// `--not-ready-nsid 1`）。`spawn_and_accept()` = 空 extra（既有测试零影响）。
+async fn spawn_and_accept_with_args(extra_args: &[&str]) -> Result<(TcpStream, Harness)> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("bind 127.0.0.1:0")?;
@@ -222,11 +228,13 @@ async fn spawn_and_accept() -> Result<(TcpStream, Harness)> {
     let log_file = std::fs::File::create(&log).context("create log file")?;
     let log_file2 = log_file.try_clone().context("clone log fd")?;
 
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_nvme_firmware"))
-        .arg("--tcp-addr")
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nvme_firmware"));
+    cmd.arg("--tcp-addr")
         .arg(format!("127.0.0.1:{port}"))
         .arg("--backing-file")
-        .arg(&backing)
+        .arg(&backing);
+    cmd.args(extra_args);
+    let child = cmd
         .env("RUST_LOG", "warn")
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_file2))
@@ -4076,3 +4084,231 @@ async fn openhcl_abort_inflight_io_command() -> Result<()> {
 //  被 biased-device-first 杜绝）。其精确触发应由 controller 单测用确定性 `CaptureTransport`
 //  （可任意编排"发 shadow-read → 删 SQ → 投 completion"的帧交错）覆盖；当前该防御分支无
 //  e2e 也无对应单测，属 unit-test-ownable 的 defensive 分支。**不**在此 harness 伪造触发。
+
+/// **NS-not-ready spec-completeness** 专用 setup —— enable controller + 建一对 IO 队列，
+/// 但**不** Format（区别于 `setup_enabled_4k_io`）。因为 Format 会把 not-ready NS 转 ready，
+/// 而本测试要先观察 not-ready 态，故 setup 阶段不能 Format。
+async fn setup_enabled_io_no_format(driver: &NvmeDriver) -> Result<(QueueState, QueueState)> {
+    driver.enable_controller().await.context("enable")?;
+    let mut admin = QueueState::admin();
+    let cdw10_q = (IO_QID as u32) | (((IO_Q_DEPTH - 1) as u32) << 16);
+    let cqe = admin
+        .submit(
+            driver,
+            Sqe {
+                opcode: 0x05, // Create IO CQ
+                cid: 0x10,
+                prp1: IO_CQ_GPA,
+                cdw10: cdw10_q,
+                cdw11: 0b11, // PC | IEN，IV=0
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Create IO CQ")?;
+    if cqe.sc != 0 {
+        return Err(anyhow!("Create IO CQ sc={:#x}", cqe.sc));
+    }
+    let cqe = admin
+        .submit(
+            driver,
+            Sqe {
+                opcode: 0x01, // Create IO SQ
+                cid: 0x11,
+                prp1: IO_SQ_GPA,
+                cdw10: cdw10_q,
+                cdw11: 1 | ((IO_QID as u32) << 16),
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Create IO SQ")?;
+    if cqe.sc != 0 {
+        return Err(anyhow!("Create IO SQ sc={:#x}", cqe.sc));
+    }
+    Ok((admin, QueueState::io()))
+}
+
+/// **NS-not-ready spec-completeness（NAMESPACE_NOT_READY 0x82）** — NS 已 attach 但 media
+/// 尚未初始化（NSTAT.NRDY=1）时，对它的 IO 必须返 NAMESPACE_NOT_READY (full status 0x0082)；
+/// Format NVM 初始化该 NS 后转 ready，IO 恢复正常。NRDY 广告（Identify NS CNS 0x08 byte 13）
+/// 必须与 IO 门一致。
+///
+/// 触发：bin `--not-ready-nsid 1` 让 NS 1 开机即 not-ready（模拟 media 未初始化）。
+///
+/// **两条独立 oracle**（来自不同代码路径，互补）：
+/// - **oracle A（IO 门）**：IO Read NS1 经真 wire 回的完整 16-bit CQE status。not-ready 时
+///   硬编码期望 0x0082；ready 后期望 0x0000（success）。
+/// - **oracle B（NSTAT 广告）**：Identify NS CNS 0x08 的 byte 13 bit0（NRDY）。not-ready 时
+///   ==1，ready 后 ==0。这条走 admin Identify 数据路径，独立于 IO 门，验"广告⟺门一致"。
+///
+/// **revert-verify（已实测）**：
+/// - 删 `io.rs` 的 not-ready 门 → 第一次 IO Read 返 0x0000 而非 0x0082 → oracle A FAIL。
+/// - 把 `admin.rs` CNS 0x08 的 `buf[13] = not_ready as u8` 改回硬编码 0 → 第一次 Identify
+///   NRDY==0 → oracle B FAIL。
+#[tokio::test]
+async fn openhcl_ns_not_ready_then_format_makes_ready() -> Result<()> {
+    const SC_NAMESPACE_NOT_READY: u16 = 0x0082; // Generic SCT=0, SC 0x82
+
+    // NS 1 开机 not-ready。
+    let (stream, _harness) = spawn_and_accept_with_args(&["--not-ready-nsid", "1"]).await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    // 不 Format（否则会过早 ready）。
+    let (mut admin, mut io) = setup_enabled_io_no_format(&driver).await?;
+
+    // ── not-ready 阶段 ──
+    // oracle B（before）：Identify NS CNS 0x08 → NSTAT byte 13 NRDY == 1。
+    let cqe = admin
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x06, // Identify
+                cid: 0x20,
+                nsid: 1,
+                prp1: IDENTIFY_GPA,
+                cdw10: 0x08, // CNS=0x08 I/O Command Set Independent Identify NS
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Identify NS CNS 0x08 (not-ready)")?;
+    assert_eq!(cqe.sc, 0, "Identify CNS 0x08 应成功");
+    let idns = driver.read_guest(IDENTIFY_GPA, 4096).await?;
+    assert_eq!(
+        idns[13] & 0x1,
+        1,
+        "not-ready NS 的 NSTAT.NRDY (byte 13 bit0) 应=1，实={:#x}",
+        idns[13]
+    );
+
+    // oracle A（before）：IO Read NS1 → NAMESPACE_NOT_READY (0x0082)。
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02, // Read
+                cid: 0x30,
+                nsid: 1,
+                prp1: READ_BUF_GPA,
+                cdw10: 0, // slba=0
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("IO Read on not-ready NS")?;
+    assert_eq!(
+        cqe.status, SC_NAMESPACE_NOT_READY,
+        "not-ready NS 的 IO 应返 NAMESPACE_NOT_READY (full status 0x0082)，实 status={:#x}",
+        cqe.status
+    );
+
+    // oracle A'（fused 路径门，reviewer HIGH-1）：fused Compare-and-Write 在 dispatch_sqe
+    // 的 fuse==2 分支直接进 dispatch_fused_compare_write，**绕过 dispatch_io 的门**；验它也
+    // 被 not-ready 拦——两条（Compare FIRST + Write SECOND）都应返 NAMESPACE_NOT_READY，
+    // 而非 Compare 半边照常读盘、仅 Write 半边被拦的非原子结果。
+    let cmp = Sqe {
+        opcode: 0x05, // Compare
+        fuse: 1,      // FUSE_FIRST
+        cid: 0x32,
+        nsid: 1,
+        prp1: COMPARE_BUF_GPA,
+        cdw10: 0, // slba=0
+        ..Default::default()
+    }
+    .encode();
+    let wr = Sqe {
+        opcode: 0x01, // Write
+        fuse: 2,      // FUSE_SECOND
+        cid: 0x33,
+        nsid: 1,
+        prp1: WRITE_BUF_GPA,
+        cdw10: 0,
+        ..Default::default()
+    }
+    .encode();
+    let (c_cmp, c_wr) = io
+        .submit_pair(&driver, cmp, wr)
+        .await
+        .context("fused C&W on not-ready NS")?;
+    assert_eq!(
+        c_cmp.status, SC_NAMESPACE_NOT_READY,
+        "fused Compare 半边应返 NAMESPACE_NOT_READY，实={:#x}",
+        c_cmp.status
+    );
+    assert_eq!(
+        c_wr.status, SC_NAMESPACE_NOT_READY,
+        "fused Write 半边应返 NAMESPACE_NOT_READY，实={:#x}",
+        c_wr.status
+    );
+
+    // ── Format NVM 初始化 NS（LBAF 0 = 512B，维持默认扇区）→ 转 ready ──
+    let cqe = admin
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x80, // Format NVM
+                cid: 0x40,
+                nsid: 1,
+                cdw10: 0, // LBAF=0 (512B no-meta)
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Format NVM (readies NS)")?;
+    assert_eq!(cqe.sc, 0, "Format NVM 应成功，实 sc={:#x}", cqe.sc);
+
+    // ── ready 阶段 ──
+    // oracle B（after）：NSTAT.NRDY == 0。
+    let cqe = admin
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x06,
+                cid: 0x21,
+                nsid: 1,
+                prp1: IDENTIFY_GPA,
+                cdw10: 0x08,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Identify NS CNS 0x08 (ready)")?;
+    assert_eq!(cqe.sc, 0, "Identify CNS 0x08 应成功");
+    let idns = driver.read_guest(IDENTIFY_GPA, 4096).await?;
+    assert_eq!(
+        idns[13] & 0x1,
+        0,
+        "Format 后 NS 的 NSTAT.NRDY 应=0 (ready)，实={:#x}",
+        idns[13]
+    );
+
+    // oracle A（after）：IO Read NS1 → success (0x0000)。
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02,
+                cid: 0x31,
+                nsid: 1,
+                prp1: READ_BUF_GPA,
+                cdw10: 0,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("IO Read on ready NS")?;
+    assert_eq!(
+        cqe.status, 0,
+        "Format 后 NS 的 IO 应成功 (status 0x0000)，实 status={:#x}",
+        cqe.status
+    );
+
+    Ok(())
+}

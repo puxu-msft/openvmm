@@ -671,6 +671,24 @@ impl NvmeController {
                 sc::INVALID_NAMESPACE,
             ));
         }
+        // **NS-not-ready spec-completeness（NAMESPACE_NOT_READY 0x82）** — NS 已 attach
+        // 但 media 尚未初始化（not_ready=true，NSTAT.NRDY=1）时，对它的所有 IO 一律拒
+        // NAMESPACE_NOT_READY，直到 Format NVM 初始化该 NS 清此位。与 Identify NS CNS 0x08
+        // 的 NSTAT.NRDY 广告一致（admin.rs）。spec § generic status 0x82：DNR=0，driver 重试。
+        if nsid != 0
+            && nsid != 0xFFFF_FFFF
+            && let Some(ns) = self.namespaces.get(&nsid)
+            && ns.not_ready
+        {
+            tracing::debug!(nsid, "IO rejected: NS not ready");
+            return Some(Cqe::error(
+                cid,
+                sq_id,
+                sq_head,
+                phase,
+                sc::NAMESPACE_NOT_READY,
+            ));
+        }
         match sqe.opcode() {
             nvm_opc::READ => {
                 let cdw10 = sqe.cdw10;
