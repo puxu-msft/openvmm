@@ -114,9 +114,57 @@ spec 值（SC/offset 等）一律对 `nvme_spec` / 真 wire 核，**不手算、
    → `usnvmemu/docs/LESSONS.md`（§20 self-consistent 陷阱 / §23·26 无牙 / §30 scaffolding）。
 3. 验绿基线：`cd usnvmemu/crates/nvme_firmware && cargo test --lib --no-default-features`
    应 ≥148 passed（对方可能又加了几个）。
-4. 起手提示词建议：
-   > 接续 B6b-4 多 LBA separate-metadata（按 docs/plans/2026-06-11-b6b4-and-resume-plan.md）。
-   > 先做 N≤2（dual-PRP）的 WRITE+READ，逐 LBA verify，全段走 implement→test→revert-verify→
-   > ecc:rust-reviewer→中文 commit 纪律；与并发会话选择性 staging 共存。
+4. **起手提示词（完整版，直接粘到新会话）**：
+
+```
+接续 usnvmemu NVMe firmware 的 B6b-4：多 LBA separate-metadata（PRACT=0），
+严格按 usnvmemu/crates/nvme_firmware/docs/plans/2026-06-11-b6b4-and-resume-plan.md
+的设计与当前状态。
+
+【任务】把单 LBA separate-buffer 路径（B6b-1/2/3 已完成）推广到多 LBA：先做 N≤2
+（dual-PRP data + MPTR 装 N×8 PI），逐 LBA verify；N>2（PRP-list data）显式 reject
++ 文档化为最终扩展（复用 PrpListOp）。WRITE finalize 必须 verify-all-then-store-all
+（原子：任一块 host PI 失败则全不落盘）；READ 对称（读 N 块→verify 全部 stored PI→
+data 回 PRP[1/2] + PI 回 MPTR）。N>2 / inline-NS-PRACT=0 / PRCHK 逐项门控仍按边界 defer。
+
+【每段必走的纪律，不可跳】
+1) implement（新增注释/文档/commit/对话一律中文，原英文不动；wire struct 字段序对齐 spec）。
+2) 写差分 oracle 测试——断言用独立于被测代码的真相源（capture 的 DMA 字节 / backing
+   file / nvme_spec 常量），不是自洽（LESSONS §20：self-consistent 测不出 self-consistent bug）。
+3) revert-verify：往实现注入 bug，确认测试 FAIL，再恢复——没红过的测试不算有牙（§23/§26）。
+4) cargo test --lib --no-default-features + clippy -D warnings + cargo fmt --check 全绿。
+5) ecc:rust-reviewer subagent 同步 review（run_in_background:false），APPROVE（0 CRITICAL/HIGH）
+   才提交——review 不可选，"我验过了"≠review。前序会话 reviewer 抓出多个我自认没问题的真 bug：
+   C1① 把 block_bytes 误用进 host 传输 size → 多 LBA PI 写 silent corruption（CRITICAL）；
+   A1 多-DMA 命令 partial-abort 泄漏（HIGH）；B1 reservation 通知类型 1/3 反置（HIGH）；
+   D persistent-features 漏回灌 mirror-backed live 字段(current_ps)（HIGH）；
+   B6b-3 READ PI 错误码恒报 guard 0x82 而非按类型（MEDIUM）。所以**改完必 review 再 commit**。
+6) 中文 conventional commit（feat/fix/docs…），写清做了什么 + reviewer 结论 + 边界。
+
+【核对纪律】所有 spec 值（SC 码/SCT/offset/字段语义）一律对 canonical nvme_spec
+（/home/xp/refs/openvmm/vm/devices/storage/nvme_spec）或真 wire 核，绝不手算、不信自己
+写的注释（前序靠 offset_of! 锚定 + nvme_spec 比对抓出 GET_LBA_STATUS=0x1e 错码、FLBAS
+inband_metadata 极性反置等）。
+
+【§30 scaffolding 铁律】清理/不实现前分辨"过时残留 vs 前瞻预置"。已声明长远目标的前瞻
+代码（N>2 PRP-list、PRACT=0 inline、chaining 激活）→ 保留/defer + 锚定 + 注明激活条件，
+不投机 wire 不可达路径；纯残留才删；拿不准就留。
+
+【并发会话共存，本会话踩过坑】本仓有另一会话并行改 sgl.rs / pcie_device_* / experiments/
+/ DECISIONS.md。只 git add <自己改的具体文件>，绝不 git add -A、也别裸 git commit 整个
+index——共享 index 下 git commit 会吞掉对方已 git add 的改动（f50b8ca9 就误吞了对方
+experiments/ 改名）。提交前 git status --short 确认只有自己的文件；用 git commit -- <pathspec>
+限定。不碰对方文件；若对方未提交改动让 cargo test 编译失败，用 cargo build --lib 验自己
+生产代码（不是你的 bug），必要时 sleep 等待对方收尾。
+
+【工作姿态】方向明确就做下去，只有破坏性操作 / 真正 either-or 分支才停；遇到改变任务性质
+的材料发现（如某边界其实需要更大改动）简洁 surface 一次即可，别反复追问、也别反复说"会话
+太长"——要么继续、要么写完善 handoff。教学=严谨：每层 spec-complete、结构干净，不拿"教学"
+当浅做借口。用户只认长远正确、不认 ROI——别用"成本大/改动多"劝阻正确方向。
+
+先验绿基线（cargo test --lib 应 ≥149 passed）+ 读本 plan + TEST_COVERAGE_PROGRESS.md +
+docs/LESSONS.md，再起手 B6b-4。
+```
+
 5. 记忆：相关条目已在 `memory/`（usnvmemu 结构 / spec-aligned-field-order / teaching=rigor /
    review-not-optional 等）；新会话会自动加载 MEMORY.md。
