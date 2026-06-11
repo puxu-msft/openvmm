@@ -650,10 +650,14 @@ pub(super) struct SglPlanFrag {
 // ═══════════════════════ A1（Abort, spec § 5.1）═══════════════════════
 //
 // Abort 命令按 (SQID, CID) 定位一条 in-flight 命令并中止。本 controller 的
-// in-flight 异步命令分散在 7 张 DMA-pending 累积器表里（都在等 host DMA 完成），
-// 每张表的累积器都带 (sq_id, cid)（定位键）+ (cq_id, sq_head)（构造被中止
-// 命令 CQE 所需）。下面的 trait + 泛型扫描把这 7 张表统一处理；fused FIRST
-// 等 SECOND（pending_fused，keyed by sq_id，cid 在 Sqe 内）形状不同，单独处理。
+// in-flight 异步命令有两类追踪：
+//  1. **单-DMA 命令**（plain Write/Read）：仅在 `pending_ios`（token→PendingIo）。
+//  2. **累积器命令**（dual-PRP / PI-multi / PRP-list / SGL / Compare）：一个累积器
+//     （6 张表之一）+ **多条** `pending_ios` 子-DMA 条目（都带命令的 sqid/cid）。
+// 每个累积器都带 (sq_id, cid)（定位键）+ (cq_id, sq_head)（构造被中止命令 CQE）。
+// 下面的 trait + 泛型 `abort_scan` 处理这 6 张累积器表；`pending_ios` 的子-DMA 条目
+// 由 `try_abort_inflight` 直接 sweep（避免 partial-abort）；fused FIRST 等 SECOND
+// （pending_fused，keyed by sq_id，cid 在 Sqe 内）形状不同，单独处理。
 
 /// async-pending 累积器的 Abort 定位能力（A1）。
 trait AbortableOp {
@@ -663,7 +667,8 @@ trait AbortableOp {
     fn abort_target(&self) -> (u16, u16);
 }
 
-/// 7 张累积器的字段名一致（sq_id/cid/cq_id/sq_head），用 macro 消除重复 impl。
+/// 6 个累积器的字段名一致（sq_id/cid/cq_id/sq_head），用 macro 消除重复 impl。
+/// （PendingIo 的子-DMA 条目改由 `try_abort_inflight` 直接 sweep，不走 abort_scan。）
 macro_rules! impl_abortable_op {
     ($t:ty) => {
         impl AbortableOp for $t {
@@ -676,7 +681,6 @@ macro_rules! impl_abortable_op {
         }
     };
 }
-impl_abortable_op!(PendingIo);
 impl_abortable_op!(WriteAccum);
 impl_abortable_op!(CompareAccum);
 impl_abortable_op!(PiWriteAccum);
@@ -3339,10 +3343,16 @@ impl NvmeController {
     /// "fire-on-every-CQE"（原行为）。Admin CQ (cq_id=0) 不参与
     /// coalescing — spec 要求 admin 延迟最小。
     /// **A1（Abort, spec § 5.1）** — 尝试中止 (sqid, cid) 命名的 in-flight 命令。
-    /// 扫 7 张 DMA-pending 累积器表 + fused-first-pending；命中则移除累积器
-    /// （后续到达的 DMA completion 走 unknown-token 静默忽略，同 `disable()`，
-    /// 杜绝重复完成）并给被中止命令 post 一条 COMMAND_ABORT_REQUESTED CQE。
     /// 返回 true=已中止 / false=未找到（已完成 / 从未提交 / 已同步执行完）。
+    ///
+    /// **多-DMA 命令的完整清理（A1-fix）**：accumulator 类命令（dual-PRP /
+    /// PI-multi / PRP-list / SGL）在 `pending_ios` 里有**多条**子-DMA 条目（都带命令
+    /// 的 sqid/cid）+ 一个累积器。必须**全部**清掉：先移累积器，再 sweep 掉
+    /// `pending_ios` 里该命令的所有子-DMA 条目，只 post **一条** CQE。否则只移一条
+    /// 子-DMA、留下累积器 + 其余子-DMA = partial-abort（累积器永不集齐 → 泄漏）。
+    /// 单-DMA 命令（NvmWriteDmaRead / NvmReadDmaWrite 等）只有 pending_ios 条目，
+    /// 由 sweep 取其 target。被移条目对应的在飞 DMA completion 后续走 unknown-token
+    /// 静默忽略（同 `disable()`），杜绝重复完成。
     ///
     /// **教学边界**：只中止真正"在飞"的异步命令（等 host DMA）。已 fetch 但还在
     /// sqe_inbox 待同步 dispatch 的命令转瞬即完，不在此中止——spec § 5.1 允许对
@@ -3353,26 +3363,38 @@ impl NvmeController {
         sqid: u16,
         cid: u16,
     ) -> bool {
-        let target = abort_scan(&mut self.pending_ios, sqid, cid)
-            .or_else(|| abort_scan(&mut self.dual_prp_writes, sqid, cid))
+        // 1) 先扫累积器表（每个 remove 累积器并返其 (cq_id, sq_head)）。
+        let acc_target = abort_scan(&mut self.dual_prp_writes, sqid, cid)
             .or_else(|| abort_scan(&mut self.compare_ops, sqid, cid))
             .or_else(|| abort_scan(&mut self.pi_writes, sqid, cid))
             .or_else(|| abort_scan(&mut self.pi_reads, sqid, cid))
             .or_else(|| abort_scan(&mut self.prp_list_ops, sqid, cid))
-            .or_else(|| abort_scan(&mut self.sgl_ops, sqid, cid))
-            .or_else(|| {
-                // fused FIRST 等 SECOND：keyed by sq_id，cid 在缓存的 Sqe 内。
-                let hit = self
-                    .pending_fused
-                    .get(&sqid)
-                    .is_some_and(|(fsqe, _)| fsqe.cid() == cid);
-                if !hit {
-                    return None;
-                }
-                let (_, sq_head) = self.pending_fused.remove(&sqid).unwrap();
-                let cq_id = self.sqs.get(&sqid).map(|s| s.cq_id)?;
-                Some((cq_id, sq_head))
-            });
+            .or_else(|| abort_scan(&mut self.sgl_ops, sqid, cid));
+        // 2) sweep `pending_ios`：移除该命令的所有（子-）DMA 条目；若无累积器
+        //    （单-DMA 命令），从中取 target。
+        let mut po_target: Option<(u16, u16)> = None;
+        self.pending_ios.retain(|_, p| {
+            if p.sq_id == sqid && p.cid == cid {
+                po_target.get_or_insert((p.cq_id, p.sq_head));
+                false
+            } else {
+                true
+            }
+        });
+        // 3) 累积器 target 优先（其 sq_head 与子-DMA 一致）；否则单-DMA target；
+        //    再否则 fused FIRST 等 SECOND（keyed by sq_id，cid 在缓存的 Sqe 内）。
+        let target = acc_target.or(po_target).or_else(|| {
+            let hit = self
+                .pending_fused
+                .get(&sqid)
+                .is_some_and(|(fsqe, _)| fsqe.cid() == cid);
+            if !hit {
+                return None;
+            }
+            let (_, sq_head) = self.pending_fused.remove(&sqid).unwrap();
+            let cq_id = self.sqs.get(&sqid).map(|s| s.cq_id)?;
+            Some((cq_id, sq_head))
+        });
         let Some((cq_id, sq_head)) = target else {
             return false;
         };

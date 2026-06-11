@@ -164,6 +164,101 @@ fn abort_inflight_command_real_cancel() {
     );
 }
 
+/// **A1-fix（多-DMA 命令完整中止）差分 oracle** — accumulator 类命令（这里 2-LBA
+/// PI WRITE = 2 子-DMA in `pending_ios` + 1 `PiWriteAccum`）被 Abort 时必须**全清**：
+///   ① `pending_ios` 所有子条目移除；② `pi_writes` 累积器移除；③ 恰 post 一条
+///   COMMAND_ABORT_REQUESTED CQE；④ Abort dw0 bit0=0。
+///
+/// 旧版 `try_abort_inflight` 扫 `pending_ios` 优先且命中即停 → 只移一条子-DMA、
+/// 留累积器 + 另一条子-DMA = partial-abort 泄漏。revert-verify：改回"扫 pending_ios
+/// 优先且命中即停" → ① pending_ios 非空 / ② pi_writes 非空 转红。
+#[test]
+fn abort_multi_dma_command_full_cleanup() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    let mut c = make_ctrl_with_tmp("abort_multidma");
+    {
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+        ns.pi_first = true;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / ns.block_bytes();
+    }
+    c.cqs.insert(
+        1,
+        crate::regs::CompletionQueue {
+            base_gpa: 0x1_0000,
+            size: 64,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        },
+    );
+    let mut cap = CaptureTransport::with_start_token(0x100);
+    const TCID: u16 = 0x55;
+    // 2-LBA PI WRITE（PRACT=1，dual-PRP）→ 2 子-DMA + 1 PiWriteAccum。
+    {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let mut sqe = io_sqe(0x01, 1, 0, 2, 0x4000, true, TCID);
+        sqe.prp2 = 0x5000;
+        let r = c.dispatch_io(&mut ctx, 1, sqe, TCID, 0, 1);
+        assert!(r.is_none(), "多 LBA PI 写走异步");
+    }
+    assert_eq!(c.pending_ios.len(), 2, "dual-PRP = 2 子-DMA 条目");
+    assert_eq!(c.pi_writes.len(), 1, "1 个 PiWriteAccum 累积器");
+    // Abort (sqid=1, cid=TCID)
+    let pre = cap.events().len();
+    let abort_dw0 = {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let mut ab = io_sqe(0x08, 0, 0, 1, 0, false, 0x60);
+        ab.cdw10 = 1u32 | ((TCID as u32) << 16);
+        c.dispatch_admin(&mut ctx, ab, 0x60, 0, 0)
+            .expect("Abort 返 CQE")
+            .cdw0
+    };
+    // ④ Abort dw0 bit0=0（命中）。
+    assert_eq!(abort_dw0 & 1, 0, "命中 → dw0 bit0=0（Aborted）");
+    // ①② 全清：pending_ios + pi_writes 都空（无 partial-abort 泄漏）。
+    assert!(
+        c.pending_ios.is_empty(),
+        "所有子-DMA 条目应被 sweep（实剩 {}）",
+        c.pending_ios.len()
+    );
+    assert!(
+        c.pi_writes.is_empty(),
+        "PiWriteAccum 累积器应被移除（实剩 {}）",
+        c.pi_writes.len()
+    );
+    // ③ 恰一条 COMMAND_ABORT_REQUESTED CQE 到 CQ1。
+    let cqes: Vec<Vec<u8>> = cap
+        .events()
+        .iter()
+        .skip(pre)
+        .filter_map(|e| match e {
+            TransportEvent::DmaWrite { gpa, data, .. }
+                if *gpa >= 0x1_0000 && *gpa < 0x1_0000 + 64 * 16 && data.len() >= 16 =>
+            {
+                Some(data.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cqes.len(), 1, "恰 post 一条被中止命令 CQE（非多条/零条）");
+    let dw3 = u32::from_le_bytes(cqes[0][12..16].try_into().unwrap());
+    assert_eq!((dw3 & 0xffff) as u16, TCID, "被中止 CQE cid = 目标");
+    let status = (((dw3 >> 17) & 0xff) | (((dw3 >> 25) & 0x7) << 8)) as u16;
+    assert_eq!(
+        status,
+        sc::COMMAND_ABORT_REQUESTED,
+        "status = COMMAND_ABORT_REQUESTED"
+    );
+}
+
 /// **M4 driven 错误码矩阵（Wave 2）** — 真正把 controller 驱动进各错误路径，断言
 /// emit 的**完整 16-bit status（含 SCT）**。这次结构性 SC bug
 /// （`INVALID_PROTECTION_INFO` 曾当 Generic 发→driver 误读 Capacity Exceeded、
