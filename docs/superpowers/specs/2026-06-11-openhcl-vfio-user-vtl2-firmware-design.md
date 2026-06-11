@@ -89,8 +89,17 @@ POC-1 已证它对非-QEMU client 的 fd-passing 零拷贝 DMA 可行。新工�
 - **W2**：PCIe 呈现（复用 pcie_remote 层）+ REGION_RW。
 - **W3**：DMA_MAP 导出 GuestMemory region fd → firmware 零拷贝（按 POC-1）+ JIT map。
 - **W4**：MSI-X eventfd → `Interrupt::deliver`（按 POC-2）。
-- **W5**：firmware-as-VTL2-进程 集成（IGVM initrd / diag-exec 部署）+ 降权。
-- **W6**：underhill_core 接入 + reconnect（firmware 重启重映射/重 SET_IRQS）。
+- **W5**：firmware-as-VTL2-进程 集成 + 降权——**三段递进**部署形态（POC-3/6 真机已证 VTL2
+  是完整 Linux + busybox + base64 + 可写 /tmp + ohcldiag-dev run 转发 stdin，firmware ELF
+  在 VTL2 内启停/更新等同普通用户态程序生命周期，无机制障碍，约束在治理）：
+  - **W5a (dev 期)**：`ohcldiag-dev run` + stdin base64 推送 ——POC-3/6 现成路径，**真"随时
+    启停/更新"**，不重启 VM、不重建 IGVM；无签名/审计，仅开发迭代用。
+  - **W5b (集成期)**：underhill `Command::new` 子进程 + supervisor（auto-restart + reconnect
+    握手）；与 underhill 同信任域生命周期，加 seccomp/userns/uid-drop 降权。`livedump.rs` 的
+    `Command::new("underhill-crash")` 是先例。
+  - **W5c (生产期)**：塞 IGVM initrd 出厂自带（签名链清晰、可重现），或加 A/B image 包管理；
+    更新走 VM 重启。
+- **W6**：underhill_core 接入 + reconnect（firmware 重启重映射/重 SET_IRQS；W5b 起依赖此）。
 - **W7**：真 Hyper-V OpenHCL VM e2e（guest fio/4K IO；对照 host backing 独立 oracle）。
 
 ## 7. 测试
