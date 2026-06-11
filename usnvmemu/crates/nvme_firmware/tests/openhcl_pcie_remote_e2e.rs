@@ -421,6 +421,10 @@ impl NvmeDriver {
                             // **A1 DMA-hold**：解扣 gpa 并**补服务**所有 stash 的命中帧（逐条回
                             // DmaCompletion，与原服务路径同逻辑：Read 从 guest 取数据、Write 写 guest）。
                             // 非命中的 stash 帧保留（罕见：同时扣多个 gpa）。
+                            // 注：写失败用 `return`（非 `break`）——此处在 `for` 内，`break` 只
+                            // 跳出 for、**不**终止 pump；wire 断须终止整个 pump，语义同主 device
+                            // arm 的 break（那个在 select arm 层、直接跳主 loop）。误改 break 会留
+                            // 着断掉的 wire 继续轮询。
                             Cmd::ReleaseDma { gpa } => {
                                 held_gpas.remove(&gpa);
                                 let mut still_held = Vec::new();
@@ -503,6 +507,8 @@ impl NvmeDriver {
     /// `write_guest` 风格）。此后 firmware 对该 gpa 发的 ReadGpa/WriteGpa 被 pump stash、
     /// 不回执 → 发起该 DMA 的命令停在 in-flight，供 Abort 真中止。**必须在触发该 DMA 的命令
     /// 提交之前调**（经同一有序 cmd channel，保证 hold 标记先于后续命令生效）。
+    /// **匹配为 gpa 精确相等**（非区间重叠）：本测试 DMA 的 gpa == buffer 基址，故够用；若日后复
+    /// 用于起始落在 buffer 中段的 DMA，则不会命中——届时须改成区间匹配。
     fn hold_dma(&self, gpa: u64) {
         let _ = self.cmd_tx.send(Cmd::HoldDma { gpa });
     }
@@ -2487,7 +2493,8 @@ async fn openhcl_sgl_length_mismatch_rejected() -> Result<()> {
 ///
 /// **revert-verify（已实测）**：删 `sgl.rs::parse_sgl_list` 里 `sub_type==1` 那条
 /// match 臂（让其落到 OK / 偏移被误当 GPA）→ descriptor 通过 parse，随后落到
-/// completion.rs 的粗粒度 `sub_type != 0` 检查 → CQE status 变 0x0011
+/// completion.rs `NvmSglFetch` data-descriptor walk 内的 **per-fragment 粗检**（`sub_type != 0`
+/// ——**非**本 diff 改的 `parse_sgl_list` 错误臂；用符号定位而非行号，避免随 WIP 漂移）→ status 变 0x0011
 /// (SGL_DESCRIPTOR_TYPE_INVALID)，**不再** 0x0012 → 本测试 assert status==0x0012
 /// FAIL（实测 left=0x11 right=0x12）；恢复后绿。
 #[tokio::test]
@@ -3940,9 +3947,12 @@ async fn openhcl_abort_inflight_io_command() -> Result<()> {
     );
     io.ring_sq(&driver);
 
-    // 短 sleep 让 firmware 抵达"发数据 ReadGpa 并被扣住"的点。**注意这非 race**：hold 使该
+    // 短 sleep 让 firmware 抵达“发数据 ReadGpa 并被扣住”的点。**注意这非 race**：hold 使该
     // in-flight 态**稳定/持久**——命令在 release 前**绝不可能**完成，故任何 ≥ dispatch 时延的
     // 等待都成立、更久也无害（不会偶发提前完成）。给足跨进程往返余量。
+    // **更根本的 no-flake 保证**（比 hold 更硬）：单线程串行 SDK loop + 单条有序 wire——IO write
+    // 的 data ReadGpa token 在处理 SQE-fetch completion 的**同一** dispatch_inbound 内即入
+    // pending_ios，严格先于 firmware 读到 Abort 帧，故连 sleep(0) 都正确；150ms 只为省 poll 自旋。
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // 3) 提交 Abort（admin，blocking）：cdw10 = IO_QID | (TARGET_CID << 16)。Abort 同步处理

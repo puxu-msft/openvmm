@@ -176,3 +176,18 @@ scripts/test-quality.sh anchors
 - 本系列已提交参考实现：`c0cfb419`(CMB-SGL)、`a928f7ba`(队列管理错误处理：同套"加 SC + inline anchor
   + e2e + revert-verify"模式)、`b7eed0ec`(abort-in-flight：DMA-hold + 双 oracle)。
 - e2e harness：`tests/openhcl_pcie_remote_e2e.rs`（§2 的限制 + helper + 现有同类测试）。
+
+## 6. 散落 follow-up（reviewer 标过、非本系列主线，记此不丢）
+
+本会话各轮 reviewer 留的小尾巴，非 scaffolding-SC 主线但同属"长远正确"，一并记此免散失：
+
+- **#1 queue-mgmt qid 越界 SC 精确性**（与本 SC 主题近）：Create IO CQ/SQ 对 `qid==0 / qid>cap` 仍返
+  `INVALID_FIELD(0x02)`，spec-correct 应是 `INVALID_QUEUE_IDENTIFIER(0x101)`。**当前有意保留**——
+  `tests.rs` 的 `create_io_queue_rejects_out_of_range_qid` / `create_io_queue_gate_uses_runtime_io_queue_pairs`
+  两测试锁死 `INVALID_FIELD`，改对须同改这两测试（另一会话的 M-matrix 域）→ **待协调**。来源：`a928f7ba`
+  reviewer。做时与 item-0 一并考虑（可纳入 SC 精确性扫尾）。
+- **#2 DBBUF vfio `drain_dma_completions` per-pump 让步**（跨主题，DBBUF hardening 非 SC）：
+  `vfio_user_transport/src/session.rs` 的 drain while 循环——in-range 振荡 shadow 自馈时，
+  `MAX_SHADOW_POLL_ITERS` cap 已保**有限**终止（≤ 1<<16 往返后置 CFS），但那段时间 host 线程不响应其他
+  连接。future hardening：drain 每 N 次让步回 run-loop 保响应。来源：DBBUF point-3 reviewer / LESSONS
+  §29（`controller/mod.rs` 的 `MAX_SHADOW_POLL_ITERS` 文档已指向 session.rs）。低优先（cap 已兜底）。
