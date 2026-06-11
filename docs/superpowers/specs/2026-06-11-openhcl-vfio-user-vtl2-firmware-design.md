@@ -96,7 +96,8 @@ POC-1 已证它对非-QEMU client 的 fd-passing 零拷贝 DMA 可行。新工�
     启停/更新"**，不重启 VM、不重建 IGVM；无签名/审计，仅开发迭代用。
   - **W5b (集成期)**：underhill `Command::new` 子进程 + supervisor（auto-restart + reconnect
     握手）；与 underhill 同信任域生命周期，加 seccomp/userns/uid-drop 降权。`livedump.rs` 的
-    `Command::new("underhill-crash")` 是先例。
+    `Command::new("underhill-crash")` 是先例。**承接 §11 外部控制面：supervisor 同时是 host
+    控制命令的执行点。**
   - **W5c (生产期)**：塞 IGVM initrd 出厂自带（签名链清晰、可重现），或加 A/B image 包管理；
     更新走 VM 重启。
 - **W6**：underhill_core 接入 + reconnect（firmware 重启重映射/重 SET_IRQS；W5b 起依赖此）。
@@ -223,3 +224,26 @@ audit CRITICAL 从"现有 API 不可行"转为"给 underhill 加原语"：
 
 **结论加固**：firmware **必须在 VTL2** 才能 live 零拷贝访问 guest RAM——已有 POC 级
 （非推理级）背书。topology B 的"不可产品化"由 12 条路径全否 + 2 个真机 POC 失败实证。
+
+## 11. host ↔ VTL2 外部控制面（控制 firmware）
+
+**用户需求**：Windows host 经 vsock 等通道控制 firmware（deploy/start/stop/update/stats/
+inject/reload）。不动 firmware 自身的安全姿态（firmware 对外仅 AF_UNIX 一道门）。
+
+**架构**：**underhill 当 gateway**，host 控制命令走 vsock → underhill 鉴权/审计/路由 →
+underhill 经 AF_UNIX 控制面给 firmware 下命令（与 W5b 的 supervisor 同一执行点）。firmware
+**不**直接 listen vsock —— 避免攻击面扩大、复用 underhill 现有信任域 + ACL + 日志。
+
+**两路实现**（W5b 阶段定）：
+- **B1 复用 ohcldiag-dev（推荐起步）**：扩 `diag_proto` RPC schema 加 `firmware-control`
+  命令族；diag_server 路由到 underhill 的 firmware supervisor。零新 wire/0 新端口、复用
+  现有 grpc + ACL。dev 期工具链一致。
+- **B2 独立 vsock 服务**：另起服务名/channel，独立 ACL/rate-limit/audit log。隔离更干净，
+  但要新加服务和客户端工具。生产期可演进。
+
+**对应 W5/W6**：W5b 的 supervisor = host 控制命令的执行点；W6 reconnect 由 host 控制命令
+（或 supervisor 自检）触发。host 端命令调用现成 ohcldiag-dev（B1）或新工具（B2）。
+
+**安全**：vsock 命令携带的所有 host-originated 数据由 underhill 校验后再委派；firmware
+对 underhill 之外的输入仍零信任（POC-7 已确认 host 进程够不到 guest RAM，但控制面是
+host→VTL2 双向通信，须 enforce 该通道仅经 underhill 中介）。
