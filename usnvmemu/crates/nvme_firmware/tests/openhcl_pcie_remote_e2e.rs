@@ -4377,3 +4377,123 @@ async fn openhcl_fused_cw_exceeds_atomic_unit() -> Result<()> {
 
     Ok(())
 }
+
+/// 在 temp 建一个 128 KiB（1 BPSZ 单位）的 boot partition 镜像文件，每 4 KiB block 用
+/// **block-distinct** pattern（`(i&0xFF) ^ (i>>12)`）——offset 读错会被 oracle 抓到。
+/// 返 (路径, 内容)。调用方负责 remove。
+fn make_boot_partition_file(tag: &str) -> Result<(std::path::PathBuf, Vec<u8>)> {
+    let mut p = std::env::temp_dir();
+    p.push(format!("openhcl_bp_{}_{}.img", std::process::id(), tag));
+    let content: Vec<u8> = (0..131072u32)
+        .map(|i| ((i & 0xFF) ^ (i >> 12)) as u8)
+        .collect();
+    std::fs::write(&p, &content).context("write boot partition file")?;
+    Ok((p, content))
+}
+
+/// **Boot Partition Read（spec § 8.13，item-3 BP-1）** — `--boot-partition-file` 装载只读
+/// 出厂镜像后：controller 广告 BPINFO.BPSZ>0；driver 写 BPMBL + BPRSEL 触发 Boot Partition
+/// Read → controller DMA-write 对应区段到 BPMBL，BRS 跨回调推进到 2(complete)；driver poll
+/// BRS 后读出。**boot partition read 是 pre-boot（CC.EN 之前），故本测试不 enable controller**。
+///
+/// **独立 oracle**：DMA 进 guest buffer 的 4 KiB == 直读 BP 文件 block0（两条独立路径读同一
+/// 文件源——firmware 启动装载→DMA vs 测试直读磁盘；firmware 若读错 offset/长度/乱码则不等）。
+/// pattern block-distinct 故 offset 错（读成 block1）也会被抓。
+///
+/// **revert-verify（已实测）**：把 mmio.rs BPRSEL handler 的 `boot_read_status = 1`+dma_write
+/// 改回 no-op（不触发）→ BRS 永 0 → poll 超时断言 FAIL；恢复后绿。
+#[tokio::test]
+async fn openhcl_boot_partition_read_roundtrip() -> Result<()> {
+    let (bp_path, _content) = make_boot_partition_file("read")?;
+    let bp_path_str = bp_path.to_str().unwrap().to_string();
+
+    let (stream, _harness) =
+        spawn_and_accept_with_args(&["--boot-partition-file", &bp_path_str]).await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+
+    // BPINFO.BPSZ（bits 14:0）应=1（131072 / 128 KiB）。
+    let bpinfo = driver.mmio_read(0x40, 4).await?;
+    assert_eq!(
+        bpinfo & 0x7fff,
+        1,
+        "BPSZ 应=1（128 KiB 单位），BPINFO={bpinfo:#x}"
+    );
+
+    // 设 BPMBL = 目标 guest buffer；BPRSEL = BPRSZ=1(4KiB) + BPROF=0 → 触发读 block0。
+    driver.mmio_write(0x48, 8, READ_BUF_GPA);
+    driver.mmio_write(0x44, 4, 1); // bits 9:0 = BPRSZ=1，BPROF=0
+
+    // poll BPINFO.BRS（bits 25:24）到 2(complete) 或 3(error)。
+    let mut brs = 0u64;
+    for _ in 0..100 {
+        let v = driver.mmio_read(0x40, 4).await?;
+        brs = (v >> 24) & 0x3;
+        if brs == 2 || brs == 3 {
+            break;
+        }
+    }
+    assert_eq!(
+        brs, 2,
+        "Boot Partition Read 完成后 BRS 应=2(complete)，实={brs}"
+    );
+
+    // 独立 oracle：DMA'd 4 KiB == 直读 BP 文件 block0。
+    let got = driver.read_guest(READ_BUF_GPA, 4096).await?;
+    let file = std::fs::read(&bp_path).context("读 BP 文件")?;
+    assert_eq!(
+        got,
+        file[0..4096],
+        "Boot Partition Read 的 4 KiB 应==文件 block0（独立 oracle，非自洽）"
+    );
+
+    let _ = std::fs::remove_file(&bp_path);
+    Ok(())
+}
+
+/// **Boot Partition write-protect（spec § 8.13 + § 5.16，item-3 = scaffolding-SC 0x11e 收尾）**
+/// — 本教学 controller 的 boot partition 是只读出厂镜像。Firmware Commit 带 BPID=1（cdw10
+/// bit 31，提交 image 到 boot partition）→ 必返 `BOOT_PARTITION_WRITE_PROHIBITED` (0x011e)。
+/// 这使此前 anchored-only 的 0x11e **真 emit 且可达**（广告了 BPSZ>0 的 BP 才会被 driver 写）。
+///
+/// **独立 oracle** = firmware 经真 wire 回的完整 16-bit CQE status，硬编码期望 0x011e
+/// （SCT=Command Specific 0x1 << 8 | SC 0x1e）。
+///
+/// **revert-verify（已实测）**：去掉 admin.rs FW_COMMIT 的 bpid 写保护分支 → BPID commit 落到
+/// 普通 slot-commit 路径返 success/别的 → 本断言 FAIL；恢复后绿。
+#[tokio::test]
+async fn openhcl_fw_commit_boot_partition_write_prohibited() -> Result<()> {
+    const SC_BOOT_PARTITION_WRITE_PROHIBITED: u16 = 0x011e; // SCT=Cmd-Specific, SC 0x1e
+
+    let (bp_path, _content) = make_boot_partition_file("wp")?;
+    let bp_path_str = bp_path.to_str().unwrap().to_string();
+
+    let (stream, _harness) =
+        spawn_and_accept_with_args(&["--boot-partition-file", &bp_path_str]).await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    driver.enable_controller().await.context("enable")?;
+    let mut admin = QueueState::admin();
+
+    // Firmware Commit，cdw10 bit31=BPID(写 boot partition) + fs=1。BP write-protected → 0x11e。
+    let cqe = admin
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x10, // FW Commit
+                cid: 0x60,
+                cdw10: (1u32 << 31) | 1, // BPID=1 + FS=1
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("FW Commit BPID")?;
+    assert_eq!(
+        cqe.status, SC_BOOT_PARTITION_WRITE_PROHIBITED,
+        "FW Commit BPID 到 write-protected boot partition 应返 \
+         BOOT_PARTITION_WRITE_PROHIBITED (0x011e)，实 status={:#x}",
+        cqe.status
+    );
+
+    let _ = std::fs::remove_file(&bp_path);
+    Ok(())
+}

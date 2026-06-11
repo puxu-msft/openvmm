@@ -43,7 +43,13 @@ impl NvmeController {
             // 服务 → driver 写 BPRSEL 后 poll BRS 永远 0 = hang。BPSZ=0
             // driver enumerate 即跳过。BPRSEL/BPMBL 仍 RW 保 spec
             // register layout 完整（教学读 BAR0 时能看见）。
-            (0x40, _) => 0,                  // BPINFO — BPSZ=0 (no BP advertise)
+            // **Boot Partition（spec § 8.13）** — BPINFO：boot_partition 非空时广告
+            // BPSZ（bits 14:0，128 KiB 单位）+ BRS（bits 25:24，Boot Read Status）+
+            // ABPID（bit 31，单 BP 恒 0）；空 = BPSZ=0（不广告，历史 stub 行为）。
+            (0x40, _) => {
+                let bpsz = (self.boot_partition.len() / (128 * 1024)) as u64;
+                (bpsz & 0x7fff) | ((self.boot_read_status as u64 & 0x3) << 24)
+            }
             (0x44, _) => self.bprsel as u64, // BPRSEL — RW，回读上次写值
             (0x48, 8) => self.bpmbl,         // BPMBL 64-bit
             (0x48, 4) => self.bpmbl & 0xFFFF_FFFF, // 低 32
@@ -117,14 +123,43 @@ impl NvmeController {
             0x34 => {
                 self.acq = (self.acq & 0xffff_ffff) | (value << 32);
             }
-            // **Phase Q5** — Boot Partition control registers
+            // **Boot Partition（spec § 8.13）** — BPRSEL control register
             0x44 => {
-                // BPRSEL = boot partition read select。bits 9:0 = BPRSZ
-                // (read size 4 KiB units)；bits 31:10 = BPROF (offset 4 KiB units)；
-                // bit 31:30 实际为 BPID (active partition ID)。教学 controller
-                // 无真 boot image，写入立即返；driver 拉 BPINFO.BRS 看完成。
+                // BPRSEL：bits 9:0 = BPRSZ（read size，4 KiB 单位）；bits 29:10 = BPROF
+                // （read offset，4 KiB 单位）；bit 31 = BPID。写它**触发**一次 Boot
+                // Partition Read：把 boot_partition[BPROF*4K .. +BPRSZ*4K] DMA-write 到
+                // BPMBL，BRS 置 1(in progress)，完成回调（pending_boot_reads）置 2/3。
                 self.bprsel = value as u32;
-                tracing::debug!(value, "BPRSEL set (boot partition no-op)");
+                if self.boot_partition.is_empty() {
+                    // 未广告 boot partition（BPSZ=0）→ 仅存值，driver 不应到此（历史 stub）。
+                    tracing::debug!(value, "BPRSEL set (no boot partition advertised)");
+                } else {
+                    let bprsel = value as u32;
+                    let bprsz = (bprsel & 0x3ff) as usize; // 4 KiB 单位
+                    let bprof = ((bprsel >> 10) & 0xf_ffff) as usize; // 4 KiB 单位
+                    let off = bprof * 4096;
+                    let len = bprsz * 4096;
+                    if len == 0 || off.saturating_add(len) > self.boot_partition.len() {
+                        tracing::warn!(
+                            off,
+                            len,
+                            bp_len = self.boot_partition.len(),
+                            "Boot Partition Read 越界/零长 → BRS=error(3)"
+                        );
+                        self.boot_read_status = 3; // error
+                    } else {
+                        let content = self.boot_partition[off..off + len].to_vec();
+                        let tok = ctx.dma_write(self.bpmbl, content);
+                        self.pending_boot_reads.insert(tok);
+                        self.boot_read_status = 1; // read in progress
+                        tracing::debug!(
+                            off,
+                            len,
+                            bpmbl = format_args!("{:#x}", self.bpmbl),
+                            "Boot Partition Read 触发 → DMA-write content 到 BPMBL"
+                        );
+                    }
+                }
             }
             0x48 => {
                 // BPMBL 同为 8-byte 寄存器，同样 size-aware（见上 ASQ 注释）。

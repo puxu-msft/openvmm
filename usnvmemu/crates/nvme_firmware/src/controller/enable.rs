@@ -215,6 +215,11 @@ impl NvmeController {
         self.shadow_ring_pending.clear();
         self.last_mmio_sq_doorbell.clear();
         self.last_eventidx_sq.clear();
+        // **reviewer MED-2** — Boot Partition Read 在飞 token + BRS 状态在 CC.EN 1→0 复位
+        // 时清（与上方所有 in-flight token 集同侪）。BP Read 通常 pre-enable，但 reset 后
+        // 残留 token 会落 unknown-token、BRS 也会冻结上次值——清掉保持一致。
+        self.pending_boot_reads.clear();
+        self.boot_read_status = 0;
         // K8: power state 重置到 PS0
         self.current_ps = 0;
         // M1: interrupt coalescing 重置默认（无 coalesce）

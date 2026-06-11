@@ -217,6 +217,20 @@ impl NvmeController {
             self.handle_shadow_poll_complete(ctx, p, ok, data);
             return;
         }
+        // **Boot Partition Read（spec § 8.13）** —— boot partition 内容 DMA-write 到 BPMBL
+        // 完成：把 BPINFO.BRS 推进到 2(complete)/3(error)。driver 在写 BPRSEL 后 poll BRS
+        // 等此跨回调状态机推进（不在 DMA 在飞时乐观置 2，见 mod.rs pending_boot_reads doc）。
+        // 不属 pending_ios（Boot Partition Read 是寄存器触发的操作，非队列命令、无 CQE）。
+        if self.pending_boot_reads.remove(&token) {
+            self.boot_read_status = if ok { 2 } else { 3 };
+            tracing::debug!(
+                token,
+                ok,
+                brs = self.boot_read_status,
+                "Boot Partition Read 完成"
+            );
+            return;
+        }
         if !ok {
             tracing::warn!(token, "DMA failed");
             // 清相关 pending（IO 或 fetch）

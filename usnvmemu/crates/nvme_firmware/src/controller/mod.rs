@@ -1149,6 +1149,21 @@ pub struct NvmeController {
     /// 64-bit RW，driver 提供的 guest memory 缓冲区地址（4 KiB 对齐）。
     /// controller 把 boot image 用 DMA-write 到这里。
     pub(super) bpmbl: u64,
+    /// **Boot Partition（spec § 8.13）** — boot partition 内容（in-memory），经 bin
+    /// `--boot-partition-file` 装载。**非空时**才广告 BPSZ>0（BPINFO）并服务 Boot
+    /// Partition Read（BPRSEL 触发 → DMA-write 此内容到 BPMBL）；空 = 不广告（BPSZ=0，
+    /// 与历史 stub 一致）。本教学 controller 的 boot partition 是**只读出厂镜像**
+    /// （write-protected）：FW Commit 带 BPID 写它 → BOOT_PARTITION_WRITE_PROHIBITED。
+    pub(super) boot_partition: Vec<u8>,
+    /// **Boot Partition** — BPINFO.BRS（Boot Read Status，bits 25:24）：0=no read /
+    /// 1=read in progress / 2=read complete / 3=error。BPRSEL 触发置 1，DMA 完成（经
+    /// `pending_boot_reads`）置 2 / 失败置 3。driver poll BPINFO.BRS 等完成。
+    pub(super) boot_read_status: u8,
+    /// **Boot Partition** — 在飞的 Boot Partition Read DMA-write token 集（content →
+    /// BPMBL）。完成回调（completion.rs on_dma_complete_impl 早段）据此把 BRS 推进到
+    /// 2/3——**跨回调的异步状态机**，不在 DMA 在飞时就乐观置 2（避免 [[lesson §29]] 的
+    /// async 顺序竞态）。
+    pub(super) pending_boot_reads: std::collections::HashSet<u64>,
 
     state: CtrlState,
 
@@ -2273,6 +2288,9 @@ impl NvmeController {
             acq: 0,
             bprsel: 0,
             bpmbl: 0,
+            boot_partition: Vec::new(),
+            boot_read_status: 0,
+            pending_boot_reads: std::collections::HashSet::new(),
             state: CtrlState::Disabled,
             sqs: DenseMap::new(MAX_QID as usize),
             cqs: DenseMap::new(MAX_QID as usize),
@@ -2363,6 +2381,32 @@ impl NvmeController {
                 None => tracing::warn!(nsid, "--not-ready-nsid 指定了不存在的 NSID"),
             }
         }
+    }
+
+    /// **Boot Partition（spec § 8.13）** — 装载 boot partition 内容（出厂只读镜像）。
+    /// 非空后 controller 广告 BPINFO.BPSZ>0 并服务 Boot Partition Read。bin 经
+    /// `--boot-partition-file` 调用。同 `set_namespaces_not_ready`：追加 setter 而非改
+    /// `open()` 签名（20+ 调用点）。空内容（不调用）= 历史 stub 行为（BPSZ=0 不广告）。
+    pub fn set_boot_partition(&mut self, mut content: Vec<u8>) {
+        // **reviewer MED-1** — BPINFO.BPSZ 以 128 KiB 为单位（向下取整）。若内容非 128 KiB
+        // 倍数，零填充到下一个倍数，使**广告 BPSZ×128KiB == 实际可读长度**一致（否则尾段
+        // 落在广告 BPSZ 之外却仍能被 raw-len bounds-check 放行 = 广告⟺存储不一致）。
+        const BP_UNIT: usize = 128 * 1024;
+        let rem = content.len() % BP_UNIT;
+        if rem != 0 {
+            let pad = BP_UNIT - rem;
+            tracing::warn!(
+                orig_len = content.len(),
+                pad,
+                "Boot Partition 内容非 128 KiB 倍数，零填充到下一倍数（对齐 BPSZ 广告）"
+            );
+            content.resize(content.len() + pad, 0);
+        }
+        tracing::info!(
+            len = content.len(),
+            "Boot Partition 内容装载（只读出厂镜像）"
+        );
+        self.boot_partition = content;
     }
 
     /// 计算 doorbell offset 是 SQ 还是 CQ + queue id。

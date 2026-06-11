@@ -1197,7 +1197,23 @@ impl NvmeController {
                 //   0x10 + reason = error
                 let fs = (sqe.cdw10 & 0x7) as u8;
                 let ca = ((sqe.cdw10 >> 3) & 0x7) as u8;
-                tracing::info!(fs, ca, "Firmware Commit");
+                let bpid = (sqe.cdw10 >> 31) & 0x1 != 0;
+                tracing::info!(fs, ca, bpid, "Firmware Commit");
+                // **Boot Partition write-protect（spec § 8.13 + § 5.16 Firmware Commit BPID）**
+                // — BPID=1 表示把下载的 image 提交到 boot partition。本教学 controller 的 boot
+                // partition 是**只读出厂镜像**（write-protected）→ BOOT_PARTITION_WRITE_PROHIBITED；
+                // 未广告 BP（BPSZ=0，boot_partition 空）却带 BPID → INVALID_FIELD（无此 BP）。
+                if bpid {
+                    return Some(if self.boot_partition.is_empty() {
+                        Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD)
+                    } else {
+                        tracing::warn!(
+                            "FW Commit BPID=1 到 write-protected boot partition → \
+                             BOOT_PARTITION_WRITE_PROHIBITED"
+                        );
+                        Cqe::error(cid, 0, sq_head, phase, sc::BOOT_PARTITION_WRITE_PROHIBITED)
+                    });
+                }
                 if !(1..=7).contains(&fs) {
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }

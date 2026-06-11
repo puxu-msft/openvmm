@@ -41,7 +41,7 @@
 | GET_LOG_PAGE (0x02) | ◐ | 上限 2 MiB（>2 MiB chaining 机制已在 device→host 路径就绪但 caller cap 未放开；真 log 都 <2 MiB）| §5.16 | admin.rs GET_LOG_PAGE |
 | ABORT (0x08) | ✅ [F] | 真定位 in-flight 命令并中止 + dw0 报真结果（A1；多-DMA 完整清理）| §5.1 | admin.rs ABORT |
 | FORMAT_NVM (0x80) | ✅ [F] | LBAF 0/1/2 + PI Type 0/1 + MSET 极性(B6a) + 接受 separate(B6b-1) + 清 not_ready→ready(item-1[Q]) | §5.14 | admin.rs FORMAT_NVM |
-| FW_COMMIT (0x10) | ✅ | firmware slot commit | §5.12 | admin.rs FW_COMMIT |
+| FW_COMMIT (0x10) | ✅ | firmware slot commit；**BPID=1（写 boot partition）→ BOOT_PARTITION_WRITE_PROHIBITED**（BP write-protected，item-3[Q]）| §5.12 | admin.rs FW_COMMIT |
 | FW_IMAGE_DOWNLOAD (0x11) | ✅ | chunk download（64 MiB defense cap）| §5.13 | admin.rs FW_IMAGE_DOWNLOAD |
 | DEVICE_SELF_TEST (0x14) | ✅ | short/extended，tick 推进 | §5.8 | admin.rs DEVICE_SELF_TEST |
 | NS_MANAGEMENT (0x0d) | ✅ | create/delete NS | §5.20 | admin.rs NS_MANAGEMENT |
@@ -93,6 +93,7 @@
 | **MDTS** 强制 | ✅ [F] | 全数据命令；计入 inline metadata(C1①)；值=5(128 KiB) | src/regs.rs MDTS_MAX_BYTES + io.rs |
 | **Fused** Compare&Write | ✅ | 原子；**>1page(超原子能力)→ATOMIC_WRITE_UNIT_EXCEEDED(0x14)**（item-2[Q]，共享 `fused_cw_reject_sc`，本地+fabric 一致）| io.rs/completion.rs fused + mod.rs fused_cw_reject_sc |
 | **NS-not-ready 门** (0x82) | ✅ [Q] | not_ready NS 的 IO + fused C&W→NAMESPACE_NOT_READY；`--not-ready-nsid` 触发、Format 转 ready、Identify CNS 0x08 NSTAT.NRDY 跟随（item-1）| io.rs/mod.rs not_ready 门 + admin.rs NSTAT |
+| **Boot Partition** (spec § 8.13) | ✅ [Q] | `--boot-partition-file` 装只读出厂镜像→BPINFO.BPSZ>0 + Boot Partition Read（BPRSEL 触发→DMA content 到 BPMBL，BRS 跨回调状态机）；write-protected（FW Commit BPID→0x11e）；无文件=BPSZ=0 不广告（item-3）| mmio.rs BPINFO/BPRSEL + completion.rs pending_boot_reads + admin.rs FW_COMMIT |
 | **DBBUF** shadow doorbell | ✅ | DMA-poll + event_idx + 自续深度 cap | mod.rs shadow poll |
 | **persistent features**(Save) | ✅ [F] | 跨 reset 回灌(含 mirror-backed live 字段)（D）| enable.rs + admin.rs |
 | **CSTS.CFS** on shutdown-flush 失败 | ✅ [F] | spec § 3.1.4.5（D）| enable.rs process_shutdown |
@@ -112,7 +113,7 @@
 | CMB-SGL SC 一致 (0x12) | ✅ | item-0：`sgl.rs` 共享 `subtype_to_sc`，3 路径统一 emit（`fe30b715`）| [Q] |
 | NS-not-ready (0x82) | ✅ | item-1：per-NS `not_ready` + `--not-ready-nsid` 触发 + IO/fused 门 + Format-readiness + NSTAT.NRDY 跟随（`488ffaa8`）| [Q] |
 | AWUN (0x14) | ✅ | item-2：fused C&W >1page(超原子能力)→ATOMIC_WRITE_UNIT_EXCEEDED；普通 Write>AWUN 不 reject（spec：仅不保证原子）（`5b8dafa1`）| [Q] |
-| boot-partition (0x11e) | ⏸ | item-3：大特性，独立 plan `plans/2026-06-11-boot-partition-feature.md`；仍 anchored-only（BPSZ=0 stub，未 emit）| [Q] |
+| boot-partition (0x11e) | ✅ | item-3：`--boot-partition-file` 装只读出厂镜像→广告 BPSZ>0 + 服务 Boot Partition Read（BPRSEL→DMA→BMBL，BRS 状态机）+ FW Commit BPID→BOOT_PARTITION_WRITE_PROHIBITED（write-protected）| [Q] |
 | Reservation Report EDS=1(64-byte HOSTID) + ptpls@19 | ◐→⏸ | 多 host HOSTID 扩展 + builder 补字段 | [F] |
 | Security(TCG OPAL) / Virtualization(SR-IOV) | ✗ | 偏离教学核心，真实现工程量大；诚实 INVALID_FIELD 优于半吊子 | — |
 | Write Uncorrectable | ✗ | backing 无 ECC 概念 | — |

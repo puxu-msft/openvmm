@@ -87,6 +87,12 @@ struct Args {
     /// 例：`--not-ready-nsid 1` 或 `--not-ready-nsid 1,2`。默认空（所有 NS 开机即 ready）。
     #[arg(long = "not-ready-nsid", value_delimiter = ',', num_args = 0..)]
     not_ready_nsids: Vec<u32>,
+    /// **Boot Partition（spec § 8.13）** — 把指定文件内容装载为只读出厂 boot partition。
+    /// 给定后 controller 广告 BPINFO.BPSZ>0 并服务 Boot Partition Read（driver 写 BPRSEL
+    /// 触发 → DMA 到 BPMBL）；该 BP write-protected（FW Commit BPID 写它 →
+    /// BOOT_PARTITION_WRITE_PROHIBITED）。不给 = 不广告 boot partition（BPSZ=0）。
+    #[arg(long = "boot-partition-file")]
+    boot_partition_file: Option<String>,
     /// PCI Vendor ID（默认 0x1414 = Microsoft，配合 OpenHCL 的 default 路由）。
     #[arg(long, default_value_t = 0x1414)]
     vid: u16,
@@ -197,6 +203,11 @@ fn run_vfio_user(args: Args) -> Result<()> {
         c.set_io_queue_pairs(args.io_queue_pairs)?;
         c.set_max_namespaces(args.max_namespaces)?;
         c.set_namespaces_not_ready(&args.not_ready_nsids);
+        if let Some(ref bp) = args.boot_partition_file {
+            let content =
+                std::fs::read(bp).map_err(|e| anyhow!("read --boot-partition-file {bp}: {e}"))?;
+            c.set_boot_partition(content);
+        }
         Ok(c)
     })
 }
@@ -234,6 +245,11 @@ fn run_main(args: Args) -> Result<()> {
             device.set_io_queue_pairs(args.io_queue_pairs)?;
             device.set_max_namespaces(args.max_namespaces)?;
             device.set_namespaces_not_ready(&args.not_ready_nsids);
+            if let Some(ref bp) = args.boot_partition_file {
+                let content = std::fs::read(bp)
+                    .map_err(|e| anyhow!("read --boot-partition-file {bp}: {e}"))?;
+                device.set_boot_partition(content);
+            }
             let opts = RunOptions {
                 // tick 用于：① Sanitize / Self-Test 进度推进 ② AEN 派发
                 // ③ **Phase M1b** Interrupt Coalescing time flush。原 60s
