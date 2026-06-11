@@ -163,3 +163,20 @@ audit CRITICAL 从"现有 API 不可行"转为"给 underhill 加原语"：
   （如 vmbus relay 用的）+ guest 侧协商可建**共享 bounce 区**，但①需 guest 协作（破"inbox
   driver 0 改动"）②是 bounce 拷贝非任意 guest RAM 零拷贝。须实验厘清，非显然优于 firmware-in-VTL2。
 - 这些实验排在"当前 POC/spec track 收口之后"。
+
+### 10.1 bounded 导出调研结论（2026-06-11，Explore + POC-6 真机）
+
+- **POC-6 真机 PASS**：SCM_RIGHTS 传 mshv_vtl_low fd → 接收进程 mmap 真 guest RAM 成立
+  （fd-pass 数据路径 seam 解决）。但传的是**整个设备 fd = 全 GPA 写权**。
+- **bounded sub-region 零拷贝 fd 须改 HCL 内核**：mshv_vtl_low 驱动**源不在本仓**，是外部
+  `microsoft/OHCL-Linux-Kernel`（flowey 拉预编译包，`resolve_openhcl_kernel_package.rs:287`）。
+  需在该外部仓加 ioctl（如 `MSHV_VTL_LOW_CREATE_BOUNDED_FD(gpa,len)->fd`，mmap 强制
+  `[0,len)→[gpa,gpa+len)` 越界 -EINVAL，最好实现为 dma-buf exporter）+ 重出内核包 + 本仓
+  `hcl/src/ioctl.rs` 配 Rust 包装。
+- **userspace-only 做不到 bounded 零拷贝**：udmabuf 不适用于 mshv 的设备/ZONE_DEVICE 页；
+  已 mmap 的 VA 无法重打包成 bounded 可传 fd。userspace 唯一 bounded 路径是 **memfd bounce
+  拷贝**（`sparse_mmap` 现成）——但丢零拷贝。
+- **关键权衡**：用户已接受"firmware 可改 guest 内存"（topology 决策）。故**非-CVM Spec A
+  用整设备 fd（POC-6 验过、纯本仓、零拷贝）功能上已足**；bounded 是 defense-in-depth 加固，
+  须外部内核改动。三条路：① 整-GPA fd（本仓可落、符合已接受信任模型）② 改外部内核加 bounded
+  fd（重、跨外部仓）③ bounce 拷贝（本仓但非零拷贝，自废武功）。
