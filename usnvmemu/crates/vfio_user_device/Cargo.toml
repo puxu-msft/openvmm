@@ -1,0 +1,16 @@
+[package]
+name = "vfio_user_device"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "vfio-user client (underhill 侧)：connect AF_UNIX + VERSION 握手 + (后续) PCIe 呈现 / DMA_MAP / MSI-X。与 vfio_user_transport (firmware server) 对接，复用 vfio_user_wire sans-IO 协议层。"
+
+[dependencies]
+# 与其它 usnvmemu crate 对齐版本；本 crate 在 workspace exclude（不用 workspace.dependencies）。
+vfio_user_wire = { path = "../vfio_user_wire" }
+zerocopy = { version = "0.8", features = ["derive"] }
+anyhow = "1.0"
+
+[dev-dependencies]
+# loopback 单测对接真 server_handshake。
+vfio_user_transport = { path = "../vfio_user_transport" }

@@ -476,6 +476,22 @@ pub enum ProtoError {
     /// JSON 解析失败（VERSION caps）。
     #[error("invalid JSON capabilities: {0}")]
     BadJson(String),
+    /// VERSION 协商失败：server reply 的 (major, minor) 与 client 提议不兼容
+    /// （major 必须相等；server.minor 不得高于 client 提议）。
+    #[error(
+        "version mismatch: server replied (major={server_major}, minor={server_minor}), \
+         client proposed (major={proposed_major}, minor={proposed_minor})"
+    )]
+    VersionMismatch {
+        /// client 提议的 major。
+        proposed_major: u16,
+        /// client 提议的 minor。
+        proposed_minor: u16,
+        /// server reply 的 major。
+        server_major: u16,
+        /// server reply 的 minor。
+        server_minor: u16,
+    },
 }
 
 // ─── 编解码 helper ──────────────────────────────────────────────────────

@@ -95,6 +95,67 @@ pub fn build_version_reply_payload(client_minor: u16, server_caps: &[u8]) -> Vec
     reply_payload
 }
 
+/// client advertise 的最简 capabilities JSON。
+///
+/// client 不发 server-语义字段（`max_dma_maps` / `pgsizes` 是接收方=server 的
+/// 能力）；`max_data_xfer_size` / `max_msg_fds` 只对 client→server DMA 方向
+/// （W3+）有意义，W1 握手省略。空 capabilities 对端用 [`parse_caps_blob`] 接受。
+pub const CLIENT_CAPS_JSON: &str = "{\"capabilities\":{}}";
+
+/// client 侧握手结果摘要（镜像 [`Negotiated`]，但字段语义是**对端 = server**）。
+#[derive(Debug, Clone)]
+pub struct NegotiatedClient {
+    /// server reply 的 protocol major（与 client 提议必须相等）。
+    pub server_major: u16,
+    /// server reply 的 protocol minor（spec：≤ client 提议）。
+    pub server_minor: u16,
+    /// server reply 的 capabilities JSON 原文（已 UTF-8 解码 / NUL 去尾）。
+    pub server_caps_json: String,
+}
+
+/// 构造 client→server 的 VERSION **command** payload：
+/// `VersionPayload(4) + caps_json + NUL`。
+///
+/// 对称于 [`build_version_reply_payload`]，但 client **自填** `(major, minor)`
+/// 而非 echo/negotiate（client 是发起协商的一方）。caller 负责包 Header
+/// （`Command::Version` + `Header::command`）并写到 socket。
+pub fn build_version_command_payload(major: u16, minor: u16, client_caps: &[u8]) -> Vec<u8> {
+    let payload_len = 4 + client_caps.len() + 1;
+    let mut payload = Vec::with_capacity(payload_len);
+    let ver = VersionPayload { major, minor };
+    payload.extend_from_slice(ver.as_bytes());
+    payload.extend_from_slice(client_caps);
+    payload.push(0); // NUL
+    payload
+}
+
+/// client 验证 server 的 VERSION reply：
+/// - `reply.major == proposed_major`（major 必须相等）
+/// - `reply.minor <= proposed_minor`（spec：server.minor ≤ client 提议；
+///   server 回更高 minor 非法）
+///
+/// **注意方向**：这不是 [`negotiate_minor`]（那是 server 决定回什么）。client
+/// 是**校验对端没回过头**——`negotiate_minor` 当验证会漏掉"server 回更高 minor"
+/// 的非法情形。
+pub fn verify_server_version_reply(
+    proposed_major: u16,
+    proposed_minor: u16,
+    reply: &VersionPayload,
+) -> Result<(), ProtoError> {
+    // packed 字段先 copy（VersionPayload 也是 packed）。
+    let server_major = reply.major;
+    let server_minor = reply.minor;
+    if server_major != proposed_major || server_minor > proposed_minor {
+        return Err(ProtoError::VersionMismatch {
+            proposed_major,
+            proposed_minor,
+            server_major,
+            server_minor,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +225,73 @@ mod tests {
     fn parse_caps_blob_rejects_invalid_utf8() {
         let raw = &[0xff, 0xfe, 0xfd, 0x00];
         assert!(matches!(parse_caps_blob(raw), Err(ProtoError::BadJson(_))));
+    }
+
+    // ── client 侧决策（W1）────────────────────────────────────────────
+
+    /// client VERSION command payload 布局：4B VersionPayload + caps + NUL.
+    #[test]
+    fn build_version_command_payload_has_expected_layout() {
+        let caps = b"{\"capabilities\":{}}";
+        let payload = build_version_command_payload(PROTOCOL_MAJOR, PROTOCOL_MINOR, caps);
+        assert_eq!(payload.len(), 4 + caps.len() + 1);
+        assert_eq!(*payload.last().unwrap(), 0);
+        assert_eq!(&payload[0..2], PROTOCOL_MAJOR.to_le_bytes());
+        assert_eq!(&payload[2..4], PROTOCOL_MINOR.to_le_bytes());
+        assert_eq!(&payload[4..4 + caps.len()], caps);
+    }
+
+    /// server reply 与提议完全一致 → 通过.
+    #[test]
+    fn verify_server_reply_exact_match_ok() {
+        let reply = VersionPayload {
+            major: PROTOCOL_MAJOR,
+            minor: PROTOCOL_MINOR,
+        };
+        assert!(verify_server_version_reply(PROTOCOL_MAJOR, PROTOCOL_MINOR, &reply).is_ok());
+    }
+
+    /// server 回更低 minor（合法协商降级）→ 通过.
+    #[test]
+    fn verify_server_reply_lower_minor_ok() {
+        let reply = VersionPayload {
+            major: PROTOCOL_MAJOR,
+            minor: 0,
+        };
+        assert!(verify_server_version_reply(PROTOCOL_MAJOR, PROTOCOL_MINOR, &reply).is_ok());
+    }
+
+    /// server 回更高 minor（非法：spec 要求 server.minor ≤ client 提议）→ 拒.
+    #[test]
+    fn verify_server_reply_higher_minor_rejected() {
+        let reply = VersionPayload {
+            major: PROTOCOL_MAJOR,
+            minor: PROTOCOL_MINOR + 1,
+        };
+        assert!(matches!(
+            verify_server_version_reply(PROTOCOL_MAJOR, PROTOCOL_MINOR, &reply),
+            Err(ProtoError::VersionMismatch { .. })
+        ));
+    }
+
+    /// server 回不同 major → 拒.
+    #[test]
+    fn verify_server_reply_major_mismatch_rejected() {
+        let reply = VersionPayload {
+            major: PROTOCOL_MAJOR + 99,
+            minor: PROTOCOL_MINOR,
+        };
+        assert!(matches!(
+            verify_server_version_reply(PROTOCOL_MAJOR, PROTOCOL_MINOR, &reply),
+            Err(ProtoError::VersionMismatch { .. })
+        ));
+    }
+
+    /// CLIENT_CAPS_JSON 是合法 ASCII 且不含 server-语义字段.
+    #[test]
+    fn client_caps_json_is_minimal() {
+        assert!(CLIENT_CAPS_JSON.is_ascii());
+        assert!(!CLIENT_CAPS_JSON.contains("max_dma_maps"));
+        assert!(!CLIENT_CAPS_JSON.contains("pgsizes"));
     }
 }
