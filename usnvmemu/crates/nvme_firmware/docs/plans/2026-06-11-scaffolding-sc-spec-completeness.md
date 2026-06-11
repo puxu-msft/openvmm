@@ -1,5 +1,10 @@
 # scaffolding-SC spec-completeness 收尾 — 执行说明 (handoff)
 
+> **✅ 全 4 项已完成（2026-06-11）**：item-0 CMB-SGL 一致(`fe30b715`) / item-1 NS-not-ready
+> 0x82(`488ffaa8`) / item-2 AWUN 0x14 fused>ACWU(`5b8dafa1`) / item-3 boot-partition 0x11e
+> (`4c40d065`)。4 个 sc 常量全部从 anchored-only scaffolding 变为**真 emit**。权威状态见
+> `SPEC_CONFORMANCE.md`。下文为当初执行说明，保留作记录。
+
 > 写于 2026-06-11。**目的**：把 `nvme_firmware` 里"SC 常量已锚定 nvme_spec、但对应特性/场景尚未
 > emit 该 SC"的 scaffolding-SC 缺口逐个补全。本文是给**新 context 会话**的自包含执行说明——
 > 不依赖原对话历史，照本文 + 引用的工程文档即可独立执行。

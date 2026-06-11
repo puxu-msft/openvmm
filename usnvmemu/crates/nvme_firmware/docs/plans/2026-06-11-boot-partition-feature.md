@@ -1,5 +1,15 @@
 # Boot Partition 特性 — 独立 phase plan（scaffolding-SC item-3）
 
+> **✅ 已实现（2026-06-11，commit `4c40d065`）**。最终采用比本 plan 更简单的**只读出厂镜像**
+> 模型：`--boot-partition-file` 装载只读 BP → 广告 BPSZ>0 + 服务 Boot Partition Read（BPRSEL
+> 触发→DMA 到 BPMBL，BRS 跨回调状态机）+ FW Commit BPID→`BOOT_PARTITION_WRITE_PROHIBITED`
+> (0x11e)。**BP-2（经 FW Commit 真写 BP）未做**——BP 只读、write-protected，写尝试即拒，足以
+> coherent emit 0x11e。本 plan 下文的 BP-0/1/2/3 分阶是当初设计，保留作设计记录；真实现见
+> `SPEC_CONFORMANCE.md` Boot Partition 行 + commit `4c40d065`。若未来要支持 BP 可写（真 BP-2），
+> 再按下文 BP-2 做。
+
+---
+
 > 写于 2026-06-11。**目的**：把 `nvme_firmware` 里刻意 stub 掉的 **Boot Partition**（NVMe
 > Base spec § 8.13）做成真特性，从而**真 emit** 目前 anchored-only 的 scaffolding-SC
 > `BOOT_PARTITION_WRITE_PROHIBITED` (0x011e)。本文是给**新 context 会话**的自包含执行
