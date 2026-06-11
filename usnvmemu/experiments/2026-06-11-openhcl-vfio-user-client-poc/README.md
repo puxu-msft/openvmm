@@ -12,7 +12,7 @@ guest 内存零拷贝）的设计文档**之前**，先用 POC 验证它的承�
 |-----|------|------------|------|------|
 | 1 | `poc1_dma_zerocopy.py` | 非-QEMU vfio-user client 经 fd-passing DMA_MAP，server mmap **零拷贝双向 DMA** | 本地 | **✅ PASSED** |
 | 2 | `poc2_msix_eventfd.py` | client 经 SET_IRQS 配 eventfd，firmware 完成命令后**触发 MSI-X 信号** | 本地 | **✅ PASSED** |
-| 3 | `poc3_guest_ram_fd.py` | OpenHCL VTL2 经 `/dev/mshv_vtl_low` 拿**真 guest RAM** fd 并自映射 | 需真 VTL2 | ⏳ **ENV-GATED**（本地确认设备缺席符合预期；探针就绪） |
+| 3 | `poc3_guest_ram_fd.py` / `poc3_mshv_vtl_low_probe.rs` | OpenHCL VTL2 独立进程经 `/dev/mshv_vtl_low` mmap **真 guest RAM** | **真 OpenHCL VM** | **✅ PASSED**（活 VM `pcie-remote-exp`）|
 | 4 | `poc4_cvm_convert_revoke.py` | （Spec B/CVM）owner 无法单方面撤销他进程的共享映射 ⟹ 必须 revoke-before-convert | 本地（模型） | **✅ PASSED**（复现审计 CRITICAL 根因） |
 | 5 | （调查，见下 §POC-5） | OpenHCL VTL2 能否承载独立 firmware 进程 + AF_UNIX | 代码调查 | ✅ **可行（有先例）** |
 
@@ -42,23 +42,41 @@ client 经 `SET_IRQS`（`DATA_EVENTFD|ACTION_TRIGGER`，SCM_RIGHTS）配下 4 �
 
 → 中断路径 **firmware→client 半段**已证实（VTL0 注入半段是 OpenHCL `Interrupt::deliver`，需真环境）。
 
-## POC-3：真 guest RAM fd 导出 ⏳ ENV-GATED（探针就绪，待真 VTL2）
+## POC-3：真 guest RAM 直访（OpenHCL VTL2 独立进程）✅ PASSED（真 VM）
 
 两个文件：
-- `poc3_guest_ram_fd.py`：本地存在性探测（确认 `/dev/mshv_vtl_low` 在当前环境缺席，符合预期）。
-- `poc3_mshv_vtl_low_probe.rs`：**真 VTL2 mmap 探针**（静态 Rust bin，零外部 crate）——open
-  `/dev/mshv_vtl_low` + 线性 mmap `POC_GPA` + 读写验证。原生编译通过、无设备时优雅失败。
+- `poc3_guest_ram_fd.py`：本地存在性探测（本地无设备，符合预期）。
+- `poc3_mshv_vtl_low_probe.rs`：静态 musl 探针 —— open `/dev/mshv_vtl_low` + 线性 mmap
+  `POC_GPA` + 读写验证。
 
-**交付路径发现**：`ohcldiag-dev File` 只读（不能 push bin）；`Run` 只能跑 initrd 内已有
-的命令；busybox 的 dd `read` 不可靠（设备可能只实现 `.mmap` 不实现 `.read`）。故要在真
-VTL2 跑 mmap 探针，**必须把它塞进 OpenHCL VTL2 initrd（定制 IGVM）**——多小时 + 非平凡
-flowey 活。
+**真机实测（活 OpenHCL VM `pcie-remote-exp`，2026-06-11）**：
+```
+[poc3] mmap file_offset=0x100000 (GPA=0x100000)
+[poc3] 读 GPA[0x100000] 首 8 字节 = 0x1c2f0006e696268   ← 真 guest 内存（非零）
+[poc3] 写回 marker + 重读一致 → POC-3 PASSED ✓
+```
+一个**非-underhill 的独立 VTL2 进程**成功 mmap guest RAM 并双向读写。
 
-**剩余风险低（机制已被生产代码证明）**：`openhcl/underhill_mem/src/mapping.rs` 即 open
-`/dev/mshv_vtl_low` + `map_file` 线性映射 VTL0 RAM。非-underhill 进程 open 同一字符设备
-是标准 Linux。故 POC-3 是**确认**而非发现——真 run 主要捕捉权限/namespace/SHARED_MEMORY_FLAG
-语义等代码读不出的细节。建议把它作为 Spec A 实现期 W0 的真-VTL2 gate（那时本就要定制
-OpenHCL build），而非现在单独为它走一遍多小时 IGVM 构建。
+**交付（无需重建 IGVM）**：`ohcldiag-dev run` 转发 stdin → 把静态 musl 探针经
+`base64 -d` 流进活 VM 的 `/tmp` 执行：
+```bash
+strip /tmp/poc3_probe_static   # 静态 musl，~447KB
+base64 -w0 /tmp/poc3_probe_static | \
+  /mnt/c/temp/pcie_remote_exp/ohcldiag-dev.exe pcie-remote-exp run /bin/sh -- -c \
+  'base64 -d >/tmp/p; chmod +x /tmp/p; POC_GPA=0x100000 POC_LEN=0x1000 /tmp/p'
+```
+（探针构建：`rustc --edition 2024 -O --target x86_64-unknown-linux-musl
+-C target-feature=+crt-static poc3_mshv_vtl_low_probe.rs -o poc3_probe_static`）
+
+**实测要点**：
+- `/dev/mshv_vtl_low` 存在、root-only；ohcldiag-dev 起的独立进程是 root，能 open。
+- 设备**只支持 mmap，不支持 read()**（`dd` 报错）——故必须 mmap 探针，不能 dd。
+- 非-CVM 这台 VM：`file_offset = 裸 GPA`（无需 `SHARED_MEMORY_FLAG`）。
+- **机制本就被生产代码用**（`underhill_mem/mapping.rs` 同样 open + `map_file`）；本 POC
+  确认**独立进程**也能做，且实测拿到真 guest 数据。
+
+→ **topology A（firmware-in-VTL2 零拷贝）真机证实可行。** Linux firmware binary（vfio-user
+feature 已能编）放进 VTL2 即可直访 guest RAM。
 
 ## POC-4：CVM page-convert 撤销不变量 ✅（模型）
 
@@ -95,7 +113,8 @@ munmap+ack）。证明 Spec B 的 RED 判断正确。（模型不复现硬件加
 
 - Spec A 的**协议/数据路径**（client fd-passing DMA 零拷贝 + MSI-X eventfd）—— POC-1/2
   **本地证实可行**，且校准了 client wire 细节。
-- **真 guest RAM fd 导出**（POC-3）—— env-gated，待真 VTL2。
+- **真 guest RAM 直访**（POC-3）—— ✅ **真 OpenHCL VM 实测 PASSED**：独立 VTL2 进程
+  mmap `/dev/mshv_vtl_low` 拿到真 guest 数据 + 写回。topology A（firmware-in-VTL2）证实可行。
 - **CVM**（POC-4）—— 审计 RED 判断**实测验证**，naive 直访不安全。
 - **架构前提**（POC-5）—— ✅ 独立进程 + AF_UNIX 在 VTL2 **可行且有先例**（underhill
   已 spawn crash/dump/vnc/gdb 进程；diag 可 exec）。A（in-process）vs B（独立进程）是
