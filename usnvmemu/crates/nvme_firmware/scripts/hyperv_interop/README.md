@@ -44,6 +44,20 @@ PRP-list path (`NVM Write PRP-list … num_blocks=32 full_len=16384`), and the
 host oracle found the marker in the raw backing file at byte offset **22,577,152**
 (~9.2 MB non-zero in the 1 GiB image). See `usnvmemu/docs/pcie-remote-phase/`.
 
+### Re-verified — 2026-06-11 (post-DBBUF)
+
+Re-ran with the **current post-DBBUF** binary (shadow-doorbell feature `f35e5a71`
++ Phases through O5). Same dual-oracle **PASS**: guest enumerated `OpenHCL
+Userspace NVMe v2.0`, format + 4 MiB write/readback (`markerMatch=True`), PRP-list
+path (`num_blocks=256 full_len=131072`), host raw-backing oracle found the marker.
+**Windows `nvme.sys` does not use DBBUF** — no `Doorbell Buffer Config` appears in
+the controller log, only plain MMIO doorbells (offsets `0x1004`/`0x1008`/`0x100c`).
+So this L3 run confirms the DBBUF changes did **not** regress the real-guest
+non-DBBUF MMIO path. (DBBUF itself is exercised by the Linux-side e2e — vfio
+`qemu_interop` + the OpenHCL `tests/openhcl_pcie_remote_e2e.rs` DBBUF tests — since
+shadow doorbells are a Linux nvme-driver feature.) Reused the existing VM
+(`pcie-remote-exp`); `BUILD=1` cross-rebuilt the firmware in 9.76s.
+
 ## Usage
 
 One-time prerequisites (see [HYPERV_RUNBOOK.md](../../../../docs/pcie-remote-phase/HYPERV_RUNBOOK.md)):
