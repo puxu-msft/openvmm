@@ -225,25 +225,35 @@ audit CRITICAL 从"现有 API 不可行"转为"给 underhill 加原语"：
 **结论加固**：firmware **必须在 VTL2** 才能 live 零拷贝访问 guest RAM——已有 POC 级
 （非推理级）背书。topology B 的"不可产品化"由 12 条路径全否 + 2 个真机 POC 失败实证。
 
-## 11. host ↔ VTL2 外部控制面（控制 firmware）
+## 11. host ↔ VTL2 外部控制面：`usnvmemu-ioctl`（复用 ohcldiag-dev）
 
-**用户需求**：Windows host 经 vsock 等通道控制 firmware（deploy/start/stop/update/stats/
-inject/reload）。不动 firmware 自身的安全姿态（firmware 对外仅 AF_UNIX 一道门）。
+**用户需求**：Windows host 控制 VTL2 内的 firmware（deploy/start/stop/update/stats/
+inject/reload 等设备控制语义）。
 
-**架构**：**underhill 当 gateway**，host 控制命令走 vsock → underhill 鉴权/审计/路由 →
-underhill 经 AF_UNIX 控制面给 firmware 下命令（与 W5b 的 supervisor 同一执行点）。firmware
-**不**直接 listen vsock —— 避免攻击面扩大、复用 underhill 现有信任域 + ACL + 日志。
+**架构（务实选择）**：**复用 ohcldiag-dev**，扩它的 RPC schema 加 `usnvmemu-ioctl`
+命令族。命名指向 usnvmemu 项目 + 强调"设备控制语义"（vfio_user 抽象层的 ioctl 模型），
+不是泛 firmware-control。
 
-**两路实现**（W5b 阶段定）：
-- **B1 复用 ohcldiag-dev（推荐起步）**：扩 `diag_proto` RPC schema 加 `firmware-control`
-  命令族；diag_server 路由到 underhill 的 firmware supervisor。零新 wire/0 新端口、复用
-  现有 grpc + ACL。dev 期工具链一致。
-- **B2 独立 vsock 服务**：另起服务名/channel，独立 ACL/rate-limit/audit log。隔离更干净，
-  但要新加服务和客户端工具。生产期可演进。
+```
+host: ohcldiag-dev usnvmemu-ioctl <verb> [args]
+       │
+       └──vsock──▶ underhill diag_server
+                   │  路由到 W5b supervisor
+                   └──AF_UNIX──▶ firmware
+```
 
-**对应 W5/W6**：W5b 的 supervisor = host 控制命令的执行点；W6 reconnect 由 host 控制命令
-（或 supervisor 自检）触发。host 端命令调用现成 ohcldiag-dev（B1）或新工具（B2）。
+**为什么不另起独立服务**：
+- 复用现有 ohcldiag-dev 工具链 + grpc 协议 + 客户端 binary，dev 期同源工具链
+- 与 W5a 的 `ohcldiag-dev run` 共享同一 vsock transport，零新 wire/0 新端口
+- host 端用户只需学一个新子命令，不要装新 CLI
 
-**安全**：vsock 命令携带的所有 host-originated 数据由 underhill 校验后再委派；firmware
-对 underhill 之外的输入仍零信任（POC-7 已确认 host 进程够不到 guest RAM，但控制面是
-host→VTL2 双向通信，须 enforce 该通道仅经 underhill 中介）。
+**命令族 `usnvmemu-ioctl` 初步动词**（随实现演进）：
+- `deploy <elf>` —— 推 firmware ELF 进 VTL2 + supervisor 拉起（W5a/W5b 同语义）
+- `start` / `stop` / `restart` —— 生命周期
+- `stats` —— 读 firmware 性能/状态计数器
+- `inject <event>` —— 测试期触发 AER / abort / 各种故障
+- `reload-config` —— 重读 backing file / NS 布局等
+- `reconnect` —— 显式触发 W6 reconnect
+
+**对应 W5/W6**：W5b supervisor = `usnvmemu-ioctl` 命令的实际执行点；W6 reconnect 可由
+`usnvmemu-ioctl reconnect` 或 supervisor 自检触发（同一 reconnect 流程）。
