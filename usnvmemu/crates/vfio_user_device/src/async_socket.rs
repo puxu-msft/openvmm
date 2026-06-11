@@ -19,6 +19,8 @@
 use pal_async::interest::InterestSlot;
 use pal_async::interest::PollEvents;
 use pal_async::socket::PolledSocket;
+use pal_async::socket::ReadHalf;
+use pal_async::socket::WriteHalf;
 use std::future::poll_fn;
 use std::io;
 use std::io::IoSlice;
@@ -106,6 +108,77 @@ impl AsyncSocket {
                     .poll_io(cx, InterestSlot::Read, PollEvents::IN, |socket| {
                         try_recv(socket.get(), &mut buf[read..])
                     })
+            })
+            .await?;
+            if n == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            read += n;
+        }
+        Ok(())
+    }
+
+    /// 取出内部 `PolledSocket`（消费 `AsyncSocket`）。供 [`split_full_duplex`] 拆全双工
+    /// 读写半用（W6b worker 需并发收发）。`Mutex::into_inner` 无锁、无 panic。
+    pub(crate) fn into_polled(self) -> PolledSocket<UnixStream> {
+        self.socket.into_inner()
+    }
+}
+
+/// 把一条 `PolledSocket` 拆成全双工读写半（W6b）。两半经 pal_async 内部 `Arc` 共享同一
+/// socket，但 send/recv 各自 `poll_io`、**不跨内核调用持锁**——故 worker 可在 `select!`
+/// 里同时发请求帧与收 reply 帧，互不阻塞（串行 `AsyncSocket` 的 `Mutex<PolledSocket>`
+/// 做不到）。
+pub(crate) fn split_full_duplex(socket: PolledSocket<UnixStream>) -> (WriterHalf, ReaderHalf) {
+    let (read, write) = socket.split();
+    (WriterHalf { write }, ReaderHalf { read })
+}
+
+/// 全双工**写**半：只发不收。复用 [`try_send`]/[`build_remaining_iov`]（cmsg/unsafe
+/// 全在本模块自由函数里，不重复）。
+pub(crate) struct WriterHalf {
+    write: WriteHalf<UnixStream>,
+}
+
+impl WriterHalf {
+    /// 发一组 iovec（首段带可选 fd，经 SCM_RIGHTS）。语义同 [`AsyncSocket::send_with_fds`]，
+    /// 仅驱动 [`WriteHalf::poll_io`]（读写半各自 poll，不互锁）。fd 只随首次 sendmsg。
+    pub(crate) async fn send_with_fds(
+        &mut self,
+        iov: &[IoSlice<'_>],
+        fds: &[impl AsFd],
+    ) -> io::Result<()> {
+        let raw_fds: Vec<RawFd> = fds.iter().map(|f| f.as_fd().as_raw_fd()).collect();
+        let mut sent = 0;
+        let total: usize = iov.iter().map(|s| s.len()).sum();
+        while sent < total {
+            let remaining_iov = build_remaining_iov(iov, sent);
+            let send_fds: &[RawFd] = if sent == 0 { &raw_fds } else { &[] };
+            let n = poll_fn(|cx| {
+                self.write
+                    .poll_io(cx, |h| try_send(h.get(), &remaining_iov, send_fds))
+            })
+            .await?;
+            sent += n;
+        }
+        Ok(())
+    }
+}
+
+/// 全双工**读**半：只收不发。复用 [`try_recv`]（含意外-fd drop 防泄漏路径）。
+pub(crate) struct ReaderHalf {
+    read: ReadHalf<UnixStream>,
+}
+
+impl ReaderHalf {
+    /// 收满 `buf.len()` 字节。语义同 [`AsyncSocket::recv_exact`]，仅驱动
+    /// [`ReadHalf::poll_io`]。读到 0（对端关闭 / 半包断开）→ `UnexpectedEof`。
+    pub(crate) async fn recv_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        let mut read = 0;
+        while read < buf.len() {
+            let n = poll_fn(|cx| {
+                self.read
+                    .poll_io(cx, |h| try_recv(h.get(), &mut buf[read..]))
             })
             .await?;
             if n == 0 {

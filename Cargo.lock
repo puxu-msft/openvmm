@@ -166,9 +166,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.99"
+version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0674a1ddeecb70197781e945de4b3b8ffb61fa939a5597bcf48503737663100"
+checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "arbitrary"
@@ -4191,11 +4191,10 @@ dependencies = [
 
 [[package]]
 name = "lock_api"
-version = "0.4.13"
+version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96936507f153605bddfcda068dd804796c84324ed2510809e5b2a624c81da765"
+checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 dependencies = [
- "autocfg",
  "scopeguard",
 ]
 
@@ -4350,6 +4349,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
 ]
 
 [[package]]
@@ -4934,6 +4942,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -5950,9 +5959,9 @@ checksum = "f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba"
 
 [[package]]
 name = "parking_lot"
-version = "0.12.4"
+version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70d58bf43669b5795d1576d0641cfb6fbb2057bf629506267a92807158584a13"
+checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
  "lock_api",
  "parking_lot_core",
@@ -5960,15 +5969,15 @@ dependencies = [
 
 [[package]]
 name = "parking_lot_core"
-version = "0.9.11"
+version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc838d2a56b5b1a6c25f55575dfc605fabb63bb2365f6c2353ef9159aa69e4a5"
+checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
 dependencies = [
  "cfg-if",
  "libc",
  "redox_syscall",
  "smallvec",
- "windows-targets 0.52.6",
+ "windows-link 0.2.0",
 ]
 
 [[package]]
@@ -6102,6 +6111,10 @@ dependencies = [
  "vmcore",
  "zerocopy",
 ]
+
+[[package]]
+name = "pcie_device_core"
+version = "0.1.0"
 
 [[package]]
 name = "pcie_remote_device"
@@ -8298,9 +8311,9 @@ dependencies = [
 
 [[package]]
 name = "tracing"
-version = "0.1.43"
+version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d15d90a0b5c19378952d479dc858407149d7bb45a14de0142f6c534b16fc647"
+checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
  "pin-project-lite",
  "tracing-attributes",
@@ -8320,9 +8333,9 @@ dependencies = [
 
 [[package]]
 name = "tracing-core"
-version = "0.1.35"
+version = "0.1.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a04e24fab5c89c6a36eb8558c9656f30d81de51dfa4d3b45f26b21d61fa0a6c"
+checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
  "valuable",
@@ -9064,6 +9077,86 @@ dependencies = [
  "tracelimit",
  "tracing",
  "vfio-bindings",
+]
+
+[[package]]
+name = "vfio_user_device"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "pal_async",
+ "parking_lot",
+ "vfio_user_wire",
+ "zerocopy",
+]
+
+[[package]]
+name = "vfio_user_pci_device"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chipset_device",
+ "chipset_device_resources",
+ "cvm_tracing",
+ "device_emulators",
+ "futures",
+ "guestmem",
+ "guid",
+ "inspect",
+ "mesh",
+ "pal_async",
+ "pal_event",
+ "parking_lot",
+ "pci_core",
+ "pci_resources",
+ "pcie_device_core",
+ "thiserror 2.0.16",
+ "tracelimit",
+ "tracing",
+ "vfio_user_device",
+ "vfio_user_pci_resources",
+ "vfio_user_transport",
+ "vfio_user_wire",
+ "vm_resource",
+ "vmcore",
+ "zerocopy",
+]
+
+[[package]]
+name = "vfio_user_pci_resources"
+version = "0.0.0"
+dependencies = [
+ "guid",
+ "mesh",
+ "vm_resource",
+]
+
+[[package]]
+name = "vfio_user_transport"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "libc",
+ "memmap2",
+ "nix 0.30.1",
+ "parking_lot",
+ "pcie_device_core",
+ "thiserror 1.0.69",
+ "tracing",
+ "vfio_user_wire",
+ "zerocopy",
+]
+
+[[package]]
+name = "vfio_user_wire"
+version = "0.1.0"
+dependencies = [
+ "pcie_device_core",
+ "thiserror 1.0.69",
+ "zerocopy",
 ]
 
 [[package]]

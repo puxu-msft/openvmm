@@ -1,0 +1,50 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vfio_user_pci_device"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# W6b 本地依赖：resource handle + W6a async client（vfio_user_device/_wire 在 workspace exclude 列表里，靠 path-dep 引入）
+vfio_user_pci_resources = { path = "../vfio_user_pci_resources" }
+vfio_user_device = { path = "../../../../usnvmemu/crates/vfio_user_device" }
+vfio_user_wire = { path = "../../../../usnvmemu/crates/vfio_user_wire" }
+
+# vm-* deps
+chipset_device.workspace = true
+chipset_device_resources.workspace = true
+cvm_tracing.workspace = true
+device_emulators.workspace = true
+pci_core.workspace = true
+pci_resources.workspace = true
+vmcore.workspace = true
+vm_resource.workspace = true
+guestmem.workspace = true
+
+# support-* deps
+pal_async.workspace = true
+pal_event.workspace = true
+mesh = { workspace = true, features = ["prost"] }
+guid = { workspace = true, features = ["mesh"] }
+inspect.workspace = true
+
+# crates.io
+async-trait.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracelimit.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+pal_async.workspace = true
+# loopback worker 单测对接真 server 半：VfioUserSession + MockDev（pcie_device_core PcieDevice）。
+vfio_user_transport = { path = "../../../../usnvmemu/crates/vfio_user_transport" }
+pcie_device_core = { path = "../../../../usnvmemu/crates/pcie_device_core" }
+
+[lints]
+workspace = true

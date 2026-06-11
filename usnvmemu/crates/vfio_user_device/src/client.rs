@@ -7,6 +7,9 @@
 #![deny(unsafe_code)]
 
 use crate::async_socket::AsyncSocket;
+use crate::async_socket::split_full_duplex;
+use crate::channel::VfioUserReader;
+use crate::channel::VfioUserWriter;
 use crate::framing::read_message;
 use crate::framing::write_message;
 use anyhow::Context as _;
@@ -79,6 +82,18 @@ impl VfioUserClient {
         let id = self.next_msg_id;
         self.next_msg_id = self.next_msg_id.wrapping_add(1);
         id
+    }
+
+    /// 消费一个**已握手**的 client，拆出全双工读写半（W6b worker 用）。msg_id 分配
+    /// 移到调用方（worker 持 `next_msg_id` 计数器），故 `next_msg_id` 在此丢弃。
+    ///
+    /// 拆分后 [`VfioUserWriter`]/[`VfioUserReader`] 共享同一 socket 但各自 `poll_io`、
+    /// **不跨内核调用持锁**——worker 可在 `select!` 里并发发请求 + 收 reply（串行
+    /// `VfioUserClient` 的「写后立即读」做不到，见 [`crate::channel`] 模块文档）。
+    pub fn into_channel(self) -> (VfioUserWriter, VfioUserReader) {
+        let polled = self.sock.into_polled();
+        let (writer, reader) = split_full_duplex(polled);
+        (VfioUserWriter::new(writer), VfioUserReader::new(reader))
     }
 
     /// 执行 VERSION 握手：发 client VERSION command → 收 server reply → 验证协商。
@@ -168,7 +183,9 @@ impl VfioUserClient {
             return Err(anyhow!("{cmd:?} reply 不是 REPLY 帧"));
         }
         if flags.is_error() {
-            return Err(anyhow!("{cmd:?} reply 是 error（error_no={reply_error_no}）"));
+            return Err(anyhow!(
+                "{cmd:?} reply 是 error（error_no={reply_error_no}）"
+            ));
         }
         if reply_cmd != cmd as u16 {
             return Err(anyhow!("{cmd:?} reply cmd 不匹配：got {reply_cmd}"));
@@ -214,7 +231,8 @@ impl VfioUserClient {
                 reply.payload.len()
             ));
         }
-        decode_payload(&reply.payload[..want]).with_context(|| format!("decode {cmd:?} reply payload"))
+        decode_payload(&reply.payload[..want])
+            .with_context(|| format!("decode {cmd:?} reply payload"))
     }
 
     /// DEVICE_GET_INFO：查 region 数 / IRQ 数 / flags。

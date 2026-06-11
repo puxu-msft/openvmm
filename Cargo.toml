@@ -61,6 +61,9 @@ members = [
   # pcie_remote experimental device
   "vm/devices/pcie_remote_protocol",
   "vm/devices/pcie_remote_device",
+  # W6b vfio-user NVMe device
+  "vm/devices/pci/vfio_user_pci_resources",
+  "vm/devices/pci/vfio_user_pci_device",
 ]
 exclude = [
   "xsync",
