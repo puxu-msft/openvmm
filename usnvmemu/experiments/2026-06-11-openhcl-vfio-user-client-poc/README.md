@@ -42,11 +42,23 @@ client 经 `SET_IRQS`（`DATA_EVENTFD|ACTION_TRIGGER`，SCM_RIGHTS）配下 4 �
 
 → 中断路径 **firmware→client 半段**已证实（VTL0 注入半段是 OpenHCL `Interrupt::deliver`，需真环境）。
 
-## POC-3：真 guest RAM fd 导出 ⏳ ENV-GATED
+## POC-3：真 guest RAM fd 导出 ⏳ ENV-GATED（探针就绪，待真 VTL2）
 
-探测 `/dev/mshv_vtl_low`（OpenHCL VTL2 内核设备）。本地（WSL2）确认缺席——符合预期，
-证明这条路径是 VTL2-only 承重假设，须在**真 OpenHCL VTL2** 内跑探针（`POC_ALLOW_MSHV=1
-POC_GPA=.. POC_LEN=.. python3 poc3_guest_ram_fd.py`）才能证成/证伪。**未验**。
+两个文件：
+- `poc3_guest_ram_fd.py`：本地存在性探测（确认 `/dev/mshv_vtl_low` 在当前环境缺席，符合预期）。
+- `poc3_mshv_vtl_low_probe.rs`：**真 VTL2 mmap 探针**（静态 Rust bin，零外部 crate）——open
+  `/dev/mshv_vtl_low` + 线性 mmap `POC_GPA` + 读写验证。原生编译通过、无设备时优雅失败。
+
+**交付路径发现**：`ohcldiag-dev File` 只读（不能 push bin）；`Run` 只能跑 initrd 内已有
+的命令；busybox 的 dd `read` 不可靠（设备可能只实现 `.mmap` 不实现 `.read`）。故要在真
+VTL2 跑 mmap 探针，**必须把它塞进 OpenHCL VTL2 initrd（定制 IGVM）**——多小时 + 非平凡
+flowey 活。
+
+**剩余风险低（机制已被生产代码证明）**：`openhcl/underhill_mem/src/mapping.rs` 即 open
+`/dev/mshv_vtl_low` + `map_file` 线性映射 VTL0 RAM。非-underhill 进程 open 同一字符设备
+是标准 Linux。故 POC-3 是**确认**而非发现——真 run 主要捕捉权限/namespace/SHARED_MEMORY_FLAG
+语义等代码读不出的细节。建议把它作为 Spec A 实现期 W0 的真-VTL2 gate（那时本就要定制
+OpenHCL build），而非现在单独为它走一遍多小时 IGVM 构建。
 
 ## POC-4：CVM page-convert 撤销不变量 ✅（模型）
 
