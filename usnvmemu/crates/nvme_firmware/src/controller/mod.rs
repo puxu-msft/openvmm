@@ -480,6 +480,11 @@ pub(super) enum PendingOp {
     SepMetaWriteMeta {
         op_id: u64,
     },
+    /// **B6b-3** — separate PI Read 的一条 DMA-write（data→PRP 或 tuple→MPTR）完成。
+    /// 两条都完成后 SepMetaReadAccum.remaining→0 post success CQE。
+    SepMetaReadDone {
+        op_id: u64,
+    },
     /// **Phase K4b** — PI Read sibling 占位（per-LBA file read + verify
     /// 在 dispatch 时同步完成，DMA-write 数据回 PRP1 在 PendingIo 路径）。
     NvmReadPiDmaWrite {
@@ -729,6 +734,18 @@ pub(super) struct SepMetaWriteAccum {
     pub(super) meta: Option<Vec<u8>>,
 }
 
+/// **B6b-3（separate metadata，PRACT=0）** — separate-buffer PI Read 累积器。
+/// dispatch 时已从 backing 读 interleaved block + verify PI + 发两条 DMA-write
+/// （data→PRP、tuple→MPTR）；两条都完成（remaining→0）后 post success CQE。
+pub(super) struct SepMetaReadAccum {
+    pub(super) sq_id: u16,
+    pub(super) cid: u16,
+    pub(super) sq_head: u16,
+    pub(super) cq_id: u16,
+    /// 尚未完成的 DMA-write 数（初值 2：data + meta）。
+    pub(super) remaining: u32,
+}
+
 // ═══════════════════════ A1（Abort, spec § 5.1）═══════════════════════
 //
 // Abort 命令按 (SQID, CID) 定位一条 in-flight 命令并中止。本 controller 的
@@ -770,6 +787,7 @@ impl_abortable_op!(PiReadAccum);
 impl_abortable_op!(PrpListOp);
 impl_abortable_op!(SglOp);
 impl_abortable_op!(SepMetaWriteAccum);
+impl_abortable_op!(SepMetaReadAccum);
 
 /// 在一张 DMA-pending 表里找 (sqid, cid) 匹配的累积器，命中则移除并返其
 /// (cq_id, sq_head)。移除后该 op 在飞的 DMA completion 会走 unknown-token
@@ -1121,6 +1139,8 @@ pub struct NvmeController {
     /// **B6b-2（separate metadata，PRACT=0）** — separate-buffer PI Write 累积器。
     /// op_id → 等 data(PRP) + meta(MPTR) 两条 DMA 到齐 → verify host PI → 存盘。
     pub(super) sep_meta_writes: HashMap<u64, SepMetaWriteAccum>,
+    /// **B6b-3** — separate-buffer PI Read 累积器（等 data+meta 两条 DMA-write 完成）。
+    pub(super) sep_meta_reads: HashMap<u64, SepMetaReadAccum>,
     /// **Phase O2** — Fused operation state：per-SQ 缓存 FUSE_FIRST 的
     /// SQE，等待紧接其后的 FUSE_SECOND。spec § 6.2 要求：
     /// (a) 两条必须连续在同一 SQ；(b) 都 fused-marked；(c) 都同 nsid。
@@ -2216,6 +2236,7 @@ impl NvmeController {
             pi_writes: HashMap::new(),
             pi_reads: HashMap::new(),
             sep_meta_writes: HashMap::new(),
+            sep_meta_reads: HashMap::new(),
             pending_fused: HashMap::new(),
             sqe_inbox: Vec::new(),
             stat_host_reads: 0,
@@ -3466,7 +3487,8 @@ impl NvmeController {
             .or_else(|| abort_scan(&mut self.pi_reads, sqid, cid))
             .or_else(|| abort_scan(&mut self.prp_list_ops, sqid, cid))
             .or_else(|| abort_scan(&mut self.sgl_ops, sqid, cid))
-            .or_else(|| abort_scan(&mut self.sep_meta_writes, sqid, cid));
+            .or_else(|| abort_scan(&mut self.sep_meta_writes, sqid, cid))
+            .or_else(|| abort_scan(&mut self.sep_meta_reads, sqid, cid));
         // 2) sweep `pending_ios`：移除该命令的所有（子-）DMA 条目；若无累积器
         //    （单-DMA 命令），从中取 target。
         let mut po_target: Option<(u16, u16)> = None;

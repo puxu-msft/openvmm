@@ -735,6 +735,7 @@ impl NvmeController {
                 let is_plain =
                     ns.meta_size == 0 && !ns.pi_enabled() && (ns.lbads == 9 || ns.lbads == 12);
                 let sector_bytes = 1u64 << ns.lbads;
+                let meta_inline_r = ns.meta_inline; // B6b-3：separate(false) 走 MPTR 路径
                 // **Phase Q1 + reviewer 12轮 H-Q1**:
                 // - PRACT=1 + 非 PI NS = INVALID_PROTECTION_INFO（spec § 8.3.1）
                 // - PRACT=0 + PI NS = INVALID_PROTECTION_INFO 因 K4 路径**不支持**
@@ -752,17 +753,124 @@ impl NvmeController {
                     ));
                 }
                 if !pract && is_pi_path {
-                    tracing::warn!(
-                        nsid,
-                        "READ PRACT=0 on PI NS unsupported (driver must use PRACT=1)"
+                    // **B6b-3（separate metadata，PRACT=0）** — separate NS：从 backing
+                    // 读 interleaved block → verify stored PI → data 回 PRP + PI tuple 回
+                    // MPTR（两条 DMA-write）。inline NS（extended LBA）的 PRACT=0 仍未实现。
+                    if meta_inline_r {
+                        tracing::warn!(
+                            nsid,
+                            "READ PRACT=0 on inline(extended-LBA) PI NS unsupported (用 PRACT=1)"
+                        );
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::INVALID_PROTECTION_INFO,
+                        ));
+                    }
+                    if nlb != 1 {
+                        tracing::warn!(nlb, "separate-meta READ 暂仅支持单 LBA（多 LBA 待续）");
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                    }
+                    if sqe.mptr == 0 {
+                        tracing::warn!(nsid, "separate-meta READ 需 MPTR（host PI buffer）");
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                    }
+                    let mptr = sqe.mptr;
+                    let pi_type = ns.pi_type;
+                    let pi_first = ns.pi_first;
+                    let block_bytes = ns.block_bytes() as usize; // 4104
+                    let data_bytes = ns.data_bytes() as usize; // 4096
+                    let total_lba = ns.total_lba;
+                    if slba >= total_lba {
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE));
+                    }
+                    // 读 interleaved block（drop ns 不可变借用后用 ns_mut）。
+                    let mut block = vec![0u8; block_bytes];
+                    let ns_mut = self.ns_mut(nsid).unwrap();
+                    if let Err(e) = ns_mut.read_at(&mut block, slba * block_bytes as u64) {
+                        tracing::warn!(error = %e, nsid, slba, "separate-meta READ backing fail");
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::DATA_TRANSFER_ERROR,
+                        ));
+                    }
+                    // 按 pi_first 拆 tuple + data。
+                    let (tuple_bytes, data_part): ([u8; 8], Vec<u8>) = if pi_first {
+                        (
+                            block[0..8].try_into().unwrap(),
+                            block[8..8 + data_bytes].to_vec(),
+                        )
+                    } else {
+                        (
+                            block[data_bytes..data_bytes + 8].try_into().unwrap(),
+                            block[0..data_bytes].to_vec(),
+                        )
+                    };
+                    // verify stored PI（检测 backing 损坏；over-strict 同 WRITE，PRCHK 未门控）。
+                    let stored_tuple = crate::pi::PiTuple::from_bytes(&tuple_bytes);
+                    match stored_tuple.verify(&data_part, slba, pi_type) {
+                        crate::pi::PiCheck::Ok => {}
+                        other => {
+                            // **reviewer M-1**：映射具体失败类型（Guard 0x82 / RefTag 0x84 /
+                            // AppTag 0x83）而非恒 0x82，与 WRITE 侧对称（spec § 4.6.1）。
+                            let sc_byte = other.to_sc().unwrap_or(0x82);
+                            tracing::warn!(
+                                nsid,
+                                slba,
+                                ?other,
+                                "separate-meta READ: stored PI verify 失败"
+                            );
+                            return Some(Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::status(sc_byte, sc::SCT_MEDIA_DATA_INTEGRITY),
+                            ));
+                        }
+                    }
+                    // data → PRP1，tuple → MPTR（两条 DMA-write，都完成后 success CQE）。
+                    let op_id = self.alloc_op_id();
+                    let tok_d = ctx.dma_write(prp1, data_part);
+                    self.pending_ios.insert(
+                        tok_d,
+                        PendingIo {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            nsid,
+                            op: PendingOp::SepMetaReadDone { op_id },
+                        },
                     );
-                    return Some(Cqe::error(
-                        cid,
-                        sq_id,
-                        sq_head,
-                        phase,
-                        sc::INVALID_PROTECTION_INFO,
-                    ));
+                    let tok_m = ctx.dma_write(mptr, tuple_bytes.to_vec());
+                    self.pending_ios.insert(
+                        tok_m,
+                        PendingIo {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            nsid,
+                            op: PendingOp::SepMetaReadDone { op_id },
+                        },
+                    );
+                    self.sep_meta_reads.insert(
+                        op_id,
+                        crate::controller::SepMetaReadAccum {
+                            sq_id,
+                            cid,
+                            sq_head,
+                            cq_id,
+                            remaining: 2,
+                        },
+                    );
+                    return None;
                 }
                 if !is_pi_path && !is_plain {
                     // **Reviewer H5** — 用 INVALID_PROTECTION_INFO 而非 INVALID_FIELD

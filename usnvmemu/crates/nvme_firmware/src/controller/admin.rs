@@ -990,6 +990,7 @@ impl NvmeController {
                     || !self.pi_writes.is_empty()
                     || !self.pi_reads.is_empty()
                     || !self.sep_meta_writes.is_empty()
+                    || !self.sep_meta_reads.is_empty()
                     || !self.pending_fused.is_empty();
                 if inflight {
                     tracing::warn!(

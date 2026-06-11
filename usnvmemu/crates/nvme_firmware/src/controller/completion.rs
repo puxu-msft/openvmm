@@ -612,6 +612,25 @@ impl NvmeController {
                         tracing::warn!(op_id, "SepMetaWriteMeta unknown op_id（已 abort?）");
                     }
                 }
+                PendingOp::SepMetaReadDone { op_id } => {
+                    // **B6b-3** — separate-meta PI Read 的一条 DMA-write（data→PRP 或
+                    // tuple→MPTR）完成。两条都完成（remaining→0）→ success CQE。
+                    let done = if let Some(acc) = self.sep_meta_reads.get_mut(&op_id) {
+                        acc.remaining = acc.remaining.saturating_sub(1);
+                        acc.remaining == 0
+                    } else {
+                        tracing::warn!(op_id, "SepMetaReadDone unknown op_id（已 abort?）");
+                        false
+                    };
+                    if done {
+                        let acc = self.sep_meta_reads.remove(&op_id).unwrap();
+                        let phase = self.cqs.get(&acc.cq_id).map(|c| c.phase).unwrap_or(1);
+                        self.stat_host_reads += 1;
+                        self.stat_lba_read += 1;
+                        let cqe = Cqe::success(acc.cid, acc.sq_id, acc.sq_head, phase);
+                        self.post_cqe(ctx, acc.cq_id, cqe);
+                    }
+                }
                 PendingOp::NvmReadDualPrpSiblingHalf => {
                     // **H4**：成功路径无 op — counter + success CQE 全由
                     // tok2 (NvmReadDmaWrite) 处理；这里只是消化 token

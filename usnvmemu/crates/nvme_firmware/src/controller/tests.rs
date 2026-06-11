@@ -1195,6 +1195,139 @@ fn b6b_separate_meta_write_host_pi() {
     }
 }
 
+/// **B6b-3（separate metadata READ，PRACT=0，spec § 8.3）差分 oracle** — separate
+/// NS 上 PRACT=0 READ：盘上 interleaved [tuple][data] → verify stored PI → data 回
+/// PRP + PI tuple 回 MPTR（两条 DMA-write）。
+///   正例：盘上 PI 正确 → data→PRP1 + tuple→MPTR + success；
+///   负例：盘上 PI guard 损坏 → Media SCT=2 GUARD 错误（同步），**不** DMA-write 到 host。
+///
+/// 独立 oracle：从 capture 的 DmaWrite 取回送 host 的 data/tuple 字节比对。
+/// revert-verify：跳过 stored-PI verify → 负例的"Media 错误"断言转红。
+#[test]
+fn b6b_separate_meta_read() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    fn sep_ns() -> NvmeController {
+        let mut c = make_ctrl_with_tmp("b6b_seprd");
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+        ns.pi_first = true;
+        ns.meta_inline = false;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / ns.block_bytes();
+        c.cqs.insert(
+            1,
+            crate::regs::CompletionQueue {
+                base_gpa: 0x1_0000,
+                size: 64,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 0,
+                interrupt_enabled: false,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        c
+    }
+    fn seed(c: &mut NvmeController, tuple: &[u8; 8], data: &[u8]) {
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        let mut block = vec![0u8; 4104];
+        block[0..8].copy_from_slice(tuple);
+        block[8..4104].copy_from_slice(data);
+        ns.write_at(&block, 0).unwrap();
+    }
+    let data: Vec<u8> = (0..4096).map(|i| ((i * 3 + 1) & 0xff) as u8).collect();
+    let tuple = crate::pi::PiTuple::compute(&data, 0, 1).to_bytes();
+
+    // ── 正例：READ → data→PRP1 + tuple→MPTR + success ──
+    {
+        let mut c = sep_ns();
+        seed(&mut c, &tuple, &data);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x02, 1, 0, 1, 0x4000, false, 0x62); // READ PRACT=0
+            sqe.mptr = 0x5000;
+            let r = c.dispatch_io(&mut ctx, 1, sqe, 0x62, 0, 1);
+            assert!(r.is_none(), "separate READ 走异步 2 DMA-write");
+            assert_eq!(c.sep_meta_reads.len(), 1, "1 个 SepMetaReadAccum");
+            let toks: Vec<u64> = c.pending_ios.keys().copied().collect();
+            assert_eq!(toks.len(), 2, "data + tuple 两条 DMA-write");
+            for t in toks {
+                c.on_dma_complete_impl(&mut ctx, t, true, Vec::new());
+            }
+        }
+        let mut writes: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+        for e in cap.events() {
+            if let TransportEvent::DmaWrite { gpa, data, .. } = e {
+                writes.insert(*gpa, data.clone());
+            }
+        }
+        assert_eq!(
+            writes.get(&0x4000).map(|d| &d[..]),
+            Some(&data[..]),
+            "data → PRP1"
+        );
+        assert_eq!(
+            writes.get(&0x5000).map(|d| &d[..]),
+            Some(&tuple[..]),
+            "PI tuple → MPTR"
+        );
+        assert!(c.sep_meta_reads.is_empty(), "两条完成后 accum 移除");
+    }
+
+    // ── 负例：盘上 PI guard 损坏 → Media 错误（同步），不回送 host ──
+    {
+        let mut c = sep_ns();
+        let mut bad = tuple;
+        bad[0] ^= 0xff; // 损坏 stored guard
+        seed(&mut c, &bad, &data);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let cqe = {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x02, 1, 0, 1, 0x4000, false, 0x63);
+            sqe.mptr = 0x5000;
+            c.dispatch_io(&mut ctx, 1, sqe, 0x63, 0, 1)
+        };
+        let cqe = cqe.expect("stored PI 损坏 → 同步 Media 错误 CQE");
+        assert_eq!(
+            cqe_status(&cqe),
+            crate::cmd::sc::status(0x82, crate::cmd::sc::SCT_MEDIA_DATA_INTEGRITY),
+            "盘上 guard 损坏 → Media GUARD_CHECK_ERR (0x0282)"
+        );
+        let leaked = cap
+            .events()
+            .iter()
+            .any(|e| matches!(e, TransportEvent::DmaWrite { gpa, .. } if *gpa == 0x4000 || *gpa == 0x5000));
+        assert!(!leaked, "stored PI verify 失败不应 DMA-write 到 host");
+    }
+
+    // ── 负例 2（reviewer M-1）：guard 对但 RefTag 错 → Media REF_TAG (0x84) 而非 0x82 ──
+    // 盘上 tuple 是为 lba=5 算的（ref_tag=5），却存在 lba=0：guard 仍对（data 未变），
+    // 但 ref_tag(5) != 期望(0) → RefTagFail，须报 0x84（不能恒报 guard 0x82）。
+    {
+        let mut c = sep_ns();
+        let wrong_lba_tuple = crate::pi::PiTuple::compute(&data, 5, 1).to_bytes();
+        seed(&mut c, &wrong_lba_tuple, &data);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let cqe = {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x02, 1, 0, 1, 0x4000, false, 0x64);
+            sqe.mptr = 0x5000;
+            c.dispatch_io(&mut ctx, 1, sqe, 0x64, 0, 1)
+        };
+        let cqe = cqe.expect("RefTag 不符 → 同步 Media 错误");
+        assert_eq!(
+            cqe_status(&cqe),
+            crate::cmd::sc::status(0x84, crate::cmd::sc::SCT_MEDIA_DATA_INTEGRITY),
+            "RefTag 失配 → Media REFERENCE_TAG_CHECK_ERR (0x0284)，非恒 guard 0x0282"
+        );
+    }
+}
+
 /// **C1① MDTS 计入 inline metadata（spec § 5.17.2.2 / § 8.x）差分 oracle** —
 /// extended-LBA（内联 metadata）的 host 传输大小 = block_bytes(data+meta)，MDTS
 /// 须计入 metadata。PI 格式 4104 B/LBA，MDTS=128 KiB：

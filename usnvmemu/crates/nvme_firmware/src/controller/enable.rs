@@ -174,6 +174,7 @@ impl NvmeController {
         self.pi_writes.clear();
         self.pi_reads.clear();
         self.sep_meta_writes.clear();
+        self.sep_meta_reads.clear();
         self.pending_fused.clear();
         self.sqe_inbox.clear();
         debug_assert!(self.pending_ios.is_empty());
@@ -184,6 +185,7 @@ impl NvmeController {
         debug_assert!(self.pi_writes.is_empty());
         debug_assert!(self.pi_reads.is_empty());
         debug_assert!(self.sep_meta_writes.is_empty());
+        debug_assert!(self.sep_meta_reads.is_empty());
         debug_assert!(self.pending_fused.is_empty());
         // AEN queue 跨 reset 不保留 (NVMe spec § 5.2 "Implicit Aborts on Reset")
         self.aen_pending.clear();
