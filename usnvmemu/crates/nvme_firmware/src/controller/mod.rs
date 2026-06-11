@@ -770,6 +770,12 @@ pub(super) struct Namespace {
     /// ZNS NS 的 CSI=0x02，Identify NS CNS=0x05 返 ZNS-specific 字段；
     /// Read/Write 必须遵循 SWR（Sequential Write Required）。
     pub(super) zns: Option<ZnsState>,
+    /// **B6b（separate metadata，spec § 8.3 / FLBAS.inband_metadata）** — metadata
+    /// 布局：true = extended LBA（内联，MSET=1，host buffer data+meta 连续 / PRACT=1
+    /// 时 controller 自动插）；false = separate buffer（MSET=0，metadata 走独立 MPTR
+    /// buffer）。仅 meta_size>0 时有意义。默认 true（既有内联 NS）。Format MSET 设置；
+    /// Identify NS FLBAS bit4 = (meta_size>0 && meta_inline)。
+    pub(super) meta_inline: bool,
     /// **D（test-only fault injection）** — 强制 `flush()` 返 Err，用来测
     /// shutdown-flush 失败 → CSTS.CFS 路径（真 file sync_all 难在单测里失败）。
     /// production 恒 false（仅 `#[cfg(test)]` 置位）。
@@ -2059,6 +2065,7 @@ impl NvmeController {
                     nswp: 0,
                     attached: true,
                     zns: None,
+                    meta_inline: true,
                     force_flush_err: false,
                 },
             );

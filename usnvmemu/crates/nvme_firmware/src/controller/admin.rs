@@ -143,6 +143,7 @@ impl NvmeController {
                             ns.meta_size,
                             ns.pi_type,
                             ns.pi_first,
+                            ns.meta_inline,
                         )
                     }
                     0x01 => {
@@ -955,20 +956,15 @@ impl NvmeController {
                     );
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
-                // **B6a — MSET 极性修正（spec § 5.14 Format MSET / FLBAS
-                // inband_metadata）**：mset=1 = metadata 作 extended LBA 内联（本
-                // firmware 支持）；mset=0 = metadata 走独立 MPTR buffer（B6b，尚未
-                // 实现）。仅当所选 LBAF 含 metadata（LBAF[1]，MS=8）时 mset 有意义；
-                // 无 meta（LBAF[0/2]，MS=0）时 mset 被忽略。旧版极性反置（拒内联的
-                // mset=1、收 mset=0 当内联=实为 separate）与 spec / 真 driver 不兼容。
+                // **B6a 极性 + B6b separate buffer（spec § 5.14 Format MSET /
+                // FLBAS inband_metadata）**：mset=1 = metadata 作 extended LBA 内联；
+                // mset=0 = metadata 走独立 MPTR buffer（B6b 已实现 PRACT=0 host-PI 路径）。
+                // 仅当所选 LBAF 含 metadata（LBAF[1]，MS=8）时 mset 有意义；无 meta
+                // （LBAF[0/2]，MS=0）时 mset 被忽略（meta_inline 取默认 true 无影响）。
                 let lbaf_has_meta = lbafl == 1;
-                if lbaf_has_meta && mset == 0 {
-                    tracing::warn!(
-                        lbafl,
-                        "Format rejected: separate metadata buffer (MSET=0) 未实现，仅支持 MSET=1 extended LBA"
-                    );
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
-                }
+                // meta_inline：有 meta 时由 mset 决定（1=内联/extended，0=separate）；
+                // 无 meta 时取 true（无意义，FLBAS bit4 仍为 0 因 meta_size=0）。
+                let new_meta_inline = !lbaf_has_meta || mset == 1;
                 // **Phase K1 + 2026-06-09** 计算新 LBAF + PI 配置。
                 // LBAF: 0→(512B,no-meta) / 1→(4K,8B-meta) / 2→(4K,no-meta)。
                 let (new_lbads, new_meta_size): (u8, u8) = match lbafl {
@@ -1101,6 +1097,7 @@ impl NvmeController {
                         ns.meta_size = new_meta_size;
                         ns.pi_type = new_pi_type;
                         ns.pi_first = new_pi_first;
+                        ns.meta_inline = new_meta_inline;
                         // total_lba 按新 block_bytes 重算
                         ns.total_lba = size / ns.block_bytes();
                         tracing::info!(
@@ -1153,6 +1150,7 @@ impl NvmeController {
                         ns.meta_size = new_meta_size;
                         ns.pi_type = new_pi_type;
                         ns.pi_first = new_pi_first;
+                        ns.meta_inline = new_meta_inline;
                         ns.total_lba = size / ns.block_bytes();
                         tracing::info!(
                             nsid = target_nsid,

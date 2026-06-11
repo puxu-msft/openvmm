@@ -803,6 +803,7 @@ impl IdentifyNamespace {
         meta_size: u8,
         pi_type: u8,
         pi_first: bool,
+        meta_inline: bool,
     ) -> Vec<u8> {
         let mut ns = SpecIdentifyNamespace::new_zeroed();
         ns.nsze = total_lba;
@@ -810,10 +811,9 @@ impl IdentifyNamespace {
         ns.nuse = 0;
         ns.nsfeat = 0x01.into(); // THINP
         // FLBAS bits 3:0 = current LBAF index；bit 4 (inband_metadata) = 1 当
-        // metadata 内联（extended LBA）。**B6a 极性修正**：本 firmware 的 metadata
-        // 格式(LBAF[1])一律内联存储，故 meta_size>0 时 bit4=1（spec FLBAS /
-        // nvme_spec Flbas.inband_metadata：1=in-band/extended）。旧版恒置 0，错报
-        // "separate buffer" 而实际内联 → 真 driver 会按 separate 给 MPTR、布局失配。
+        // metadata **内联**（extended LBA）。**B6a 极性修正 + B6b**：内联格式
+        // (meta_size>0 && meta_inline) 报 bit4=1；separate buffer(MSET=0) 报 bit4=0
+        // （nvme_spec Flbas.inband_metadata：1=in-band/extended）。旧版恒置 0 错报。
         // **2026-06-09** — 3 个 LBAF：0=512B/no-meta、1=4K+8B-meta(PI)、2=纯 4K/no-meta。
         // flbas 需用 (lbads, meta_size) 双因素区分 index 1 vs 2（都 lbads=12）。
         let lbaf_idx: u8 = match (lbads, meta_size) {
@@ -822,7 +822,11 @@ impl IdentifyNamespace {
             (12, _) => 1, // 4K + metadata
             _ => 0,
         };
-        let inband_bit: u8 = if meta_size > 0 { 0x10 } else { 0 };
+        let inband_bit: u8 = if meta_size > 0 && meta_inline {
+            0x10
+        } else {
+            0
+        };
         ns.flbas = (lbaf_idx | inband_bit).into();
         ns.nlbaf = 2; // 3 LBAF slots（0-based：nlbaf = 格式数 - 1）
         ns.lbaf[0] = nvme_spec::nvm::Lbaf::new()
@@ -907,7 +911,7 @@ mod tests {
     /// IdentifyNamespace LBAF[0] 必须落在 offset 128，spec § 5.17.2.1。
     #[test]
     fn identify_namespace_byte_layout() {
-        let buf = IdentifyNamespace::build_v2_bytes(2097152, 9, 0, 0, true); // 1 GiB / 512
+        let buf = IdentifyNamespace::build_v2_bytes(2097152, 9, 0, 0, true, true); // 1 GiB / 512
         assert_eq!(buf.len(), 4096);
         // NSZE/NCAP/NUSE u64 LE @ 0/8/16
         assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 2097152);

@@ -1006,6 +1006,7 @@ fn format_mset_flbas_polarity() {
             ns.meta_size,
             ns.pi_type,
             ns.pi_first,
+            ns.meta_inline,
         )[26]
     }
     let mut cap = CaptureTransport::with_start_token(0x100);
@@ -1032,18 +1033,23 @@ fn format_mset_flbas_polarity() {
         assert_eq!(flbas(ns) & 0x0f, 1, "FLBAS index = LBAF[1]");
     }
 
-    // ② LBAF[1] + MSET=0（独立 buffer）→ INVALID_FIELD（B6b 未实现）。
+    // ② LBAF[1] + MSET=0（独立 buffer，B6b）→ 接受；meta_inline=false，FLBAS bit4=0。
     {
         let mut c = make_ctrl_with_tmp("fmt_separate");
         let mut ctx = DeviceCtx::new(&mut cap);
         let cqe = c
             .dispatch_admin(&mut ctx, fmt_sqe(1, 1, 0, 1), 0x33, 0, 0)
             .expect("Format 同步返 CQE");
+        assert_eq!(cqe_status(&cqe), 0, "LBAF[1] MSET=0（separate，B6b）应接受");
+        let ns = &c.namespaces[&1];
+        assert!(!ns.meta_inline, "MSET=0 → meta_inline=false（separate）");
         assert_eq!(
-            cqe_status(&cqe),
-            crate::cmd::sc::INVALID_FIELD,
-            "MSET=0 独立 metadata buffer 未实现 → INVALID_FIELD"
+            (ns.lbads, ns.meta_size, ns.pi_type),
+            (12, 8, 1),
+            "格式已应用"
         );
+        assert_eq!(flbas(ns) & 0x10, 0, "separate 格式 FLBAS.inband_metadata=0");
+        assert_eq!(flbas(ns) & 0x0f, 1, "FLBAS index 仍 = LBAF[1]");
     }
 
     // ③ LBAF[2]（纯 4K no-meta）+ MSET=0 → 接受（无 meta，MSET 被忽略），FLBAS bit4=0。
@@ -3771,7 +3777,7 @@ fn identify_controller_advertises_awun() {
 /// NPDG/NPDA (NVMe NVM CS § 5.17.2.1)。Driver 用来决定 alignment/granularity。
 #[test]
 fn identify_namespace_advertises_atomic_granularity() {
-    let buf = IdentifyNamespace::build_v2_bytes(2097152, 9, 0, 0, true);
+    let buf = IdentifyNamespace::build_v2_bytes(2097152, 9, 0, 0, true, true);
     // SpecIdentifyNamespace 字段顺序：nsze@0 ncap@8 nuse@16 nsfeat@24
     //   nlbaf@25 flbas@26 mc@27 dpc@28 dps@29 nmic@30 rescap@31 fpi@32
     //   dlfeat@33 nawun@34 nawupf@36 nacwu@38 nabsn@40 nabo@42 nabspf@44
@@ -4141,17 +4147,17 @@ fn set_max_queue_entries_validates_and_writes_mqes() {
 #[test]
 fn identify_ns_advertises_pure_4k_lbaf() {
     // 512B NS → flbas=0（no meta，inband bit=0）
-    let b512 = IdentifyNamespace::build_v2_bytes(2048, 9, 0, 0, false);
+    let b512 = IdentifyNamespace::build_v2_bytes(2048, 9, 0, 0, false, true);
     assert_eq!(b512[26], 0, "512B → flbas=0");
     // 4K+meta NS → flbas index=1 + inband_metadata bit4=1（内联，B6a 极性修正：
     // 旧版恒 0 错报 separate buffer；spec/nvme_spec Flbas.inband_metadata=1=内联）
-    let b4km = IdentifyNamespace::build_v2_bytes(2048, 12, 8, 0, false);
+    let b4km = IdentifyNamespace::build_v2_bytes(2048, 12, 8, 0, false, true);
     assert_eq!(
         b4km[26], 0x11,
         "4K+meta → flbas index=1 + inband_metadata(bit4)=1"
     );
     // 纯 4K NS → flbas=2（no meta，inband bit=0）
-    let b4k = IdentifyNamespace::build_v2_bytes(2048, 12, 0, 0, false);
+    let b4k = IdentifyNamespace::build_v2_bytes(2048, 12, 0, 0, false, true);
     assert_eq!(b4k[26], 2, "纯 4K → flbas=2");
     assert_eq!(b4k[25], 2, "nlbaf=2（3 个格式）");
     // LBAF[2] @ 128+8：ms(bytes 0:1)=0, lbads(byte 2)=12
@@ -4181,8 +4187,22 @@ fn multi_ns_independent_format() {
     // NS1 仍 512B（flbas=0），NS2 纯 4K（flbas=2）
     let n1 = c.namespaces.get(&1).unwrap();
     let n2 = c.namespaces.get(&2).unwrap();
-    let id1 = IdentifyNamespace::build_v2_bytes(n1.total_lba, n1.lbads, n1.meta_size, 0, false);
-    let id2 = IdentifyNamespace::build_v2_bytes(n2.total_lba, n2.lbads, n2.meta_size, 0, false);
+    let id1 = IdentifyNamespace::build_v2_bytes(
+        n1.total_lba,
+        n1.lbads,
+        n1.meta_size,
+        0,
+        false,
+        n1.meta_inline,
+    );
+    let id2 = IdentifyNamespace::build_v2_bytes(
+        n2.total_lba,
+        n2.lbads,
+        n2.meta_size,
+        0,
+        false,
+        n2.meta_inline,
+    );
     assert_eq!(id1[26], 0, "NS1 flbas=0 (512B)");
     assert_eq!(id2[26], 2, "NS2 flbas=2 (纯 4K) — per-NS 独立");
 }

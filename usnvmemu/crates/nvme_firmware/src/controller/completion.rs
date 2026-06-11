@@ -1176,6 +1176,7 @@ impl NvmeController {
                                                 nswp: 0,
                                                 attached: true,
                                                 zns: None,
+                                                meta_inline: true,
                                                 force_flush_err: false,
                                             },
                                         );
