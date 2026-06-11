@@ -14,7 +14,7 @@ guest 内存零拷贝）的设计文档**之前**，先用 POC 验证它的承�
 | 2 | `poc2_msix_eventfd.py` | client 经 SET_IRQS 配 eventfd，firmware 完成命令后**触发 MSI-X 信号** | 本地 | **✅ PASSED** |
 | 3 | `poc3_guest_ram_fd.py` | OpenHCL VTL2 经 `/dev/mshv_vtl_low` 拿**真 guest RAM** fd 并自映射 | 需真 VTL2 | ⏳ **ENV-GATED**（本地确认设备缺席符合预期；探针就绪） |
 | 4 | `poc4_cvm_convert_revoke.py` | （Spec B/CVM）owner 无法单方面撤销他进程的共享映射 ⟹ 必须 revoke-before-convert | 本地（模型） | **✅ PASSED**（复现审计 CRITICAL 根因） |
-| 5 | （调查，见下 §POC-5） | OpenHCL VTL2 能否承载独立 firmware 进程 + AF_UNIX | 代码调查 | ⚠️ **发现架构冲突**（见下） |
+| 5 | （调查，见下 §POC-5） | OpenHCL VTL2 能否承载独立 firmware 进程 + AF_UNIX | 代码调查 | ✅ **可行（有先例）** |
 
 公共逻辑在 `poclib.py`（build/spawn、SCM_RIGHTS fd 传递、DMA_MAP、SET_IRQS、NVMe
 bring-up），各 POC 复用；`poclib` 复用 interop_py 的 `vfio_proto` 作基础 wire。
@@ -56,27 +56,26 @@ owner 枚举/强制撤销他人映射的 API。⟹ OpenHCL `change_host_visibili
 out-of-process mmap 结构性失明 → **CVM 必须 revoke-before-convert**（sidecar 显式
 munmap+ack）。证明 Spec B 的 RED 判断正确。（模型不复现硬件加密，只证根本不变量。）
 
-## POC-5：AF_UNIX VTL2 独立进程可行性 ⚠️ 发现架构冲突
+## POC-5：AF_UNIX VTL2 独立进程可行性 ✅ 可行（有先例）
 
-代码调查（`openhcl/underhill_core`、`openhcl/diag_server`、`vp.rs`）发现：
+代码调查（`openhcl/underhill_core`、`openhcl/diag_server`、`vp.rs`）：
 
-1. **"sidecar" 在 OpenHCL 已占用**：`sidecar_enabled()` / `spawn_sidecar_vp()` 指
-   sidecar **VP**（offline CPU 的内核特性），**不是**用户态进程。我们别用这个词。
-2. **underhill 是单进程模型**：所有 `spawn` 都是 `task::spawn`（async task）；**无
-   `Command::new`/fork 启动独立用户态进程的先例**。
-3. **AF_UNIX 在 VTL2 可用**：`diag_server` 用 `UnixListener::bind`——但那是 underhill
-   自己进程内 bind，不是与另一进程通信。
+1. **underhill 会起独立用户态子进程**：`livedump.rs` 用 `std::process::Command::new`
+   起 `underhill-crash` / `underhill-dump`；`lib.rs` 起 vnc / gdb host 进程。**独立
+   进程在 VTL2 有先例。**
+2. **VTL2 能 exec 辅助二进制**：`diag_server::handle_exec` 经 `pal::unix::process::Builder`
+   执行任意命令（即 `ohcldiag-dev` 的 exec 路径）——这也是把 POC-3 探针送进 VTL2 的途径。
+3. **AF_UNIX 在 VTL2 可用**：`diag_server` 用 `UnixListener::bind`。
+4. **命名提醒**："sidecar" 在 OpenHCL 已指 sidecar **VP**（`sidecar_enabled()`/
+   `spawn_sidecar_vp()`，offline CPU 内核特性），**别用这个词**指 firmware 进程。
 
-**结论（必须先与用户确认，不埋进设计）**：整个"vfio-user client + AF_UNIX + SCM_RIGHTS
-fd-passing"前提是 **firmware 作独立进程**。但 OpenHCL 单进程架构下，更自然的做法是把
-firmware **链接进 underhill**（像所有 OpenHCL 设备一样作 crate/task）——那样它**直接持
-GuestMemory**，零拷贝、根本不需要 vfio-user 协议/AF_UNIX/fd-passing。即：
+> **更正**：本节初版曾误判"underhill 单进程、无独立进程先例、与架构相抵"——那是第一遍
+> grep 过度过滤（漏了 `livedump.rs` 的 `Command::new`）造成的错误结论。实测代码证明：
+> **firmware 作 VTL2 独立进程 + AF_UNIX 可行且有先例**，并不与 OpenHCL 架构相抵。
 
-> "vfio-user for OpenHCL（独立进程 + AF_UNIX）" 与 OpenHCL 单进程模型相抵；
-> in-process 链接是更顺架构的零拷贝路径，但那不是 vfio-user，而是"把 controller
-> 链进 underhill"（≈ 本地版 pcie_remote）。
-
-这个 fork 改变了 Spec A 的根本形态，POC-first 在写设计前把它挖了出来。
+**结论**：A（in-process 链接）vs B（独立进程 + vfio-user）**两者都可行**，不是"B 被阻塞"，
+而是真实的设计取舍（in-process 最简、无协议开销 / 独立进程得统一 vfio-user 协议 + 进程隔离）。
+该取舍 + 真 VTL2 的 POC-3（guest RAM fd 导出）是定 Spec A 形态前要补的两块。
 
 ---
 
@@ -86,5 +85,6 @@ GuestMemory**，零拷贝、根本不需要 vfio-user 协议/AF_UNIX/fd-passing�
   **本地证实可行**，且校准了 client wire 细节。
 - **真 guest RAM fd 导出**（POC-3）—— env-gated，待真 VTL2。
 - **CVM**（POC-4）—— 审计 RED 判断**实测验证**，naive 直访不安全。
-- **架构前提**（POC-5）—— ⚠️ 独立进程 vs in-process 链接是未决的根本 fork，
-  **写 Spec A 前必须先定**。
+- **架构前提**（POC-5）—— ✅ 独立进程 + AF_UNIX 在 VTL2 **可行且有先例**（underhill
+  已 spawn crash/dump/vnc/gdb 进程；diag 可 exec）。A（in-process）vs B（独立进程）是
+  真实设计取舍、非阻塞。**写 Spec A 前需定 A/B + 补真 VTL2 的 POC-3。**
