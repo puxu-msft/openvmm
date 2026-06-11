@@ -11,7 +11,8 @@
 //! - `RegionRead` / `RegionWrite` — 直接调 [`PcieDevice::mmio_read/write`]
 //! - `DeviceReset` — 调 [`PcieDevice::reset`]
 //!
-//! 仅 DMA_MAP/UNMAP/DMA_READ/DMA_WRITE/SET_IRQS 留给 U4/U5。
+//! DMA_MAP/UNMAP/DMA_READ/DMA_WRITE 现由 [`crate::dma`]、SET_IRQS 由
+//! [`crate::irq`] 实现，并经本 session 的 `dispatch_one` 派发（见下）。
 
 use crate::framing::FramingError;
 use crate::framing::Message;
@@ -55,9 +56,11 @@ pub(crate) const MAX_REGION_ACCESS: usize = crate::handshake::SERVER_MAX_DATA_XF
 /// region；DMA_READ/WRITE 通过 [`crate::dma::dma_read_sync`] / `dma_write_sync`
 /// 走真往返。
 ///
-/// **Phase U5**：内部持 [`crate::IrqVectors`] 收 MSI-X eventfd；session
-/// 的 `fire_interrupt(idx)` 方法（U5 后由 [`VfioUserTransport`] 调）会
-/// 往该 eventfd 写 8 byte u64=1 触发 guest 中断。
+/// **Phase U5**：内部持 [`crate::IrqVectors`] 收 MSI-X eventfd。
+/// `VfioUserSession` 自身 `impl pcie_device_core::Transport`，其
+/// `fire_interrupt(idx)` 往对应向量 eventfd 写 8 byte u64=1 触发 guest 中断；
+/// 设备经 `DeviceCtx` 反向发起的 DMA / 中断即走这条 impl（无独立
+/// `VfioUserTransport` 类型）。
 ///
 /// **Phase U5-polish (review H1)**：DMA 走 *同步完成 + pending 队列* —
 /// `dma_read` 内部完成 wire 往返后把 `(token, data)` 推 `pending_completions`，
@@ -66,7 +69,7 @@ pub(crate) const MAX_REGION_ACCESS: usize = crate::handshake::SERVER_MAX_DATA_XF
 /// 丢 callback 而 hang。
 pub struct VfioUserSession {
     stream: UnixStream,
-    #[allow(dead_code)] // U5 之后会用 negotiated caps 限速
+    #[allow(dead_code)] // 暂未读取；保留以便后续按 negotiated caps（max_data_xfer_size）限速
     negotiated: Negotiated,
     /// DMA_MAP 通告的所有 guest RAM region。
     pub(crate) dma_table: crate::dma::DmaTable,
@@ -262,7 +265,7 @@ impl VfioUserSession {
                 &msg,
                 no_reply,
             ),
-            // U5 实现：
+            // SET_IRQS：配置 MSI-X 向量 eventfd（DATA_EVENTFD 收 fd / DATA_NONE 清表）。
             Command::DeviceSetIrqs => {
                 let mut msg = msg;
                 crate::irq::handle_set_irqs(
@@ -724,7 +727,7 @@ impl pcie_device_core::Transport for VfioUserSession {
                     gpa = format_args!("{gpa:#x}"),
                     len,
                     bytes = data.len(),
-                    "VfioUserTransport.dma_read OK; enqueue on_dma_complete"
+                    "VfioUserSession.dma_read OK; enqueue on_dma_complete"
                 );
                 self.pending_completions.push_back(DmaCompletion {
                     token,
@@ -735,7 +738,7 @@ impl pcie_device_core::Transport for VfioUserSession {
             }
             Err(e) => {
                 tracing::warn!(error = %e, gpa = format_args!("{gpa:#x}"), len,
-                    "VfioUserTransport.dma_read failed");
+                    "VfioUserSession.dma_read failed");
                 // **review M-2** — 用 alloc 取**唯一** token（advance），避免与成功
                 // 路径 token 撞导致 pending_ios 错配。
                 let token = crate::dma::alloc_server_msg_id(&mut self.next_server_msg_id) as u64;
@@ -764,7 +767,7 @@ impl pcie_device_core::Transport for VfioUserSession {
                     token,
                     gpa = format_args!("{gpa:#x}"),
                     bytes = data.len(),
-                    "VfioUserTransport.dma_write OK; enqueue on_dma_complete"
+                    "VfioUserSession.dma_write OK; enqueue on_dma_complete"
                 );
                 self.pending_completions.push_back(DmaCompletion {
                     token,
@@ -775,7 +778,7 @@ impl pcie_device_core::Transport for VfioUserSession {
             }
             Err(e) => {
                 tracing::warn!(error = %e, gpa = format_args!("{gpa:#x}"),
-                    "VfioUserTransport.dma_write failed");
+                    "VfioUserSession.dma_write failed");
                 // **review M-2** — 唯一 token（advance），防与成功路径撞。
                 let token = crate::dma::alloc_server_msg_id(&mut self.next_server_msg_id) as u64;
                 self.pending_completions.push_back(DmaCompletion {
@@ -1462,7 +1465,7 @@ mod tests {
         assert_eq!(last_reset, 0);
     }
 
-    /// Phase U5 后 SET_IRQS 真处理（DATA_NONE+count=0 → 清向量表 OK reply）。
+    /// SET_IRQS 处理：DATA_NONE+count=0 → 清向量表，回 OK reply。
     #[test]
     fn set_irqs_clear_returns_ok() {
         let (server, mut client) = pair();

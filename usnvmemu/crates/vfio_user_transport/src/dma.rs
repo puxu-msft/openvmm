@@ -16,9 +16,11 @@
 //!   用 server-initiated msg_id（顶位 `0x8000` 起始便于日志区分）。
 //!
 //! - **同步阻塞**：`dma_read` 内部 `write request → read reply` 完成后才返
-//!   token；上游 [`PcieDevice`] 拿到 token 后立刻 `on_dma_complete` 被 caller
-//!   触发（U5 中由 [`VfioUserTransport`] 自己投递）。Phase U4 暂不接 PcieDevice
-//!   callback；仅提供 `dma_read_sync` / `dma_write_sync` 让 session handler 用。
+//!   token。[`VfioUserSession`](crate::VfioUserSession)（它自身 `impl Transport`）
+//!   在 `dma_read`/`dma_write` 里调本模块的 `dma_read_sync` / `dma_write_sync`
+//!   完成 wire 往返，把 `(token, data)` 推 `pending_completions`，再由 `pump`
+//!   主循环投给 [`PcieDevice`] 的 `on_dma_complete`。本模块只提供 sync 原语，
+//!   不直接持 PcieDevice callback。
 //!
 //! - **bound 校验**：DMA_MAP 表查 (addr, len) 是否落在某个映射区间；不在则返
 //!   `EFAULT`（vfio-user 标准行为）。
@@ -526,10 +528,10 @@ pub(crate) fn read_reply_deferring_inbound(
 /// caller 当 DMA 完成 token）；`data` 是 guest mem 字节。
 ///
 /// **review H1/H2** — vfio-user spec 两方向 msg_id 独立、不要求严格请求/应答
-/// 顺序；client 完全可能在我们等 reply 时插一条 REGION_READ。本函数本身
-/// 用 [`read_message`] *直接* 拿下一帧并按 msg_id+cmd 校验；若 caller 有
-/// 多路复用需求（U5 VfioUserTransport 需要在等 reply 期间继续处理 inbound
-/// cmd），应改用更上层的 session 方法走 wait-for-reply 循环（U5 加）。
+/// 顺序；client 完全可能在我们等 reply 时插一条 REGION_READ。本函数通过
+/// `read_reply_deferring_inbound` 拿 reply：匹配本次 `msg_id` 的帧才返回，
+/// 其余入站帧 defer 到 `inbound_queue`，由 session pump 后续处理 —— 多路复用
+/// 已在此满足，无需上层再套 wait-for-reply 循环。
 ///
 /// **review H2** — 校验 `reply.header.msg_id == msg_id` + `cmd == DmaRead`，
 /// 并把 `msg_id` 返给 caller，token 由它直接持有不依赖 `wrapping_sub(1)`。
@@ -623,8 +625,7 @@ pub fn dma_write_sync(
 
 /// **review H2** — 公共 DMA reply 校验：msg_id + cmd + error flag。
 ///
-/// 提取为 pub(crate) 让 U5 [`VfioUserTransport`] 在 multiplexed wait 循环中
-/// 复用同一套校验逻辑。
+/// 提取为 pub(crate) 让 `dma_read_sync` / `dma_write_sync` 复用同一套校验逻辑。
 pub(crate) fn validate_dma_reply(
     reply: &crate::framing::Message,
     expected_id: u16,
