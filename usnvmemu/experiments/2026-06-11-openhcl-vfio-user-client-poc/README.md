@@ -16,7 +16,7 @@ guest 内存零拷贝）的设计文档**之前**，先用 POC 验证它的承�
 | 4 | `poc4_cvm_convert_revoke.py` | （Spec B/CVM）owner 无法单方面撤销他进程的共享映射 ⟹ 必须 revoke-before-convert | 本地（模型） | **✅ PASSED**（复现审计 CRITICAL 根因） |
 | 5 | （调查，见下 §POC-5） | OpenHCL VTL2 能否承载独立 firmware 进程 + AF_UNIX | 代码调查 | ✅ **可行（有先例）** |
 | 6 | `poc6_fd_pass_mmap/` | 进程 A open mshv_vtl_low → SCM_RIGHTS 传 fd → 进程 B（非自开）mmap 真 guest RAM | **真 OpenHCL VM** | ✅ **PASSED**（seam 成立，但传的是全-GPA 设备 fd）|
-| 7 | `poc7_rpm_vmwp.ps1` / `poc7b_livekd_dump.ps1` | **host 进程**经 RPM(vmwp)/livekd hypercall **读 guest RAM** —— 纠之前过宽的"host 够不到"结论；oracle = GPA 0x100000 处 marker 0x9E66...9E66 | 真 OpenHCL VM (admin) | ⏳ **WAITING admin run**（脚本就绪，须 Windows 管理员 PowerShell 执行）|
+| 7 | `poc7_rpm_vmwp.ps1` / `poc7b_livekd_dump.ps1` | **host 进程**经 RPM(vmwp)/livekd hypercall **读 guest RAM** —— 纠之前过宽的"host 够不到"结论；oracle = GPA 0x100000 处 marker 0x9E66...9E66 | 真 OpenHCL VM (admin) | **7a（RPM）**：OpenProcess OK 但 vmwp 总 commit 仅 32 MiB、未扫到 marker → **(d) OpenHCL 不把 guest RAM 映入 vmwp VA**（LiveCloudKd 2010 模型不适用）。**7b（livekd hypercall）⏳ 待 admin 跑**——hypercall 路径不依赖 vmwp VA，仍可能 PASS |
 
 公共逻辑在 `poclib.py`（build/spawn、SCM_RIGHTS fd 传递、DMA_MAP、SET_IRQS、NVMe
 bring-up），各 POC 复用；`poclib` 复用 interop_py 的 `vfio_proto` 作基础 wire。
