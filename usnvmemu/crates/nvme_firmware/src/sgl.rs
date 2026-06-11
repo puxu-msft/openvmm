@@ -93,6 +93,31 @@ impl SglDescriptor {
     }
 }
 
+/// **CMB-SGL spec-completeness 共享 classifier** — 把一个 SGL descriptor 的
+/// sub_type（byte 15 低 nibble）映射到"是否非法 + 精确 NVMe Status Code"。
+///
+/// 三条 SGL 路径共用本判据，使**同一非法 sub_type 跨路径返同一 SC**，不再漂移：
+/// - `parse_sgl_list`（PSDT=10 segment 页里的 Data Block descriptor）
+/// - `controller/io.rs::resolve_data_pointers`（PSDT=01 inline 单 Data Block）
+/// - `controller/io.rs::validate_segment_pointer`（PSDT=10 SGL1 / chain continuation 指针）
+///
+/// 映射（spec § 4.4 SGL Descriptor sub-type）：
+/// - `0`（Address，host 内存）→ `None`：合法，放行。
+/// - `1`（Offset，CMB-relative）→ `Some(SGL_INVALID_USE_OF_CMB)` (0x12)：本 controller
+///   **无 CMB**（Identify/CMBLOC/CMBSZ 全 0），其 address 字段是 CMB 内偏移而非 GPA，
+///   放行会被误当 GPA 解引用 → 必须以 generic status 0x12 拒（spec generic status 0x12
+///   "SGL Invalid Use of CMB"）。
+/// - `≥2`（reserved/vendor）→ `Some(SGL_DESCRIPTOR_TYPE_INVALID)` (0x11)：本教学实现
+///   一律以 Descriptor Type Invalid 拒。
+pub(crate) fn subtype_to_sc(sub_type: u8) -> Option<u16> {
+    use crate::cmd::sc;
+    match sub_type {
+        0 => None,
+        1 => Some(sc::SGL_INVALID_USE_OF_CMB),
+        _ => Some(sc::SGL_DESCRIPTOR_TYPE_INVALID),
+    }
+}
+
 /// 解析一段 SGL list（已通过 DMA-read 拿到 raw bytes），按 16-byte 切片
 /// 返回所有 descriptor。caller 负责处理 Segment chain（递归 DMA-read 下
 /// 一段）+ Last Segment 终止 + bit bucket skip。
@@ -119,16 +144,12 @@ pub(crate) fn parse_sgl_list(buf: &[u8]) -> Result<Vec<SglDescriptor>, u16> {
         let arr: [u8; 16] = chunk.try_into().unwrap();
         let desc = SglDescriptor::parse(&arr).ok_or(sc::SGL_DESCRIPTOR_TYPE_INVALID)?;
         // ── 逐 descriptor sub_type 校验（spec § 4.4 SGL Descriptor sub-type）──
-        // 本 controller **无 CMB**（Identify/CMBLOC/CMBSZ 全 0），故 sub_type=1
-        // (Offset, CMB-relative) 的 SGL descriptor 永远非法：其 address 字段是
-        // CMB 内偏移而非 GPA，若放行会被误当 GPA 解引用 → 必须以 spec generic
-        // status 0x12 = SGL Invalid Use of CMB 拒绝（§ generic status 0x12）。
-        // sub_type≥2 是 reserved/vendor，本教学实现一律以 Descriptor Type Invalid
-        // (0x11) 拒。仅 sub_type=0 (Address, host 内存) 放行。
-        match desc.sub_type {
-            0 => {}
-            1 => return Err(sc::SGL_INVALID_USE_OF_CMB),
-            _ => return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID),
+        // 经共享 `subtype_to_sc` classifier 判（三条 SGL 路径同判据，见其 doc）：
+        // sub_type=0 (Address) 放行；sub_type=1 (Offset, CMB-relative) → 本 controller
+        // 无 CMB，address 是 CMB 内偏移而非 GPA，返 generic status 0x12 = SGL Invalid
+        // Use of CMB；sub_type≥2 (reserved/vendor) → Descriptor Type Invalid (0x11)。
+        if let Some(err_sc) = subtype_to_sc(desc.sub_type) {
+            return Err(err_sc);
         }
         out.push(desc);
     }
@@ -309,6 +330,27 @@ mod tests {
         let mut bad = vec![0u8; 16];
         bad[15] = 0x60;
         assert!(parse_sgl_list(&bad).is_err());
+    }
+
+    /// **共享 classifier 单测** — `subtype_to_sc` 是三条 SGL 路径（parse_sgl_list /
+    /// resolve_data_pointers / validate_segment_pointer）共用的 sub_type→SC 判据；
+    /// 直锁其映射，防三处漂移。值经 `cmd::sc`（已 M1-anchor 到 nvme_spec）间接锚定。
+    #[test]
+    fn subtype_to_sc_maps_each_subtype() {
+        use crate::cmd::sc;
+        // 0 = Address（host 内存）→ 合法，None。
+        assert_eq!(subtype_to_sc(0), None);
+        // 1 = Offset（CMB-relative）→ SGL_INVALID_USE_OF_CMB (0x12)。
+        assert_eq!(subtype_to_sc(1), Some(sc::SGL_INVALID_USE_OF_CMB));
+        // ≥2 = reserved/vendor → SGL_DESCRIPTOR_TYPE_INVALID (0x11)。逐值锁，
+        // 防"只 match 2、漏 15"之类的部分实现。
+        for st in 2u8..=15 {
+            assert_eq!(
+                subtype_to_sc(st),
+                Some(sc::SGL_DESCRIPTOR_TYPE_INVALID),
+                "sub_type={st} 应返 Descriptor Type Invalid"
+            );
+        }
     }
 
     /// **CMB-SGL spec-completeness（unit anchor）** — 本 controller 无 CMB

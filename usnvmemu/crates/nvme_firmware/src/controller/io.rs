@@ -322,8 +322,10 @@ pub(crate) fn resolve_data_pointers(sqe: &Sqe) -> Result<DataPointer, u16> {
                 Some(d) => d,
                 None => return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID),
             };
-            if desc.sub_type != 0 {
-                return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID);
+            // sub_type 校验经共享 classifier（与 parse_sgl_list / validate_segment_pointer
+            // 同判据）：sub_type=1 (CMB-relative) → 0x12，≥2 (reserved) → 0x11。
+            if let Some(err_sc) = crate::sgl::subtype_to_sc(desc.sub_type) {
+                return Err(err_sc);
             }
             match desc.sgl_type {
                 crate::sgl::SglType::DataBlock => {
@@ -384,12 +386,14 @@ pub(crate) fn resolve_data_pointers(sqe: &Sqe) -> Result<DataPointer, u16> {
 pub(crate) fn validate_segment_pointer(
     desc: &crate::sgl::SglDescriptor,
 ) -> Result<(u32, bool), u16> {
-    if desc.sub_type != 0 {
+    // sub_type 校验经共享 classifier（与 parse_sgl_list / resolve_data_pointers 同判据）：
+    // sub_type=1 (CMB-relative) → SGL_INVALID_USE_OF_CMB (0x12)，≥2 (reserved) → 0x11。
+    if let Some(err_sc) = crate::sgl::subtype_to_sc(desc.sub_type) {
         tracing::warn!(
             sub_type = desc.sub_type,
             "SGL segment 指针 sub_type 非 0 (仅 Address)"
         );
-        return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID);
+        return Err(err_sc);
     }
     let is_last = match desc.sgl_type {
         crate::sgl::SglType::LastSegment => true,

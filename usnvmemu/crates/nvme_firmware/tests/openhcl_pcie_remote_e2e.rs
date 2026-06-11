@@ -2534,6 +2534,123 @@ async fn openhcl_sgl_cmb_relative_offset_rejected() -> Result<()> {
     Ok(())
 }
 
+/// **CMB-SGL spec-completeness（路径 2/3：inline PSDT=01）** — 与上一测试同一非法
+/// 输入（SGL sub_type=1，CMB-relative），但走**另一条独立代码路径**：PSDT=01 的 SQE
+/// **inline 单 Data Block** descriptor（bytes 24..40，即 prp1/prp2 字段位），由
+/// `controller/io.rs::resolve_data_pointers` 校验，而非 segment 页里的 `parse_sgl_list`。
+///
+/// 这条路径此前对**所有** sub_type≠0 一律返粗粒度 `SGL_DESCRIPTOR_TYPE_INVALID`
+/// (0x0011)；共享 `subtype_to_sc` classifier 接入后，sub_type=1 精确返
+/// `SGL_INVALID_USE_OF_CMB` (0x0012)，与 segment-页路径一致（同一非法输入跨路径同 SC）。
+///
+/// 构造：inline descriptor id_byte=0x01（type 0 Data Block + sub_type 1 Offset），
+/// length=4096 恰覆盖 1 个 4K LBA → **长度合法**，唯一拒因是 sub_type=1（隔离变量）。
+/// prp1=address，prp2 高字节(byte 15)=id、低 4 字节(bytes 8..12)=length。
+///
+/// **独立 oracle** = firmware 经真 wire 发回的 CQE 完整 16-bit status，硬编码期望 0x0012。
+///
+/// **revert-verify（已实测）**：把 `resolve_data_pointers` 的 `subtype_to_sc` 调用还原成
+/// `if desc.sub_type != 0 { return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID); }` → CQE status
+/// 变 0x0011 → 本断言 FAIL（left=0x11 right=0x12）；恢复后绿。
+#[tokio::test]
+async fn openhcl_sgl_inline_cmb_relative_offset_rejected() -> Result<()> {
+    const FRAG0_GPA: u64 = 0xC_0000;
+    const SC_SGL_INVALID_USE_OF_CMB: u16 = 0x0012; // Generic SCT=0, SC 0x12
+
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (_admin, mut io) = setup_enabled_4k_io(&driver).await?;
+
+    // inline 单 Data Block（PSDT=01）：byte 15 = 0x01（type 0 Data Block + sub_type 1
+    // Offset/CMB-relative），length=4096（合法）。prp2 = (id<<56) | length。
+    let prp1 = FRAG0_GPA;
+    let prp2 = (0x01u64 << 56) | 4096u64;
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02, // Read
+                psdt: 1,      // PSDT=01 inline SGL
+                cid: 0x73,
+                nsid: 1,
+                prp1,
+                prp2,
+                cdw10: 7, // slba=7（任意；4K NS，NLB 默认 0 → 1 个 LBA）
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("inline SGL Read with CMB-relative Data Block")?;
+    assert_eq!(
+        cqe.status, SC_SGL_INVALID_USE_OF_CMB,
+        "inline (PSDT=01) CMB-relative SGL Data Block 应返 SGL Invalid Use of CMB \
+         (full status 0x0012)，实 status={:#x}",
+        cqe.status
+    );
+
+    Ok(())
+}
+
+/// **CMB-SGL spec-completeness（路径 3/3：SGL1 segment 指针）** — 同一非法输入
+/// （sub_type=1），走**第三条独立代码路径**：PSDT=10 的 **SGL1 段指针本身**
+/// （embedded 在 prp1/prp2）携带 sub_type=1，由 `controller/io.rs::validate_segment_pointer`
+/// 校验（早于 DMA-read segment 页 → 不需提供 segment 内容）。
+///
+/// 与 `openhcl_sgl_cmb_relative_offset_rejected`（CMB-relative 在 segment 页里的 Data
+/// Block，走 `parse_sgl_list`）区别：本测试是**段指针自身**的 sub_type 非法。此前
+/// `validate_segment_pointer` 对 sub_type≠0 返 0x0011；classifier 接入后 sub_type=1
+/// 精确返 0x0012。
+///
+/// 构造：SGL1 id_byte=0x31（type 3 Last Segment + sub_type 1 Offset），seg_len=16
+/// （单 descriptor，长度合法）、type nibble=3（Last Segment，合法）→ **唯一拒因是
+/// sub_type=1**（隔离变量）。
+///
+/// **独立 oracle** = firmware CQE 完整 16-bit status，硬编码期望 0x0012。
+///
+/// **revert-verify（已实测）**：把 `validate_segment_pointer` 的 `subtype_to_sc` 还原成
+/// `if desc.sub_type != 0 { ...; return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID); }` → status
+/// 变 0x0011 → 本断言 FAIL；恢复后绿。
+#[tokio::test]
+async fn openhcl_sgl1_segment_pointer_cmb_relative_rejected() -> Result<()> {
+    const SEG_GPA: u64 = 0xA_0000;
+    const SC_SGL_INVALID_USE_OF_CMB: u16 = 0x0012; // Generic SCT=0, SC 0x12
+
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (_admin, mut io) = setup_enabled_4k_io(&driver).await?;
+
+    // SGL1 段指针：byte 15 = 0x31（type 3 Last Segment + sub_type 1 CMB-relative），
+    // seg_len=16（合法）。校验在 DMA-read segment 之前即拒 → 不需写 segment 页。
+    let prp1 = SEG_GPA;
+    let prp2 = (0x31u64 << 56) | 16u64;
+    let cqe = io
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x02, // Read
+                psdt: 2,      // PSDT=10 SGL Segment
+                cid: 0x74,
+                nsid: 1,
+                prp1,
+                prp2,
+                cdw10: 7,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("SGL Read with CMB-relative SGL1 segment pointer")?;
+    assert_eq!(
+        cqe.status, SC_SGL_INVALID_USE_OF_CMB,
+        "CMB-relative (sub_type=1) SGL1 段指针应返 SGL Invalid Use of CMB \
+         (full status 0x0012)，实 status={:#x}",
+        cqe.status
+    );
+
+    Ok(())
+}
+
 /// **O4（DBBUF / shadow doorbells）TEST 1** — shadow tail 领先于 stale MMIO doorbell。
 ///
 /// 此前 DBBUF（shadow doorbells，spec § 5.7 + § 7.13）在 **pcie_remote 这条真异步 wire
