@@ -97,18 +97,39 @@ impl SglDescriptor {
 /// 返回所有 descriptor。caller 负责处理 Segment chain（递归 DMA-read 下
 /// 一段）+ Last Segment 终止 + bit bucket skip。
 ///
-/// 返 Err 描述哪里出错；调用方按 sc::SGL_* 转 CQE。
+/// 返 `Err(u16)` 时，u16 是**精确的 NVMe Status Code**（含 SCT 高字节），caller
+/// 直接透传给 `finish_sgl_error` → CQE，无需在调用点再手挑 SC：
+/// - 字节数非 16 倍数 → `INVALID_SGL_SEGMENT_DESCRIPTOR` (0x0d)
+/// - `SglDescriptor::parse` 返 None（type 高 nibble 未识别）→ `SGL_DESCRIPTOR_TYPE_INVALID` (0x11)
+/// - sub_type=1（Offset / CMB-relative）→ `SGL_INVALID_USE_OF_CMB` (0x12)；本 controller
+///   无 CMB，故永远非法（见函数体注释）
+/// - sub_type≥2（reserved/vendor）→ `SGL_DESCRIPTOR_TYPE_INVALID` (0x11)
 ///
 /// **Phase R2a** 起已 wire：`controller/completion.rs::NvmSglFetch` 用本函数
 /// 解析 PSDT=10 segment 页里的 descriptor 数组。
-pub(crate) fn parse_sgl_list(buf: &[u8]) -> Result<Vec<SglDescriptor>, &'static str> {
+pub(crate) fn parse_sgl_list(buf: &[u8]) -> Result<Vec<SglDescriptor>, u16> {
+    // 错误现在直接返**精确 NVMe SC**（u16，含 SCT 高字节），caller 透传给 CQE，
+    // 不再在调用点手填一个粗粒度 SC——与 cmd.rs sc 模块"以 spec 源为准"同一纪律。
+    use crate::cmd::sc;
     if !buf.len().is_multiple_of(16) {
-        return Err("SGL list bytes not multiple of 16");
+        return Err(sc::INVALID_SGL_SEGMENT_DESCRIPTOR);
     }
     let mut out = Vec::with_capacity(buf.len() / 16);
     for chunk in buf.chunks_exact(16) {
         let arr: [u8; 16] = chunk.try_into().unwrap();
-        let desc = SglDescriptor::parse(&arr).ok_or("SGL descriptor type unknown")?;
+        let desc = SglDescriptor::parse(&arr).ok_or(sc::SGL_DESCRIPTOR_TYPE_INVALID)?;
+        // ── 逐 descriptor sub_type 校验（spec § 4.4 SGL Descriptor sub-type）──
+        // 本 controller **无 CMB**（Identify/CMBLOC/CMBSZ 全 0），故 sub_type=1
+        // (Offset, CMB-relative) 的 SGL descriptor 永远非法：其 address 字段是
+        // CMB 内偏移而非 GPA，若放行会被误当 GPA 解引用 → 必须以 spec generic
+        // status 0x12 = SGL Invalid Use of CMB 拒绝（§ generic status 0x12）。
+        // sub_type≥2 是 reserved/vendor，本教学实现一律以 Descriptor Type Invalid
+        // (0x11) 拒。仅 sub_type=0 (Address, host 内存) 放行。
+        match desc.sub_type {
+            0 => {}
+            1 => return Err(sc::SGL_INVALID_USE_OF_CMB),
+            _ => return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID),
+        }
         out.push(desc);
     }
     Ok(out)
@@ -288,5 +309,42 @@ mod tests {
         let mut bad = vec![0u8; 16];
         bad[15] = 0x60;
         assert!(parse_sgl_list(&bad).is_err());
+    }
+
+    /// **CMB-SGL spec-completeness（unit anchor）** — 本 controller 无 CMB
+    /// （CMBLOC/CMBSZ=0），故 sub_type=1 (Offset, CMB-relative) 的 SGL Data Block
+    /// 永远非法 → `parse_sgl_list` 必返精确 `SGL_INVALID_USE_OF_CMB` (0x12)，而非
+    /// 粗粒度的 Descriptor Type Invalid。sub_type=0 (Address) 仍 Ok。sub_type≥2
+    /// （reserved）走 Descriptor Type Invalid。
+    ///
+    /// 这是新行为的单元级锚点；e2e `openhcl_sgl_cmb_relative_offset_rejected` 在真
+    /// wire 上验同一 SC（独立 oracle = firmware CQE status 0x0012）。
+    #[test]
+    fn parse_sgl_list_rejects_cmb_relative_subtype() {
+        use crate::cmd::sc;
+        // sub_type=1（id_byte 0x01 = type 0 Data Block + sub 1 Offset）→ 0x12。
+        let mut cmb = [0u8; 16];
+        cmb[8..12].copy_from_slice(&4096u32.to_le_bytes());
+        cmb[15] = 0x01;
+        assert_eq!(
+            parse_sgl_list(&cmb).unwrap_err(),
+            sc::SGL_INVALID_USE_OF_CMB,
+            "sub_type=1 (CMB-relative) 必返 SGL_INVALID_USE_OF_CMB (0x12)"
+        );
+        // sub_type=0（id_byte 0x00 = type 0 Data Block + sub 0 Address）→ Ok。
+        let mut addr = [0u8; 16];
+        addr[8..12].copy_from_slice(&4096u32.to_le_bytes());
+        addr[15] = 0x00;
+        let ok = parse_sgl_list(&addr).expect("sub_type=0 (Address) 应 Ok");
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].sub_type, 0);
+        // sub_type=2（id_byte 0x02 = type 0 Data Block + sub 2 reserved）→ 0x11。
+        let mut rsvd = [0u8; 16];
+        rsvd[15] = 0x02;
+        assert_eq!(
+            parse_sgl_list(&rsvd).unwrap_err(),
+            sc::SGL_DESCRIPTOR_TYPE_INVALID,
+            "sub_type≥2 (reserved) 必返 SGL_DESCRIPTOR_TYPE_INVALID (0x11)"
+        );
     }
 }

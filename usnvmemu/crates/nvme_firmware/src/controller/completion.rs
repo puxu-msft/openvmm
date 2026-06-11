@@ -2035,10 +2035,12 @@ impl NvmeController {
                     // R2a：仅 Data Block。Bit Bucket → R2c；Keyed → reject。
                     let descs = match crate::sgl::parse_sgl_list(&data) {
                         Ok(d) => d,
-                        Err(e) => {
-                            tracing::warn!(op_id, err = e, "SGL segment 解析失败");
-                            // segment 字节非 16 倍数等 = segment descriptor 本身非法。
-                            self.finish_sgl_error(ctx, op_id, sc::INVALID_SGL_SEGMENT_DESCRIPTOR);
+                        Err(sc) => {
+                            // parse_sgl_list 现返精确 SC（CMB-relative sub_type=1 →
+                            // SGL_INVALID_USE_OF_CMB 0x12、非 16 倍数 → 0x0d、未知 type /
+                            // reserved sub_type → 0x11）；直接透传给 CQE，不再手填粗粒度 SC。
+                            tracing::warn!(op_id, sc, "SGL segment 解析失败");
+                            self.finish_sgl_error(ctx, op_id, sc);
                             return;
                         }
                     };
