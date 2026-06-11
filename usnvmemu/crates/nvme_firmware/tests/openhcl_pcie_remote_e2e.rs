@@ -3051,8 +3051,10 @@ async fn openhcl_dbbuf_per_queue_shadow_keying() -> Result<()> {
 /// re-create 段仍保留（证 qid 可重建且功能正常），但**明确是较弱信号**（Create 覆盖语义）；
 /// 生命周期的"删真生效"由上面的 backing-file 负 oracle 钉死。
 ///
-/// 注：本测试**不**断言"删带关联 SQ 的 CQ 返 Invalid Queue Deletion"——已核对 firmware
-/// 不强制该不变量（`DELETE_IO_CQ` 无条件删），断言它会假阳。
+/// 注：本测试的删序是 **SQ 先于 CQ**（spec § 5.6 要求删 CQ 前先删其关联 SQ）——故删
+/// qid 3 CQ 时其 SQ 已先删，firmware 的 "Invalid Queue Deletion（仍有关联 SQ）" 不变量
+/// 不会触发，两条 delete 都应 sc==0。该不变量（删带关联 SQ 的 CQ 应被拒）由专门的
+/// `openhcl_delete_cq_with_associated_sq_*` 测试覆盖，本生命周期测试不重复。
 #[tokio::test]
 async fn openhcl_delete_io_queue_lifecycle() -> Result<()> {
     // 删后做负 oracle 的目标 LBA（4K LBAF[2] 下 backing 偏移 = LBA*4096，落 4 MiB 内）。
@@ -3310,6 +3312,269 @@ async fn openhcl_delete_io_queue_lifecycle() -> Result<()> {
         "re-create 后队列 round-trip 应一致（qid 3 可重建且功能正常）"
     );
 
+    Ok(())
+}
+
+// ═══════════════════ IO 队列管理 spec 错误条件（Create/Delete IO CQ/SQ）═══════════════════
+//
+// 这组 e2e 钉死 NVMe base spec § 5.4-5.7 的 Command-Specific 错误条件——firmware 此前
+// 在这些路径或静默成功、或返通用 INVALID_FIELD。独立 oracle = firmware 经真 wire emit 的
+// 完整 16-bit CQE status（`CqeResult.status`，含 SCT 高字节）；期望值是**硬编码的 spec
+// 数值**（不 import crate::cmd::sc，与 firmware 侧常量解耦——drift 在此独立转红）。
+//
+// **SC 值校正记录**：Invalid Queue Deletion 的 SC byte = **0x0C**（→ 完整 status 0x010c），
+// 非任务书初稿的 0x08（0x08 实为 Invalid Interrupt Vector）。已据 canonical nvme_spec 校正。
+//
+// 用 qid 4/5/6（与 setup 的 qid 1、生命周期的 qid 3 都不同）+ 0x14_0000 起的空 GPA
+// （远在 GUEST_MEM_BYTES 16 MiB 内）。建队列只为行使错误条件，多数不跑真 IO。
+
+/// IO 队列管理错误条件用的完整 16-bit status（spec § 5.4-5.7；SCT=1 Command-Specific）。
+const SC_COMPLETION_QUEUE_INVALID: u16 = 0x0100; // SC 0x00 | SCT 0x01
+const SC_INVALID_QUEUE_IDENTIFIER: u16 = 0x0101; // SC 0x01 | SCT 0x01
+const SC_INVALID_QUEUE_DELETION: u16 = 0x010c; // SC 0x0c | SCT 0x01（非 0x08！）
+
+// 错误条件测试用的独立 qid / GPA（与既有布局零重叠）。
+const ERRQ_SQ_GPA: u64 = 0x14_0000;
+const ERRQ_CQ_GPA: u64 = 0x15_0000;
+
+/// **IO 队列管理 — Create CQ 重复 qid 被拒（spec § 5.4）** — 同一 qid 建两次 CQ：第二次
+/// 必须返 Command-Specific **Invalid Queue Identifier**，且**不**静默覆盖既有 CQ。
+///
+/// 独立 oracle = firmware 经真 wire emit 的完整 16-bit status。
+///
+/// **revert-verify（已实测，见报告）**：去掉 admin.rs CREATE_IO_CQ 的
+/// `if self.cqs.contains_key(&qid)` 拒绝分支 → 第二次 Create 走 `cqs.insert` 覆盖 →
+/// 返 sc==0 → 本测试 `status == 0x0101` 断言 FAIL。
+#[tokio::test]
+async fn openhcl_create_cq_duplicate_qid_rejected() -> Result<()> {
+    const QID: u16 = 4;
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (mut admin, _io1) = setup_enabled_4k_io(&driver).await?;
+
+    let cdw10_q = (QID as u32) | (((IO_Q_DEPTH - 1) as u32) << 16);
+    let mk_cq = |cid: u16| {
+        Sqe {
+            opcode: 0x05, // Create IO CQ
+            cid,
+            prp1: ERRQ_CQ_GPA,
+            cdw10: cdw10_q,
+            cdw11: 0b11, // PC | IEN，IV=0
+            ..Default::default()
+        }
+        .encode()
+    };
+    // 第一次：成功。
+    let cqe = admin
+        .submit(&driver, mk_cq(0x40))
+        .await
+        .context("首建 CQ")?;
+    assert_eq!(
+        cqe.status, 0,
+        "首次 Create CQ(qid=4) 应成功，实 status={:#x}",
+        cqe.status
+    );
+    // 第二次（同 qid）：拒，Invalid Queue Identifier。
+    let cqe = admin
+        .submit(&driver, mk_cq(0x41))
+        .await
+        .context("重复建 CQ")?;
+    assert_eq!(
+        cqe.status, SC_INVALID_QUEUE_IDENTIFIER,
+        "重复 qid Create CQ 应返 Invalid Queue Identifier (0x0101)，实 status={:#x}",
+        cqe.status
+    );
+    Ok(())
+}
+
+/// **IO 队列管理 — Create SQ 绑不存在的 CQID 被拒（spec § 5.5）** — Create IO SQ 的
+/// cdw11 高 16 位指向一个从未创建的 CQID → 必须返 Command-Specific **Completion Queue
+/// Invalid**（非通用 INVALID_FIELD）。
+///
+/// 独立 oracle = firmware 经真 wire emit 的完整 16-bit status。
+///
+/// **revert-verify（已实测，见报告）**：把 admin.rs CREATE_IO_SQ 的 CQID-不存在分支
+/// SC 从 `COMPLETION_QUEUE_INVALID` 改回 `INVALID_FIELD` → 本测试 `status == 0x0100`
+/// 断言 FAIL（实得 0x0002）。
+#[tokio::test]
+async fn openhcl_create_sq_nonexistent_cqid_rejected() -> Result<()> {
+    const QID: u16 = 5;
+    const BOGUS_CQID: u16 = 0x300; // 远超授予的 IO 队列数，必不存在
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (mut admin, _io1) = setup_enabled_4k_io(&driver).await?;
+
+    let cdw10_q = (QID as u32) | (((IO_Q_DEPTH - 1) as u32) << 16);
+    let cqe = admin
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x01, // Create IO SQ
+                cid: 0x50,
+                prp1: ERRQ_SQ_GPA,
+                cdw10: cdw10_q,
+                cdw11: 1 | ((BOGUS_CQID as u32) << 16), // PC | CQID(不存在)
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Create SQ 绑不存在 CQID")?;
+    assert_eq!(
+        cqe.status, SC_COMPLETION_QUEUE_INVALID,
+        "SQ 绑不存在 CQID 应返 Completion Queue Invalid (0x0100)，实 status={:#x}",
+        cqe.status
+    );
+    Ok(())
+}
+
+/// **IO 队列管理 — Delete 一个从未创建的 SQ 被拒（spec § 5.7）** — 删一个从未建过的 qid 的
+/// SQ → 必须返 Command-Specific **Invalid Queue Identifier**，而非无条件 success。
+///
+/// 独立 oracle = firmware 经真 wire emit 的完整 16-bit status。
+///
+/// **revert-verify（已实测，见报告）**：把 admin.rs DELETE_IO_SQ 改回无条件
+/// `self.sqs.remove(&qid)` + `Cqe::success`（删 = 恒成功）→ 删不存在的 SQ 返 sc==0 →
+/// 本测试 `status == 0x0101` 断言 FAIL。
+#[tokio::test]
+async fn openhcl_delete_nonexistent_sq_rejected() -> Result<()> {
+    const NEVER_QID: u16 = 6;
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (mut admin, _io1) = setup_enabled_4k_io(&driver).await?;
+
+    let cqe = admin
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x00, // DELETE_IO_SQ
+                cid: 0x60,
+                cdw10: NEVER_QID as u32, // cdw10 = QID（从未创建）
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("Delete 不存在的 SQ")?;
+    assert_eq!(
+        cqe.status, SC_INVALID_QUEUE_IDENTIFIER,
+        "删不存在的 SQ 应返 Invalid Queue Identifier (0x0101)，实 status={:#x}",
+        cqe.status
+    );
+    Ok(())
+}
+
+/// **IO 队列管理 — 删带关联 SQ 的 CQ 被拒；先删 SQ 再删 CQ 才成功（spec § 5.6）** —
+/// 建 CQ+SQ（SQ 绑该 CQ）后：
+///   ① 直接删 CQ → 必须返 Command-Specific **Invalid Queue Deletion**（仍有关联 SQ）；
+///   ② 删 SQ（成功）；
+///   ③ 再删 CQ（此时无关联 SQ）→ 成功；
+///   ④ 再删同一个（已消失的）CQ → **Invalid Queue Identifier**（覆盖 "CQ 不存在" 分支）。
+///
+/// 独立 oracle = firmware 经真 wire emit 的完整 16-bit status（四条断言全用）。
+///
+/// **revert-verify（已实测，见报告）**：去掉 admin.rs DELETE_IO_CQ 的
+/// `self.sqs.iter().any(|(_, sq)| sq.cq_id == qid)` 拒绝分支 → 步骤①直接删 CQ 返 sc==0 →
+/// 本测试步骤① `status == 0x010c` 断言 FAIL。
+#[tokio::test]
+async fn openhcl_delete_cq_with_associated_sq_rejected() -> Result<()> {
+    const QID: u16 = 4;
+    let (stream, _harness) = spawn_and_accept().await?;
+    let (driver, _dev) = NvmeDriver::start(stream).await?;
+    let (mut admin, _io1) = setup_enabled_4k_io(&driver).await?;
+
+    // 建一对队列（SQ 绑同 qid 的 CQ）。复用 create_io_queue_pair（含两条 sc==0 断言）。
+    let q = QueueState {
+        qid: QID,
+        sq_base: ERRQ_SQ_GPA,
+        cq_base: ERRQ_CQ_GPA,
+        depth: IO_Q_DEPTH,
+        sq_tail: 0,
+        cq_head: 0,
+        cq_phase: true,
+    };
+    driver
+        .create_io_queue_pair(&mut admin, &q, 0, 0x44, 0x45)
+        .await
+        .context("建 CQ+SQ(qid 4)")?;
+
+    // ① 直接删 CQ（SQ 仍在）→ Invalid Queue Deletion。
+    let cqe = admin
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x04, // DELETE_IO_CQ
+                cid: 0x46,
+                cdw10: QID as u32,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("删带关联 SQ 的 CQ")?;
+    assert_eq!(
+        cqe.status, SC_INVALID_QUEUE_DELETION,
+        "删带关联 SQ 的 CQ 应返 Invalid Queue Deletion (0x010c)，实 status={:#x}",
+        cqe.status
+    );
+
+    // ② 删 SQ → 成功。
+    let cqe = admin
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x00, // DELETE_IO_SQ
+                cid: 0x47,
+                cdw10: QID as u32,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("删 SQ")?;
+    assert_eq!(cqe.status, 0, "删 SQ 应成功，实 status={:#x}", cqe.status);
+
+    // ③ 再删 CQ（无关联 SQ 了）→ 成功。
+    let cqe = admin
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x04, // DELETE_IO_CQ
+                cid: 0x48,
+                cdw10: QID as u32,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("删 SQ 后再删 CQ")?;
+    assert_eq!(
+        cqe.status, 0,
+        "删完关联 SQ 后删 CQ 应成功，实 status={:#x}",
+        cqe.status
+    );
+
+    // ④ 再删同一个（已消失的）CQ → Invalid Queue Identifier（覆盖 DELETE_IO_CQ 的
+    //    "CQ 不存在" 分支；spec § 5.6）。revert-verify：去掉 admin.rs DELETE_IO_CQ 的
+    //    `if !self.cqs.contains_key(&qid)` 分支 → 删不存在的 CQ 返 sc==0 → 本断言 FAIL。
+    let cqe = admin
+        .submit(
+            &driver,
+            Sqe {
+                opcode: 0x04, // DELETE_IO_CQ
+                cid: 0x49,
+                cdw10: QID as u32,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .await
+        .context("删已消失的 CQ")?;
+    assert_eq!(
+        cqe.status, SC_INVALID_QUEUE_IDENTIFIER,
+        "删不存在的 CQ 应返 Invalid Queue Identifier (0x0101)，实 status={:#x}",
+        cqe.status
+    );
     Ok(())
 }
 

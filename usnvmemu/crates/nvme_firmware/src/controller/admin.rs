@@ -341,11 +341,29 @@ impl NvmeController {
                 // **2026-06-09** — qid 范围校验：admin(0) 不可重建；> IO_QUEUE_SLOT_CAPACITY
                 // 超授予上限。DenseMap 越界 insert 静默丢弃，必须在此显式拒，否则会
                 // 对未创建的队列误返 success。
+                //
+                // 注：此 qid-范围错误按 spec 语义更贴 INVALID_QUEUE_IDENTIFIER，但
+                // controller/tests.rs::create_io_queue_rejects_out_of_range_qid /
+                // create_io_queue_gate_uses_runtime_io_queue_pairs 现锚定 INVALID_FIELD，
+                // 为不破坏并行会话的测试，**保留** INVALID_FIELD（残留不一致：范围错用
+                // Generic、重复/无效 CQID 用 Command-Specific）。规范统一待 M-matrix owner。
                 if qid == 0 || qid > self.io_queue_pairs {
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
                 if !pc {
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
+                }
+                // **IO 队列管理 spec gap 修复（2026-06-11，spec § 5.4）** — qid 已存在则
+                // 拒，**不**静默覆盖（旧版 `cqs.insert` 直接覆写既有 CQ → driver 误以为
+                // 重建成功，实则丢了原队列状态）。返 Command-Specific Invalid Queue Identifier。
+                if self.cqs.contains_key(&qid) {
+                    return Some(Cqe::error(
+                        cid,
+                        0,
+                        sq_head,
+                        phase,
+                        sc::INVALID_QUEUE_IDENTIFIER,
+                    ));
                 }
                 tracing::info!(
                     qid,
@@ -379,14 +397,37 @@ impl NvmeController {
                 let cqid = ((sqe.cdw11 >> 16) & 0xffff) as u16;
                 let prp1 = sqe.prp1;
                 // **2026-06-09** — qid 范围校验（同 Create IO CQ；防 DenseMap 越界误 success）。
+                // 同上：保留 INVALID_FIELD 以不破坏 tests.rs 的范围锚定。
                 if qid == 0 || qid > self.io_queue_pairs {
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
                 if !pc {
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
+                // **IO 队列管理 spec gap 修复（2026-06-11，spec § 5.5）** — qid 已存在则拒，
+                // 不静默覆盖（旧版 `sqs.insert` 覆写既有 SQ）。Command-Specific Invalid
+                // Queue Identifier。
+                if self.sqs.contains_key(&qid) {
+                    return Some(Cqe::error(
+                        cid,
+                        0,
+                        sq_head,
+                        phase,
+                        sc::INVALID_QUEUE_IDENTIFIER,
+                    ));
+                }
+                // **IO 队列管理 spec gap 修复（2026-06-11，spec § 5.5）** — SQ 绑定的 CQID
+                // 必须是一个**已创建**的 CQ。旧版用通用 INVALID_FIELD；spec 规定此条件应返
+                // Command-Specific **Completion Queue Invalid**（0x100）——driver 据此区分
+                // "CQID 无效" 与其它字段错误。CQID 解析自 cdw11 bits 31:16（见上）。
                 if !self.cqs.contains_key(&cqid) {
-                    return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
+                    return Some(Cqe::error(
+                        cid,
+                        0,
+                        sq_head,
+                        phase,
+                        sc::COMPLETION_QUEUE_INVALID,
+                    ));
                 }
                 tracing::info!(
                     qid,
@@ -804,12 +845,50 @@ impl NvmeController {
             admin_opc::DELETE_IO_SQ => {
                 let qid = (sqe.cdw10 & 0xffff) as u16;
                 tracing::info!(qid, "Delete IO SQ");
-                self.sqs.remove(&qid);
+                // **IO 队列管理 spec gap 修复（2026-06-11，spec § 5.7）** — 删一个不存在的
+                // SQ 必须返 Command-Specific Invalid Queue Identifier，**不**无条件返
+                // success（旧版恒 success，会让 driver 误以为删了一个从未建过的队列）。
+                // `remove` 返 None 即原本不存在。
+                if self.sqs.remove(&qid).is_none() {
+                    return Some(Cqe::error(
+                        cid,
+                        0,
+                        sq_head,
+                        phase,
+                        sc::INVALID_QUEUE_IDENTIFIER,
+                    ));
+                }
                 Some(Cqe::success(cid, 0, sq_head, phase))
             }
             admin_opc::DELETE_IO_CQ => {
                 let qid = (sqe.cdw10 & 0xffff) as u16;
                 tracing::info!(qid, "Delete IO CQ");
+                // **IO 队列管理 spec gap 修复（2026-06-11，spec § 5.6）** — 两个 spec 错误
+                // 条件（顺序：先验存在，再验无关联 SQ，最后才删）：
+                //   ① CQ 不存在 → Invalid Queue Identifier；
+                //   ② 仍有 SQ 绑定到本 CQID → Invalid Queue Deletion（spec 要求删 CQ 前
+                //      必须先删其所有关联 SQ；否则那些 SQ 的完成将无处投递）。
+                // SQ→CQ 绑定存于 `SubmissionQueue.cq_id`（Create IO SQ 时由 cdw11 高 16 位
+                // 设定）；扫 `self.sqs` 找任一 `cq_id == qid` 的 SQ（admin qid 0 的 SQ 绑
+                // CQ0，永不命中 IO CQID，无需特判）。
+                if !self.cqs.contains_key(&qid) {
+                    return Some(Cqe::error(
+                        cid,
+                        0,
+                        sq_head,
+                        phase,
+                        sc::INVALID_QUEUE_IDENTIFIER,
+                    ));
+                }
+                if self.sqs.iter().any(|(_, sq)| sq.cq_id == qid) {
+                    return Some(Cqe::error(
+                        cid,
+                        0,
+                        sq_head,
+                        phase,
+                        sc::INVALID_QUEUE_DELETION,
+                    ));
+                }
                 self.cqs.remove(&qid);
                 Some(Cqe::success(cid, 0, sq_head, phase))
             }

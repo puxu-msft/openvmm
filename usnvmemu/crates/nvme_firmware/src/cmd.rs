@@ -293,6 +293,21 @@ pub mod sc {
     /// 发，driver 误读为 Capacity Exceeded）。
     pub const INVALID_PROTECTION_INFO: u16 = 0x0181;
 
+    // ── IO 队列管理 Command Specific (SCT=1)（NVMe base spec § 5.4/5.5 Create
+    //    IO CQ/SQ、§ 5.6/5.7 Delete IO CQ/SQ；值 == nvme_spec::Status）──
+    //
+    // Create/Delete IO Queue 的 spec 错误条件用这三个 Command-Specific 码（非通用
+    // INVALID_FIELD）。锚定见本文件末 `mod sc_queue_anchor`（精确逐位 == nvme_spec）。
+    /// Create IO SQ 绑定的 CQID 不存在（spec § 5.4：SQ 必须绑一个已建的 CQ）。
+    pub const COMPLETION_QUEUE_INVALID: u16 = 0x0100;
+    /// Create IO CQ/SQ 的 QID 已存在（重复），或 Delete IO CQ/SQ 的 QID 不存在
+    /// （spec § 5.4-5.7：QID 必须唯一且被删的队列必须存在）。
+    pub const INVALID_QUEUE_IDENTIFIER: u16 = 0x0101;
+    /// Delete IO CQ 时仍有 SQ 绑定到该 CQ（spec § 5.6：删 CQ 前必须先删其所有关联
+    /// SQ）。**SC byte = 0x0C**（已锚 nvme_spec；任务书初稿的 0x08 实为 Invalid
+    /// Interrupt Vector，已据 canonical nvme_spec 校正——见 `sc_queue_anchor`）。
+    pub const INVALID_QUEUE_DELETION: u16 = 0x010c;
+
     // ── NVM Command Set 专属 Command Specific (SCT=1) ──
     /// DSM range 互重叠 / Read 与 DSM 抢同 LBA。
     pub const CONFLICTING_ATTRIBUTES: u16 = 0x0180;
@@ -1074,5 +1089,56 @@ mod tests {
         let buf = IdentifyController::build_v2_bytes(0x1414, 0xc0de, 1);
         let mdts = buf[offset_of!(SpecIdentifyController, mdts)];
         assert_eq!(mdts, 5, "MDTS=5 (= 128 KiB = V_HOST_IO_NLB_MAX 256 LBA)");
+    }
+}
+
+/// **IO 队列管理 SC 锚定（内联）** — 把新增的三个 IO 队列管理状态码逐位锚到
+/// canonical `nvme_spec::Status`（vm/devices/storage/nvme_spec），同 tests.rs 的
+/// `sc_constants_match_nvme_spec` 纪律（[[LESSONS §25/§26]]：以 spec 源为准，drift
+/// 即测试红）。
+///
+/// **为何独立于 tests.rs 的 M1 折叠**：`sc_constants_match_nvme_spec` 当前由 M-matrix
+/// owner 维护且正被并行修改（共享工作树），在此就地加锚避免改动竞争文件。规范的 M1
+/// 合并（把本三行并入那张大锚表）**延后给 M-matrix owner**。
+///
+/// **校正记录**：任务书初稿把 `INVALID_QUEUE_DELETION` 写成 0x0108——但 0x0108 在
+/// canonical nvme_spec 是 `INVALID_INTERRUPT_VECTOR`。Invalid Queue Deletion 的 SC
+/// byte 实为 **0x0C**（→ 完整 status 0x010c），本锚直接钉死这个事实。
+#[cfg(test)]
+mod sc_queue_anchor {
+    use super::sc;
+    use nvme_spec::Status;
+
+    #[test]
+    fn queue_mgmt_sc_match_nvme_spec() {
+        // 逐位 == canonical nvme_spec::Status（含 SCT 高字节 0x01 = Command-Specific）。
+        assert_eq!(
+            sc::COMPLETION_QUEUE_INVALID,
+            Status::COMPLETION_QUEUE_INVALID.0
+        );
+        assert_eq!(
+            sc::INVALID_QUEUE_IDENTIFIER,
+            Status::INVALID_QUEUE_IDENTIFIER.0
+        );
+        assert_eq!(sc::INVALID_QUEUE_DELETION, Status::INVALID_QUEUE_DELETION.0);
+        // 三者都须 Command-Specific（SCT=1，高字节 == 0x01）——这是它们区别于通用
+        // INVALID_FIELD(SCT=0) 的根据。
+        for code in [
+            sc::COMPLETION_QUEUE_INVALID,
+            sc::INVALID_QUEUE_IDENTIFIER,
+            sc::INVALID_QUEUE_DELETION,
+        ] {
+            assert_eq!(
+                code >> 8,
+                sc::SCT_COMMAND_SPECIFIC as u16,
+                "IO 队列管理码须 Command-Specific (SCT=1)"
+            );
+        }
+        // 锚死 SC byte 校正：Invalid Queue Deletion = 0x0C（非任务书初稿的 0x08）。
+        assert_eq!(
+            sc::INVALID_QUEUE_DELETION & 0xff,
+            0x0c,
+            "Invalid Queue Deletion SC byte = 0x0C (spec § 5.6；0x08 是 Invalid Interrupt Vector)"
+        );
     }
 }
