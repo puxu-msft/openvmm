@@ -91,7 +91,21 @@ host-backed、RAM-backed 的区**，guest 零拷贝直访。
 - **诚实警示**：OpenVMM 自带的 `guest_emulation_device`（OpenVMM-hosted 测试用模拟 host）把
   `handle_create_ram_gpa_range` **硬编码返回 FAILED**（`vm/devices/get/guest_emulation_device/src/lib.rs`
   的 handler 体）；**真 Hyper-V** 的 GET 对端实现 `IVmGuestMemoryAccess`（故 client/protocol/i440bx
-  生产用例都在）。即真机支持、OpenVMM 测试桩未实现。**真机确认见同目录后续记录**（待补）。
+  生产用例都在）。即真机支持、OpenVMM 测试桩未实现。
+
+### 真机确认（活 VM `pcie-remote-exp`，2026-06-12，ohcldiag-dev inspect）
+
+- ✅ **VTL0-backed 内存池机制活着**：`inspect vm/get/gpa_allocator` 显示
+  `backing.type="locked_memory_lower_vtl"`、`params.lower_vtl_policy="vtl0"` —— underhill 实际在用
+  VTL0 侧内存池（"VTL2 取用 host/VTL0 侧内存"这半截**实测在跑**）。GET 通道活、版本 `NICKEL_REV2`
+  （`CreateRamGpaRange`=28 是早立请求，远在该版本支持内）。
+- ❌ **`CreateRamGpaRange` 本身在本 VM 未被触发**：`inspect vm/vtl0_memory_map` 只有两段裸 guest RAM
+  （0x0-0xf8000000、0x1_0000_0000-0x1_0800_0000），无 host-created RAM GPA 区；chipset 无 i440bx host
+  bridge（Gen2 OpenHCL 不用 PIIX4），无 framebuffer → 无任何用户触发它。故无法被动观测。
+- **结论**：真机证实了**支撑半截**（VTL0 侧内存池 + GET 通道）；`CreateRamGpaRange` 本身的 SUCCESS
+  需 **underhill 侧探针**主动调 GET client 才能实测（重活：自定义 underhill 构建/注入）。**但其可行性
+  已被生产代码强锚定**——shipping OpenHCL 的 `i440bx_host_pci_bridge` 真调它并按 success 处理，若真
+  Hyper-V 不实现 `IVmGuestMemoryAccess::CreateRamGpaRange`，该生产路径会坏。即"推断"实为"生产代码依赖"。
 
 **离今天 vfio-user 的差距**：`vfio_user_pci_device` BAR0 现为 trap-and-forward（每访问 = 往返
 firmware message）。要拿零拷贝共享区需新接线：(a) 设备经 `create_ram_gpa_range` 申请 RAM GPA 区，
