@@ -31,19 +31,22 @@
 //!   `vpci_relay`（同样用 `add_dyn_device`/`DynamicDeviceUnit::remove` 做 runtime
 //!   add/remove）才是对的范本。
 //!
-//! # MSI 链跨 bus 重建的正确性
+//! # MSI 链 + 虚拟设备的生命周期（C0 真机 POC 修正）
 //!
-//! device shim 的 `MsixEmulator` 在装配时把一个 [`MsiTarget`] clone 进每个 table entry。
-//! `MsiTarget` 内部是 `Arc<RwLock<..>>`。本模块**持久持有**对应的 [`MsiConnection`]
-//! （与 device shim 同生命周期）。每个 Live 边沿：
-//! 1. `partition.new_virtual_device()?.build(Vtl0, device_id)` 造一个新的虚拟设备
-//!    （`Arc<dyn SignalMsi> + MapVpciInterrupt`）；
-//! 2. `msi_conn.connect(virtual_device)` 把 MSI 投递重指向该新虚拟设备；
-//! 3. `VpciInterruptMapper::new(virtual_device)` 交给新建的 `VpciBus`。
+//! device shim 的 `MsixEmulator` 装配时把一个 [`MsiTarget`] clone 进每个 table entry。
+//! `MsiTarget` 内部是 `Arc<RwLock<..>>`。本模块在 **assemble 时一次性**：
+//! 1. `partition.new_virtual_device()?.build(Vtl0, device_id)` 造虚拟设备
+//!    （`Arc<dyn SignalMsi> + MapVpciInterrupt`），**device_id 注册只此一次**；
+//! 2. `msi_conn.connect(virtual_device)` 把 MSI 投递指向它（持久，之后不再 connect）；
+//! 3. 存下 [`VpciInterruptMapper`]（内部 `Arc`，`Clone`）。
 //!
-//! device shim 的 MsixEmulator entries 经共享的 `Arc<RwLock>` 自动看到更新后的
-//! `signal_msi`，无需重建 device shim。这与 `build_vpci_device`（boot 路径）的 MSI
-//! 装配语义一致，只是把「connect 虚拟设备」从 boot 一次性挪到每个 Live 边沿。
+//! 之后每个 Live 边沿 `add_bus` 只 `interrupt_mapper.clone()` 交给新建的 `VpciBus`，
+//! **不**重建虚拟设备。**为什么必须一次性**：虚拟设备 + device_id 是分区级资源；若每个
+//! Live 重建，旧的仍被持久 `msi_conn`/`interrupt_mapper` 持有（device_id 未释放），
+//! re-add 时 `build(device_id)` 撞 "device id already in use" —— C0 真机 POC 正是
+//! 撞到这个（kill→重起 usnvmemu 后盘不回来）。故虚拟设备与 device shim 同生命周期长存，
+//! 只有薄壳 `VpciBus` 随 add/remove；`build_vpci_device`（boot 路径）本就一次性建好，
+//! 语义一致。
 //!
 //! # C0 范围
 //!
@@ -96,9 +99,10 @@ pub struct VfioUserHotplug {
     /// device 状态机句柄（Connecting/Live/Lost）。reconcile 据 `load()` 读当前态做幂等决策。
     state: SharedState,
 
-    /// 持久 MSI 连接（与 device shim 的 MsixEmulator 共享同一 `MsiTarget`）。每个 Live
-    /// 边沿 `connect(新虚拟设备)` 重指向，无需重建 device shim。见模块文档「MSI 链」。
-    msi_conn: MsiConnection,
+    /// 持久 MSI 连接（与 device shim 的 MsixEmulator 共享同一 `MsiTarget`）。assemble
+    /// 时 `connect(虚拟设备)` **一次**，之后只为保活该连接而持有（故 `_` 前缀，无运行时
+    /// 读取）。虚拟设备/device_id 长存，不随 bus add/remove 重建。
+    _msi_conn: MsiConnection,
 
     /// vmbus 控制句柄（offer VpciBus channel 用）。
     vmbus: Arc<vmbus_server::VmbusServerControl>,
@@ -109,8 +113,14 @@ pub struct VfioUserHotplug {
     /// 任务驱动源（spawn offer task + VpciBus 内部 task 用）。
     driver_source: VmTaskDriverSource,
 
-    /// 分区句柄（每个 Live 边沿 `new_virtual_device().build()` 造虚拟设备用）。
-    partition: Arc<dyn DeviceBuilderPartition>,
+    /// 持久 `VpciInterruptMapper`：assemble 时**一次性**造虚拟设备得到，跨 add/remove
+    /// 周期复用 `clone()`。**虚拟设备 + 其 device_id 注册只建一次**——若每个 Live 边沿
+    /// 重建会撞 "device id already in use"（C0 真机 POC 实测：kill→重起 usnvmemu 后
+    /// re-add 时 `new_virtual_device().build(device_id)` 因 device_id 仍被持久 msi_conn
+    /// 持有而失败）。虚拟设备是**分区级资源**，应与 device shim 同生命周期长存，而非
+    /// 随 bus add/remove。`VpciInterruptMapper` 内部 = `Arc<dyn DynMapVpciInterrupt>`，
+    /// `Clone` 即增引用，每个 add_bus clone 一份交给新 VpciBus。
+    interrupt_mapper: VpciInterruptMapper,
 
     /// 当前 VpciBus 的 unit；`Some` = 已 add（盘对 guest 可见），`None` = 未 add（Lost / 初始）。
     bus_unit: Option<DynamicDeviceUnit>,
@@ -221,6 +231,16 @@ impl VfioUserHotplug {
         // 取与 device shim（及其 worker）共享的状态句柄：reconcile 据它读 Live/Lost。
         let state = device.lock().shared_state();
 
+        // **一次性**造虚拟设备并把持久 `msi_conn` 指向它。device_id 注册只此一次、与
+        // device shim 同生命周期长存，跨 add/remove 周期复用 `interrupt_mapper.clone()`
+        // —— 避免每个 Live 边沿重建撞 "device id already in use"（C0 真机 POC 实测的
+        // 根因）。device_id 与 `build_vpci_device`（device_builder.rs:66）一致。
+        let device_id = (instance_id.data2 as u64) << 16 | (instance_id.data3 as u64 & 0xfff8);
+        let (msi_controller, interrupt_mapper) = partition
+            .build_virtual_device(device_id)
+            .context("failed to create virtual device for vfio_user hotplug")?;
+        msi_conn.connect(msi_controller);
+
         tracing::info!(
             CVM_ALLOWED,
             %instance_id,
@@ -232,11 +252,11 @@ impl VfioUserHotplug {
             device,
             _device_unit: device_unit,
             state,
-            msi_conn,
+            _msi_conn: msi_conn,
             vmbus,
             vtom,
             driver_source: driver_source.clone(),
-            partition,
+            interrupt_mapper,
             bus_unit: None,
             edge_rx,
         })
@@ -283,20 +303,13 @@ impl VfioUserHotplug {
         chipset_devices: &ChipsetDevices,
         state_units: &mut StateUnits,
     ) -> anyhow::Result<()> {
-        // device_id 与 build_vpci_device（device_builder.rs:66）一致。
-        let device_id =
-            (self.instance_id.data2 as u64) << 16 | (self.instance_id.data3 as u64 & 0xfff8);
-
-        // 造新虚拟设备并把持久 MsiConnection 重指向它（device shim 的 MsixEmulator
-        // 经共享 Arc<RwLock> 自动看到新 signal_msi）。
-        let (msi_controller, interrupt_mapper) = self
-            .partition
-            .build_virtual_device(device_id)
-            .context("failed to create virtual device for vfio_user hotplug bus")?;
-        self.msi_conn.connect(msi_controller);
-
         // coerce 长存 device shim → dyn ChipsetDevice（VpciBus::new 的入参类型）。
         let device: Arc<CloseableMutex<dyn ChipsetDevice>> = self.device.clone();
+        // 复用 assemble 时**一次性**造好的持久 interrupt_mapper（`clone()` = 增 Arc
+        // 引用，**不**重建虚拟设备、**不**重注册 device_id）。虚拟设备 + msi 连接在
+        // assemble 已建好长存，跨 add/remove 周期不变（修 C0 真机 POC 暴露的
+        // "device id already in use" re-add 失败）。
+        let interrupt_mapper = self.interrupt_mapper.clone();
 
         let instance_id = self.instance_id;
         let driver_source = &self.driver_source;
