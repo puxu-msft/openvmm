@@ -75,6 +75,30 @@ TLB、中断 —— **无任何"把 VTL2 页注入 VTL0 GPA"的命令**。
 - `vm/devices/framebuffer/src/lib.rs:286`（VRAM 映进 guest，guest 直写像素）
 - `vm/devices/pci/vfio_assigned_device/src/lib.rs:10,58,655`（assigned BAR 直映 guest GPA；`map_to_guest` 在 :655）
 
+### 关键：framebuffer 不是孤例，`CreateRamGpaRange` 是通用原语（已生产在用）
+
+GET 有一个**通用** HostRequest `CREATE_RAM_GPA_RANGE`(=28) / `RESET_RAM_GPA_RANGE`(=29)
+（`vm/devices/get/get_protocol/src/lib.rs:159-160`），映射到 host 侧
+`IVmGuestMemoryAccess::CreateRamGpaRange`（`guest_emulation_transport/src/process_loop.rs:272`；
+client API `client.rs:717`）。语义 = **VTL2 经 GET 请求 host 在 guest GPA 里创建一段
+host-backed、RAM-backed 的区**，guest 零拷贝直访。
+
+- **不是 framebuffer 专用**：生产代码 `openhcl/underhill_core/src/emuplat/i440bx_host_pci_bridge.rs:202,207`
+  —— **PCI host bridge** 用它给 option ROM / PCI RAM 区做 backing（`CreateRamGpaRangeFlags::with_rom_mb`，
+  flags 见 `get_protocol/src/lib.rs:1788`）。"host 为 PCI 设备建 guest-可见 RAM 区"**已在跑**。
+- **与单向定律一致**：bytes 由 host 分配、落在 guest GPA（非 VTL2 私有），guest 直访，firmware
+  经 `mshv_vtl_low` 反手共享 → 双向零拷贝。是 framebuffer 模式的泛化，不违反定律。
+- **诚实警示**：OpenVMM 自带的 `guest_emulation_device`（OpenVMM-hosted 测试用模拟 host）把
+  `handle_create_ram_gpa_range` **硬编码返回 FAILED**（`vm/devices/get/guest_emulation_device/src/lib.rs`
+  的 handler 体）；**真 Hyper-V** 的 GET 对端实现 `IVmGuestMemoryAccess`（故 client/protocol/i440bx
+  生产用例都在）。即真机支持、OpenVMM 测试桩未实现。**真机确认见同目录后续记录**（待补）。
+
+**离今天 vfio-user 的差距**：`vfio_user_pci_device` BAR0 现为 trap-and-forward（每访问 = 往返
+firmware message）。要拿零拷贝共享区需新接线：(a) 设备经 `create_ram_gpa_range` 申请 RAM GPA 区，
+(b) 呈现为 BAR/子区，(c) firmware 经 `mshv_vtl_low` 映同一页。**原语齐备，缺 vfio-user 这条的 wiring
+——工程量，非架构禁区。** 这也修正了早前"CMB/PMR 无意义"判断的一半：CMB/shared-BAR 有现成 host
+原语支撑，不是凭空发明。
+
 ## 对 firmware 的净意义
 
 - firmware-in-VTL2 **暴露自有内存给 guest 零拷贝直访 = 死路**，勿在此设计任何特性。
