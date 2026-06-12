@@ -99,21 +99,37 @@ shareable && no_bitmap_gating）。
 
 **= W6b 里程碑达成：guest 枚举 DEV_00A9 + 驱动设备 + 真 4MiB IO（零拷贝 DMA）。**
 
-### finding-⑤（未完全 root-cause，疑 harness artifact，阻 oracle-2）
+### finding-⑤（已 root-cause + 已规避，= 诊断 harness artifact 非产品缺陷）
 
-oracle-2（VTL2 侧 `ohcldiag-dev run grep` 扫 256MB backing file 找 marker，独立于 guest
-NTFS readback）**可复现地触发 os-error-10053 + VTL2 panic-reboot**（`/proc/uptime` 重置、
-/tmp 清空、kmsg 从 0.0）。关键：**触发器是从 VTL2 读 usnvmemu-mmap'd 的大 backing file**，
-**不是 IO 路径**（IO 本身跑得很干净：4233 reads/1255 writes 无崩）。故疑为**诊断 harness
-artifact**（在 512MB-RAM 的 VTL2 里 grep 流式读 256MB mmap'd tmpfs 文件），非 W6c 产品缺陷。
-**未取得 panic message**（reboot 冲掉 kmsg）。
+oracle-2 初版用 VTL2 侧 `ohcldiag-dev run grep -a` 扫 256MB backing file，**可复现触发 VTL2
+panic-reboot**（os-error-10053、/proc/uptime 重置、/tmp 清空、kmsg 从 0.0）。关键观察：
+触发器是**读大 mmap'd 文件**，**非 IO 路径**（IO 本身干净：4233 reads/1255 writes 无崩）。
 
-**根因待 com-port panic 捕获**（下个聚焦步）。规避/替代 oracle-2 方案：① 小 backing（64MB）
-减压；② `ohcldiag-dev file -p` 流式导出再 host 侧扫（不同代码路径）；③ 干净 VM 重启避开
-多次崩后的 "started"（非 "running"）退化态。oracle-1 + usnvmemu write-cmd 证据已强证数据路径，
-oracle-2 是 belt-and-suspenders 的独立确认。
+**根因（差分确认）**：改用**流式 `ohcldiag-dev file -p /tmp/nvme_backing.img | host-grep`**
+在**同一个 256MB 文件**上**成功**（marker 命中 @ byte 22577152，VTL2 uptime 104s 不重置）。
+同文件 grep 崩、file-p 通 → 坐实 **finding-⑤ = `grep -a` 在无换行的二进制上把整个 256MB
+当"一行"缓冲 → 在 512MB-RAM 的 VTL2 里 OOM → 内核 `oops=panic` → reboot**。这是**诊断手段
+用错工具（grep-on-binary）的 harness artifact，不是 W6c 产品缺陷**。
 
-**注**：多次崩后 VTL2 停在 control_state="started"（非 "running"），疑崩溃后退化；干净复验
-建议整 VM 重启。`pgrep -x <comm>` 与 `pgrep -f <pattern-含自身>` 两种 busybox 误报都踩过
-（[[nvme-of-tcp-real-linux-interop-milestone]] 同族）——VTL2 判活/死务必 `ps` 实证。
+**规避**：从 VTL2 取大文件用**流式 `file -p` 导出到 host 再扫**（host 内存充裕），或 `strings`/
+bounded read；**勿在 VTL2 内对二进制 `grep`**。
+
+### ✅ oracle-2 PASS — 独立验证完成
+
+`ohcldiag-dev file -p /tmp/nvme_backing.img | grep -a -bo "$MARKER"` →
+**`22577152:USNVMEMU-W6C-DMA-REVERIFY-20260612`** —— marker 在 raw backing file 的字节
+偏移 22577152（≈21.5MiB，NTFS 给 4MiB 文件分配的簇位置）被独立读出。**这是独立于 guest
+NTFS readback 的第二 oracle（raw 字节，不经 guest 文件系统）**，证 guest 写的数据真持久化到
+backing store。VTL2 全程存活（usnvmemu pid 不变、uptime 不重置）。
+
+**W6c 真机 e2e 双 oracle 全通**：oracle-1（guest readback markerMatch）+ oracle-2（独立 raw
+backing 扫描 @ offset 22577152）+ usnvmemu 4233 dma_read OK / 1255 writes + DMA_MAP×2
+zero-copy + revive 重发。**guest 枚举 DEV_00A9 + 驱动 NVMe 设备 + 真 4MiB 零拷贝 IO，
+端到端双重独立验证完成。**
+
+### oracle-2 复跑（用流式 file-p，勿在 VTL2 grep 二进制）
+```bash
+ohcldiag-dev pcie-remote-exp file -p /tmp/nvme_backing.img | grep -a -bo "<MARKER>" | head -1
+```
+
 
