@@ -59,3 +59,61 @@ cd peek && cargo build --release --target x86_64-unknown-linux-musl
 base64 -w0 < target/.../w6c_peek | ohcldiag-dev pcie-remote-exp run -- sh -c 'base64 -d > /tmp/w6c_peek && chmod +x /tmp/w6c_peek'
 ohcldiag-dev pcie-remote-exp run -- /tmp/w6c_peek 0xeae00000 64
 ```
+
+---
+
+## ✅ W6c 真机 e2e — DMA 零拷贝数据路径 PROVEN（commit 7cd8bfa4 码 + direct-view 修正）
+
+**日期**：2026-06-12　**VM**：pcie-remote-exp（真 OpenHCL VM，W6c IGVM）
+
+### 真机调试暴露并修正的承重事实：本 VM alias-map ON
+
+实现初版按源码追踪用 `fd_offset = file_starting_offset + base_addr`（= underhill 自身的
+aliased offset）。真机 kmsg 证本 VM **alias-map ON**（`enabling alias map
+alias_map=0x200000000000`，因 VTL1/Guest-VSM 启用）。早期为稳妥加的"alias-on 即禁用共享"
+门控（H-2）于是把 `sharing()` 返 None → **DMA_MAP count=0 → 无 disk**。
+
+**修正（POC-backed）**：`fd_offset` 改用**裸 guest_address（mshv_vtl_low 直接视图
+offset=gpa）**，非 underhill 的 aliased offset。依据：guest NVMe driver 在 PRP/SGL 填裸
+VTL0 GPA（不知 VTL2 alias map），server 收到的 DMA IOVA 是裸 gpa；mshv_vtl_low 在
+offset=gpa 直接映射该 VTL0 物理内存。本目录的 mmap POC 已在**同一 alias-on VM** 上证
+offset=gpa 读出真 guest 数据（W5a 亦用裸 gpa）。故 alias on/off 都用直接视图，
+IOVA==fd_offset==裸 gpa，无需按 alias 门控（删 H-2 的"alias-on 禁用"，改 do_share =
+shareable && no_bitmap_gating）。
+
+### PROVEN（真机证据）
+
+修正后重建 IGVM + boot + push/launch usnvmemu（256MiB backing）：
+- usnvmemu：`DMA_MAP added addr=0x0 size=0xF8000000 zero_copy=true` + `addr=0x100000000
+  size=0x8000000 zero_copy=true`（**2 段 = memory_layout.ram() 低/高 RAM，MMIO hole 排除**，
+  正是 mmap POC 预测的布局；addr 是**裸 gpa 非 alias-tagged**）；**dma_read fail count=0**。
+- underhill：`collected 2 shareable guest-RAM region(s) for DMA_MAP` + `reconnected, Live`。
+- guest（PSDirect）：枚举 `PCI\VEN_1414&DEV_00A9` → disable/enable 重 init（usnvmemu 在
+  guest 早期 probe 时尚未 Live，故先 Error；Live 后 re-init）→ devnode **Status=OK** +
+  **NVMe disk「OpenHCL Userspace NVMe v2.0」256MB Online**。
+- **真 IO（oracle-1）**：guest 写 4MiB（嵌 marker）+ `Write-VolumeCache` flush + 读回 →
+  **markerMatch=True**。usnvmemu 日志 **dma_read OK ×4233 + write/IO ×1255** —— 证 4MiB IO
+  真经 usnvmemu 零拷贝 DMA 路径（非仅 NTFS cache）。
+- **revive-with-DMA**：usnvmemu 重启后连接器重连 → `reconnected, Live` + **DMA_MAP×2 重发**
+  （W6c reconnect 重发 hook 生效，同 C-3）。
+
+**= W6b 里程碑达成：guest 枚举 DEV_00A9 + 驱动设备 + 真 4MiB IO（零拷贝 DMA）。**
+
+### finding-⑤（未完全 root-cause，疑 harness artifact，阻 oracle-2）
+
+oracle-2（VTL2 侧 `ohcldiag-dev run grep` 扫 256MB backing file 找 marker，独立于 guest
+NTFS readback）**可复现地触发 os-error-10053 + VTL2 panic-reboot**（`/proc/uptime` 重置、
+/tmp 清空、kmsg 从 0.0）。关键：**触发器是从 VTL2 读 usnvmemu-mmap'd 的大 backing file**，
+**不是 IO 路径**（IO 本身跑得很干净：4233 reads/1255 writes 无崩）。故疑为**诊断 harness
+artifact**（在 512MB-RAM 的 VTL2 里 grep 流式读 256MB mmap'd tmpfs 文件），非 W6c 产品缺陷。
+**未取得 panic message**（reboot 冲掉 kmsg）。
+
+**根因待 com-port panic 捕获**（下个聚焦步）。规避/替代 oracle-2 方案：① 小 backing（64MB）
+减压；② `ohcldiag-dev file -p` 流式导出再 host 侧扫（不同代码路径）；③ 干净 VM 重启避开
+多次崩后的 "started"（非 "running"）退化态。oracle-1 + usnvmemu write-cmd 证据已强证数据路径，
+oracle-2 是 belt-and-suspenders 的独立确认。
+
+**注**：多次崩后 VTL2 停在 control_state="started"（非 "running"），疑崩溃后退化；干净复验
+建议整 VM 重启。`pgrep -x <comm>` 与 `pgrep -f <pattern-含自身>` 两种 busybox 误报都踩过
+（[[nvme-of-tcp-real-linux-interop-milestone]] 同族）——VTL2 判活/死务必 `ps` 实证。
+
