@@ -45,3 +45,19 @@ cp flowey-out/artifacts/build-igvm/debug/x64-custom/openhcl-x64-custom.bin <win>
 - **最高概率根因（待真机验，按序）**：① **peer `pkill` 后 EOF 没真到达 underhill**（accepted fd 被存活线程/子进程持有 / SCM_RIGHTS dup 到别处 / 未在 exit 关闭）——in-process harness 干净关 fd 故复现不出；真机用 `ss -xp`/`lsof`/strace worker fd 验。② 真 `VmTaskDriver` 下 worker task idle 时未被 IO 驱动（io_uring ring 所在 VP/线程 idle 时没 pump）。
 - **稳健修法（不依赖 idle-EOF，#1/#2 通吃，且是 NVMe KATO 基础）**：worker `select_biased!` 加 **active liveness 臂**——Live 且 idle N 秒→发廉价探测帧（如 `GET_REGION_INFO`/no-op `REGION_READ`），send `Err` 或 deadline 内无 reply→`go_lost`。把"静默半开/永不 EOF 死亡"转成已处理的 write-err/timeout。**待真机确认 #1（EOF 是否到达）后实现**：若 firmware 漏关 fd，真修可能在 firmware 侧（exit 关 accepted/listener fd）。
 - regression guard：`reconnect_loopback.rs` scenario7（idle peer-death→Lost）已加，PASS（7 场景全绿）。
+
+---
+
+## ✅ 更正：发现② 是测试假象，revive 真机 PROVEN（非 bug）
+
+**发现② 不存在。** 根因：VTL2 的 busybox `pkill -x usnvmemu` / `pgrep -x usnvmemu` **匹配不到** comm="usnvmemu" 的真进程（busybox `-x` 语义怪癖；`pgrep -f` 能找到 pid 72 comm=usnvmemu，但 `-x` 返回 NONE）。所以之前"停 usnvmemu"的 `pkill -x usnvmemu` **啥也没杀**→ usnvmemu 一直活着 → worker **正确**保持 Live（peer 没死）。"alive=empty" 是 `pgrep -x` 也匹配不到导致的误读，不是真被杀。
+
+**用正确的 `pkill -f "/tmp/usnvmemu --vfio-user-sock"` 复测，完整 revive 真机 PROVEN**：
+- 停 usnvmemu（pkill -f）→ kmsg `going Lost` **count=1 → Lost DETECTED ✓**（worker idle-EOF 检测真机正常工作）。
+- 重起 usnvmemu → kmsg `reconnected, Live` **count=2 → REVIVE ✓**（连接器重连 + worker 再 Live）。
+
+**故完整 reconnect 生命周期全在真 OpenHCL 硬件跑通**：assemble(Connecting) → 持久重连 → usnvmemu 起 → connect+握手+C-3 set_irqs → **Live** → usnvmemu 死 → **Lost** → 重起 → **Live(revive)**。C-1/C-2/C-3/边沿-lost/持久重连/Lost-on-peer-death/revive 全部真机验证。
+
+scenario7（idle peer-death loopback）仍是有效回归守卫（PASS 证 idle-EOF 检测逻辑正确）——与真机一致。
+
+**教训**：VTL2 busybox 下 kill 进程用 `pkill -f <cmdline>` 或按 pid，**勿用 `pkill -x <comm>`**（busybox -x 匹配不到）。这个假"bug"耗了一轮诊断——VTL2 工具链怪癖要先验证 kill 真生效（`pgrep -f` 确认）再下结论。
