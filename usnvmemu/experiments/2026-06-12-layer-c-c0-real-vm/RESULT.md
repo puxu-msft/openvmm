@@ -80,3 +80,34 @@ W6c disable/enable 缺口）。三个 architect 预警的 guest-PnP 未知**全�
 # rebuild: cargo xflowey build-igvm x64 --override-openvmm-hcl-feature vpci
 # boot(无 usnvmemu)→guest 无盘；起 usnvmemu→guest 自动出盘+IO；kill(RAW 盘)→移盘；重起→re-add
 ```
+
+---
+
+## ✅ C2-0 真机门 0 — graceful EJECT 缓解 finding-⑥（commit b2e8ab41e）
+
+**日期**：2026-06-12（upstream merge d1f26a05 后）。C2-0 在撤通道前先发 graceful PnP
+EJECT 给 guest（query-remove 窗口），等 EJECT_COMPLETE（1500ms 超时兜底）再 rescind。
+
+**门 0 测试**：复现 finding-⑥ 崩溃条件——热-add → 格式化 NTFS + 写 4MiB + Write-VolumeCache
+flush（挂载+脏卷）→ `pkill usnvmemu`（触发 graceful remove）→ 看 guest 是否崩。
+
+**结果（2/2 guest 存活）**：两轮都 — kmsg `vpci: sending graceful EJECT to guest` → 
+`graceful EJECT timed out; proceeding to rescind`（1500ms）→ `VpciBus removed`；guest **VM
+uptime 不重置（89→99 / 55→64）+ PSDirect 全程响应 + disk 干净归 0**。对比 C0 同条件
+（surprise-rescind）intermittent BSOD→reboot，**C2-0 graceful EJECT 下 guest 不崩**。
+
+**承重 nuance（诚实记）**：guest **未回 EJECT_COMPLETE**（恒超时）。根因 = finding-⑥ 触发场景
+是 usnvmemu **被 kill（后端已死）** → device shim Lost → guest 收到 EJECT 后做 query-remove
+要 flush，但 flush 打到 Lost device（MMIO 返 Err）→ flush 失败 → eject 不完成。但 guest 的
+**有序 query-remove teardown（接受 flush 失败）仍避免了 surprise-yank 的 BSOD**。即 C2-0 是
+"EJECT heads-up + 超时 fallback rescind"，对**后端已死**的非计划移除是能达到的最好结果
+（无法向死后端 flush）；对**计划移除**（operator 先 EJECT 再停 usnvmemu，后端尚活）才能拿到
+完整 EJECT_COMPLETE 的干净 flush——那是未来 operator-workflow，非 C2-0 reactive 模型范畴。
+
+**2/2 非铁证（⑥ intermittent），但 EJECT heads-up 的机制是确定性的**（每次都先给 guest
+query-remove 信号再 rescind），故合理判定门 0 PASS：**graceful EJECT 缓解 ⑥**。
+
+**仍未做 = finding-⑦**（re-offer 同 instance_id 不重枚举）：C2-0 只改了 remove 路径加 EJECT，
+**没动 re-add**（仍 channel rescind/re-offer）→ ⑦ 未修，re-add 后 guest 盘不回来。→ **C2-1**：
+device_count 0↔1 模型（VpciBus 通道恒在，重发变长 BUS_RELATIONS2）修 ⑦。
+
