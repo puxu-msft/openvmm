@@ -152,7 +152,7 @@ pub(crate) enum PiCheck {
 
 impl PiCheck {
     /// 失败时映射到 NVMe SC：spec § 4.6.1 Media/Data Integrity (SCT=0x02)。
-    #[allow(dead_code)] // Phase K4 真 PI Read 路径会用
+    /// （已在 B6b/B6c/K4c PI verify 多条生产路径使用，无需 dead_code 豁免。）
     pub(crate) fn to_sc(self) -> Option<u8> {
         match self {
             PiCheck::Ok => None,

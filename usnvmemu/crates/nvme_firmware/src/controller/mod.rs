@@ -695,6 +695,25 @@ pub(super) struct PrpListOp {
     /// **且** meta 到齐才触发，并做 verify-all-then-store-all。READ 在 scatter 前同步
     /// verify-all stored PI（dispatch 时 backing 已读、stored tuple concat 已算）。
     pub(super) sep_meta: Option<SepMetaPrp>,
+    /// **B6c-3（inline metadata PRACT=0，nlb≥2，PRP-list data）** —
+    /// 可选 inline-PI 描述符。`None` = 非 inline-PI 路径（plain/admin/separate，行为不变）；
+    /// `Some` = 本命令是 inline (extended-LBA) PI WRITE，host 经 PRP-list 提供完整
+    /// `nlb × block_bytes` 连续 extended-block 流（按 4096 页分段传输，与 PI 的 block_bytes
+    /// 分块**两种分组**）。WRITE finalize 在 data 全到齐后：拼回连续流 → 按 block_bytes 切 nlb
+    /// 块 → 逐块 verify host PI（PRCHK）→ 任一失败不落盘（原子）→ 全通过才把连续流原样写
+    /// backing（backing 布局 == extended-block 流）。READ 方向**不用**本标记：dispatch 同步
+    /// 读 backing + verify 后，把连续流当普通字节流走 plain PRP-list scatter。
+    pub(super) inline_pi: Option<InlinePiPrp>,
+}
+
+/// **B6c-3** — `PrpListOp` 的 inline-PI（extended-LBA）WRITE 扩展描述符。
+/// 与 `SepMetaPrp` 不同：inline PI 在 data 流内部（无 MPTR），故无 mptr/meta 字段。
+pub(super) struct InlinePiPrp {
+    pub(super) pi_type: u8,
+    pub(super) pi_first: bool,
+    pub(super) data_bytes: u32,
+    pub(super) block_bytes: u32,
+    pub(super) prchk: crate::pi::PrChk,
 }
 
 /// **B6b-4-N>2** — `PrpListOp` 的 separate-meta 扩展描述符。WRITE 与 READ 用同一结构
@@ -3665,6 +3684,7 @@ impl NvmeController {
                     data_pages,
                     list_pages_fetched: 0,
                     sep_meta: None,
+                    inline_pi: None,
                 },
             );
             // DMA-read PRP list 页（在 prp2）；到达后 NvmReadPrpListFetch 解析 + per-page 写。

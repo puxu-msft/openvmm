@@ -405,6 +405,105 @@ impl NvmeController {
         };
         self.post_cqe(ctx, op.cq_id, cqe);
     }
+
+    /// **B6c-3（inline metadata PRACT=0，nlb≥2，PRP-list data）** — extended-LBA 多块 WRITE
+    /// 收尾：host 经 PRP-list 提供的 `nlb × block_bytes` 连续 extended-block 流（按 4096 页
+    /// 分段到齐）→ 拼回连续流 → 按 block_bytes 切 nlb 块 → 逐块按 PRCHK verify host PI →
+    /// **任一失败则不落盘（原子，首个失败 Media SCT=2）** → 全通过才把连续流**原样**写
+    /// backing（backing 布局 == extended-block 流，无需重排）。
+    fn prp_list_write_inline_pi_finalize(&mut self, ctx: &mut DeviceCtx<'_>, op_id: u64) {
+        let Some(op) = self.prp_list_ops.remove(&op_id) else {
+            return;
+        };
+        let ipi = match op.inline_pi {
+            Some(x) => x,
+            None => {
+                tracing::warn!(op_id, "inline-pi finalize called without inline_pi");
+                return;
+            }
+        };
+        let num_blocks = op.num_blocks as usize;
+        let block_bytes = ipi.block_bytes as usize;
+        let data_bytes = ipi.data_bytes as usize;
+        let total_bytes = num_blocks * block_bytes;
+        let phase = self.cqs.get(&op.cq_id).map(|c| c.phase).unwrap_or(1);
+        // 拼回连续 extended-block 流。
+        let mut full = Vec::with_capacity(total_bytes);
+        for b in op.data_pages.iter().flatten() {
+            full.extend_from_slice(b);
+        }
+        let cqe = if full.len() < total_bytes {
+            tracing::warn!(
+                got = full.len(),
+                want = total_bytes,
+                "inline-pi WRITE 拼接长度不足"
+            );
+            Cqe::error(op.cid, op.sq_id, op.sq_head, phase, sc::DATA_TRANSFER_ERROR)
+        } else {
+            full.truncate(total_bytes);
+            // ── ① 逐块 verify host PI（任一失败 → 不落盘，原子）──
+            let mut verify_err: Option<crate::pi::PiCheck> = None;
+            for i in 0..num_blocks {
+                let blk = &full[i * block_bytes..(i + 1) * block_bytes];
+                let (data_slice, tuple_slice) = if ipi.pi_first {
+                    (&blk[8..8 + data_bytes], &blk[0..8])
+                } else {
+                    (&blk[0..data_bytes], &blk[data_bytes..data_bytes + 8])
+                };
+                let tuple_arr: [u8; 8] = tuple_slice.try_into().unwrap();
+                let host_tuple = crate::pi::PiTuple::from_bytes(&tuple_arr);
+                match host_tuple.verify(data_slice, op.lba + i as u64, ipi.pi_type, ipi.prchk) {
+                    crate::pi::PiCheck::Ok => {}
+                    other => {
+                        verify_err = Some(other);
+                        break;
+                    }
+                }
+            }
+            if let Some(other) = verify_err {
+                let sc_byte = other
+                    .to_sc()
+                    .expect("non-Ok PiCheck always maps to an SC byte");
+                tracing::warn!(
+                    nsid = op.nsid,
+                    lba = op.lba,
+                    ?other,
+                    "inline-pi WRITE: host PI verify 失败（全块不落盘）"
+                );
+                Cqe::error(
+                    op.cid,
+                    op.sq_id,
+                    op.sq_head,
+                    phase,
+                    sc::status(sc_byte, sc::SCT_MEDIA_DATA_INTEGRITY),
+                )
+            } else if let Some(ns) = self.namespaces.get_mut(&op.nsid) {
+                // ── ② 全通过 → 连续流原样写 backing（== extended-block 布局）──
+                match ns.write_at(&full, op.lba * block_bytes as u64) {
+                    Ok(()) => {
+                        self.stat_host_writes += 1;
+                        self.stat_lba_written += num_blocks as u64;
+                        crate::controller::io::advance_zns_wp(ns, op.lba, num_blocks as u32);
+                        tracing::debug!(
+                            nsid = op.nsid,
+                            lba = op.lba,
+                            num_blocks,
+                            "inline-pi WRITE OK（host PI verified，N 块原子落盘）"
+                        );
+                        Cqe::success(op.cid, op.sq_id, op.sq_head, phase)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, nsid = op.nsid, "inline-pi WRITE backing fail");
+                        Cqe::error(op.cid, op.sq_id, op.sq_head, phase, sc::DATA_TRANSFER_ERROR)
+                    }
+                }
+            } else {
+                Cqe::error(op.cid, op.sq_id, op.sq_head, phase, sc::INVALID_NAMESPACE)
+            }
+        };
+        self.post_cqe(ctx, op.cq_id, cqe);
+    }
+
     pub(super) fn on_dma_complete_impl(
         &mut self,
         ctx: &mut DeviceCtx<'_>,
@@ -2184,12 +2283,20 @@ impl NvmeController {
                     for (i, gpa) in list.iter().enumerate() {
                         let page_idx = (i + 1) as u32;
                         let want_bytes = if page_idx == total_pages - 1 {
-                            // 末页可能不满 4 KiB
-                            // **2026-06-09 纯 4K** — 按 per-NS 扇区算总字节。
+                            // 末页可能不满 4 KiB。**关键**：总传输字节按本 op 真实形态算——
+                            // inline-PI（extended-LBA）流是 num_blocks × block_bytes（含 inline
+                            // metadata，4104/块）；plain / sep-meta（data 经 PRP，meta 经 MPTR）
+                            // 是 num_blocks × sector（纯 data）。**误用 sector 当 inline 总字节
+                            // 会让末页 size 算成 0 → inline nlb≥2 WRITE silent 丢末页数据**
+                            // （reviewer B6c-3 HIGH，C1① 同类教训）。
                             let op = &self.prp_list_ops[&op_id];
-                            let sector =
-                                1u64 << self.namespaces.get(&op.nsid).map_or(9u8, |n| n.lbads);
-                            let total_bytes = op.num_blocks as u64 * sector;
+                            let total_bytes = if let Some(ipi) = op.inline_pi.as_ref() {
+                                op.num_blocks as u64 * ipi.block_bytes as u64
+                            } else {
+                                let sector =
+                                    1u64 << self.namespaces.get(&op.nsid).map_or(9u8, |n| n.lbads);
+                                op.num_blocks as u64 * sector
+                            };
                             let last = total_bytes - (page_idx as u64) * NVME_PAGE_SIZE;
                             last as u32
                         } else {
@@ -2217,8 +2324,9 @@ impl NvmeController {
                 PendingOp::NvmWritePrpListData { op_id, page_idx } => {
                     // **Phase E**：单个数据页 DMA-read 到达。填入 data_pages；plain 路径全
                     // 部齐 → 合并写文件 → CQE。**B6b-4-N>2**：sep_meta 路径需 data 全到齐
-                    // **且** meta 也到齐才 finalize；本 arm 只填数据 + 触发双门控检查。
-                    let (done_all, has_sep_meta, sep_meta_ready) =
+                    // **且** meta 也到齐才 finalize。**B6c-3**：inline_pi 路径 data 全到齐 →
+                    // 拼连续流 → 逐块 verify host PI → 原子存盘。本 arm 只填数据 + 触发门控。
+                    let (done_all, has_sep_meta, sep_meta_ready, has_inline_pi) =
                         if let Some(op) = self.prp_list_ops.get_mut(&op_id) {
                             op.data_pages[page_idx as usize] = Some(data);
                             op.pages_done += 1;
@@ -2229,14 +2337,17 @@ impl NvmeController {
                                 .as_ref()
                                 .map(|s| s.meta.is_some())
                                 .unwrap_or(false);
-                            (data_done, has_sm, meta_ok)
+                            (data_done, has_sm, meta_ok, op.inline_pi.is_some())
                         } else {
                             tracing::warn!(op_id, page_idx, "PRP list data completion unknown");
-                            (false, false, false)
+                            (false, false, false, false)
                         };
                     if done_all && has_sep_meta && sep_meta_ready {
                         // sep_meta 路径双门控达成 → verify-all-then-store-all。
                         self.prp_list_write_sep_meta_finalize(ctx, op_id);
+                    } else if done_all && has_inline_pi {
+                        // **B6c-3** inline-PI nlb≥2：拼连续流 → 逐块 verify → 原子存盘。
+                        self.prp_list_write_inline_pi_finalize(ctx, op_id);
                     } else if done_all && !has_sep_meta {
                         let op = self.prp_list_ops.remove(&op_id).unwrap();
                         // 合并 data_pages → 一段连续 buffer

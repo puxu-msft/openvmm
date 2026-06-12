@@ -782,13 +782,167 @@ impl NvmeController {
                     if meta_inline_r {
                         // **B6c-2（inline metadata，PRACT=0）READ** — nlb=1 dual-PRP 路径：
                         // backing 读 4104 byte block → 按 PRCHK verify stored PI → 前 4096 → PRP1、
-                        // 末 8 → PRP2（两条 DMA-write）。nlb≥2 inline 需 PRP-list defer。
-                        if nlb != 1 {
-                            tracing::warn!(
-                                nlb,
-                                "inline-meta READ nlb≥2 需 PRP-list（待续）→ INVALID_FIELD"
+                        // 末 8 → PRP2（两条 DMA-write）。**B6c-3** nlb≥2 走 PRP-list scatter。
+                        if nlb >= 2 {
+                            // 同步读 nlb×block_bytes → 逐块 verify stored PI → 把连续 extended-block
+                            // 流当普通字节流走 plain PRP-list scatter（scatter 不需 inline 标记）。
+                            let pi_type = ns.pi_type;
+                            let pi_first = ns.pi_first;
+                            let block_bytes = ns.block_bytes() as usize;
+                            let data_bytes = ns.data_bytes() as usize;
+                            let total_lba = ns.total_lba;
+                            if block_bytes != NVME_PAGE_SIZE as usize + 8 {
+                                tracing::warn!(
+                                    block_bytes,
+                                    "inline-meta READ nlb≥2 仅支持标准 PI NS（block=4104）"
+                                );
+                                return Some(Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::INVALID_FIELD,
+                                ));
+                            }
+                            if prp2 == 0 {
+                                tracing::warn!(
+                                    nsid,
+                                    "inline-meta READ nlb≥2 需 PRP2（PRP-list 页）"
+                                );
+                                return Some(Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::INVALID_FIELD,
+                                ));
+                            }
+                            if (prp1 & (NVME_PAGE_SIZE - 1)) != 0
+                                || (prp2 & (NVME_PAGE_SIZE - 1)) != 0
+                            {
+                                tracing::warn!(
+                                    "inline-meta READ nlb≥2 要求 PRP1/PRP2 页对齐（教学边界）"
+                                );
+                                return Some(Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::INVALID_FIELD,
+                                ));
+                            }
+                            let total_bytes = nlb as u64 * block_bytes as u64;
+                            if total_bytes > MDTS_MAX_BYTES {
+                                return Some(Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::INVALID_FIELD,
+                                ));
+                            }
+                            match slba.checked_add(nlb as u64) {
+                                Some(end) if end <= total_lba => {}
+                                _ => {
+                                    return Some(Cqe::error(
+                                        cid,
+                                        sq_id,
+                                        sq_head,
+                                        phase,
+                                        sc::LBA_OUT_OF_RANGE,
+                                    ));
+                                }
+                            }
+                            // 读 nlb 个连续 extended block。
+                            let mut blocks = vec![0u8; block_bytes * nlb as usize];
+                            let ns_mut = self.ns_mut(nsid).unwrap();
+                            if let Err(e) = ns_mut.read_at(&mut blocks, slba * block_bytes as u64) {
+                                tracing::warn!(error = %e, nsid, slba, "inline-meta READ nlb≥2 backing fail");
+                                return Some(Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::DATA_TRANSFER_ERROR,
+                                ));
+                            }
+                            // 逐块 verify stored PI（按 PRCHK 门控）；失败 → 同步 Media 错误，不 scatter。
+                            let prchk = crate::pi::PrChk::from_cdw12(cdw12);
+                            for i in 0..nlb as usize {
+                                let blk = &blocks[i * block_bytes..(i + 1) * block_bytes];
+                                let (data_slice, tuple_slice) = if pi_first {
+                                    (&blk[8..8 + data_bytes], &blk[0..8])
+                                } else {
+                                    (&blk[0..data_bytes], &blk[data_bytes..data_bytes + 8])
+                                };
+                                let tuple_arr: [u8; 8] = tuple_slice.try_into().unwrap();
+                                let stored = crate::pi::PiTuple::from_bytes(&tuple_arr);
+                                match stored.verify(data_slice, slba + i as u64, pi_type, prchk) {
+                                    crate::pi::PiCheck::Ok => {}
+                                    other => {
+                                        let sc_byte = other
+                                            .to_sc()
+                                            .expect("non-Ok PiCheck always maps to an SC byte");
+                                        tracing::warn!(
+                                            nsid,
+                                            lba = slba + i as u64,
+                                            ?other,
+                                            "inline-meta READ nlb≥2: stored PI verify 失败"
+                                        );
+                                        return Some(Cqe::error(
+                                            cid,
+                                            sq_id,
+                                            sq_head,
+                                            phase,
+                                            sc::status(sc_byte, sc::SCT_MEDIA_DATA_INTEGRITY),
+                                        ));
+                                    }
+                                }
+                            }
+                            // 全 OK → 连续 extended-block 流按 4096 页切，走 plain PRP-list scatter。
+                            let total_pages = total_bytes.div_ceil(NVME_PAGE_SIZE) as u32;
+                            let mut data_pages: Vec<Option<Vec<u8>>> =
+                                Vec::with_capacity(total_pages as usize);
+                            for p in 0..total_pages as usize {
+                                let off = p * NVME_PAGE_SIZE as usize;
+                                let end = ((p + 1) * NVME_PAGE_SIZE as usize).min(blocks.len());
+                                data_pages.push(Some(blocks[off..end].to_vec()));
+                            }
+                            let op_id = self.alloc_op_id();
+                            self.prp_list_ops.insert(
+                                op_id,
+                                crate::controller::PrpListOp {
+                                    sq_id,
+                                    cid,
+                                    sq_head,
+                                    cq_id,
+                                    nsid,
+                                    lba: slba,
+                                    num_blocks: nlb,
+                                    is_write: false,
+                                    prp1_gpa: prp1,
+                                    list_entries: None,
+                                    total_pages,
+                                    pages_done: 0,
+                                    data_pages,
+                                    list_pages_fetched: 0,
+                                    sep_meta: None,
+                                    inline_pi: None, // READ scatter 走 plain，无需标记
+                                },
                             );
-                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                            let tok = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+                            self.pending_ios.insert(
+                                tok,
+                                PendingIo {
+                                    sq_id,
+                                    cid,
+                                    sq_head,
+                                    cq_id,
+                                    nsid,
+                                    op: PendingOp::NvmReadPrpListFetch { op_id },
+                                },
+                            );
+                            return None;
                         }
                         let pi_type = ns.pi_type;
                         let pi_first = ns.pi_first;
@@ -1056,6 +1210,7 @@ impl NvmeController {
                                     meta: Some(tuple_concat),
                                     meta_pending: false, // scatter step 触发时 set true
                                 }),
+                                inline_pi: None,
                             },
                         );
                         // fetch PRP list 页（NvmReadPrpListFetch arm 会 walk + scatter）。
@@ -1599,6 +1754,7 @@ impl NvmeController {
                             data_pages,
                             list_pages_fetched: 0,
                             sep_meta: None,
+                            inline_pi: None,
                         },
                     );
                     let tok = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
@@ -1697,13 +1853,140 @@ impl NvmeController {
                     // 走 dual-PRP（PRP1=4096 head + PRP2=8 tail，因 block_bytes=4104 > NVME_PAGE_SIZE）；
                     // nlb≥2 inline 需 PRP-list（与 N>2 separate 同走 PrpListOp 机件）作为最终扩展 defer。
                     if meta_inline {
-                        // **B6c-1（inline metadata，PRACT=0）WRITE** — nlb=1 dual-PRP 路径。
-                        if nlb != 1 {
-                            tracing::warn!(
-                                nlb,
-                                "inline-meta WRITE nlb≥2 需 PRP-list（待续）→ INVALID_FIELD"
+                        // **B6c-1（inline metadata，PRACT=0）WRITE** — nlb=1 dual-PRP 路径；
+                        // **B6c-3** nlb≥2 走 PRP-list（连续 nlb×block_bytes extended-block 流，
+                        // 按 4096 页分段 gather，finalize 逐块 verify host PI 后原子存盘）。
+                        if nlb >= 2 {
+                            let block_bytes = ns.block_bytes() as usize;
+                            let data_bytes = ns.data_bytes() as usize;
+                            // B6c-3 当前仅标准 PI NS（4104）；非标准布局是 #3 子系统级改动 defer。
+                            if block_bytes != NVME_PAGE_SIZE as usize + 8 {
+                                tracing::warn!(
+                                    block_bytes,
+                                    "inline-meta WRITE nlb≥2 仅支持标准 PI NS（block=4104）"
+                                );
+                                return Some(Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::INVALID_FIELD,
+                                ));
+                            }
+                            if prp2 == 0 {
+                                tracing::warn!(
+                                    nsid,
+                                    "inline-meta WRITE nlb≥2 需 PRP2（PRP-list 页）"
+                                );
+                                return Some(Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::INVALID_FIELD,
+                                ));
+                            }
+                            if (prp1 & (NVME_PAGE_SIZE - 1)) != 0
+                                || (prp2 & (NVME_PAGE_SIZE - 1)) != 0
+                            {
+                                tracing::warn!(
+                                    "inline-meta WRITE nlb≥2 要求 PRP1/PRP2 页对齐（教学边界）"
+                                );
+                                return Some(Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::INVALID_FIELD,
+                                ));
+                            }
+                            // MDTS 按含 metadata 校核（C1①）：总传输 = nlb × block_bytes。
+                            let total_bytes = nlb as u64 * block_bytes as u64;
+                            if total_bytes > MDTS_MAX_BYTES {
+                                tracing::warn!(nlb, total_bytes, "inline-meta WRITE nlb≥2 超 MDTS");
+                                return Some(Cqe::error(
+                                    cid,
+                                    sq_id,
+                                    sq_head,
+                                    phase,
+                                    sc::INVALID_FIELD,
+                                ));
+                            }
+                            let total_lba = ns.total_lba;
+                            match slba.checked_add(nlb as u64) {
+                                Some(end) if end <= total_lba => {}
+                                _ => {
+                                    return Some(Cqe::error(
+                                        cid,
+                                        sq_id,
+                                        sq_head,
+                                        phase,
+                                        sc::LBA_OUT_OF_RANGE,
+                                    ));
+                                }
+                            }
+                            let pi_type = ns.pi_type;
+                            let pi_first = ns.pi_first;
+                            let prchk = crate::pi::PrChk::from_cdw12(cdw12);
+                            // 连续流按 4096 页分段：total_pages 个 host 数据页（PRP1 + PRP-list）。
+                            let total_pages = total_bytes.div_ceil(NVME_PAGE_SIZE) as u32;
+                            let data_pages: Vec<Option<Vec<u8>>> = vec![None; total_pages as usize];
+                            let op_id = self.alloc_op_id();
+                            self.prp_list_ops.insert(
+                                op_id,
+                                crate::controller::PrpListOp {
+                                    sq_id,
+                                    cid,
+                                    sq_head,
+                                    cq_id,
+                                    nsid,
+                                    lba: slba,
+                                    num_blocks: nlb,
+                                    is_write: true,
+                                    prp1_gpa: prp1,
+                                    list_entries: None,
+                                    total_pages,
+                                    pages_done: 0,
+                                    data_pages,
+                                    list_pages_fetched: 0,
+                                    sep_meta: None,
+                                    inline_pi: Some(crate::controller::InlinePiPrp {
+                                        pi_type,
+                                        pi_first,
+                                        data_bytes: data_bytes as u32,
+                                        block_bytes: block_bytes as u32,
+                                        prchk,
+                                    }),
+                                },
                             );
-                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                            // fetch PRP list 页 + PRP1 数据页（page 0），复用 plain WRITE PRP-list
+                            // gather（NvmWritePrpListFetch / NvmWritePrpListData），finalize 走
+                            // inline_pi 分支。
+                            let tok_list = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+                            self.pending_ios.insert(
+                                tok_list,
+                                PendingIo {
+                                    sq_id,
+                                    cid,
+                                    sq_head,
+                                    cq_id,
+                                    nsid,
+                                    op: PendingOp::NvmWritePrpListFetch { op_id },
+                                },
+                            );
+                            let tok_prp1 = ctx.dma_read(prp1, NVME_PAGE_SIZE as u32);
+                            self.pending_ios.insert(
+                                tok_prp1,
+                                PendingIo {
+                                    sq_id,
+                                    cid,
+                                    sq_head,
+                                    cq_id,
+                                    nsid,
+                                    op: PendingOp::NvmWritePrpListData { op_id, page_idx: 0 },
+                                },
+                            );
+                            return None;
                         }
                         let block_bytes = ns.block_bytes() as usize;
                         // 当前 inline 仅支持标准 PI NS（lbads=12 + meta_size=8 → 4104）；
@@ -1899,6 +2182,7 @@ impl NvmeController {
                                     meta: None,
                                     meta_pending: false,
                                 }),
+                                inline_pi: None,
                             },
                         );
                         // fetch PRP list 页本身
@@ -2320,6 +2604,7 @@ impl NvmeController {
                             data_pages,
                             list_pages_fetched: 0,
                             sep_meta: None,
+                            inline_pi: None,
                         },
                     );
                     // 先 fetch PRP list 页本身
