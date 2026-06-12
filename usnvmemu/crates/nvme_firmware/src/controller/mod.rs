@@ -38,6 +38,7 @@
 //! 体现在 driver 视角（4 SQ 可独立投 cmd，不互相 stall 等待 CQE）。
 
 mod admin;
+mod cmb;
 mod completion;
 pub mod discovery_log;
 mod enable;
@@ -1550,6 +1551,43 @@ pub struct NvmeController {
     /// 其寄存器。backing 注入留后续 Phase（P1a 用 `Vec`-backed 中立实现 +
     /// `enable_cmb_for_test` 测试构造入口）。
     pub(super) cmb: Option<CmbState>,
+
+    /// **CMB-P1b** — 本地合成-completion 待投递队列。CMB 命中的 read/write 在
+    /// `guest_read`/`guest_write` 内**同步**读写 backing，把合成完成事件入此队列；
+    /// **绝不**在 `access_guest`/`guest_*` 调用栈内递归调 `on_dma_complete*`（设计
+    /// §10#2 铁律——否则破坏 `MAX_SHADOW_POLL_ITERS` 自喂防护）。真正喂
+    /// `on_dma_complete_impl` 由顶层入口（`mmio_write`/`tick`/`on_dma_complete`）
+    /// 收尾的 `drain_cmb_completions` 在**调用栈尾**完成。
+    pub(super) cmb_completions: std::collections::VecDeque<CmbCompletion>,
+
+    /// **CMB-P1b** — drain 重入哨兵：`drain_cmb_completions` 运行期置 `true`。
+    /// 顶层入口在 drain 已在跑时跳过再起 drain（顶层 drain 循环会消费 cascade
+    /// 入队的新条目）。同时作非重入断言的可观测点（测试用）。
+    pub(super) cmb_draining: bool,
+
+    /// **CMB-P1b（非重入铁律 §10#2 的机器校验）** — `guest_read`/`guest_write`
+    /// 在访问 backing 期间置 `true`。`on_dma_complete_impl` 入口 `debug_assert` 它为
+    /// `false`——即**绝不**在 `access_guest`/`guest_*` 调用栈内触达 completion 派发
+    /// （否则破坏 `MAX_SHADOW_POLL_ITERS` 自喂防护）。debug-only，release 无开销。
+    pub(super) cmb_in_access_guest: bool,
+
+    /// **CMB-P1b** — CMB 合成 token 计数器（低位）。CMB token = `CMB_TOKEN_TAG | n`，
+    /// tag 在 bit 63，保证与各 transport 分配的 token（vfio: 低 16 位；pcie_remote:
+    /// `1<<40` 起）**永不冲突**。`on_dma_complete_impl` 按 pending 表成员关系路由，
+    /// 故 CMB token 与真 DMA token 进同一套 pending 表无歧义。
+    pub(super) cmb_next_token: u64,
+}
+
+/// **CMB-P1b** — 一条本地合成的 DMA 完成事件（CMB 命中的 read/write 退化为同步
+/// 内存访问，但仍走 token 模型以兼容 io.rs 的异步 PendingOp 状态机）。
+pub(super) struct CmbCompletion {
+    /// 与 `guest_read`/`guest_write` 返回值一致的 token（CMB tag 命名空间）。
+    pub(super) token: u64,
+    /// 访问成败（CMB 命中恒同步完成；越界 → `false`）。
+    pub(super) ok: bool,
+    /// read 完成时携带从 backing 读出的字节；write 完成为 `None`（对齐
+    /// `on_dma_complete` 契约：dma_write 的 data 始终空）。
+    pub(super) data: Option<Vec<u8>>,
 }
 
 /// **CMB-P1a** — Controller Memory Buffer 运行时状态。
@@ -1773,6 +1811,10 @@ impl NvmeController {
             return false;
         }
         self.mmio_write_impl(ctx, 0, ofst as u64, size, value);
+        // CMB-P1b（reviewer MEDIUM-2）：fabric 顶层入口也需 tail-drain，否则 CMB+fabric
+        // 共存时合成 completion 漏投。今天 CMB 是 PCIe-only（cmb=None 下为 no-op），
+        // 此为防御性 + 前向正确。
+        self.drain_cmb_completions(ctx);
         true
     }
 
@@ -1815,6 +1857,9 @@ impl NvmeController {
         self.current_dispatch_conn_id = conn_id;
         let r = self.dispatch_admin(ctx, sqe, cid, /*sq_head*/ 0, cq_id);
         self.current_dispatch_conn_id = prev;
+        // CMB-P1b（reviewer MEDIUM-2）：fabric 入口 tail-drain（CMB+fabric 共存防漏投；
+        // 今天 CMB PCIe-only，cmb=None 下 no-op）。
+        self.drain_cmb_completions(ctx);
         r
     }
 
@@ -1831,7 +1876,11 @@ impl NvmeController {
         cid: u16,
         cq_id: u16,
     ) -> Option<crate::cmd::Cqe> {
-        self.dispatch_io(ctx, sq_id, sqe, cid, /*sq_head*/ 0, cq_id)
+        let r = self.dispatch_io(ctx, sq_id, sqe, cid, /*sq_head*/ 0, cq_id);
+        // CMB-P1b（reviewer MEDIUM-2）：fabric 入口 tail-drain（CMB+fabric 共存防漏投；
+        // 今天 CMB PCIe-only，cmb=None 下 no-op）。
+        self.drain_cmb_completions(ctx);
+        r
     }
 
     /// **2026-06-09 纯 4K** — 查指定 NSID 当前激活 LBA Format 的 `lbads`
@@ -2612,6 +2661,10 @@ impl NvmeController {
             ssvid,
             msix_count: 4, // admin (vec 0) + IO (vec 1) + 2 spare
             cmb: None,
+            cmb_completions: std::collections::VecDeque::new(),
+            cmb_draining: false,
+            cmb_in_access_guest: false,
+            cmb_next_token: 0,
         })
     }
 
@@ -2773,7 +2826,7 @@ impl NvmeController {
         // 段 1：[old_tail .. old_tail + first_count)
         let bytes1 = first_count * SQE_BYTES as u32;
         let gpa1 = base_gpa + old_tail as u64 * SQE_BYTES;
-        let tok1 = ctx.dma_read(gpa1, bytes1);
+        let tok1 = self.guest_read(ctx, gpa1, bytes1);
         self.pending_fetches.insert(
             tok1,
             FetchCtx {
@@ -2795,7 +2848,7 @@ impl NvmeController {
         if second_count > 0 {
             let bytes2 = second_count * SQE_BYTES as u32;
             let gpa2 = base_gpa;
-            let tok2 = ctx.dma_read(gpa2, bytes2);
+            let tok2 = self.guest_read(ctx, gpa2, bytes2);
             self.pending_fetches.insert(
                 tok2,
                 FetchCtx {
@@ -2912,6 +2965,10 @@ impl NvmeController {
     fn issue_shadow_read(&mut self, ctx: &mut DeviceCtx<'_>, qid: u16, is_cq: bool, iters: u32) {
         let off = qid as u64 * 8 + if is_cq { 4 } else { 0 };
         let gpa = self.doorbell_shadow_gpa + off;
+        // **CMB-P1b（reviewer L3）** — shadow doorbell buffer 由 driver 经 Doorbell Buffer
+        // Config 提供，是 host/driver 私有 RAM、**不**在 CMB（CMB 是 controller 暴露给
+        // driver 的内存，方向相反）。故 shadow 读**刻意保留** `ctx.dma_read`、不走
+        // `guest_read`：避免 shadow 自喂 re-read 链与 CMB 合成-completion 路径交叉。
         let token = ctx.dma_read(gpa, 4);
         self.pending_shadow_polls
             .insert(token, ShadowPollCtx { qid, is_cq, iters });
@@ -2930,6 +2987,8 @@ impl NvmeController {
     fn write_eventidx(&mut self, ctx: &mut DeviceCtx<'_>, qid: u16, is_cq: bool, value: u32) {
         let off = qid as u64 * 8 + if is_cq { 4 } else { 0 };
         let gpa = self.doorbell_event_idx_gpa + off;
+        // **CMB-P1b（reviewer L3）** — event_idx buffer 同 shadow doorbell：driver 私有
+        // RAM、非 CMB，刻意保留 `ctx.dma_write`（见 `issue_shadow_read` 注释）。
         let token = ctx.dma_write(gpa, value.to_le_bytes().to_vec());
         self.pending_eventidx_writes.insert(token);
         tracing::trace!(
@@ -3462,7 +3521,7 @@ impl NvmeController {
         // 512-vs-4096 长度不一致导致 4K 上 Compare 恒 fail。
         let sector = self.ns(nsid).map_or(SECTOR_SIZE, |n| 1u64 << n.lbads);
         let bytes = nlb as u64 * sector;
-        let tok = ctx.dma_read(prp1, bytes as u32);
+        let tok = self.guest_read(ctx, prp1, bytes as u32);
         self.pending_ios.insert(
             tok,
             PendingIo {
@@ -3741,7 +3800,7 @@ impl NvmeController {
         cq_id: u16,
     ) {
         if data.len() as u64 <= NVME_PAGE_SIZE {
-            let tok = ctx.dma_write(prp1, data);
+            let tok = self.guest_write(ctx, prp1, data);
             self.pending_ios.insert(
                 tok,
                 PendingIo {
@@ -3804,7 +3863,7 @@ impl NvmeController {
                 },
             );
             // DMA-read PRP list 页（在 prp2）；到达后 NvmReadPrpListFetch 解析 + per-page 写。
-            let tok = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+            let tok = self.guest_read(ctx, prp2, NVME_PAGE_SIZE as u32);
             self.pending_ios.insert(
                 tok,
                 PendingIo {
@@ -3821,7 +3880,7 @@ impl NvmeController {
         let half = NVME_PAGE_SIZE as usize;
         let (b1, b2) = data.split_at(half);
         // page0 → PRP1（sibling 半，success no-op）。
-        let tok1 = ctx.dma_write(prp1, b1.to_vec());
+        let tok1 = self.guest_write(ctx, prp1, b1.to_vec());
         self.pending_ios.insert(
             tok1,
             PendingIo {
@@ -3834,7 +3893,7 @@ impl NvmeController {
             },
         );
         // page1 → PRP2（completer，success post CQE）。后发 → in-order 下最后完成。
-        let tok2 = ctx.dma_write(prp2, b2.to_vec());
+        let tok2 = self.guest_write(ctx, prp2, b2.to_vec());
         self.pending_ios.insert(
             tok2,
             PendingIo {
@@ -3942,12 +4001,21 @@ impl NvmeController {
         }
         // 累计未通知 CQE
         cq.pending_completions = cq.pending_completions.saturating_add(1);
+        let pending_completions = cq.pending_completions;
         tracing::debug!(cq_id, slot, gpa = format_args!("{:#x}", gpa), "post CQE");
-        ctx.dma_write_fire_and_forget(gpa, bytes);
+        // **CMB-P1b** — CQE 写经 guest_write dispatch（CMB-resident CQ → 落 backing；
+        // 否则走 transport）。fire-and-forget 语义：丢弃返回 token（成功与否不阻塞
+        // 中断逻辑，与原 `dma_write_fire_and_forget` 一致）；CMB 命中时合成 completion
+        // 入队由顶层 drain 静默消费（无 pending 表项 → unknown-token 静默路径）。
+        // 先取出上面 `cq` 借用所需的标量再调（guest_write 需 `&mut self`），调后重取 `cq`。
+        let _ = self.guest_write(ctx, gpa, bytes);
         if !iv_enabled {
             return;
         }
-        let must_fire = should_fire_irq(cq_id, cq.pending_completions, aggr_thr, aggr_time_100us);
+        let must_fire = should_fire_irq(cq_id, pending_completions, aggr_thr, aggr_time_100us);
+        let Some(cq) = self.cqs.get_mut(&cq_id) else {
+            return;
+        };
         if must_fire {
             cq.pending_completions = 0;
             cq.last_fire = Some(std::time::Instant::now());
@@ -4105,6 +4173,10 @@ impl PcieDevice for NvmeController {
         value: u64,
     ) {
         self.mmio_write_impl(ctx, bar, offset, size, value);
+        // **CMB-P1b** — 顶层入口收尾 tail-drain：mmio_write_impl 内（doorbell →
+        // SQE-fetch / dispatch）可能经 guest_* 合成 CMB completion 入队；在调用栈尾
+        // 栈外投递（设计 §10#2）。
+        self.drain_cmb_completions(ctx);
     }
 
     fn reset(&mut self, kind: u32) {
@@ -4206,12 +4278,19 @@ impl PcieDevice for NvmeController {
                 self.start_shadow_cq_poll(ctx, qid);
             }
         }
+        // **CMB-P1b** — tick 收尾 tail-drain：上面的 shadow-poll 起链等路径若经
+        // guest_* 命中 CMB 会入队合成 completion；栈尾栈外投递（设计 §10#2）。
+        self.drain_cmb_completions(ctx);
     }
 
     /// **H-3 修复** — DMA 完成派发委托到 `controller/completion.rs` 中的
     /// `on_dma_complete_impl`，让 mod.rs 不背 ~1600 行 IO 完成路径代码。
     fn on_dma_complete(&mut self, ctx: &mut DeviceCtx<'_>, token: u64, ok: bool, data: Vec<u8>) {
         self.on_dma_complete_impl(ctx, token, ok, data);
+        // **CMB-P1b** — 顶层入口收尾 tail-drain：真 DMA 完成的处理路径（io.rs）可能
+        // 经 guest_* 命中 CMB 而入队合成 completion；在此调用栈尾栈外投递（设计 §10#2，
+        // 与 `MAX_SHADOW_POLL_ITERS` 自喂防护同栈外纪律）。
+        self.drain_cmb_completions(ctx);
     }
 }
 
@@ -5329,10 +5408,15 @@ mod cmb_tests {
         let mut cap_t = CaptureTransport::with_start_token(0x100);
         let mut ctx = DeviceCtx::new(&mut cap_t);
         let cba = 0x1_0000_0000u64; // >4 GiB，验高 32 位不截断
+        // **P1b LOW-2 后**：CBA 仅在 CMSE=0 时可写（spec § 3.1.24）。故 split-dword 须
+        // 先在 CMSE=0 下写完整 CBA（low+high 含 CRE，不含 CMSE），再单独置 CMSE。
+        // 本测仍验"高 32 位不截断"这一寄存器 plumbing（与 64-bit 寄存器回归同纪律）。
+        let pre = (cba & cmbmsc::CBA_MASK) | cmbmsc::CRE; // CMSE=0
+        c.mmio_write_impl(&mut ctx, 0, 0x50, 4, pre & 0xffff_ffff);
+        c.mmio_write_impl(&mut ctx, 0, 0x54, 4, pre >> 32);
+        // 再置 CMSE（合法 latch）。
+        c.mmio_write_impl(&mut ctx, 0, 0x50, 4, (pre | cmbmsc::CMSE) & 0xffff_ffff);
         let v = (cba & cmbmsc::CBA_MASK) | cmbmsc::CMSE | cmbmsc::CRE;
-        // 分两条 4-byte 写（low 含 CRE/CMSE，high 含 CBA 高位）。
-        c.mmio_write_impl(&mut ctx, 0, 0x50, 4, v & 0xffff_ffff);
-        c.mmio_write_impl(&mut ctx, 0, 0x54, 4, v >> 32);
         assert_eq!(
             c.mmio_read_impl(0, 0x50, 8),
             v,
@@ -5426,5 +5510,441 @@ mod cmb_tests {
         assert!(!c.cmb.as_ref().unwrap().cmse, "FLR reset 清 CMSE");
         // CSTS.RDY 也被清（确认走了完整 disable 路径）。
         assert_eq!(c.csts & csts::RDY, 0);
+    }
+}
+
+/// **CMB-P1b** — CMB 数据路径（dispatch helper + 本地合成-completion 队列 +
+/// tail-drain 非重入）单测。
+///
+/// 验收（设计 §10#2 铁律 + 任务纪律）：
+/// (a) CMB gpa 的 read 命中 backing 内容、write 落进 backing；
+/// (b) 合成 completion 经 tail-drain 驱动 `on_dma_complete_impl`（PendingOp 推进），
+///     **且非重入**（`access_guest`/`guest_*` 调用栈内绝不调 `on_dma_complete*`）；
+/// (c) 非-CMB gpa 仍走 `ctx.dma_*`（transport 异步路径）；
+/// (d) cascade（一条 CMB completion 触发的后续 CMB 访问也被正确 drain）；
+/// (e) live（CMSE=1）改 CBA 被拒。
+#[cfg(test)]
+mod cmb_datapath_tests {
+    use super::*;
+    use crate::regs::{SQE_BYTES, SubmissionQueue, cmbmsc, csts};
+    use pcie_device_core::{CaptureTransport, DeviceCtx, PcieDevice as _, TransportEvent};
+
+    const CMB_SIZE: u64 = 2 * 1024 * 1024; // 2 MiB
+    const CMB_BIR: u8 = 2;
+    const CBA: u64 = 0x8000_0000; // CMB 在 guest 地址空间基址（4 KiB 对齐）
+    const SQ_DEPTH: u32 = 64;
+
+    fn mk() -> NvmeController {
+        let path = std::env::temp_dir().join(format!(
+            "nvme_cmb_dp_test_{}_{:?}.img",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(4 * 1024 * 1024).unwrap();
+        drop(f);
+        NvmeController::open(&[path.to_str().unwrap().to_string()], 0x1414, 0, &[]).unwrap()
+    }
+
+    /// 启用 CMB（2 MiB / BAR2）+ 合法编程 CRE+CMSE+CBA（CMB live）。
+    fn mk_cmb_live() -> NvmeController {
+        let mut c = mk();
+        c.enable_cmb(CMB_SIZE, CMB_BIR).unwrap();
+        let v = (CBA & cmbmsc::CBA_MASK) | cmbmsc::CMSE | cmbmsc::CRE;
+        c.write_cmbmsc(v);
+        assert!(c.cmb.as_ref().unwrap().cmse, "CMB 应 live");
+        c
+    }
+
+    // ---------------- (a) CMB read 命中 backing / write 落进 backing ----------------
+
+    #[test]
+    fn cmb_read_hits_backing_contents() {
+        let mut c = mk_cmb_live();
+        // 预置 backing 内容：CMB 内偏移 0x100 处写一段 magic。
+        let off = 0x100usize;
+        let magic: [u8; 8] = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
+        c.cmb.as_mut().unwrap().backing.as_bytes_mut()[off..off + 8].copy_from_slice(&magic);
+
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap);
+        // guest_read 命中 CMB（gpa = cba + off）→ 同步入队合成 completion，返回 token。
+        let token = c.guest_read(&mut ctx, CBA + off as u64, 8);
+
+        // 不应有任何 transport outbound（CMB 命中不走 DMA）。
+        assert!(cap.events().is_empty(), "CMB read 不应触发 transport DMA");
+        // 合成 completion 已入本地队列（栈外才 drain，此处仅断言入队）。
+        let comp = c
+            .cmb_completions
+            .iter()
+            .find(|c| c.token == token)
+            .expect("合成 completion 应入队");
+        assert!(comp.ok, "CMB read 命中 → ok");
+        assert_eq!(
+            comp.data.as_deref(),
+            Some(&magic[..]),
+            "read 数据 == backing 内容"
+        );
+    }
+
+    #[test]
+    fn cmb_write_lands_in_backing() {
+        let mut c = mk_cmb_live();
+        let off = 0x200usize;
+        let payload = vec![0x5Au8; 16];
+
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let token = c.guest_write(&mut ctx, CBA + off as u64, payload.clone());
+
+        assert!(cap.events().is_empty(), "CMB write 不应触发 transport DMA");
+        // backing 已立即更新（同步写）。
+        assert_eq!(
+            &c.cmb.as_ref().unwrap().backing.as_bytes()[off..off + 16],
+            &payload[..],
+            "write 落进 backing"
+        );
+        // 合成 completion 入队（write → data=None）。
+        let comp = c
+            .cmb_completions
+            .iter()
+            .find(|c| c.token == token)
+            .expect("合成 completion 应入队");
+        assert!(
+            comp.ok && comp.data.is_none(),
+            "write completion ok + 无 data"
+        );
+    }
+
+    #[test]
+    fn cmb_out_of_bounds_access_is_rejected() {
+        let mut c = mk_cmb_live();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap);
+        // gpa 起点在 CMB 内但 gpa+len 越过 CMB 末尾（straddle 出尾）→ 合成 ok=false
+        // （不 panic、不读越界、不回退 DMA）。
+        let token = c.guest_read(&mut ctx, CBA + CMB_SIZE - 4, 8);
+        let comp = c
+            .cmb_completions
+            .iter()
+            .find(|c| c.token == token)
+            .expect("越界访问仍入队（ok=false）");
+        assert!(!comp.ok, "CMB straddle 出尾 read → ok=false");
+        assert!(
+            cap.events().is_empty(),
+            "straddle 不回退到 DMA（gpa 起点在 CMB 内）"
+        );
+    }
+
+    /// **reviewer H2** — 对称 straddle：起点在 CMB **外**、区段伸入 CMB。绝不能被当
+    /// Miss 走 DMA（那样 CMB 段会落错 backing → 静默数据损坏）。须判 straddle → ok=false。
+    #[test]
+    fn cmb_straddle_into_window_is_rejected_not_dma() {
+        let mut c = mk_cmb_live();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap);
+        // 起点 CBA-4（窗口外），len=16 → 终点 CBA+12（伸入窗口）。
+        let token = c.guest_write(&mut ctx, CBA - 4, vec![0xAAu8; 16]);
+        let comp = c
+            .cmb_completions
+            .iter()
+            .find(|c| c.token == token)
+            .expect("起点在外伸入 CMB 的 straddle 应入队 ok=false");
+        assert!(!comp.ok, "起点在外伸入 CMB（straddle）→ ok=false");
+        assert!(
+            cap.events().is_empty(),
+            "straddle-into 绝不走 DMA（否则 CMB 段损坏）"
+        );
+    }
+
+    /// **reviewer H2** — 整段横跨：起点在 CMB 外、终点也在 CMB 外，但区段整个覆盖 CMB
+    /// 窗口（gpa<cba 且 gpa+len>cba+size）→ 仍判 straddle → ok=false。
+    #[test]
+    fn cmb_full_span_over_window_is_rejected() {
+        let mut c = mk_cmb_live();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap);
+        // 起点 CBA-8，len = CMB_SIZE + 16（横跨整个窗口）。len 是 u32，CMB_SIZE 合法。
+        let token = c.guest_read(&mut ctx, CBA - 8, CMB_SIZE as u32 + 16);
+        let comp = c
+            .cmb_completions
+            .iter()
+            .find(|c| c.token == token)
+            .expect("横跨窗口应入队 ok=false");
+        assert!(!comp.ok, "整段横跨 CMB 窗口 → ok=false");
+        assert!(cap.events().is_empty(), "横跨不走 DMA");
+    }
+
+    #[test]
+    fn cmb_gpa_near_u64_max_does_not_panic_and_misses() {
+        // reviewer HIGH-1：gpa 近 u64::MAX 时 gpa+len 溢出。裸 `+` 会在 debug 构建 panic；
+        // checked_add 应判 Miss（走 transport），不 panic、不入 CMB。
+        let mut c = mk_cmb_live();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let token = c.guest_read(&mut ctx, u64::MAX - 4, 32);
+        assert!(
+            !c.cmb_completions.iter().any(|c| c.token == token),
+            "溢出 gpa 不应入 CMB 合成队列"
+        );
+        assert!(!cap.events().is_empty(), "溢出 gpa 判 Miss → 走 transport DMA");
+    }
+
+    // ---------------- (c) 非-CMB gpa 仍走 ctx.dma ----------------
+
+    #[test]
+    fn non_cmb_gpa_goes_through_transport_dma() {
+        let mut c = mk_cmb_live();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap);
+        // gpa 在 CMB 窗口之外（远低于 CBA）→ 走 transport。
+        let r_token = c.guest_read(&mut ctx, 0x1000, 512);
+        let w_token = c.guest_write(&mut ctx, 0x2000, vec![1, 2, 3, 4]);
+        // transport 记录了真 DMA；token 来自 transport（非 CMB tag）。
+        assert_eq!(
+            cap.events(),
+            &[
+                TransportEvent::DmaRead {
+                    token: 0x100,
+                    gpa: 0x1000,
+                    len: 512
+                },
+                TransportEvent::DmaWrite {
+                    token: 0x101,
+                    gpa: 0x2000,
+                    data: vec![1, 2, 3, 4]
+                },
+            ]
+        );
+        assert_eq!(r_token, 0x100, "非-CMB read token 来自 transport");
+        assert_eq!(w_token, 0x101, "非-CMB write token 来自 transport");
+        assert!(c.cmb_completions.is_empty(), "非-CMB 不入本地队列");
+    }
+
+    #[test]
+    fn cmb_disabled_falls_back_to_dma() {
+        // CMB 启用但未 live（CMSE=0）→ 即使 gpa 在 [cba,cba+size) 也走 DMA。
+        let mut c = mk();
+        c.enable_cmb(CMB_SIZE, CMB_BIR).unwrap();
+        c.write_cmbmsc(cmbmsc::CRE); // 仅 CRE，CMSE=0 → 不 live
+        assert!(!c.cmb.as_ref().unwrap().cmse);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let _ = c.guest_read(&mut ctx, CBA, 64);
+        assert_eq!(cap.events().len(), 1, "CMSE=0 → CMB 不拦截，走 DMA");
+        assert!(c.cmb_completions.is_empty());
+    }
+
+    // ---------------- (b) tail-drain 驱动 PendingOp + 非重入 ----------------
+
+    /// SQ 落在 CMB 内：ring SQ doorbell → SQE-fetch 命中 CMB → 合成 completion →
+    /// tail-drain 喂 `on_dma_complete_impl` → `on_fetched_sqes` 推进 SQ head。
+    /// 这验证合成 completion 确实驱动了 PendingOp 状态机（pending_fetches）。
+    #[test]
+    fn cmb_resident_sq_fetch_drives_pending_fetch_via_drain() {
+        let mut c = mk_cmb_live();
+        c.csts |= csts::RDY;
+        // SQ1 base 落在 CMB 内（CMB 偏移 0）。
+        let sq_off = 0usize;
+        let sq_base = CBA + sq_off as u64;
+        c.sqs.insert(
+            1,
+            SubmissionQueue {
+                base_gpa: sq_base,
+                size: SQ_DEPTH,
+                head: 0,
+                tail: 0,
+                cq_id: 1,
+            },
+        );
+        // 在 CMB backing 内放一条 SQE（slot 0）：opcode=0（教学：随后 dispatch 会被
+        // 处理，但本测只验 fetch → head 推进，不关心命令语义；置 cid 便于辨识）。
+        let mut sqe = vec![0u8; SQE_BYTES as usize];
+        sqe[0] = 0x00; // opcode (admin? 这是 IO SQ，opc=0 = Flush)
+        // cid in bytes 2..4
+        sqe[2] = 0x42;
+        c.cmb.as_mut().unwrap().backing.as_bytes_mut()[sq_off..sq_off + SQE_BYTES as usize]
+            .copy_from_slice(&sqe);
+
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            // ring SQ1 tail = 1（提交 1 条）。doorbell 在 BAR0（仍走 mmio_write）。
+            c.mmio_write(&mut ctx, 0, 0x1008, 4, 1); // SQ1 tail doorbell（走 trait 入口 → 收尾 drain）
+        }
+        // SQE fetch 命中 CMB → 合成 completion → mmio_write 收尾 drain → on_fetched_sqes
+        // 推进 sq.head 到 1。若 drain 没跑（completion 留在队列），head 仍 0。
+        assert_eq!(
+            c.sqs.get(&1).unwrap().head,
+            1,
+            "CMB SQE fetch 经 drain 推进 head"
+        );
+        // 队列已 drain 空。
+        assert!(c.cmb_completions.is_empty(), "drain 后队列空");
+        // SQE fetch 不应触发 transport DMA（命中 CMB）。
+        assert!(
+            !cap.events().iter().any(|e| matches!(
+                e,
+                TransportEvent::DmaRead { gpa, .. } if *gpa == sq_base
+            )),
+            "CMB SQE fetch 不走 transport"
+        );
+    }
+
+    /// **非重入铁律**（设计 §10#2）：`guest_read`/`guest_write` 调用栈内**绝不**触达
+    /// `on_dma_complete*`。机器校验：`on_dma_complete_impl` 入口 `debug_assert`
+    /// `!cmb_in_access_guest`（见 completion.rs）——本测的 drain 真投递 completion，
+    /// 若 access_guest 标志未在投递前清掉，断言会响。此外断言入队后哨兵均清、栈外才 drain。
+    #[test]
+    fn drain_is_not_reentrant() {
+        let mut c = mk_cmb_live();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap);
+        // 入队一条不绑定任何 pending 表的孤儿 token（on_dma_complete_impl 走 unknown-token
+        // 静默路径，不 panic）。关键：入队后两哨兵都清（access_guest 区间已退出、未进 drain）。
+        let _ = c.guest_read(&mut ctx, CBA, 8);
+        assert!(!c.cmb_in_access_guest, "入队后 access_guest 哨兵清（栈外）");
+        assert!(!c.cmb_draining, "入队后未进入 drain（栈外才 drain）");
+        assert_eq!(c.cmb_completions.len(), 1, "仅入队");
+        // drain 真投递该 completion；若投递时 access_guest 标志仍置，on_dma_complete_impl
+        // 的 debug_assert 会 panic（机器校验非重入）。
+        c.drain_cmb_completions(&mut ctx);
+        assert!(!c.cmb_draining, "drain 结束后哨兵清");
+        assert!(c.cmb_completions.is_empty(), "drain 清空队列");
+    }
+
+    // ---------------- (d) cascade：CMB completion 触发的后续 CMB 访问被 drain ----------------
+
+    /// cascade：drain 一条 completion 时，其处理路径又发起 CMB 访问（再入队），
+    /// drain 循环必须把新入队的也处理掉（直到空）。用 SQE-fetch 链验证：
+    /// 一条 doorbell 提交多条 SQE，每条 dispatch 又可能发起 CMB 访问。
+    /// 这里用更直接的构造：手动入队多条、其中处理过程模拟再入队，断言 drain 全清。
+    #[test]
+    fn drain_processes_cascaded_enqueues() {
+        let mut c = mk_cmb_live();
+        c.csts |= csts::RDY;
+        // 构造一个会 cascade 的真实场景：SQ 在 CMB，提交两条 SQE（一次 doorbell
+        // fetch 两条），fetch completion drain 后 dispatch 两条命令；任一命令若再
+        // 经 CMB 访问数据也会入队。这里至少验证 fetch completion 被 drain 且队列清空。
+        let sq_base = CBA;
+        c.sqs.insert(
+            1,
+            SubmissionQueue {
+                base_gpa: sq_base,
+                size: SQ_DEPTH,
+                head: 0,
+                tail: 0,
+                cq_id: 1,
+            },
+        );
+        // 两条 Flush SQE（opc=0），slot 0 和 1。
+        for slot in 0..2usize {
+            let mut sqe = vec![0u8; SQE_BYTES as usize];
+            sqe[2] = (0x50 + slot) as u8; // cid
+            let base = slot * SQE_BYTES as usize;
+            c.cmb.as_mut().unwrap().backing.as_bytes_mut()[base..base + SQE_BYTES as usize]
+                .copy_from_slice(&sqe);
+        }
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.mmio_write(&mut ctx, 0, 0x1008, 4, 2); // SQ1 tail = 2（走 trait 入口 → 收尾 drain）
+        }
+        assert_eq!(
+            c.sqs.get(&1).unwrap().head,
+            2,
+            "两条 SQE 都被 fetch（head=2）"
+        );
+        assert!(c.cmb_completions.is_empty(), "cascade drain 后队列彻底清空");
+    }
+
+    /// **reviewer H1（多段 data-path 也走 CMB）** — 双页 device→host 数据写
+    /// （`dma_write_then_complete` 的 dual-PRP 分支）两段 PRP 都落在 CMB 内：page0→PRP1、
+    /// page1→PRP2 都经 `guest_write` 落 backing，两条合成 completion 经顶层 drain 推进
+    /// 至 post CQE。验证**第二段（continuation/sibling 半）也被 CMB 拦截**（H1 修复点），
+    /// 且 CQE 也落 CMB backing（CQ 在 CMB 内）。
+    #[test]
+    fn dual_page_device_to_host_both_prps_in_cmb() {
+        use crate::regs::{CQE_BYTES, CompletionQueue, NVME_PAGE_SIZE};
+        let mut c = mk_cmb_live();
+        c.csts |= csts::RDY;
+        // CQ0 落在 CMB 内（偏移 0x10_0000），depth 8。
+        let cq_off = 0x10_0000usize;
+        c.cqs.insert(
+            0,
+            CompletionQueue {
+                base_gpa: CBA + cq_off as u64,
+                size: 8,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 0,
+                interrupt_enabled: false,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        // PRP1/PRP2 落在 CMB 内不同偏移；payload = 2 页（触发 dual-PRP 分支）。
+        let prp1 = CBA + 0x1000;
+        let prp2 = CBA + 0x2000;
+        let payload: Vec<u8> = (0..2 * NVME_PAGE_SIZE as usize)
+            .map(|i| (i & 0xFF) as u8)
+            .collect();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.dma_write_then_complete(&mut ctx, prp1, prp2, payload.clone(), 0x7, 0, 0, 0);
+            // dma_write_then_complete 不是顶层入口，手动栈外 drain（模拟顶层收尾）。
+            c.drain_cmb_completions(&mut ctx);
+        }
+        // 两段都落进 CMB backing（H1：第二段 PRP2 也被拦截，不走 transport）。
+        let backing = c.cmb.as_ref().unwrap().backing.as_bytes();
+        assert_eq!(
+            &backing[0x1000..0x1000 + NVME_PAGE_SIZE as usize],
+            &payload[..NVME_PAGE_SIZE as usize],
+            "page0 落 PRP1（CMB backing）"
+        );
+        assert_eq!(
+            &backing[0x2000..0x2000 + NVME_PAGE_SIZE as usize],
+            &payload[NVME_PAGE_SIZE as usize..],
+            "page1 落 PRP2（CMB backing）—— H1 第二段也走 CMB"
+        );
+        // CQE 也落 CMB backing（CQ slot 0 @ cq_off）；cid=0x7 在 CQE bytes 12..14。
+        let cqe = &backing[cq_off..cq_off + CQE_BYTES as usize];
+        let cqe_cid = u16::from_le_bytes([cqe[12], cqe[13]]);
+        assert_eq!(cqe_cid, 0x7, "CQE 落 CMB backing 且 cid 正确");
+        // 全程无 transport DMA（所有 gpa 都在 CMB）。
+        assert!(
+            cap.events().is_empty(),
+            "两段数据 + CQE 全在 CMB → 无 transport outbound"
+        );
+        assert!(c.cmb_completions.is_empty(), "drain 后队列空");
+    }
+
+    // ---------------- (e) live 改 CBA 被拒（LOW-2） ----------------
+    #[test]
+    fn live_cba_change_is_rejected() {
+        let mut c = mk_cmb_live();
+        let orig_cba = c.cmb.as_ref().unwrap().cba;
+        assert_eq!(orig_cba, CBA);
+        // CMSE 已置位（live）时再写不同 CBA → 拒绝改 CBA（保持原值），置 CBAI 告警。
+        let new_cba = 0xC000_0000u64;
+        let v = (new_cba & cmbmsc::CBA_MASK) | cmbmsc::CMSE | cmbmsc::CRE;
+        c.write_cmbmsc(v);
+        let cmb = c.cmb.as_ref().unwrap();
+        assert_eq!(cmb.cba, orig_cba, "live 改 CBA 被拒：CBA 保持原值");
+        assert!(cmb.cbai, "live 改 CBA → 置 CBMSTS.CBAI 告警");
+    }
+
+    #[test]
+    fn cba_change_allowed_when_not_live() {
+        // CMSE=0 时改 CBA 合法（driver 初始编程）。
+        let mut c = mk();
+        c.enable_cmb(CMB_SIZE, CMB_BIR).unwrap();
+        c.write_cmbmsc(cmbmsc::CRE); // CRE only, CMSE=0
+        let new_cba = 0xC000_0000u64;
+        c.write_cmbmsc((new_cba & cmbmsc::CBA_MASK) | cmbmsc::CRE);
+        assert_eq!(c.cmb.as_ref().unwrap().cba, new_cba, "非 live 改 CBA 合法");
+        assert!(!c.cmb.as_ref().unwrap().cbai, "非 live 改 CBA 不置 CBAI");
     }
 }

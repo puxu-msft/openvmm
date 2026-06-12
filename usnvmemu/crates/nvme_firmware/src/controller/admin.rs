@@ -546,7 +546,7 @@ impl NvmeController {
                         // 指向 buffer。DMA-read 完成后存到 host_id_lo/hi。
                         let exhid = cdw11 & 0x1 != 0;
                         let bytes = if exhid { 16 } else { 8 };
-                        let tok = ctx.dma_read(sqe.prp1, bytes);
+                        let tok = self.guest_read(ctx, sqe.prp1, bytes);
                         self.pending_ios.insert(
                             tok,
                             crate::controller::PendingIo {
@@ -1307,7 +1307,7 @@ impl NvmeController {
                     self.fw_download_buf.resize(need_total as usize, 0);
                 }
                 // DMA-read PRP1 → 完成回调 AdminFwDownloadChunk
-                let tok = ctx.dma_read(prp1, bytes_count_u64 as u32);
+                let tok = self.guest_read(ctx, prp1, bytes_count_u64 as u32);
                 self.pending_ios.insert(
                     tok,
                     crate::controller::PendingIo {
@@ -1398,7 +1398,7 @@ impl NvmeController {
                         if sqe.nsid != 0xFFFF_FFFF {
                             return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                         }
-                        let tok = ctx.dma_read(sqe.prp1, 4096);
+                        let tok = self.guest_read(ctx, sqe.prp1, 4096);
                         self.pending_ios.insert(
                             tok,
                             crate::controller::PendingIo {
@@ -1466,7 +1466,7 @@ impl NvmeController {
                     return Some(Cqe::error(cid, 0, sq_head, phase, sc::INVALID_FIELD));
                 }
                 // PRP1 → controller list 4 KiB DMA read，完成在 on_dma_complete。
-                let tok = ctx.dma_read(sqe.prp1, 4096);
+                let tok = self.guest_read(ctx, sqe.prp1, 4096);
                 self.pending_ios.insert(
                     tok,
                     crate::controller::PendingIo {

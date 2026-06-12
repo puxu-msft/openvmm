@@ -511,6 +511,15 @@ impl NvmeController {
         ok: bool,
         data: Vec<u8>,
     ) {
+        // **CMB-P1b 非重入铁律（设计 §10#2）的机器校验** — completion 派发**绝不**
+        // 能发生在 `access_guest`/`guest_*` 调用栈内（否则破坏 `MAX_SHADOW_POLL_ITERS`
+        // 自喂防护）。`guest_read`/`guest_write` 只入队 `cmb_completions`、不调本函数；
+        // 真正喂本函数的 `drain_cmb_completions` 只在顶层栈尾跑。debug-only 断言锁住此
+        // 不变量——若未来误把 completion 拽进 access_guest 栈，test/debug 构建立即响。
+        debug_assert!(
+            !self.cmb_in_access_guest,
+            "on_dma_complete_impl 在 access_guest 栈内被调（违反 CMB §10#2 非重入铁律）"
+        );
         // **H-3 修复** — 之前是 mod.rs 中 1500+ 行的单方法。已移到本
         // controller/completion.rs 文件级隔离。按 PendingOp variant 再
         // 细拆 sub-method 收益不大（多数 variant 共享 phase/cq/post_cqe
@@ -879,7 +888,7 @@ impl NvmeController {
                         // 取 slice copy 出来发 dma_write
                         let accum_ref = self.pi_reads.get(&op_id).unwrap();
                         let chunk = accum_ref.data_only[off..off + bytes].to_vec();
-                        let tok = ctx.dma_write(gpa, chunk);
+                        let tok = self.guest_write(ctx, gpa, chunk);
                         self.pending_ios.insert(
                             tok,
                             PendingIo {
@@ -1279,7 +1288,7 @@ impl NvmeController {
                         if bytes == 0 {
                             break;
                         }
-                        let tok = ctx.dma_read(gpa, bytes);
+                        let tok = self.guest_read(ctx, gpa, bytes);
                         self.pending_ios.insert(
                             tok,
                             PendingIo {
@@ -1896,7 +1905,7 @@ impl NvmeController {
                         } else {
                             NVME_PAGE_SIZE as u32
                         };
-                        let tok = ctx.dma_read(*gpa, want_bytes);
+                        let tok = self.guest_read(ctx, *gpa, want_bytes);
                         self.pending_ios.insert(
                             tok,
                             PendingIo {
@@ -2302,7 +2311,7 @@ impl NvmeController {
                         let page_idx = (i + 1) as u32;
                         let want_bytes =
                             crate::controller::prp::page_size(page_idx, prp_off, total_bytes);
-                        let tok = ctx.dma_read(*gpa, want_bytes);
+                        let tok = self.guest_read(ctx, *gpa, want_bytes);
                         // 借用 PendingIo 共用字段 sq_id/cid/sq_head/cq_id/nsid
                         let (sq_id, cid, sq_head, cq_id, nsid) = {
                             let op = &self.prp_list_ops[&op_id];
@@ -2487,7 +2496,7 @@ impl NvmeController {
                     };
                     if let Some(next_list_gpa) = chain_ptr {
                         // 继续 walk：DMA-read 下一 list 页（重入 NvmReadPrpListFetch）。
-                        let tok = ctx.dma_read(next_list_gpa, NVME_PAGE_SIZE as u32);
+                        let tok = self.guest_read(ctx, next_list_gpa, NVME_PAGE_SIZE as u32);
                         self.pending_ios.insert(
                             tok,
                             PendingIo {
@@ -2522,7 +2531,7 @@ impl NvmeController {
                     // **Step 2a**: dma_write PRP1 数据（page idx 0）
                     let mut pages_iter = pages.into_iter();
                     let prp1_buf = pages_iter.next().unwrap_or_default();
-                    let tok_prp1 = ctx.dma_write(prp1_gpa, prp1_buf);
+                    let tok_prp1 = self.guest_write(ctx, prp1_gpa, prp1_buf);
                     self.pending_ios.insert(
                         tok_prp1,
                         PendingIo {
@@ -2538,7 +2547,7 @@ impl NvmeController {
                     for (i, gpa) in list.iter().enumerate() {
                         let page_idx = (i + 1) as u32;
                         let page_buf = pages_iter.next().unwrap_or_default();
-                        let tok = ctx.dma_write(*gpa, page_buf);
+                        let tok = self.guest_write(ctx, *gpa, page_buf);
                         self.pending_ios.insert(
                             tok,
                             PendingIo {
@@ -2563,7 +2572,7 @@ impl NvmeController {
                         })
                     });
                     if let Some((mptr, meta)) = mptr_write_args {
-                        let tok_m = ctx.dma_write(mptr, meta);
+                        let tok_m = self.guest_write(ctx, mptr, meta);
                         self.pending_ios.insert(
                             tok_m,
                             PendingIo {
@@ -2755,7 +2764,7 @@ impl NvmeController {
                                 let op = &self.sgl_ops[&op_id];
                                 (op.sq_id, op.cid, op.sq_head, op.cq_id, op.nsid)
                             };
-                            let tok = ctx.dma_read(c.address, next_len);
+                            let tok = self.guest_read(ctx, c.address, next_len);
                             self.pending_ios.insert(
                                 tok,
                                 PendingIo {
@@ -2867,13 +2876,13 @@ impl NvmeController {
             let frag_idx = idx as u32;
             let tok = if is_write {
                 // WRITE gather：dma_read host → 后续填 data。
-                ctx.dma_read(frag.address, frag.length)
+                self.guest_read(ctx, frag.address, frag.length)
             } else {
                 // READ scatter：从 data 切片 dma_write 到 host。
                 let off = frag.stream_offset as usize;
                 let end = off + frag.length as usize;
                 let slice = self.sgl_ops[&op_id].data[off..end].to_vec();
-                ctx.dma_write(frag.address, slice)
+                self.guest_write(ctx, frag.address, slice)
             };
             self.pending_ios.insert(
                 tok,

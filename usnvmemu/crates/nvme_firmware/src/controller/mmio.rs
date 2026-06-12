@@ -156,7 +156,11 @@ impl NvmeController {
                         self.boot_read_status = 3; // error
                     } else {
                         let content = self.boot_partition[off..off + len].to_vec();
-                        let tok = ctx.dma_write(self.bpmbl, content);
+                        // **CMB-P1b** — BPMBL 是 driver 提供的目标 buffer 地址；经 CMB
+                        // dispatch（落 CMB backing 或走 transport）。先取 bpmbl 标量再调
+                        // （guest_write 需 `&mut self`）。
+                        let bpmbl = self.bpmbl;
+                        let tok = self.guest_write(ctx, bpmbl, content);
                         self.pending_boot_reads.insert(tok);
                         self.boot_read_status = 1; // read in progress
                         tracing::debug!(
@@ -308,8 +312,21 @@ impl NvmeController {
         let new_cre = new & cmbmsc::CRE != 0;
         let new_cmse = new & cmbmsc::CMSE != 0;
         let new_cba = new & cmbmsc::CBA_MASK;
-        // P1b TODO（review LOW-2）：CMSE 已置位（CMB live）时改 CBA 会让数据路径映射漂移；
-        // P1b 接 `access_guest` 后应拒绝 live 改 CBA（或要求先清 CMSE）。P1a 无数据路径故无害。
+        // **LOW-2（P1b 落实 P1a 留的 TODO）** — CMSE 已置位（CMB live）时改 CBA 会让
+        // 数据路径的 gpa↔backing-offset 映射悄悄漂移（guest 已按旧 CBA 摆放 SQ/CQ/data）。
+        // spec § 3.1.24 要求 CBA 在 CMSE 置位时不可改。故 live 改 CBA → **拒绝改 CBA**
+        // （保持原值）+ 置 CMBSTS.CBAI 让 driver 感知，不静默漂移（对齐 silent-failure 纪律）。
+        if cmb.cmse && new_cmse && new_cba != cmb.cba {
+            tracing::warn!(
+                old_cba = format_args!("{:#x}", cmb.cba),
+                new_cba = format_args!("{:#x}", new_cba),
+                "CMBMSC: CMSE live 时改 CBA（spec § 3.1.24 禁止）→ 拒绝改 CBA + CMBSTS.CBAI=1"
+            );
+            cmb.cbai = true;
+            // CRE 仍按请求更新（CRE 不影响数据路径映射）；CBA/CMSE 保持原 live 值。
+            cmb.cre = new_cre;
+            return;
+        }
         cmb.cre = new_cre;
         cmb.cba = new_cba;
         if new_cmse && !new_cre {

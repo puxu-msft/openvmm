@@ -531,7 +531,7 @@ impl NvmeController {
                 transfers_total: 0,
             },
         );
-        let tok = ctx.dma_read(seg_addr, seg_len);
+        let tok = self.guest_read(ctx, seg_addr, seg_len);
         self.pending_ios.insert(
             tok,
             PendingIo {
@@ -615,7 +615,7 @@ impl NvmeController {
                 transfers_total: 0,
             },
         );
-        let tok = ctx.dma_read(seg_addr, seg_len);
+        let tok = self.guest_read(ctx, seg_addr, seg_len);
         self.pending_ios.insert(
             tok,
             PendingIo {
@@ -930,7 +930,7 @@ impl NvmeController {
                                     inline_pi: None, // READ scatter 走 plain，无需标记
                                 },
                             );
-                            let tok = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+                            let tok = self.guest_read(ctx, prp2, NVME_PAGE_SIZE as u32);
                             self.pending_ios.insert(
                                 tok,
                                 PendingIo {
@@ -1029,7 +1029,7 @@ impl NvmeController {
                         let head: Vec<u8> = block[..NVME_PAGE_SIZE as usize].to_vec();
                         let tail: Vec<u8> = block[NVME_PAGE_SIZE as usize..].to_vec();
                         let op_id = self.alloc_op_id();
-                        let tok1 = ctx.dma_write(prp1, head);
+                        let tok1 = self.guest_write(ctx, prp1, head);
                         self.pending_ios.insert(
                             tok1,
                             PendingIo {
@@ -1041,7 +1041,7 @@ impl NvmeController {
                                 op: PendingOp::InlineMetaReadDone { op_id },
                             },
                         );
-                        let tok2 = ctx.dma_write(prp2, tail);
+                        let tok2 = self.guest_write(ctx, prp2, tail);
                         self.pending_ios.insert(
                             tok2,
                             PendingIo {
@@ -1079,7 +1079,8 @@ impl NvmeController {
                             tracing::warn!(nsid, "B6b-4 N>2 READ 需 PRP2（指向 PRP-list 页）");
                             return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                         }
-                        if (prp1 & (NVME_PAGE_SIZE - 1)) != 0 || (prp2 & (NVME_PAGE_SIZE - 1)) != 0 {
+                        if (prp1 & (NVME_PAGE_SIZE - 1)) != 0 || (prp2 & (NVME_PAGE_SIZE - 1)) != 0
+                        {
                             tracing::warn!(
                                 prp1 = format_args!("{:#x}", prp1),
                                 prp2 = format_args!("{:#x}", prp2),
@@ -1209,7 +1210,7 @@ impl NvmeController {
                             },
                         );
                         // fetch PRP list 页（NvmReadPrpListFetch arm 会 walk + scatter）。
-                        let tok = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+                        let tok = self.guest_read(ctx, prp2, NVME_PAGE_SIZE as u32);
                         self.pending_ios.insert(
                             tok,
                             PendingIo {
@@ -1304,7 +1305,7 @@ impl NvmeController {
                     let op_id = self.alloc_op_id();
                     let data_prps = [prp1, prp2];
                     for (i, page) in data_pages.into_iter().enumerate() {
-                        let tok_d = ctx.dma_write(data_prps[i], page);
+                        let tok_d = self.guest_write(ctx, data_prps[i], page);
                         self.pending_ios.insert(
                             tok_d,
                             PendingIo {
@@ -1321,7 +1322,7 @@ impl NvmeController {
                     for t in &tuples {
                         meta_concat.extend_from_slice(t);
                     }
-                    let tok_m = ctx.dma_write(mptr, meta_concat);
+                    let tok_m = self.guest_write(ctx, mptr, meta_concat);
                     self.pending_ios.insert(
                         tok_m,
                         PendingIo {
@@ -1471,7 +1472,7 @@ impl NvmeController {
                     // 三档 DMA-write 到 host PRP（与 plain READ 同分流）
                     let payload_bytes = data_only.len() as u64;
                     if payload_bytes <= NVME_PAGE_SIZE {
-                        let tok = ctx.dma_write(prp1, data_only);
+                        let tok = self.guest_write(ctx, prp1, data_only);
                         self.pending_ios.insert(
                             tok,
                             PendingIo {
@@ -1487,8 +1488,8 @@ impl NvmeController {
                         let split = NVME_PAGE_SIZE as usize;
                         let part1 = data_only[..split].to_vec();
                         let part2 = data_only[split..].to_vec();
-                        let tok1 = ctx.dma_write(prp1, part1);
-                        let tok2 = ctx.dma_write(prp2, part2);
+                        let tok1 = self.guest_write(ctx, prp1, part1);
+                        let tok2 = self.guest_write(ctx, prp2, part2);
                         // tok1 dispatch sibling-half placeholder；tok2 处理
                         // success CQE + counter（与 plain dual-PRP Read 一致）
                         self.pending_ios.insert(
@@ -1538,7 +1539,7 @@ impl NvmeController {
                         // 先 dispatch page 0 → PRP1
                         let accum = self.pi_reads.get(&op_id).unwrap();
                         let first = accum.data_only[..NVME_PAGE_SIZE as usize].to_vec();
-                        let tok0 = ctx.dma_write(prp1, first);
+                        let tok0 = self.guest_write(ctx, prp1, first);
                         self.pending_ios.insert(
                             tok0,
                             PendingIo {
@@ -1551,7 +1552,7 @@ impl NvmeController {
                             },
                         );
                         // 然后 fetch PRP2 list 页
-                        let list_tok = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+                        let list_tok = self.guest_read(ctx, prp2, NVME_PAGE_SIZE as u32);
                         self.pending_ios.insert(
                             list_tok,
                             PendingIo {
@@ -1643,7 +1644,7 @@ impl NvmeController {
                         ));
                     }
                     // verify OK → dma_write 仅 data 部分 (4 KiB)
-                    let tok = ctx.dma_write(prp1, data_slice.to_vec());
+                    let tok = self.guest_write(ctx, prp1, data_slice.to_vec());
                     self.pending_ios.insert(
                         tok,
                         PendingIo {
@@ -1683,6 +1684,9 @@ impl NvmeController {
                 // **#4 非页对齐**：PRP1 可带页内偏移 O，首段=page-O；档位/分段经 prp 模块
                 // 统一计算（O=0 时与 legacy 逐字节一致）。
                 let prp_off = crate::controller::prp::prp1_offset(prp1);
+                // **#4f spec 硬化（PRP_OFFSET_INVALID，spec § 4.1.1）**：非 Single 档时 PRP2
+                // 是数据指针（Dual）或 PRP-list 页指针（List），二者都必须页对齐——offset
+                // 支持仅 PRP1 允许偏移。host 违反则返 PRP_OFFSET_INVALID 而非 silent 错位。
                 let prp_tier = crate::controller::prp::tier(prp_off, bytes);
                 if prp_tier != crate::controller::prp::PrpTier::Single {
                     // 非 Single 档必需 PRP2（Dual 数据指针 / List 页指针）：缺失 → INVALID_FIELD；
@@ -1707,7 +1711,7 @@ impl NvmeController {
                 }
                 match prp_tier {
                     crate::controller::prp::PrpTier::Single => {
-                        let tok = ctx.dma_write(prp1, buf);
+                        let tok = self.guest_write(ctx, prp1, buf);
                         self.pending_ios.insert(
                             tok,
                             PendingIo {
@@ -1723,8 +1727,8 @@ impl NvmeController {
                     crate::controller::prp::PrpTier::Dual => {
                         let s = crate::controller::prp::first_seg_len(prp_off, bytes) as usize;
                         let (b1, b2) = buf.split_at(s);
-                        let tok1 = ctx.dma_write(prp1, b1.to_vec());
-                        let tok2 = ctx.dma_write(prp2, b2.to_vec());
+                        let tok1 = self.guest_write(ctx, prp1, b1.to_vec());
+                        let tok2 = self.guest_write(ctx, prp2, b2.to_vec());
                         self.pending_ios.insert(
                             tok1,
                             PendingIo {
@@ -1783,7 +1787,7 @@ impl NvmeController {
                                 inline_pi: None,
                             },
                         );
-                        let tok = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+                        let tok = self.guest_read(ctx, prp2, NVME_PAGE_SIZE as u32);
                         self.pending_ios.insert(
                             tok,
                             PendingIo {
@@ -1989,7 +1993,7 @@ impl NvmeController {
                             // fetch PRP list 页 + PRP1 数据页（page 0），复用 plain WRITE PRP-list
                             // gather（NvmWritePrpListFetch / NvmWritePrpListData），finalize 走
                             // inline_pi 分支。
-                            let tok_list = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+                            let tok_list = self.guest_read(ctx, prp2, NVME_PAGE_SIZE as u32);
                             self.pending_ios.insert(
                                 tok_list,
                                 PendingIo {
@@ -2001,7 +2005,7 @@ impl NvmeController {
                                     op: PendingOp::NvmWritePrpListFetch { op_id },
                                 },
                             );
-                            let tok_prp1 = ctx.dma_read(prp1, NVME_PAGE_SIZE as u32);
+                            let tok_prp1 = self.guest_read(ctx, prp1, NVME_PAGE_SIZE as u32);
                             self.pending_ios.insert(
                                 tok_prp1,
                                 PendingIo {
@@ -2062,7 +2066,7 @@ impl NvmeController {
                         }
                         let op_id = self.alloc_op_id();
                         // PRP1：前 4096 字节（head）；PRP2：末 8 字节（tail）。
-                        let tok1 = ctx.dma_read(prp1, NVME_PAGE_SIZE as u32);
+                        let tok1 = self.guest_read(ctx, prp1, NVME_PAGE_SIZE as u32);
                         self.pending_ios.insert(
                             tok1,
                             PendingIo {
@@ -2077,7 +2081,7 @@ impl NvmeController {
                                 },
                             },
                         );
-                        let tok2 = ctx.dma_read(prp2, 8);
+                        let tok2 = self.guest_read(ctx, prp2, 8);
                         self.pending_ios.insert(
                             tok2,
                             PendingIo {
@@ -2129,7 +2133,8 @@ impl NvmeController {
                             tracing::warn!(nsid, "B6b-4 N>2 WRITE 需 PRP2（指向 PRP-list 页）");
                             return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                         }
-                        if (prp1 & (NVME_PAGE_SIZE - 1)) != 0 || (prp2 & (NVME_PAGE_SIZE - 1)) != 0 {
+                        if (prp1 & (NVME_PAGE_SIZE - 1)) != 0 || (prp2 & (NVME_PAGE_SIZE - 1)) != 0
+                        {
                             tracing::warn!(
                                 prp1 = format_args!("{:#x}", prp1),
                                 prp2 = format_args!("{:#x}", prp2),
@@ -2208,7 +2213,7 @@ impl NvmeController {
                             },
                         );
                         // fetch PRP list 页本身
-                        let tok_list = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+                        let tok_list = self.guest_read(ctx, prp2, NVME_PAGE_SIZE as u32);
                         self.pending_ios.insert(
                             tok_list,
                             PendingIo {
@@ -2221,7 +2226,7 @@ impl NvmeController {
                             },
                         );
                         // fetch PRP1 数据页（page_idx 0）
-                        let tok_prp1 = ctx.dma_read(prp1, NVME_PAGE_SIZE as u32);
+                        let tok_prp1 = self.guest_read(ctx, prp1, NVME_PAGE_SIZE as u32);
                         self.pending_ios.insert(
                             tok_prp1,
                             PendingIo {
@@ -2234,7 +2239,7 @@ impl NvmeController {
                             },
                         );
                         // DMA-read MPTR：N×8 字节 PI tuple concat。
-                        let tok_meta = ctx.dma_read(mptr, nlb * 8);
+                        let tok_meta = self.guest_read(ctx, mptr, nlb * 8);
                         self.pending_ios.insert(
                             tok_meta,
                             PendingIo {
@@ -2265,7 +2270,7 @@ impl NvmeController {
                     let data_prps = [prp1, prp2];
                     for page_idx in 0..nlb {
                         let prp = data_prps[page_idx as usize];
-                        let tok_d = ctx.dma_read(prp, sector_bytes as u32);
+                        let tok_d = self.guest_read(ctx, prp, sector_bytes as u32);
                         self.pending_ios.insert(
                             tok_d,
                             PendingIo {
@@ -2279,7 +2284,7 @@ impl NvmeController {
                         );
                     }
                     // PI tuple：一条 DMA-read 取 N×8 字节（host MPTR buffer 连续 N 个 tuple）。
-                    let tok_m = ctx.dma_read(mptr, nlb * 8);
+                    let tok_m = self.guest_read(ctx, mptr, nlb * 8);
                     self.pending_ios.insert(
                         tok_m,
                         PendingIo {
@@ -2410,7 +2415,7 @@ impl NvmeController {
                         );
                         // 三档：单 PRP / dual-PRP / PRP-list
                         if data_bytes_total <= NVME_PAGE_SIZE {
-                            let tok = ctx.dma_read(prp1, data_bytes_total as u32);
+                            let tok = self.guest_read(ctx, prp1, data_bytes_total as u32);
                             self.pending_ios.insert(
                                 tok,
                                 PendingIo {
@@ -2425,8 +2430,8 @@ impl NvmeController {
                         } else if data_bytes_total <= 2 * NVME_PAGE_SIZE {
                             let part1 = NVME_PAGE_SIZE as u32;
                             let part2 = (data_bytes_total - NVME_PAGE_SIZE) as u32;
-                            let tok1 = ctx.dma_read(prp1, part1);
-                            let tok2 = ctx.dma_read(prp2, part2);
+                            let tok1 = self.guest_read(ctx, prp1, part1);
+                            let tok2 = self.guest_read(ctx, prp2, part2);
                             self.pending_ios.insert(
                                 tok1,
                                 PendingIo {
@@ -2460,7 +2465,7 @@ impl NvmeController {
                             // 流程：DMA-read PRP1 第一页 + DMA-read PRP2 list 页
                             // → on_dma_complete NvmWritePiListFetch 解析 entries
                             // → 逐 entry DMA-read 各页数据。
-                            let first_tok = ctx.dma_read(prp1, NVME_PAGE_SIZE as u32);
+                            let first_tok = self.guest_read(ctx, prp1, NVME_PAGE_SIZE as u32);
                             self.pending_ios.insert(
                                 first_tok,
                                 PendingIo {
@@ -2473,7 +2478,7 @@ impl NvmeController {
                                 },
                             );
                             // Fetch PRP-list 页本身（4 KiB u64 array）
-                            let list_tok = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+                            let list_tok = self.guest_read(ctx, prp2, NVME_PAGE_SIZE as u32);
                             self.pending_ios.insert(
                                 list_tok,
                                 PendingIo {
@@ -2500,7 +2505,7 @@ impl NvmeController {
                         return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::LBA_OUT_OF_RANGE));
                     }
                     let pi_bytes = ns.data_bytes() as u32;
-                    let tok = ctx.dma_read(prp1, pi_bytes);
+                    let tok = self.guest_read(ctx, prp1, pi_bytes);
                     self.pending_ios.insert(
                         tok,
                         PendingIo {
@@ -2539,6 +2544,7 @@ impl NvmeController {
                 // **#4 非页对齐**：档位/分段经 prp 模块统一计算（PRP1 偏移 O 把首段缩到
                 // page-O；O=0 时与 legacy 逐字节一致）。
                 let prp_off = crate::controller::prp::prp1_offset(prp1);
+                // **#4f spec 硬化（PRP_OFFSET_INVALID）**：非 Single 档 PRP2 须页对齐（同 READ）。
                 let prp_tier = crate::controller::prp::tier(prp_off, bytes);
                 if prp_tier != crate::controller::prp::PrpTier::Single {
                     // 非 Single 档必需 PRP2：缺失 → INVALID_FIELD；非页对齐 → PRP_OFFSET_INVALID
@@ -2563,7 +2569,7 @@ impl NvmeController {
                 }
                 match prp_tier {
                     crate::controller::prp::PrpTier::Single => {
-                        let tok = ctx.dma_read(prp1, bytes as u32);
+                        let tok = self.guest_read(ctx, prp1, bytes as u32);
                         self.pending_ios.insert(
                             tok,
                             PendingIo {
@@ -2597,8 +2603,8 @@ impl NvmeController {
                         );
                         let first = crate::controller::prp::first_seg_len(prp_off, bytes);
                         let prp2_bytes = (bytes - first) as u32;
-                        let tok1 = ctx.dma_read(prp1, first as u32);
-                        let tok2 = ctx.dma_read(prp2, prp2_bytes);
+                        let tok1 = self.guest_read(ctx, prp1, first as u32);
+                        let tok2 = self.guest_read(ctx, prp2, prp2_bytes);
                         self.pending_ios.insert(
                             tok1,
                             PendingIo {
@@ -2655,7 +2661,7 @@ impl NvmeController {
                             },
                         );
                         // 先 fetch PRP list 页本身
-                        let tok_list = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+                        let tok_list = self.guest_read(ctx, prp2, NVME_PAGE_SIZE as u32);
                         self.pending_ios.insert(
                             tok_list,
                             PendingIo {
@@ -2669,7 +2675,7 @@ impl NvmeController {
                         );
                         // 同时 fetch PRP1 数据页（页 idx 0）—— 含偏移时首段 = page-O。
                         let first = crate::controller::prp::first_seg_len(prp_off, bytes) as u32;
-                        let tok_prp1 = ctx.dma_read(prp1, first);
+                        let tok_prp1 = self.guest_read(ctx, prp1, first);
                         self.pending_ios.insert(
                             tok_prp1,
                             PendingIo {
@@ -2936,7 +2942,7 @@ impl NvmeController {
                     // 教学：range list > 1 page 需 PRP-list 取，本路径暂限 1 page = 128 ranges
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
-                let tok = ctx.dma_read(sqe.prp1, range_list_bytes);
+                let tok = self.guest_read(ctx, sqe.prp1, range_list_bytes);
                 self.pending_ios.insert(
                     tok,
                     PendingIo {
@@ -2994,7 +3000,7 @@ impl NvmeController {
                     }
                 }
                 if bytes <= NVME_PAGE_SIZE {
-                    let tok = ctx.dma_read(prp1, bytes as u32);
+                    let tok = self.guest_read(ctx, prp1, bytes as u32);
                     self.pending_ios.insert(
                         tok,
                         PendingIo {
@@ -3031,8 +3037,8 @@ impl NvmeController {
                         },
                     );
                     let prp2_bytes = (bytes - NVME_PAGE_SIZE) as u32;
-                    let tok1 = ctx.dma_read(prp1, NVME_PAGE_SIZE as u32);
-                    let tok2 = ctx.dma_read(prp2, prp2_bytes);
+                    let tok1 = self.guest_read(ctx, prp1, NVME_PAGE_SIZE as u32);
+                    let tok2 = self.guest_read(ctx, prp2, prp2_bytes);
                     self.pending_ios.insert(
                         tok1,
                         PendingIo {
@@ -3088,7 +3094,7 @@ impl NvmeController {
                             list_entries: None,
                         },
                     );
-                    let tok_list = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+                    let tok_list = self.guest_read(ctx, prp2, NVME_PAGE_SIZE as u32);
                     self.pending_ios.insert(
                         tok_list,
                         PendingIo {
@@ -3100,7 +3106,7 @@ impl NvmeController {
                             op: PendingOp::NvmComparePrpListFetch { op_id },
                         },
                     );
-                    let tok_prp1 = ctx.dma_read(prp1, NVME_PAGE_SIZE as u32);
+                    let tok_prp1 = self.guest_read(ctx, prp1, NVME_PAGE_SIZE as u32);
                     self.pending_ios.insert(
                         tok_prp1,
                         PendingIo {
@@ -3496,7 +3502,7 @@ impl NvmeController {
                 // 写文件（PI NS 时 per-LBA compute tuple + interleave，否则
                 // 直接 write data）+ success(CQE dw0/dw1=assigned_lba) 或
                 // failure(rollback + error CQE)。
-                let tok = ctx.dma_read(prp1, host_bytes as u32);
+                let tok = self.guest_read(ctx, prp1, host_bytes as u32);
                 self.pending_ios.insert(
                     tok,
                     PendingIo {
@@ -3662,7 +3668,7 @@ impl NvmeController {
             crate::controller::ReservationKind::Release => 8u32,
             _ => 16u32,
         };
-        let tok = ctx.dma_read(sqe.prp1, bytes);
+        let tok = self.guest_read(ctx, sqe.prp1, bytes);
         self.pending_ios.insert(
             tok,
             crate::controller::PendingIo {
