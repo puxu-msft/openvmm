@@ -3,16 +3,19 @@
 
 //! 设备状态机（照抄 `pcie_remote_device::state`）。
 //!
-//! Connecting → Live → Lost（Lost 为终态）。device shim 与 async worker 经
-//! [`SharedState`] 共用一个 `AtomicU8`。
+//! Connecting → Live ⇄ Lost。**Lost 非终态**：C-3 reconnect 成功后 worker 把状态
+//! 重新 `store(Live)`（见 `worker.rs`），故 Lost↔Live 可反复跃迁（后端 usnvmemu
+//! 停了又起）。device shim 与 async worker 经 [`SharedState`] 共用一个 `AtomicU8`。
 //!
-//! **C0 热插拔（Layer C）扩展**：`SharedState` 可挂一个可选的「边沿通知」
+//! **热插拔（Layer C）扩展**：`SharedState` 可挂一个可选的「边沿通知」
 //! [`mesh::Sender<DeviceState>`]。每当状态**真正发生跃迁**（值改变）时，向该
 //! sender fire-and-forget 投递新状态。underhill 侧的 vfio_user 热插拔 reconcile
-//! （`emuplat/vfio_user_hotplug.rs`）持对应 `Receiver`，据此在 guest 里动态
-//! add/remove VpciBus（Live→add，Lost→remove）。
+//! （`emuplat/vfio_user_hotplug.rs`）持对应 `Receiver`，据此驱动 guest 侧 VpciBus：
+//! 首个 Live→add 通道（盘出现）；**Lost→保设备在位**（Option B transient-stall 模型：
+//! 不 hot-remove，靠 C-3 reconnect 透明恢复——Windows guest 无法被 VSP 迫使重枚举，
+//! 故不走 remove/re-add，详见 `vfio_user_hotplug.rs` `process` 的 Lost 分支注释）。
 //! - sender 缺省 `None`（resolver / 单元测试路径）→ **零行为变化**，不触任何通知。
-//! - 仅 C0 路径在装配 device shim 时经 [`SharedState::with_edge_notifier`] 注入。
+//! - 仅热插拔路径在装配 device shim 时经 [`SharedState::with_edge_notifier`] 注入。
 //! - 状态跃迁罕见（connect/disconnect，**非** per-IO），故通知开销可忽略；
 //!   `mesh::Sender::send` 本身是非阻塞 fire-and-forget。
 
@@ -30,7 +33,9 @@ pub enum DeviceState {
     Connecting = 0,
     /// 已就绪，cfg/MMIO 走正常路径。
     Live = 1,
-    /// 终态：cfg read 返全 1（guest 视为设备消失），MMIO 返 Err。
+    /// 后端连接丢失（usnvmemu 停）：cfg read 返全 1（guest 视为设备无响应），MMIO 返 Err。
+    /// **非终态**——C-3 reconnect 成功后回到 [`Live`](Self::Live)；短暂 Lost 窗口内 guest
+    /// 的 IO 超时重试，重连后透明恢复（如真硬件 controller 短暂 reset）。
     Lost = 2,
 }
 

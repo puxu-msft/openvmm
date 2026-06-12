@@ -111,3 +111,78 @@ query-remove 信号再 rescind），故合理判定门 0 PASS：**graceful EJECT
 **没动 re-add**（仍 channel rescind/re-offer）→ ⑦ 未修，re-add 后 guest 盘不回来。→ **C2-1**：
 device_count 0↔1 模型（VpciBus 通道恒在，重发变长 BUS_RELATIONS2）修 ⑦。
 
+
+---
+
+## 🔬 finding-⑦ 深挖 — C2-1 / C2-1-fix 真机失败 + 根因确认（2026-06-12 续）
+
+C2-1（device_count 0↔1，commit `a3122b3af`）+ C2-1-fix（`INVALIDATE_BUS`）真机门 1 **均失败**。
+逐步真机调试（**非**靠源码推断——源码不可知 Windows pci.sys 行为）确认了根因。
+
+### 真机证据链（决定性）
+
+1. **C2-1 device_count push 失败**：kill usnvmemu → graceful EJECT + `SetPresent(false)`
+   → `device_count=0`（盘移除，guest **存活**，graceful 缓解⑥再确认）；重起 usnvmemu →
+   `SetPresent(true)` → 主动 push `BUS_RELATIONS2 device_count=1` → **guest 不出盘**。
+   bus FDO（`Microsoft Hyper-V Virtual PCI Bus {11111111…}`）present 且健康，但无 child PDO。
+2. **H2（identity/ghost）否定**：清掉滞留的 `OpenHCL Userspace NVMe` 幽灵 devnode
+   （`pnputil /remove-device`，2 个全清）后，**同 serial** 的 `device_count=1` push **仍不出盘**。
+   故根因**不是** child PDO identity 撞幽灵（bump serial 不会有用）。
+3. **决定性 — FDO 重上电生效**：手动 `Disable-PnpDevice` + `Enable-PnpDevice` bus FDO
+   → **同 serial 盘立即回来 + IO 正常**。证明：device_count=1 **已正确送达**（设备确在总线上）、
+   后端/identity/config **全 OK**；唯一缺的是**让 guest 重查 relations 的触发**。
+4. **C2-1-fix INVALIDATE_BUS 失败**：`SetPresent(true)` 改发标准 `INVALIDATE_BUS`（“总线
+   relations 变了，请重查”，header-only 4 字节）→ **guest 仍不出盘**；紧接着再 disable/enable
+   FDO → 盘立即回来。证明 `INVALIDATE_BUS` **不**触发 Windows guest 重查（≠ FDO 重上电）。
+
+### 根因（已确认，平台行为）
+
+**Windows pci.sys 只在 guest 自己重上电 bus FDO（`FDO_D0_EXIT`→`FDO_D0_ENTRY`）/ 首次开通道
+时才枚举 VPCI 子设备。** 对 VSP 侧任何 push **都不重枚举**：
+- 同-instance 通道 rescind + re-offer（C0 finding-⑦）；
+- unsolicited `BUS_RELATIONS2` device_count push（C2-1）；
+- `INVALIDATE_BUS`（C2-1-fix）。
+
+而 **VSP 无法在恒定通道上迫使 guest 重上电 FDO**。故 C2「通道恒在 + device_count 切换」
+（路径 B）的**核心前提在 Windows 上不成立**——非换个信号能修。
+
+### 架构含义 + 方向（用户定：先验证 Option B）
+
+「Lost 时 hot-remove、Live 时 hot-re-add」模型在 Windows 不可闭环（remove 经 EJECT 可行，
+re-add 让 guest 重出盘不可行）。出路：
+- **Option A**：re-add 换**新 instance_id** 重建 VpciBus（guest 见全新总线→建新 FDO→`FDO_D0_ENTRY`
+  →枚举）。几乎必然生效，但每周期漏一个 phantom 总线 devnode。plan 预登记的兜底。
+- **Option B（用户选先验证）**：**改变模型**——usnvmemu Lost 视为 transient 后端停顿，**不**移除
+  设备；设备对 guest 恒在，靠长存 device shim 的 **C-3 reconnect** 透明恢复（重发 set_irqs+dma_map，
+  如真硬件 controller 短暂 reset，盘不消失、在途 IO 超时重试后恢复）。**根本不触发**需 guest
+  重枚举的 re-add 路径，绕开⑦。无 phantom 债，最贴近真硬件。验证点：guest 能否容忍 Lost 窗口
+  （NVMe driver timeout 内）。永久移除仍可用 `hide_device` graceful EJECT（保留为 scaffolding）。
+
+C2-1-fix 的 `INVALIDATE_BUS` 改动**已 revert**（真机证伪、未 commit）；委员 device.rs 维持
+committed C2-1。Option B 实现 = `vfio_user_hotplug.rs` 的 `process` Lost 边沿改为 no-op（保设备在位）。
+
+---
+
+## ✅ Option B 真机验证结果（2026-06-13）— transient-stall 模型成立（fast restart）
+
+实现：`process` 的 Lost 边沿（`(false, true, true)`）从 `hide_device()` 改为 **no-op**
+（保设备在位 + log）；`hide_device` 转 `#[expect(dead_code)]`（留作未来 operator 显式永久移除）。
+device.rs 维持 committed C2-1（device_count 机制在 Option B 下休眠，re-add 臂运行时不可达但编译可达，
+无 dead_code 告警）。`state.rs` 的 "Lost 为终态" stale doc 一并改正（Lost↔Live 经 C-3 reconnect 反复）。
+
+**真机（Option B IGVM，fresh boot → 首 add 格式化+写 marker）：**
+- **fast restart（~5s 停顿）→ 盘存活**：kill usnvmemu → kmsg `keeping device present (transient
+  stall)` → 重起 → C-3 reconnect `reconnected, Live` → **盘 Healthy + 旧 marker 持久 + 新 4MiB IO OK**，
+  guest **全程无 remove/re-add**（无需重枚举，绕开⑦）。
+- **long outage（~10s 停顿）→ guest 有序移盘**：停顿超 guest 容忍窗口 → guest 自身 IO 超时后
+  **有序**移除盘（**无⑥崩溃**——guest 主导的 orderly removal，非 surprise-rescind）；reconnect 后
+  盘**不自动回来**（re-add 不可行），需 guest FDO 重上电（reboot/rescan）恢复——FDO disable/enable
+  验证盘确可回（Healthy），证设备本体无恙、纯 guest 侧 stall-tolerance 限制。
+
+**结论**：Option B 对**快重启**（usnvmemu crash+auto-restart 的主可靠性场景）**透明无缝**，
+**与真硬件 NVMe 行为一致**（controller 短暂 reset 盘不消失；长时间消失 OS 移盘）。无 phantom 债、
+无⑥风险。长 outage 的不可自动恢复是 Windows 平台硬限（VSP 无法迫 guest 重枚举）+ 真硬件同理，
+作为已知限制记录（未来若需可加 Option-A new-instance_id 兜底强制重枚举，代价 phantom 债）。
+
+**采纳 Option B 为 Layer C 的设备-存在模型**：usnvmemu 是 transient 后端，非可热插拔设备；
+首 add（冷插/boot-absent→起）+ 透明 reconnect 覆盖主场景；永久移除留 `hide_device` graceful EJECT scaffolding。

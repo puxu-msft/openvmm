@@ -347,8 +347,30 @@ impl VfioUserHotplug {
             (true, false, _) => self.add_bus(chipset_devices, state_units).await?,
             // re-add（通道已在、当前未呈现）：device_count 0→1，guest 重枚举（修⑦）。
             (true, true, false) => self.set_present(true).await,
-            // Lost（通道已在、当前呈现）：graceful EJECT + device_count 1→0（修⑥）。
-            (false, true, true) => self.hide_device().await,
+            // Lost（通道已在、当前呈现）——**Option B：transient 后端停顿模型**：
+            //
+            // 真机 POC 确证（finding-⑦ 深挖）：Windows pci.sys 只在 guest **自己**重上电
+            // bus FDO（D0Exit→D0Entry）时才重枚举 VPCI 子设备；VSP 侧任何 push（同-instance
+            // 通道 re-offer / unsolicited BUS_RELATIONS2 / INVALIDATE_BUS）都不触发重枚举。
+            // 故「Lost 时 hot-remove，Live 时 hot-re-add」的模型在 Windows 上**无法闭环**
+            // （remove 走 EJECT 可行，但 re-add 让 guest 重出盘不可行）。
+            //
+            // 改用 transient-stall 模型：usnvmemu 停（Lost）**不**移除设备——设备对 guest
+            // 恒在，仅底层 MMIO/DMA 在 Lost 窗口返 Err（C-2 门控）。usnvmemu 重启后由长存
+            // device shim 的 **C-3 reconnect**（worker + connector + 持久 eventfd/region）
+            // 透明重连，重发 set_irqs + dma_map，控制器恢复——如真硬件 NVMe controller 短暂
+            // reset：盘不从 guest 消失，在途 IO 超时重试后恢复。这样**根本不触发**需要 guest
+            // 重枚举的 re-add 路径，绕开⑦。
+            //
+            // （永久移除 = operator 显式意图，仍可用 `hide_device` 的 graceful EJECT；那是
+            // 未来的 operator-workflow，不在「usnvmemu 进程进出」的 reactive 模型内。）
+            (false, true, true) => {
+                tracing::info!(
+                    CVM_ALLOWED,
+                    instance_id = %self.instance_id,
+                    "vfio_user hotplug: backend Lost — keeping device present (transient stall; C-3 reconnect will recover, no hot-remove)"
+                );
+            }
             // 其余：状态与呈现已一致，或通道未 add 且非 Live（boot 起 usnvmemu 未起）。
             _ => {}
         }
@@ -474,6 +496,17 @@ impl VfioUserHotplug {
     /// 若 guest 在 [`EJECT_COMPLETE_TIMEOUT`] 内不回 `EJECT_COMPLETE`（驱动卡死 / 不支持），
     /// 放弃等待直接降 `device_count`——graceful 是尽力而为，**绝不**因 guest 不配合而挂死
     /// reconcile。
+    ///
+    /// # 当前去留（Option B）
+    ///
+    /// Option B（transient-stall 模型）下 `process` 的 Lost 边沿**不再**调用本方法（设备恒在、
+    /// 靠 C-3 reconnect 恢复，绕开⑦）。本方法保留作**未来 operator 显式永久移除**的 graceful
+    /// 路径（先 EJECT 给 guest 有序 dismount 窗口再降 device_count），尚未接线 → `dead_code`
+    /// 暂允许（scaffolding，非过时残留）。
+    #[expect(
+        dead_code,
+        reason = "Option B 下 Lost 边沿不再调用本方法；保留作未来 operator 显式永久移除的 graceful EJECT 路径（见上方 doc），尚未接线"
+    )]
     async fn hide_device(&mut self) {
         // 先尝试 graceful EJECT（仅当确有命令 channel，即通道已 add）。
         // 注意：通道恒在 → `cmd_tx` 不 take（后续 re-add 的 SetPresent(true) 还要用它）。
