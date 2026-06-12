@@ -24,6 +24,7 @@
 | 009 | Firmware-as-core 愿景确认 + 命名重构 | **本文件** ↓ |
 | 010 | Phase W：pcie_device_sdk 补全 hexagonal | [pcie_device_sdk](/usnvmemu/crates/pcie_device_sdk/docs/DECISIONS.md) |
 | 011 | 文档架构改两层制 | **本文件** ↓ |
+| 012 | Transport 三层模型 + control/data plane + 命名裁定 | **本文件** ↓ |
 
 ---
 
