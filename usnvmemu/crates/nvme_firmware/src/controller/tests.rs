@@ -2882,6 +2882,114 @@ fn c1_chain_depth_cap_rejects_malformed_chain() {
     );
 }
 
+/// **L-2：PRP-list 多-sibling DMA-fail 清理（spec § 4.6.1 "one CQE per command"）差分
+/// oracle** —— 一条 PRP-list 命令派生多条共享 op_id 的 sibling 子-DMA（list-fetch +
+/// 每数据页 DMA）。当 scatter 已发出**多条** data sibling、其中一条 DMA 失败时，
+/// `on_dma_complete_impl` 的 `!ok` 清理臂必须：① sweep 掉**所有**同 op_id sibling；
+/// ② 移除累积器（不泄漏）；③ 只 post **一条** error CQE（不是每 sibling 一条）。
+///
+/// 这覆盖 chain depth cap 测试触不到的"多 sibling 共存时清理"路径（cap 在 walk 期触发、
+/// 那时只有 1 条 fetch sibling；本测试在 scatter 期、多条 data-write sibling 在飞时失败）。
+///
+/// 独立 oracle：pending_ios 清空（sweep 全 sibling）+ prp_list_ops 清空（accum 移除）+
+/// capture 里恰好 1 条 error CQE（DATA_TRANSFER_ERROR）。
+/// revert-verify：把 `!ok` 臂里 NvmReadPrpListData 的 retain sweep 改成只删命中 token（不按
+/// op_id 扫 sibling）→ 残留 sibling → 后续完成时 post 第二条 CQE / accum 泄漏 → ①③ 红。
+#[test]
+fn l2_prp_list_multi_sibling_dma_fail_single_cqe() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    const PAGE: u64 = crate::regs::NVME_PAGE_SIZE;
+    const PRP1: u64 = 0x10_0000;
+    const LIST0: u64 = 0x1000;
+    const DATA1: u64 = 0x20_0000;
+    const DATA2: u64 = 0x21_0000;
+
+    let mut c = make_ctrl_with_tmp("l2_multi_sibling");
+    // NS1 设成 plain 4K（lbads=12, 无 meta/PI）→ nlb=3 = 12288 B > 2 page → PRP-list READ。
+    {
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 0;
+        ns.pi_type = 0;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / (1u64 << ns.lbads);
+    }
+    c.cqs.insert(
+        1,
+        crate::regs::CompletionQueue {
+            base_gpa: 0x1_0000,
+            size: 64,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        },
+    );
+    // PRP list 页：2 个 data-page GPA（page idx 1、2）。
+    let mut list0 = vec![0u8; PAGE as usize];
+    list0[0..8].copy_from_slice(&DATA1.to_le_bytes());
+    list0[8..16].copy_from_slice(&DATA2.to_le_bytes());
+
+    let mut cap = CaptureTransport::with_start_token(0x100);
+    let pre = cap.events().len();
+    {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        // READ nlb=3 (3 × 4096 = 12288 > 8192 → PRP-list)。
+        let mut sqe = io_sqe(0x02, 1, 0, 3, PRP1, false, 0x55);
+        sqe.prp2 = LIST0;
+        let r = c.dispatch_io(&mut ctx, 1, sqe, 0x55, 0, 1);
+        assert!(r.is_none(), "PRP-list READ 走异步");
+        // 起步只有 list-fetch 一条 pending。
+        let tok_list = *c.pending_ios.keys().next().expect("应有 list fetch");
+        c.on_dma_complete_impl(&mut ctx, tok_list, true, list0);
+        // walk 完成 → scatter 发出 3 条 data-write sibling（PRP1 + DATA1 + DATA2）。
+        let sibling_toks: Vec<u64> = c.pending_ios.keys().copied().collect();
+        assert_eq!(
+            sibling_toks.len(),
+            3,
+            "scatter 应发 3 条 data-write sibling"
+        );
+        assert_eq!(c.prp_list_ops.len(), 1, "1 个 PrpListOp accum 在飞");
+        // **关键**：让第一条 sibling DMA **失败**（ok=false），此刻另 2 条仍在飞。
+        c.on_dma_complete_impl(&mut ctx, sibling_toks[0], false, Vec::new());
+    }
+    // 独立 oracle ①：所有 sibling 被 sweep（pending_ios 清空）。
+    assert!(
+        c.pending_ios.is_empty(),
+        "DMA-fail 应 sweep 掉所有同 op_id sibling（防泄漏 + 防 sibling 完成时第二条 CQE）"
+    );
+    // 独立 oracle ②：accum 移除。
+    assert!(c.prp_list_ops.is_empty(), "DMA-fail 应移除 PrpListOp accum");
+    // 独立 oracle ③：恰好 1 条 error CQE（DATA_TRANSFER_ERROR），非每 sibling 一条。
+    let cqe_statuses: Vec<u16> = cap
+        .events()
+        .iter()
+        .skip(pre)
+        .filter_map(|e| match e {
+            TransportEvent::DmaWrite { gpa, data, .. }
+                if *gpa >= 0x1_0000 && *gpa < 0x1_0000 + 64 * 16 && data.len() >= 16 =>
+            {
+                let dw3 = u32::from_le_bytes(data[12..16].try_into().unwrap());
+                Some((((dw3 >> 17) & 0xff) | (((dw3 >> 25) & 0x7) << 8)) as u16)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        cqe_statuses.len(),
+        1,
+        "spec § 4.6.1：一条命令只允许一条 CQE（多 sibling 失败不得多发）"
+    );
+    assert_eq!(
+        cqe_statuses[0],
+        crate::cmd::sc::DATA_TRANSFER_ERROR,
+        "应是 DATA_TRANSFER_ERROR"
+    );
+}
+
 /// flush 失败仅 warn（教学边界），现按 spec 置 CSTS.CFS 让 driver 知数据可能丢失。
 ///   正例：NS flush 失败（test fault-injection）→ CSTS.CFS=1 + SHST=complete；
 ///   负例：flush 成功 → CFS=0 + SHST=complete。
