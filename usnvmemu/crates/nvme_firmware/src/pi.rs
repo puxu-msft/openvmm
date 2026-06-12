@@ -32,19 +32,41 @@
 //! 实现：table-free bit-serial（教学清晰；perf 临界路径可换 table 或
 //! `crc-catalog::CRC_16_T10_DIF`）。
 
+/// T10 DIF CRC16 多项式 0x8BB7（init 0，no reflect，no xor-out）。
+const CRC16_T10DIF_POLY: u16 = 0x8BB7;
+
+/// 编译期预计算的 256 项 CRC16 查找表（MSB-first，每项 = 单字节 `i` 经 8 bit 处理的余式）。
+/// 取代 bit-serial 内层 8 次迭代——CRC 是**每个 PI IO 每 data 字节都跑**的热路径
+/// （[[hot-path-perf-first]]），table-driven 每字节 1 次查表 + 移位异或，~8× 减少内层运算。
+/// `const fn` 编译期构建，零运行时初始化成本。
+const CRC16_T10DIF_TABLE: [u16; 256] = {
+    let mut table = [0u16; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = (i as u16) << 8;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ CRC16_T10DIF_POLY
+            } else {
+                crc << 1
+            };
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
 /// 计算 T10 DIF CRC16（polynomial 0x8BB7，init 0，no reflect，no xor-out）。
+/// **table-driven 热路径**（见 `CRC16_T10DIF_TABLE`）：与原 bit-serial 数学等价，由
+/// known-answer（crc16_zeros / crc16_known_vector=0xD0DB）+ proptest vs `crc` crate 守正确。
 pub(crate) fn crc16_t10dif(data: &[u8]) -> u16 {
-    const POLY: u16 = 0x8BB7;
     let mut crc: u16 = 0;
     for &b in data {
-        crc ^= (b as u16) << 8;
-        for _ in 0..8 {
-            if crc & 0x8000 != 0 {
-                crc = (crc << 1) ^ POLY;
-            } else {
-                crc <<= 1;
-            }
-        }
+        let idx = (((crc >> 8) ^ b as u16) & 0xff) as usize;
+        crc = (crc << 8) ^ CRC16_T10DIF_TABLE[idx];
     }
     crc
 }
