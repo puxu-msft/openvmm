@@ -61,3 +61,19 @@ cp flowey-out/artifacts/build-igvm/debug/x64-custom/openhcl-x64-custom.bin <win>
 scenario7（idle peer-death loopback）仍是有效回归守卫（PASS 证 idle-EOF 检测逻辑正确）——与真机一致。
 
 **教训**：VTL2 busybox 下 kill 进程用 `pkill -f <cmdline>` 或按 pid，**勿用 `pkill -x <comm>`**（busybox -x 匹配不到）。这个假"bug"耗了一轮诊断——VTL2 工具链怪癖要先验证 kill 真生效（`pgrep -f` 确认）再下结论。
+
+---
+
+## 发现③（真机暴露的设计问题）：C-2 show-absent 阻止 guest 枚举
+
+**现象**：device Live（usnvmemu 在 guest PCI 枚举前就连上）后，guest 仍把设备枚举为 `PCI\VEN_1414&DEV_0000`（Status Unknown，无驱动，无 NVMe disk）。removet 旧 devnode + `pnputil /scan-devices` 不重现（PCI rescan 不重触 vmbus VPCI offer）。
+
+**根因**：VPCI offer 在 `assemble_device`（**Connecting** 态，usnvmemu 连上**之前**）就发生，guest 据 **offer 时刻的 config** 创建 devnode（且 Windows devnode 的 vendor/device 是 enum 时一次性定的，不随 rescan 变）。**C-2 让 Connecting 态 cfg_read 返 Err/absent → offer 捕获到 device_id=0 → guest 枚举成 DEV_0000/Unknown**。设备后来 Live（cfg_space 正确呈 DEV_00A9，已单测）也不重触 offer。即 **C-2 "show-absent via cfg-Err" 直接阻止 guest 正常枚举**——这是 architect round-2 设计的 C-2 的过度修正，真机才暴露。
+
+**修法（option-A：槽位恒在+真身份）**：device.rs **cfg_read/write 恒呈真（declared）config**（含 Connecting），让 offer/enum 捕获 DEV_00A9 → guest 加载 stornvme.sys；**只把 MMIO 按 Live 门控**（非 Live 返 `Err`，**绝不 `Defer`** → driver 重试/报错，不挂——291d8645 hang 是 Defer 致，Err 安全）。usnvmemu 起→Live→driver MMIO 命中真 NVMe→disk+IO；usnvmemu 停→Lost→MMIO Err→driver 报错；重起→Live→恢复。boot-safety：usnvmemu 从不连时 guest 看到一个"非功能 NVMe 控制器"（driver init 失败/重试，非 hang）——可接受（等同插了块没响应的盘）。
+
+**与决策(a)的关系**：决策(a)"复活已枚举 function" 隐含 function 得先被有效枚举；但 offer 在 Connecting + C-2 → 永远枚举不成。修法对齐二者：恒呈真 config→offer 即有效枚举(DEV_00A9)→之后靠 MMIO Live/Lost revive。
+
+**涟漪 + 下一步**：① device.rs 改（cfg 恒真 + MMIO 仅 Live；revert 部分 C-2）；② 更新 device.rs 单测（`connecting_cfg_read_returns_err_like_lost` 等需改为"Connecting cfg 呈真、MMIO Err"）+ loopback；③ subagent review（boot-safety 不退 + 不引入 291d8645 hang）；④ rebuild vpci IGVM；⑤ 真机复验：clean guest（或 remove 旧 VEN_1414 node）+ race-start usnvmemu→Live→guest 枚举 DEV_00A9 + stornvme 加载 + NVMe disk + 真 IO（host backing-file 独立 oracle）+ revive。
+
+**注**：本 guest 已被多轮历史实验污染（stale VEN_1414 DEV_C0DE/v1 nodes）；复验最好用干净 guest 或先清 stale node。
