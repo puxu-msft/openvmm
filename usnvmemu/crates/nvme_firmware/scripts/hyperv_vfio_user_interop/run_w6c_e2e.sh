@@ -91,14 +91,19 @@ fi
 # this VM (finding, device-unrelated). We boot plain and bring usnvmemu Live early
 # instead; with the W6c C-2 fix the VPCI offer latches DEV_00A9 at assemble anyway.
 echo "== boot $VM_NAME (igvm=$IGVM_NAME instance=$INSTANCE) =="
-"$PS" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "
+BOOT=$("$PS" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "
   Import-Module '$(wslpath -w "$WIN_WORKDIR")\hyperv.psm1' -Force -EA Stop
   \$vm = Get-VM -Name '$VM_NAME' -EA Stop
   if (\$vm.State -ne 'Off') { Stop-VM '$VM_NAME' -TurnOff -Force; Start-Sleep 3 }
   Set-OpenHCLFirmware -Vm \$vm -IgvmFile '$(wslpath -w "$WIN_WORKDIR")\\$IGVM_NAME'
   Set-VmCommandLine -Vm \$vm -CommandLine 'OPENHCL_VFIO_USER_NVME=$INSTANCE:$SOCK'
   Start-VM '$VM_NAME'; Write-Host ('BOOTED ' + (Get-Date -Format o))
-" 2>&1 | tr -d '\r' | grep -E "BOOTED|rror" || fail "boot failed"
+" 2>&1 | tr -d '\r')
+# H-1: 严格以 BOOTED 出现为成功判据（"BOOTED" 只在 Start-VM 成功后才 Write-Host）。
+# 不要用 grep -E "BOOTED|rror"——含 "Error" 的失败输出会误匹配而放行。先 echo 全部
+# 输出供诊断，再严格 gate。$(...) 赋值已屏蔽 PS 退出码，避免 pipefail 误判。
+echo "$BOOT" | sed 's/\x1b\[[0-9;]*m//g'
+echo "$BOOT" | grep -q "BOOTED" || fail "boot failed (见上方输出)"
 
 # --- 2. wait VTL2 reachable, push usnvmemu (base64 over `run -- sh -c`) ---
 echo "== push usnvmemu into VTL2 =="
@@ -107,7 +112,7 @@ LSIZE=$(stat -c%s "$MUSL")
 PUSHED=$(base64 -w0 < "$MUSL" | timeout 90 "$OHCL" "$VM_NAME" run -- sh -c \
   'base64 -d > /tmp/usnvmemu && chmod +x /tmp/usnvmemu && echo PUSHED rsize=$(stat -c%s /tmp/usnvmemu)' 2>&1 | tr -d '\r')
 echo "$PUSHED (local=$LSIZE)"
-echo "$PUSHED" | grep -q "rsize=$LSIZE" || fail "usnvmemu push size mismatch"
+echo "$PUSHED" | grep -qE "rsize=$LSIZE($|[^0-9])" || fail "usnvmemu push size mismatch"
 
 # --- 3. create backing + launch usnvmemu detached (setsid) ---
 echo "== create ${BACKING_MB}MiB backing + launch usnvmemu =="
@@ -123,7 +128,9 @@ done
 [ "$LIVE" = "1" ] || fail "worker never went Live (check usnvmemu.log / vpci feature)"
 DMA=$(ohcl_run 20 'grep -c "DMA_MAP added" /tmp/usnvmemu.log')
 echo "worker Live; DMA_MAP added=$DMA"
-ohcl_run 18 'ps aux 2>/dev/null | grep "[u]snvmemu" | head -1' | grep -q usnvmemu || fail "usnvmemu not running (ps)"
+# M-1: 判活锚定运行进程的 argv（含 --vfio-user-sock），而非裸 "usnvmemu"——后者会被
+# 含 "usnvmemu" 的错误串（如 "sh: /tmp/usnvmemu: cannot execute"）误匹配成假 ALIVE。
+ohcl_run 18 'ps aux 2>/dev/null | grep "[u]snvmemu" | head -1' | grep -q -- "--vfio-user-sock" || fail "usnvmemu not running (ps)"
 [ "${DMA:-0}" -ge 1 ] || fail "0 DMA_MAP issued -> no zero-copy DMA (check underhill_mem sharing())"
 
 # --- 5. guest oracle-1 (enumerate + re-init + 4 MiB IO) ---
