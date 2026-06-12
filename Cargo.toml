@@ -238,6 +238,7 @@ aarch64defs = { path = "vm/aarch64/aarch64defs" }
 aarch64emu = { path = "vm/aarch64/aarch64emu" }
 acpi = { path = "vm/acpi" }
 acpi_spec = { path = "vm/acpi_spec" }
+amd_iommu = { path = "vm/devices/iommu/amd_iommu" }
 chipset_arc_mutex_device = { path = "vm/chipset_arc_mutex_device" }
 chipset_device = { path = "vm/chipset_device" }
 chipset_device_fuzz = { path = "vm/chipset_device_fuzz" }
@@ -311,6 +312,7 @@ pci_core = { path = "vm/devices/pci/pci_core" }
 pci_resource_assignment = { path = "vm/devices/pci/pci_resource_assignment" }
 pci_resources = { path = "vm/devices/pci/pci_resources" }
 pcie = { path = "vm/devices/pci/pcie" }
+iommu_common = { path = "vm/devices/iommu/iommu_common" }
 smmu = { path = "vm/devices/iommu/smmu" }
 vpci = { path = "vm/devices/pci/vpci" }
 vpci_client = { path = "vm/devices/pci/vpci_client" }
@@ -538,12 +540,11 @@ crc32fast = { version = "1.3.2", default-features = false }
 flate2 = "1.1"
 
 # --- Cryptography & secure computing ---
-aes-kw = "0.3.0"
 constant_time_eq = "0.5"
 cms = { version = "0.3.0-pre.2", default-features = false }
 der = "0.8"
 getrandom = "0.4"
-ms-tpm-20-ref = { version = "0.1", git = "https://github.com/microsoft/ms-tpm-20-ref-rs.git", branch = "main" }
+ms-tpm-20-ref = { version = "0.1", git = "https://github.com/microsoft/ms-tpm-20-ref-rs.git", rev = "5b8ca3b5b423859da441f51ec8b1610708ed53c2" }
 openssl = "0.10.79"
 openssl-sys = "0.9"
 pkcs1 = "0.8.0-rc.4"
