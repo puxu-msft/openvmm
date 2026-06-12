@@ -21,13 +21,14 @@ guest 重查 relations。** 据此评估每个方案：
 | **C2-0 graceful EJECT** | 撤通道前发 `EJECT`(slot0) 给 guest query-remove 窗口 | ✅ 缓解⑥（脏卷不崩）；但 guest 不回 EJECT_COMPLETE（后端死无法 flush） | **保留为 scaffolding**（`hide_device`，`#[expect(dead_code)]`）。**未来 operator 显式永久移除**时用：先 EJECT 让 guest 有序 dismount 再撤。 |
 | **C2-1 device_count 0↔1 push** | 通道恒在，unsolicited 重发变长 `BUS_RELATIONS2`（device_count 0↔1） | ❌ re-add 失败：device_count=1 已送达但 guest 不出盘（remove 经 EJECT 可行） | **弃**（机制留在 device.rs 作 scaffolding，Option B 下休眠）。Windows 不响应 unsolicited relations push。 |
 | **C2-1-fix INVALIDATE_BUS** | re-add 时发标准 `INVALIDATE_BUS`（"relations 变了请重查"） | ❌ 失败：guest 不重查（≠ FDO 重上电）。已 revert | **弃**。Windows pci.sys 不响应 VSP 发的 INVALIDATE_BUS。 |
-| **Option A：换 NEW instance_id re-offer** | rescind 旧 bus + 用**全新** instance_id 重建+offer（guest 见全新总线→建**新 FDO**→`FDO_D0_ENTRY`→枚举） | ⚠️ **未验证**（C0 只验了同 instance_id；新 instance_id 是不同情形） | **未采纳，留作未来首选恢复路径**。理论应生效（新 FDO = guest 自己重上电的等价物）。代价：每次每周期漏一个 phantom 总线 devnode（Windows 会 GC）。**未来若要长停顿自动恢复，先 POC 此方案**（承重假设未验证，按项目规矩先 POC 再定）。 |
-| **Option B（已采纳）** | usnvmemu 停=transient 后端停顿，**不**移除设备；设备恒在，C-3 reconnect 透明恢复 | ✅ real-VM 通过：fast restart 盘无缝存活+IO；多次快重启稳定；long outage guest 有序移盘（无⑥崩） | **采纳**。HW-accurate（真硬件 controller reset 同理），无 phantom 债。**唯一缺口=长停顿不自动恢复**（guest 超时移盘后需 reboot/rescan，或未来上 Option A）。 |
+| **Option A：换 NEW instance_id re-offer** | rescind 旧 bus + 用**全新** instance_id 重建+offer（guest 见全新总线→建**新 FDO**→`FDO_D0_ENTRY`→枚举） | ⚠️ **POC 已验（2026-06-13）：走得最远但仍不达**。guest **接受新 bus FDO**（唯一克服 ⑦ guest 缓存的方案）；POC 暴露+修了真 config MMIO RAII 泄漏（`VpciConfigSpace` 无 Drop→unmap）；但新 bus 的 **child 在 offer 时不自动枚举**，需 guest 手动 FDO 重上电（VSP 跨不过）。 | **POC code 已 revert**（不达可靠自动恢复）。**config MMIO 修保留**（真 bug）。未来若要自动长停顿恢复需 guest 侧可被触发的 FDO 重上电机制 / guest agent rescan——纯 VSP 侧（含新 instance_id）已证不足。详见 RESULT.md「Option A POC」节。 |
+| **Option B（已采纳）** | usnvmemu 停=transient 后端停顿，**不**移除设备；设备恒在，C-3 reconnect 透明恢复 | ✅ real-VM 通过：fast restart 盘无缝存活+IO；多次快重启稳定；long outage guest 有序移盘（无⑥崩） | **采纳**。HW-accurate（真硬件 controller reset 同理），无 phantom 债。**唯一缺口=长停顿不自动恢复**（guest 超时移盘后需 reboot/rescan/disable-enable；POC 证 VSP 侧无法自动补，见 Option A 行）。 |
 
-**未来增强路径（若需要）**：Option B + Option A 混合——快重启走 Option B 透明（主场景）；
-检测到长停顿（Lost 超 guest 容忍窗口 ~8s，需计时）→ reconnect 时走 Option A（rescind 旧 bus
-先清掉 guest 可能残留的盘 + 用新 instance_id 重 offer 强制重枚举）。**先 POC 验证 Option A 的
-"新 instance_id 重枚举" 承重假设**再定混合设计。代价 = 长停顿（罕见）时的 phantom 总线债。
+**未来增强路径（若需要长停顿自动恢复）**：Option A POC（2026-06-13）已证**纯 VSP 侧不足**——
+新 instance_id 让 guest 接受新总线，但 child 在 offer 时不自动枚举（需 guest 自发 FDO 重上电，VSP
+跨不过）。故自动长停顿恢复需从 **guest 侧可被触发的 FDO 重上电** 或 **guest agent 自动 rescan**
+入手（本仓/VPCI 协议未发现 VSP→guest 强制 FDO 重上电的原语）。POC 顺带修了真 config MMIO RAII
+泄漏（保留）。在找到 guest 侧机制前，长停顿恢复 = 手动（reboot / 设备管理器 rescan / disable-enable）。
 
 ---
 

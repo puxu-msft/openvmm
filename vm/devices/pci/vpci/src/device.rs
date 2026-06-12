@@ -1547,6 +1547,25 @@ impl VpciConfigSpace {
     }
 }
 
+impl Drop for VpciConfigSpace {
+    /// RAII：通道被拆（运行时 rescind / VM teardown）时，确保 config MMIO 区域从 MMIO
+    /// 路由**注销**。
+    ///
+    /// 背景（Option A 真机暴露）：底层 `DeviceRange`（`ControlMmioIntercept` 具体实现，见
+    /// `vmotherboard/.../services.rs` 的 `impl_device_range!`）**无 `Drop`**——`map()` 在
+    /// 共享 `ranges` 注册表登记区域，但 drop 时不 `revoke`。静态 VPCI 设备只在 VM teardown
+    /// 才 drop，无碍；但**运行时 rescind** 一个已 `FdoD0Entry`（config 已 `map`）的 bus 时，
+    /// guest 不发 `FdoD0Exit` → `unmap()` 不被调用 → 旧 config 区域滞留，与后续重建的 bus 在
+    /// 同一 guest 地址（config 窗口确定性）`register` 冲突 → 新 bus config 映射失败、无可用子
+    /// 设备。此 `Drop` 让 config MMIO 生命周期严格绑定 `VpciConfigSpace`，根治该泄漏。
+    ///
+    /// `unmap()` 幂等（`DeviceRange::unmap` 仅在 `addr` 为 `Some` 时 `revoke`；`offset` 重置
+    /// 幂等），故与正常 `FdoD0Exit` 路径或从未 `map` 的情形都不冲突。
+    fn drop(&mut self) {
+        self.unmap();
+    }
+}
+
 /// PCI Config space offset structure
 #[derive(Debug, Clone, Inspect)]
 #[inspect(transparent)]

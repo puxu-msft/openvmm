@@ -1,37 +1,44 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Layer C：emulated vfio-user NVMe 设备的 **guest 运行时热插拔**。
+//! Layer C：emulated vfio-user NVMe 设备在 OpenHCL guest 的呈现 —— **Option B：把 usnvmemu
+//! 重启建模为 transient 后端停顿，而非设备热插拔**（真机定稿 2026-06-13）。
 //!
-//! # 目标
+//! # 目标与模型
 //!
-//! 让 vfio_user NVMe 设备随 usnvmemu（VTL2 内 vfio-user server）的 Live/Lost 在 guest 里
-//! 动态出现/消失：
-//! - usnvmemu 起 → device 转 `Live` → guest 里 PnP 出现 NVMe 盘；
-//! - usnvmemu 停（`pkill`）→ device 转 `Lost` → guest PnP 移盘；
-//! - usnvmemu 重起 → 盘回来 + 可再 IO。
+//! 设备在 guest 出现，并在 usnvmemu（VTL2 内 vfio-user server）重启时**透明恢复**：
+//! - usnvmemu 起（首次 / boot-absent 后起）→ device 转 `Live` → guest PnP 出现 NVMe 盘（冷插）；
+//! - usnvmemu 停（`pkill`）→ device 转 `Lost` → **设备对 guest 恒在（不移盘）**，仅底层 MMIO/DMA
+//!   在 Lost 窗口返 Err（C-2 门控）；
+//! - usnvmemu 重起 → **C-3 reconnect 透明重连**（重发 set_irqs+dma_map）→ 控制器恢复，如真硬件
+//!   NVMe controller 短暂 reset：**快重启盘不消失、在途 IO 超时重试后恢复**。
 //!
-//! 而 **device shim**（`VfioUserPciDevice` + worker + reconnect connector + irq tasks）
-//! **boot 时装配一次、长存**（不随 add/remove 重建）。每周期重建 device shim 会丢
-//! in-flight read / MSI-X 表 / 重启 worker+connector+eventfd（毁 C-3 reconnect 状态）。
+//! **为何是 transient-stall 而非 hot-remove/re-add**（真机 finding-⑦ 深挖坐实）：Windows pci.sys
+//! 只在 guest **自己**重上电 bus FDO（`FDO_D0_EXIT`→`FDO_D0_ENTRY`）时才重枚举 VPCI 子设备；VSP 侧
+//! 任何 push（C0 同-instance re-offer / C2-1 unsolicited `BUS_RELATIONS2` / C2-1-fix `INVALIDATE_BUS`
+//! / Option A 换新 instance_id）都不能可靠让 guest 在运行时重出盘。故「Lost→hot-remove、Live→
+//! hot-re-add」模型**在 Windows 不可闭环**，改用 transient-stall 绕开。完整方案对照（含 C0/C2-0/
+//! C2-1/Option A 各自真机结果）见 `docs/superpowers/plans/2026-06-12-layer-c-vpci-hotplug.md`
+//! 「已试方案与去留」表 + `usnvmemu/experiments/2026-06-12-layer-c-c0-real-vm/RESULT.md`。
 //!
-//! # C2-1：路径 B（`device_count` 0↔1，**vmbus 通道恒在**）
+//! **已知限制**：长停顿（usnvmemu 停 > guest IO 超时窗口 ~8s）→ guest 自身**有序**移盘（无⑥崩，
+//! guest 主导非 surprise-rescind）；之后恢复需 guest 侧介入（reboot / 设备管理器 rescan /
+//! disable-enable）—— 与真硬件 NVMe 一致，纯 VSP 侧无法自动补（Option A POC 已证）。
 //!
-//! C0/C2-0 走 **通道级 rescind/re-offer**（每个 Lost 边沿 `DynamicDeviceUnit::remove` 拆
-//! VpciBus，每个 Live 边沿重 add）。真机暴露 **finding-⑦**：surprise-rescind 后用**同
-//! instance_id** re-offer，guest **不重枚举**（盘不回来，pnputil 也唤不回）。
+//! # device shim + VpciBus 通道：都长存
 //!
-//! C2-1 改为 **路径 B**：**VpciBus channel 只 offer 一次、永不 rescind**；设备的「在/不在」
-//! 靠重发变长 `BUS_RELATIONS2`（`device_count=1` 或 `0`）让 guest 走标准 VPCI PnP add/remove
-//! （见 `vpci::HotplugCommand::SetPresent`）。这样 re-add 是同通道内 `device_count` 0→1，
-//! guest 干净重枚举（**修⑦**：通道/instance_id 恒定 = 同盘 in/out，无 phantom devnode）。
-//! Lost 仍保留 C2-0 的 **graceful EJECT** 前置（**修 finding-⑥**：surprise-remove 挂载+脏数据
-//! 的 NTFS 卷致 guest BSOD）。
+//! **device shim**（`VfioUserPciDevice` + worker + reconnect connector + irq tasks）
+//! **boot 时装配一次、长存**（不随状态重建）。每周期重建会丢 in-flight read / MSI-X 表 /
+//! 重启 worker+connector+eventfd（毁 C-3 reconnect 状态）。**VpciBus channel** 亦**首个 Live
+//! 边沿 add 一次、VM 全程长存**（Option B 不在运行时拆通道，Lost 是 no-op）。
 //!
 //! 生命周期对照：
 //! - **device shim**（含虚拟设备 + device_id + MSI 连接）：boot 装配一次，VM 全程长存。
 //! - **VpciBus channel + cmd_tx**：**首个 Live 边沿 add 一次**，VM 全程长存（不随 Lost 拆）。
-//! - 之后 Live/Lost 边沿只发 `SetPresent(true/false)` 命令切换 `device_count`，**不**动通道。
+//! - Lost 边沿 = **no-op**（设备恒在，C-3 reconnect 恢复）。`SetPresent`（`device_count` 0↔1）
+//!   与 `hide_device`（graceful EJECT，**修 finding-⑥** 挂载脏卷 surprise-remove 崩）保留作
+//!   **未来 operator 显式永久移除**的 scaffolding —— 它们是 C2-1 路径 B 的遗留机制，在 Option B
+//!   下运行时不触发（device_count 恒 1）。
 //!
 //! # 架构（照 `vpci_relay`，**不是** `netvsp`）
 //!

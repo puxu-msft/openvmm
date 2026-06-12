@@ -201,3 +201,41 @@ Live 设备已在→no-op）。
 C2-1-fix INVALIDATE_BUS / Option A 新 instance_id / Option B）——未采纳的留作未来参考，
 尤其 **Option A（换新 instance_id 强制重枚举）是未来长停顿自动恢复的首选 POC 目标**（承重假设
 "新 instance_id 重枚举" 未验证，按项目规矩先 POC）。
+
+---
+
+## Option A POC（2026-06-13）：换新 instance_id re-offer — 走得最远，但仍撞「运行时 child 不自动枚举」墙
+
+按用户「option a 的 POC 值得做」，POC 了 Option A（长停顿 guest 移盘后，reconnect 时 rescind
+旧 VpciBus + 用**全新 instance_id** 重建 offer，强制 guest 见全新总线重枚举）。POC 代码（`had_lost`
+标记 + `reoffer_new_instance`）**已 revert**（不达可靠自动恢复）；但 POC 暴露并修了一个真 bug。
+
+**POC v1 发现（关键）**：新 instance_id re-offer 后，guest **接受了新 bus FDO**
+（`Microsoft Hyper-V Virtual PCI Bus {11111112…}` present=OK）——**这是所有方案里唯一让 guest
+侧克服 ⑦ 缓存限制的**（同 instance_id 被当「已知/已移除」不重枚举；新 instance_id 是全新总线）。
+但**无 child disk**。
+
+**根因 #1（已修，真 RAII bug，保留）**：kmsg 抓到
+`ControlMmioIntercept::map failed conflict=vpci-11111112/config:0xfff7fe000 conflicts with
+existing vpci-11111111/config`。底层 `DeviceRange`（`ControlMmioIntercept` 具体实现，
+`vmotherboard/.../services.rs` 的 `impl_device_range!`）**无 `Drop`**——`map()` 在共享 `ranges`
+注册表登记，drop 时不 `revoke`。静态 VPCI 设备只在 teardown drop 无碍；但**运行时 rescind** 一个
+已 `FdoD0Entry`（config 已 map）的 bus 时，guest 不发 `FdoD0Exit` → `unmap` 不调 → 旧 config 区域
+滞留，与新 bus 同 guest 地址冲突。**修：`VpciConfigSpace` 加 `Drop`→`unmap`**（RAII，config MMIO
+生命周期绑定 `VpciConfigSpace`；幂等，静态调用方 teardown 时调用无害；16 vpci 测绿）。**此修
+独立于 Option A 去留，是真实潜在 bug 修复，保留。**
+
+**POC v2（config 修后）发现 — 根因 #2（未解，撞墙）**：config MMIO 冲突消失
+（`map-failed count: 0`），新 bus **功能正常**（FDO disable/enable → 盘回来 + IO）。但
+**guest 仍不在 offer 时自动枚举 child**——必须手动 FDO 重上电（disable/enable）才出盘。即新 bus
+的 first `FdoD0Entry` 没枚举 child，但 re-power 的 second `FdoD0Entry` 枚举了。**VSP 无法触发 guest
+FDO 重上电** → 同 ⑦ 的根本墙：**运行时 VPCI child 自动枚举在 Windows 上不可靠，需 guest 自发 FDO
+重上电**，新 instance_id 也不例外（它解了「总线级」缓存，但「child 级」自动枚举仍需 guest 自发动作）。
+
+**结论**：Option A **不达可靠的 VSP 触发自动长停顿恢复**（新 bus 起来了但 child 要 guest 手动
+re-power）。比其他方案走得远（guest 接受新总线 + 修了真 config bug），但最后一道墙（runtime child
+auto-enum 需 guest FDO 重上电）VSP 跨不过。**Option B 仍为终**：快重启透明无感；长停顿 = guest
+有序移盘（HW-accurate），恢复需 guest 侧介入（reboot / 设备管理器 rescan / disable-enable）。
+
+**未来若仍要自动长停顿恢复**：得从 guest 侧能被 VSP 触发 FDO 重上电的机制入手（本仓/协议未发现），
+或 guest 侧 agent 自动 rescan，或接受手动恢复。纯 VSP 侧（含新 instance_id）已证不足。
