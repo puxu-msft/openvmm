@@ -4129,6 +4129,19 @@ impl PcieDevice for NvmeController {
                 prefetchable: false,
             });
         }
+        // BAR index 唯一性不变量（reviewer MEDIUM-1）：transport `region_size` 用 `find`
+        // 按 index 命中第一条 BAR；若 describe 误产出重复 index，会静默取首条。CMB BAR
+        // 的 bir≠0（enable_cmb 保证）使当前不会重复，但锁此前提防未来 BAR 增加时回归。
+        debug_assert!(
+            {
+                let mut idx: Vec<u8> = bars.iter().map(|b| b.index).collect();
+                idx.sort_unstable();
+                let n = idx.len();
+                idx.dedup();
+                idx.len() == n
+            },
+            "describe() BAR index 必须唯一（transport region_size 依赖此前提）"
+        );
         DeviceDescribe {
             vendor_id: self.vid,
             // PCI Device ID = 0xC0DE — matches OpenHCL noop convention 便于
@@ -6224,5 +6237,141 @@ mod cmb_datapath_tests {
         // 防御：确认数据没被误写到 transport（NVME_PAGE_SIZE 仅作引用，避免未用告警）。
         let _ = NVME_PAGE_SIZE;
         assert!(c.cmb_completions.is_empty(), "drain 后队列空");
+    }
+
+    // ---------------- P3a: firmware 服务 CMB BAR 数据访问 ----------------
+    //
+    // 这是 trap-based CMB 的 firmware 半边：guest 经 CMB BAR（region index = cmb.bir）
+    // 的 MMIO read/write **不是寄存器**，而是直读写 CMB backing 的 `offset` 处。与 BAR0
+    // （NVMe 寄存器，有副作用）并列但语义不同（CMB BAR 是纯数据 RAM）。transport
+    // 层把 vfio-user REGION_READ/WRITE 路由到 `mmio_read/write(cmb.bir, offset, size)`，
+    // 故这里钉死 firmware 入口的行为。
+
+    /// **P3a** — guest 经 CMB BAR 写 offset X → 命中 backing[X]；firmware 经 `guest_*`
+    /// （gpa = cba + X）访问同一份 backing。**backing 一致性**：BAR 写后 `guest_read`
+    /// 读到的就是刚写的字节（同一 `cmb.backing`，无第二副本）。
+    #[test]
+    fn cmb_bar_write_then_guest_read_same_backing() {
+        let mut c = mk_cmb_live();
+        let off = 0x100u64;
+        // guest 经 CMB BAR 写 8 字节（mmio_write_impl，bar = CMB_BIR）。
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let magic = 0xCAFEBABE_DEADBEEFu64;
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            c.mmio_write_impl(&mut ctx, CMB_BIR as u32, off, 8, magic);
+        }
+        // CMB BAR 写不触发任何 transport DMA（纯本地 backing 写）。
+        assert!(cap.events().is_empty(), "CMB BAR 写不应触发 transport");
+
+        // ① guest（client 侧再读）经 CMB BAR 读回同一 offset → 同值。
+        assert_eq!(
+            c.mmio_read_impl(CMB_BIR as u32, off, 8),
+            magic,
+            "CMB BAR write→read 往返一致"
+        );
+        // ② firmware 侧经 guest_read（gpa = cba + off）读同一 backing → 同值（一致性）。
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let token = c.guest_read(&mut ctx, CBA + off, 8);
+        let comp = c
+            .cmb_completions
+            .iter()
+            .find(|x| x.token == token)
+            .expect("CMB 命中合成 completion");
+        assert_eq!(
+            comp.data.as_deref(),
+            Some(&magic.to_le_bytes()[..]),
+            "BAR 写的字节 == firmware guest_read 读到的字节（同一 backing）"
+        );
+    }
+
+    /// **P3a** — 反向一致性：firmware 经 `guest_write`（gpa = cba + X）写 backing →
+    /// guest 经 CMB BAR 读 offset X 读到同字节。
+    #[test]
+    fn guest_write_then_cmb_bar_read_same_backing() {
+        let mut c = mk_cmb_live();
+        let off = 0x400u64;
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let payload = 0x0102_0304_0506_0708u64;
+        let _ = c.guest_write(&mut ctx, CBA + off, payload.to_le_bytes().to_vec());
+        // guest 经 CMB BAR 读 → 同值。
+        assert_eq!(
+            c.mmio_read_impl(CMB_BIR as u32, off, 8),
+            payload,
+            "firmware guest_write 的字节 == guest 经 CMB BAR 读到的字节"
+        );
+    }
+
+    /// **P3a** — CMB BAR 4 字节粒度访问（transport 按寄存器粒度分块，常以 ≤4/8 字节
+    /// 段调 mmio）。写 4 字节、读 4 字节往返。
+    #[test]
+    fn cmb_bar_4byte_access_roundtrip() {
+        let mut c = mk_cmb_live();
+        let off = 0x80u64;
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap);
+        c.mmio_write_impl(&mut ctx, CMB_BIR as u32, off, 4, 0x1234_5678);
+        assert_eq!(c.mmio_read_impl(CMB_BIR as u32, off, 4), 0x1234_5678);
+        // 高 4 字节未被写 → 仍 0（8 字节读 = 低 32 位 = 写值）。
+        assert_eq!(c.mmio_read_impl(CMB_BIR as u32, off, 8), 0x1234_5678);
+    }
+
+    /// **P3a** — CMB BAR 访问越界（offset+size > cmb.size）：读返 0、写忽略（+warn），
+    /// 不 panic、不写穿 backing 边界。
+    #[test]
+    fn cmb_bar_out_of_bounds_read_zero_write_ignored() {
+        let mut c = mk_cmb_live();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap);
+        // offset 恰在末尾 - 4，size 8 → 越界。
+        let oob_off = CMB_SIZE - 4;
+        // 写越界：忽略（不 panic）。
+        c.mmio_write_impl(&mut ctx, CMB_BIR as u32, oob_off, 8, 0xFFFF_FFFF_FFFF_FFFF);
+        // 读越界：返 0。
+        assert_eq!(c.mmio_read_impl(CMB_BIR as u32, oob_off, 8), 0);
+        // 完全越界 offset（== size）：读 0。
+        assert_eq!(c.mmio_read_impl(CMB_BIR as u32, CMB_SIZE, 4), 0);
+    }
+
+    /// **P3a** — CMB 未 live（CMSE=0）时 CMB BAR 访问仍服务 backing（BAR 暴露与 CMSE
+    /// 数据路径门控是两件事：CMSE 门控的是 firmware 侧 gpa→backing dispatch；BAR 直访
+    /// 是 transport 把 region offset 映到 backing，CMB enable 即可服务）。这里钉死：
+    /// enable_cmb 后（即便未 CMSE）CMB BAR 读写命中 backing —— 否则 guest 在编程 CMSE
+    /// 前无法摆放 SQ/CQ。
+    #[test]
+    fn cmb_bar_access_served_when_enabled_even_before_cmse() {
+        let mut c = mk();
+        c.enable_cmb(CMB_SIZE, CMB_BIR).unwrap();
+        // 未编程 CMBMSC（CMSE=0）。
+        assert!(!c.cmb.as_ref().unwrap().cmse);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap);
+        c.mmio_write_impl(&mut ctx, CMB_BIR as u32, 0x10, 8, 0xABCD_1234_5678_9A00);
+        assert_eq!(
+            c.mmio_read_impl(CMB_BIR as u32, 0x10, 8),
+            0xABCD_1234_5678_9A00
+        );
+    }
+
+    /// **P3a** — 非 CMB BAR 索引（如 BAR3，CMB 在 BAR2）的访问仍返 0 / 忽略（现状不变）。
+    #[test]
+    fn non_cmb_non_zero_bar_still_inert() {
+        let mut c = mk_cmb_live();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap);
+        // BAR3（既非 BAR0 也非 CMB BIR=2）。
+        c.mmio_write_impl(&mut ctx, 3, 0x10, 8, 0xDEAD);
+        assert_eq!(c.mmio_read_impl(3, 0x10, 8), 0, "非 CMB 非 0 BAR 读返 0");
+    }
+
+    /// **P3a 防御纵深（reviewer MEDIUM）** — `is_cmb_bar` 对 `bar==0` 恒返 false：CMB
+    /// 绝不 shadow BAR0 寄存器区。这里直接调 `is_cmb_bar(0)` 钉死该不变量（即便将来
+    /// 有人误配 bir==0 或绕过 enable_cmb 守卫，BAR0 寄存器路径也不会被裸 backing 接管）。
+    #[test]
+    fn is_cmb_bar_never_true_for_bar0() {
+        let c = mk_cmb_live();
+        assert!(!c.is_cmb_bar(0), "CMB 绝不能 shadow BAR0 寄存器区");
+        assert!(c.is_cmb_bar(CMB_BIR as u32), "CMB BAR 正常识别");
     }
 }

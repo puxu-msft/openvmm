@@ -344,29 +344,22 @@ impl VfioUserSession {
             }
         };
         let idx = req.index;
-        // **Phase W1** — BAR/config 描述统一从中立 describe() 派生（不再 Regions）。
-        // 先把 BAR0 size 抽到 owned local，结束 describe 借用，再 match（match 臂里
-        // 的 send_err 需 &mut self，不能与 describe 借用并存）。
-        let bar0_size = self
-            .describe_for(device)
-            .bars
-            .iter()
-            .find(|b| b.index == 0)
-            .map_or(0, |b| b.size);
+        // **Phase W1 + CMB-P3a** — BAR/config 描述统一从中立 describe() 派生（不再 Regions）。
+        // region size 由 [`Self::region_size`] 据 describe() 的**所有** BAR 派生（不再只
+        // BAR0 硬编码）；vfio-user region index 与 PCI BAR index 同号（BAR_n ↔ region n），
+        // 故 CMB 数据 BAR（index = CMBLOC.BIR）天然被纳入。先把 size 抽到 owned local，
+        // 结束 describe 借用，再 match（match 臂里的 send_err 需 &mut self）。
+        let region_size = Self::region_size(self.describe_for(device), idx);
         let (flags, size) = match idx {
-            x if x == pci_region::BAR0 => {
-                if bar0_size == 0 {
+            // 任何在 describe() 出现的 BAR / CONFIG → R/W；size>0 即服务。CMB BAR 是
+            // **trap 模式**：回 (READ|WRITE)，**不**置 FLAG_MMAP（mmap 是 P4 的事）。
+            _ if idx < pci_region::NUM_REGIONS => {
+                if region_size == 0 {
                     (0u32, 0u64)
                 } else {
-                    (region_flags::READ | region_flags::WRITE, bar0_size)
+                    (region_flags::READ | region_flags::WRITE, region_size)
                 }
             }
-            x if x == pci_region::CONFIG => (
-                region_flags::READ | region_flags::WRITE,
-                crate::ConfigSpace::SIZE as u64,
-            ),
-            // BAR1..5 / ROM / VGA — 教学版无支持，size=0+flags=0。
-            _ if idx < pci_region::NUM_REGIONS => (0u32, 0u64),
             _ => {
                 self.send_err_unless(
                     no_reply,
@@ -431,22 +424,33 @@ impl VfioUserSession {
             .context("write GET_IRQ_INFO reply")
     }
 
-    /// **vfio-spec (libvfio-user oracle 复核)** — REGION 访问边界校验：
-    /// `[offset, offset+count)` 须落在该 region 的 size 内。region size 与
-    /// `GET_REGION_INFO` 同源（CONFIG = 4 KiB / BAR0 = describe 派生 / 其余 = 0）。
-    /// bogus region index（如 0xdeadbeef）或越界 → false，caller 回 EINVAL。
-    /// `desc` 由 caller 传缓存的 [`DeviceDescribe`]（见 [`Self::describe_for`]）。
-    fn region_access_ok(desc: &DeviceDescribe, region: u32, offset: u64, count: usize) -> bool {
-        let size = if region == pci_region::CONFIG {
+    /// **CMB-P3a** — 给定 vfio-user region index 的 region 大小（字节）。CONFIG → 4 KiB；
+    /// 任何在 `describe()` 出现的 BAR（含 CMB 数据 BAR，index = CMBLOC.BIR）→ 其 size；
+    /// 其余（未声明 BAR / ROM / VGA）→ 0。**vfio-user region index 与 PCI BAR index
+    /// 同号**（BAR_n ↔ region n），故 `describe().bars` 的 `index` 直接当 region index
+    /// 比对——CMB BAR 无需在 transport 硬编码、自动纳入。`GET_REGION_INFO` 与
+    /// `region_access_ok` 共用此单一真相源（避免"info 报 size 但 access 校验另一套"）。
+    fn region_size(desc: &DeviceDescribe, region: u32) -> u64 {
+        if region == pci_region::CONFIG {
             crate::ConfigSpace::SIZE as u64
-        } else if region == pci_region::BAR0 {
+        } else if region <= pci_region::BAR5 {
             desc.bars
                 .iter()
-                .find(|b| b.index == 0)
+                .find(|b| b.index as u32 == region)
                 .map_or(0, |b| b.size)
         } else {
             0
-        };
+        }
+    }
+
+    /// **vfio-spec (libvfio-user oracle 复核)** — REGION 访问边界校验：
+    /// `[offset, offset+count)` 须落在该 region 的 size 内。region size 与
+    /// `GET_REGION_INFO` 同源（见 [`Self::region_size`]：CONFIG 4 KiB / describe 出的
+    /// 任意 BAR 派生 / 其余 0）。bogus region index（如 0xdeadbeef）或越界 → false，
+    /// caller 回 EINVAL。`desc` 由 caller 传缓存的 [`DeviceDescribe`]（见
+    /// [`Self::describe_for`]）。
+    fn region_access_ok(desc: &DeviceDescribe, region: u32, offset: u64, count: usize) -> bool {
+        let size = Self::region_size(desc, region);
         offset
             .checked_add(count as u64)
             .is_some_and(|end| end <= size)
@@ -1734,5 +1738,211 @@ mod tests {
         let (_tok, ok, data) = &done[0];
         assert!(*ok, "DMA_READ 成功");
         assert_eq!(data, &vec![0xABu8; 64], "on_dma_complete 拿到 SQE 数据");
+    }
+
+    // ───────────────────────── CMB-P3a: 多 BAR / CMB 数据 BAR ─────────────────────────
+    //
+    // trap-based CMB 的 transport 半边：CMB 是一条**独立** BAR（region index = CMBLOC.BIR，
+    // 这里取 2），暴露为 (READ|WRITE) 且 **不** 置 FLAG_MMAP（trap 模式，mmap 是 P4）。
+    // guest 经该 BAR 的 REGION_READ/WRITE 路由到 `device.mmio_read/write(bir, offset, size)`。
+    // 此前 transport 只服务 BAR0 + CONFIG（BAR1-5 硬编码 size=0、region_access_ok 拒访问）；
+    // P3a 把 region_info / 边界校验泛化到 `describe()` 出的**所有** BAR。
+
+    /// 一个带 CMB 风格数据 BAR（index=2）的设备：BAR0 = 寄存器（8 KiB），BAR2 = 纯数据
+    /// RAM（4 KiB，按字节寻址）。区分 bar 路由（与 MockDev 忽略 bar 不同），用来验证
+    /// transport 对 **CMB BAR** 的 region_info 暴露 + REGION_READ/WRITE 路由到正确 bar。
+    struct CmbBarDev {
+        /// CMB 数据 BAR 的 backing（4 KiB，按字节）。模拟 firmware 的 `cmb.backing`。
+        cmb_backing: Vec<u8>,
+    }
+    const CMB_BAR_IDX: u32 = 2;
+    const CMB_BAR_SIZE: u64 = 4096;
+    impl CmbBarDev {
+        fn new() -> Self {
+            Self {
+                cmb_backing: vec![0u8; CMB_BAR_SIZE as usize],
+            }
+        }
+    }
+    impl Pde for CmbBarDev {
+        fn describe(&self) -> DeviceDescribe {
+            DeviceDescribe {
+                vendor_id: 0x1234,
+                device_id: 0xc0de,
+                class_code: 0x01_08_02,
+                revision: 1,
+                subsystem_vendor: 0,
+                subsystem_device: 0,
+                bars: vec![
+                    BarLayout {
+                        index: 0,
+                        size: 8192,
+                        kind: BarKind::Mmio32,
+                        prefetchable: false,
+                    },
+                    // CMB 数据 BAR（独立 slot，对齐 firmware describe() 的 cmb.bir 分支）。
+                    BarLayout {
+                        index: CMB_BAR_IDX as u8,
+                        size: CMB_BAR_SIZE,
+                        kind: BarKind::Mmio32,
+                        prefetchable: false,
+                    },
+                ],
+                msix_count: 1,
+                capabilities: vec![],
+                cfg_write_side_effect_offsets: vec![],
+            }
+        }
+        fn mmio_read(&mut self, bar: u32, offset: u64, size: u32) -> u64 {
+            if bar == CMB_BAR_IDX {
+                let n = size as usize;
+                let off = offset as usize;
+                if off + n > self.cmb_backing.len() {
+                    return 0;
+                }
+                let mut buf = [0u8; 8];
+                buf[..n].copy_from_slice(&self.cmb_backing[off..off + n]);
+                return u64::from_le_bytes(buf);
+            }
+            0 // BAR0 寄存器读：本 mock 不关心，返 0
+        }
+        fn mmio_write(
+            &mut self,
+            _ctx: &mut DeviceCtx<'_>,
+            bar: u32,
+            offset: u64,
+            size: u32,
+            value: u64,
+        ) {
+            if bar == CMB_BAR_IDX {
+                let n = size as usize;
+                let off = offset as usize;
+                if off + n <= self.cmb_backing.len() {
+                    self.cmb_backing[off..off + n].copy_from_slice(&value.to_le_bytes()[..n]);
+                }
+            }
+        }
+    }
+
+    /// **CMB-P3a** — GET_REGION_INFO 对 CMB BAR（index=2）回 (READ|WRITE, cmb_size)，
+    /// 且**不**置 FLAG_MMAP（trap 模式）。region index 从 describe() 派生，非硬编码。
+    #[test]
+    fn get_region_info_cmb_bar_trap_mode() {
+        let (server, mut client) = pair();
+        let mut sess = VfioUserSession::new(server, neg());
+        let mut dev = CmbBarDev::new();
+        let h = thread::spawn(move || sess.pump_one(&mut dev));
+        let req = RegionInfoPayload {
+            argsz: core::mem::size_of::<RegionInfoPayload>() as u32,
+            flags: 0,
+            index: CMB_BAR_IDX,
+            cap_offset: 0,
+            size: 0,
+            offset: 0,
+        };
+        let hdr = Header::command(1, Command::DeviceGetRegionInfo, req.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, req.as_bytes(), &[]).unwrap();
+        let reply = read_message(&mut client).unwrap();
+        let pl: RegionInfoPayload = decode_payload(&reply.payload).unwrap();
+        let (pi, pf, ps) = (pl.index, pl.flags, pl.size);
+        assert_eq!(pi, CMB_BAR_IDX);
+        assert_eq!(
+            pf,
+            region_flags::READ | region_flags::WRITE,
+            "CMB BAR = R/W"
+        );
+        assert_eq!(pf & region_flags::MMAP, 0, "trap 模式不置 FLAG_MMAP");
+        assert_eq!(ps, CMB_BAR_SIZE, "size == cmb_size");
+        assert!(h.join().unwrap().unwrap());
+    }
+
+    /// **CMB-P3a** — 一条没在 describe() 出现的 BAR（index=3）仍 size=0（现状不变）。
+    #[test]
+    fn get_region_info_undeclared_bar_still_zero() {
+        let (server, mut client) = pair();
+        let mut sess = VfioUserSession::new(server, neg());
+        let mut dev = CmbBarDev::new();
+        let h = thread::spawn(move || sess.pump_one(&mut dev));
+        let req = RegionInfoPayload {
+            argsz: core::mem::size_of::<RegionInfoPayload>() as u32,
+            flags: 0,
+            index: 3, // 未声明
+            cap_offset: 0,
+            size: 0,
+            offset: 0,
+        };
+        let hdr = Header::command(1, Command::DeviceGetRegionInfo, req.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, req.as_bytes(), &[]).unwrap();
+        let reply = read_message(&mut client).unwrap();
+        let pl: RegionInfoPayload = decode_payload(&reply.payload).unwrap();
+        let (pf, ps) = (pl.flags, pl.size);
+        assert_eq!(pf, 0);
+        assert_eq!(ps, 0);
+        assert!(h.join().unwrap().unwrap());
+    }
+
+    /// **CMB-P3a (核心闭环 a)** — client 经 REGION_WRITE 写 CMB BAR → 命中 firmware
+    /// backing；REGION_READ 读回同字节。这是 trap-based CMB 数据流在 transport 层的
+    /// 闭环（vfio-user REGION_RW ↔ device.mmio_read/write(cmb.bir, offset)）。
+    #[test]
+    fn cmb_bar_region_write_then_read_roundtrip() {
+        let (server, mut client) = pair();
+        let mut sess = VfioUserSession::new(server, neg());
+        let mut dev = CmbBarDev::new();
+        let _h = thread::spawn(move || {
+            sess.pump_one(&mut dev).unwrap();
+            sess.pump_one(&mut dev).unwrap();
+        });
+        // WRITE 8 字节 @ CMB BAR offset 0x40。
+        let data = 0xDEADBEEF_CAFEBABEu64;
+        let req = RegionAccessPayload {
+            offset: 0x40,
+            region: CMB_BAR_IDX,
+            count: 8,
+        };
+        let mut pl = Vec::new();
+        pl.extend_from_slice(req.as_bytes());
+        pl.extend_from_slice(&data.to_le_bytes());
+        let hdr = Header::command(1, Command::RegionWrite, pl.len() as u32);
+        fw_write(&mut client, &hdr, &pl, &[]).unwrap();
+        let _ = read_message(&mut client).unwrap();
+
+        // READ 回读。
+        let req = RegionAccessPayload {
+            offset: 0x40,
+            region: CMB_BAR_IDX,
+            count: 8,
+        };
+        let hdr = Header::command(2, Command::RegionRead, req.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, req.as_bytes(), &[]).unwrap();
+        let reply = read_message(&mut client).unwrap();
+        let off = core::mem::size_of::<RegionAccessPayload>();
+        let val = u64::from_le_bytes(reply.payload[off..off + 8].try_into().unwrap());
+        assert_eq!(
+            val, data,
+            "CMB BAR REGION_WRITE→READ 经 firmware backing 往返一致"
+        );
+    }
+
+    /// **CMB-P3a** — CMB BAR 访问越界（offset+count > cmb_size）→ region_access_ok 拒
+    /// （EINVAL），session 存活。证明边界校验泛化到了 CMB BAR（非只 BAR0）。
+    #[test]
+    fn cmb_bar_region_access_out_of_bounds_rejected() {
+        let (server, mut client) = pair();
+        let mut sess = VfioUserSession::new(server, neg());
+        let mut dev = CmbBarDev::new();
+        let h = thread::spawn(move || sess.pump_one(&mut dev));
+        let req = RegionAccessPayload {
+            offset: CMB_BAR_SIZE - 4,
+            region: CMB_BAR_IDX,
+            count: 8, // 末尾-4 + 8 > size
+        };
+        let hdr = Header::command(1, Command::RegionRead, req.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, req.as_bytes(), &[]).unwrap();
+        let reply = read_message(&mut client).unwrap();
+        assert!(reply.header.flags().is_error());
+        let errno = reply.header.error_no;
+        assert_eq!(errno, libc::EINVAL as u32);
+        assert!(h.join().unwrap().unwrap(), "越界不应 close session");
     }
 }

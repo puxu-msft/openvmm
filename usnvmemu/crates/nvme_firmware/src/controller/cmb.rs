@@ -61,6 +61,76 @@ impl NvmeController {
     /// **CMB-P1b** — CMB 合成 token 的高位 tag（bit 63）。见模块文档命名空间说明。
     pub(super) const CMB_TOKEN_TAG: u64 = 1u64 << 63;
 
+    /// **CMB-P3a** — 判断给定 BAR 索引是否为本设备的 CMB 数据 BAR（CMB 已 `enable_cmb`
+    /// 即成立，**不要求 CMSE**）。BAR 暴露与 CMSE 数据路径门控是两件事：CMSE 门控的是
+    /// firmware 侧 gpa→backing 的 `cmb_hit` dispatch（guest 编程 CMBMSC 后才生效）；而
+    /// CMB BAR 的**直访**（transport 把 vfio-user REGION_READ/WRITE 的 region offset
+    /// 映到 backing）在 CMB 一经 advertise（enable_cmb）即应服务——否则 guest 在编程
+    /// CMBMSC.CMSE 之前无法把 SQ/CQ/data 摆进 CMB BAR。`bar==0` 永远是 BAR0 寄存器区，
+    /// 不是 CMB（CMB 用独立 BAR，`enable_cmb` 已拒 bir==0）。
+    ///
+    /// **防御纵深（reviewer MEDIUM）**：显式拒 `bar==0`，即便 `enable_cmb` 的 bir==0
+    /// 守卫将来回归（或被别的构造路径绕过），CMB 也绝不会 shadow 整个 BAR0 寄存器区
+    /// （那会让 doorbell/CC 读写变成裸 backing 访问，静默且 blast radius 极大）。
+    pub(super) fn is_cmb_bar(&self, bar: u32) -> bool {
+        if bar == 0 {
+            return false;
+        }
+        matches!(&self.cmb, Some(cmb) if bar == cmb.bir as u32)
+    }
+
+    /// **CMB-P3a** — guest 经 CMB BAR **读** `offset` 处的 backing 数据（trap-based CMB
+    /// 的 firmware 半边）。这是纯数据 RAM 读（无寄存器副作用），与 BAR0 寄存器读并列
+    /// 但语义不同。bounds-check：`offset+size ≤ cmb.size` 才读，否则返 0（越界 + warn）。
+    /// 返回小端 u64（高位补 0），与 transport 的 ≤8 字节寄存器粒度分块约定一致。
+    pub(super) fn cmb_bar_read(&self, offset: u64, size: u32) -> u64 {
+        let Some(cmb) = self.cmb.as_ref() else {
+            return 0;
+        };
+        let n = size as usize;
+        let Some(end) = offset.checked_add(size as u64) else {
+            return 0;
+        };
+        if n == 0 || n > 8 || end > cmb.size {
+            tracing::warn!(
+                offset = format_args!("{:#x}", offset),
+                size,
+                cmb_size = cmb.size,
+                "CMB BAR read 越界/非法粒度 → 返 0"
+            );
+            return 0;
+        }
+        let off = offset as usize;
+        let mut buf = [0u8; 8];
+        buf[..n].copy_from_slice(&cmb.backing.as_bytes()[off..off + n]);
+        u64::from_le_bytes(buf)
+    }
+
+    /// **CMB-P3a** — guest 经 CMB BAR **写** `value`（低 `size` 字节，小端）到 `offset`
+    /// 处的 backing。bounds-check：`offset+size ≤ cmb.size` 才写，否则忽略（越界 +
+    /// warn），绝不写穿 backing 边界。纯数据写，无寄存器副作用。
+    pub(super) fn cmb_bar_write(&mut self, offset: u64, size: u32, value: u64) {
+        let Some(cmb) = self.cmb.as_mut() else {
+            return;
+        };
+        let n = size as usize;
+        let Some(end) = offset.checked_add(size as u64) else {
+            return;
+        };
+        if n == 0 || n > 8 || end > cmb.size {
+            tracing::warn!(
+                offset = format_args!("{:#x}", offset),
+                size,
+                cmb_size = cmb.size,
+                "CMB BAR write 越界/非法粒度 → 忽略"
+            );
+            return;
+        }
+        let off = offset as usize;
+        let bytes = value.to_le_bytes();
+        cmb.backing.as_bytes_mut()[off..off + n].copy_from_slice(&bytes[..n]);
+    }
+
     /// **CMB-P1b** — `drain_cmb_completions` 单次顶层调用的最大投递条数上限。撞顶
     /// （cascade 失控）即停止 drain 并置 CSTS.CFS，与 `MAX_SHADOW_POLL_ITERS` 同纪律
     /// （有限终止优先于隐性僵死）。正常 IO 远不会接近此值（一次 doorbell 派生的 CMB

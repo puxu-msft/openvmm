@@ -13,6 +13,12 @@ use crate::regs::MSIX_TABLE_BAR0_OFFSET;
 
 impl NvmeController {
     pub(super) fn mmio_read_impl(&mut self, bar: u32, offset: u64, size: u32) -> u64 {
+        // **CMB-P3a** — CMB 数据 BAR（独立 BAR，index = CMBLOC.BIR）：纯数据 RAM 读，
+        // 直读 backing 的 offset 处（无寄存器副作用），与 BAR0 寄存器读并列但语义不同。
+        // trap-based CMB 的 firmware 半边（transport 把 REGION_READ 路由到这里）。
+        if self.is_cmb_bar(bar) {
+            return self.cmb_bar_read(offset, size);
+        }
         if bar != 0 {
             return 0;
         }
@@ -89,6 +95,14 @@ impl NvmeController {
         size: u32,
         value: u64,
     ) {
+        // **CMB-P3a** — CMB 数据 BAR 写：纯数据 RAM 写，落进 backing 的 offset 处
+        // （无寄存器副作用、无 doorbell/CC dispatch），与 BAR0 寄存器写并列但语义不同。
+        // 与 firmware 经 `guest_*`（gpa = cba+offset）访问的是**同一份 `cmb.backing`**
+        // （无第二副本）——trap 模式 backing 一致性的根基。
+        if self.is_cmb_bar(bar) {
+            self.cmb_bar_write(offset, size, value);
+            return;
+        }
         if bar != 0 {
             return;
         }
