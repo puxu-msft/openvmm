@@ -55,8 +55,9 @@ loop {
   if lost_rx.next().await.is_none() { return }         // 阻塞至本连接 wire 死；worker 没了则退出
 }
 ```
-- **持久 eventfd**：irq 的 `pal_event::Event` 由 device 生命周期持有；连接器持其 `BorrowedFd` 以便每次重连重发 set_irqs（否则 revive 后 MSI-X 死）。
+- **持久 eventfd（C-3 owner 修正）**：`pal_event::Event` 是 `Clone`+`AsFd`（unix.rs:173 dup eventfd / :191），clone 与原指**同一内核 eventfd 对象**。assemble 时先 `let connector_events = events.iter().map(Clone::clone).collect()` **再**把原 `events.into_iter()` 移入 irq tasks；**连接器持 owned `Vec<Event>` clone**（非 BorrowedFd），每次重连 `connector_events.iter().map(Event::as_fd)` 喂新 client 的 set_irqs。两侧各持独立 OwnedFd dup 同一 eventfd → 无生命周期纠缠、无跨 swap 借用。
 - backoff 内部常量（100ms→2s），不暴露；boot 期总 grace timeout 仍走 CLI `handshake_timeout_ms`。
+- **连接器↔worker 通道装配（plumbing）**：照搬 pcie_remote `TransportSwapMap` 模式——`assemble_device` 内建**两条**通道：`reconnect`（MPSC，连接器→worker 携 `Connected{writer,reader}`）+ `lost`（worker→连接器边沿信号，**方向相反的第二条通道**，worker 持 `lost_tx`、连接器持 `lost_rx`）；两通道的连接器端存入共享 `Arc<Mutex<HashMap<Guid, ConnectorChannels>>>`，**boot 期 spawn 的连接器按 instance_id 惰性查表**（解 assemble-always 下"resolve 与首连先后不定"的次序问题——map 惰性查对两种次序都成立，spawn 时直传句柄不行）。
 
 ### 4.4 worker — 加一个 swap arm + 边沿 lost（CRITICAL C-1 + IMPORTANT）
 - `reconnect_rx: mesh::Receiver<ReconnectEvent>`（MPSC，单消费者=worker）。新 arm：
@@ -100,7 +101,7 @@ loop {
 ## 9. Layer A 构建顺序（每段 coarse commit + 真机/loopback 验 + subagent review）
 - A1：device show-absent-until-Live（Connecting→absent）+ resolver assemble-always + 声明 geometry/CLI override 解析 + validate_identity。standalone 单测。
 - A2：reconnect 模块 + worker swap arm + 边沿 lost + 持久 eventfd 重发 set_irqs。standalone loopback（场景①②③④⑤）。
-- A3：underhill 集成（连接器接 resolver/worker keepalive）+ 真机里程碑（operator 起 usnvmemu → guest 枚举+IO+revive）。
+- A3：underhill 集成（连接器接 resolver/worker keepalive；连接器在 boot 期 spawn，按 instance_id 查通道 map）+ **boot grace poll 改判据**：assemble-always 移除了 prepared-map 填充步骤，故 underhill `worker.rs` 的 grace poll 从"prepared.len()>=expected"改为**轮询 device `SharedState` 达 `Live`（或超时）**（worker.rs:2438-2446 改点）。+ 真机里程碑（operator 起 usnvmemu → guest 枚举+IO+revive）。
 
 ## 10. 未来（明确不在本设计）
 - **Layer C 真 hotplug**：让 build_vpci_device 的 VpciBus 可控（detach/re-attach + 重触 offer），实现 at-boot-absent 设备的 guest 冷插。先 POC 可控 VpciBus 可行性。
