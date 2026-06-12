@@ -999,3 +999,69 @@ fn scenario6_set_irqs_reissued_on_reconnect() {
     // drop → ServerController 发 Shutdown：deaf 路径的 cmd_rx.recv() 收到 → Exit。
     drop(server);
 }
+
+// ──────────────────────────── 场景 ⑦ ────────────────────────────
+
+/// ⑦ **idle peer death → Lost**（复现真机 bug）：connect→Live 后**不发任何 MMIO**
+/// （`in_flight` 全空 = 空闲），随后 StopConnection（peer 死）→ 断言 worker 在有界时间
+/// 内到达 Lost。
+///
+/// 与场景 ② 的关键区别：场景 ② 在 stop 前用 `wait_inflight(1)` 钉住一个**在途 read**，
+/// 故只测「正在 await reply 时」的 reader-EOF 检测。本场景**空闲**（无在途 read）—— 真机
+/// 上 `pkill usnvmemu` 时设备常处此态（无 guest MMIO 正在飞）。若 worker 的 recv 臂在
+/// 空闲时不真正 `.await` 一个能观测 EOF 的 socket read，则空闲 peer 死亡不会触发
+/// `go_lost` → 永不重连（revive 断裂）。本场景就是这条空闲路径的回归 gate。
+#[test]
+fn scenario7_idle_peer_death_goes_lost() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("vfio.sock");
+    let server = ServerController::start(path.clone(), SERVED_BAR0_SIZE, SERVED_MSIX_COUNT);
+
+    DefaultPool::run_with(async |driver| {
+        // server：accept + pump probes 后变聋（持连接 open）。
+        server.send(ServerCmd::AcceptProbesThenDeaf);
+
+        let declared = DeclaredGeometry::new(Some(SERVED_BAR0_SIZE), Some(SERVED_MSIX_COUNT));
+        let eng = spawn_engine(
+            &driver,
+            path.to_string_lossy().into_owned(),
+            declared,
+            Vec::new(),
+        );
+
+        // 等连接器 into_channel + 发 Connected → worker 到 Live。
+        server.expect_ack(&driver, ServerAck::ProbesPumped).await;
+        wait_state(&driver, &eng.state, DeviceState::Live).await;
+
+        // **关键**：到 Live 后**不发任何 MMIO**——保持 in_flight 全空（空闲）。这正是
+        // 真机 bug 的触发态：peer 死时无在途 read。
+        assert_eq!(
+            eng.stats.inflight_current.load(Ordering::Relaxed),
+            0,
+            "空闲场景：到 Live 时不应有任何在途 read"
+        );
+
+        // stop server：关连接 → 对端 socket 干净关闭（EOF）。空闲 worker 必须靠 reader
+        // 的 recv_exact 读到 0 字节 → UnexpectedEof → go_lost。
+        server.send(ServerCmd::StopConnection);
+        server.expect_ack(&driver, ServerAck::Closed).await;
+
+        // 断言：空闲态下 peer 死亡仍把 state 推到 Lost（有界）。若 worker 空闲时不读
+        // socket，这里会超时 panic（= 复现真机 bug）。
+        wait_state(&driver, &eng.state, DeviceState::Lost).await;
+
+        // 附加：Lost 原因应含 READ_ERR（空闲态唯一能察觉 socket 死的就是 reader EOF
+        // 边沿——worker 无新帧要写），且时间戳已记。
+        let reason = eng.stats.last_lost_reason.load(Ordering::Relaxed);
+        assert!(
+            reason & lost_reason::READ_ERR != 0,
+            "空闲 peer 死亡的 lost 原因应含 READ_ERR（reader EOF 边沿），got bits {reason:#x}"
+        );
+        assert_ne!(
+            eng.stats.last_lost_at_ms.load(Ordering::Relaxed),
+            0,
+            "进入 Lost 应记录时间戳"
+        );
+    });
+    drop(server);
+}

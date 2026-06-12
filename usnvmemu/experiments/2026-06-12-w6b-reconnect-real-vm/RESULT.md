@@ -38,3 +38,10 @@ cargo xflowey build-igvm x64 --override-openvmm-hcl-feature vpci   # 必带 vpci
 cp flowey-out/artifacts/build-igvm/debug/x64-custom/openhcl-x64-custom.bin <win>/openhcl-vfio-user.bin
 # 配 OPENHCL_VFIO_USER_NVME=<guid>:/tmp/vfio_nvme.sock 启动 → ohcldiag-dev setsid 起 usnvmemu → 看 kmsg "reconnected, Live"
 ```
+
+### 发现② 细化（standalone 调试 subagent，systematic-debugging，未 guess-fix）
+- **worker 代码在 in-process 验证下正确**：recv 臂 `recv_reply_or_pending(reader, is_lost)` 在 Live+idle（in_flight 空）时**确实 await 真 socket read**（无 in_flight 门控）；`recv_exact` 0-byte read→`Err(UnexpectedEof)`→`go_lost(READ_ERR)`。io_uring `PollAdd(POLLIN)` 在 peer close 时**经验证**会 read=0 完成（subagent 在真 IoUringPool 上实测）。`FdReady` poll 注册在 `self.reader`（Worker 持有），select_biased! 重建 recv future 不丢注册。
+- **loopback 加 scenario7（idle peer-death）→ PASS**（worker 正确 go Lost）→ **in-process 复现不出**，故 bug 是真机环境特定（standalone harness 模型不到的层）。reactor（io_uring vs epoll）+ topology（直连 AF_UNIX 无 relay）两候选已排除。
+- **最高概率根因（待真机验，按序）**：① **peer `pkill` 后 EOF 没真到达 underhill**（accepted fd 被存活线程/子进程持有 / SCM_RIGHTS dup 到别处 / 未在 exit 关闭）——in-process harness 干净关 fd 故复现不出；真机用 `ss -xp`/`lsof`/strace worker fd 验。② 真 `VmTaskDriver` 下 worker task idle 时未被 IO 驱动（io_uring ring 所在 VP/线程 idle 时没 pump）。
+- **稳健修法（不依赖 idle-EOF，#1/#2 通吃，且是 NVMe KATO 基础）**：worker `select_biased!` 加 **active liveness 臂**——Live 且 idle N 秒→发廉价探测帧（如 `GET_REGION_INFO`/no-op `REGION_READ`），send `Err` 或 deadline 内无 reply→`go_lost`。把"静默半开/永不 EOF 死亡"转成已处理的 write-err/timeout。**待真机确认 #1（EOF 是否到达）后实现**：若 firmware 漏关 fd，真修可能在 firmware 侧（exit 关 accepted/listener fd）。
+- regression guard：`reconnect_loopback.rs` scenario7（idle peer-death→Lost）已加，PASS（7 场景全绿）。
