@@ -717,14 +717,20 @@ impl GuestMemoryMappingBuilder {
         };
 
         // W6c finding-④：是否把本 mapping 的 guest RAM 经 vfio-user DMA_MAP 暴露给
-        // VTL2 server（零拷贝），需三条件同时成立：
-        // ① `shareable` 显式 opt-in——隔离安全不靠"恰好没 bitmap"的隐式耦合，而靠
-        //    构造点（仅非隔离 VTL0）人工审过的显式标记；
+        // VTL2 server（零拷贝），需两条件同时成立：
+        // ① `shareable` 显式 opt-in——隔离安全靠构造点（仅非隔离 VTL0）人工审过的显式
+        //    标记，不靠"恰好没 bitmap"的隐式耦合；
         // ② no-bitmap 路径（无 valid/permission bitmap 门控）——结构性兜底：任何带
-        //    bitmap 的 CVM/隔离 mapping 即便误设 shareable 也不真共享，sharing() 返 None；
-        // ③ `file_starting_offset == 0`（alias-map off 且非 shared）——此时
-        //    IOVA(裸 guest_address) == fd_offset，是 W6c 真机 POC 验证过的唯一情形。
-        //    alias-on 时 IOVA≠fd_offset 的约定未经验证 → 降级为不共享（不赌未验证假设）。
+        //    bitmap 的 CVM/隔离 mapping 即便误设 shareable 也不真共享，sharing() 返 None。
+        //
+        // **fd_offset 用裸 guest_address（mshv_vtl_low 直接视图 offset=gpa）**，而非
+        // underhill 自身为做 VTL0 保护检查所用的 aliased `file_offset`。理由：guest 的
+        // NVMe driver 在 PRP/SGL 里填的是裸 VTL0 GPA（guest 不知 VTL2 的 alias map），
+        // 故 server 收到的 DMA IOVA 是裸 gpa；mshv_vtl_low 设备在 offset=gpa 直接映射
+        // 该 VTL0 物理内存。W6c 真机 POC 已在 **alias-map ON** 的 VM 上证 offset=gpa
+        // 读出真 guest 数据（W5a 亦用裸 gpa 做零拷贝），故 alias on/off 都用直接视图，
+        // IOVA==fd_offset==裸 gpa，无需按 alias 门控（这修正了早期"alias-on 即禁用"的
+        // 过度保守——直接视图本就 alias-无关）。
         let no_bitmap_gating =
             self.valid_memory.is_none() && self.permissions_bitmap_state.is_none();
         if self.shareable {
@@ -735,15 +741,7 @@ impl GuestMemoryMappingBuilder {
                 "shareable mapping 必须无 valid/permission bitmap（隔离安全不变量）"
             );
         }
-        let iova_equals_fd_offset = file_starting_offset == 0;
-        if self.shareable && no_bitmap_gating && !iova_equals_fd_offset {
-            tracing::warn!(
-                file_starting_offset,
-                "W6c：vfio-user DMA 零拷贝共享已禁用——VTL0 alias-map/shared offset 非零，\
-                 IOVA≠fd_offset 的约定未经真机验证，降级为无零拷贝 DMA"
-            );
-        }
-        let do_share = self.shareable && no_bitmap_gating && iova_equals_fd_offset;
+        let do_share = self.shareable && no_bitmap_gating;
         let mut shareable_ranges: Vec<(u64, u64, u64)> = Vec::new();
 
         // Loop through each of the memory map entries and create a mapping for it.
@@ -766,11 +764,12 @@ impl GuestMemoryMappingBuilder {
                 )
                 .map_err(MappingError::Map)?;
 
-            // W6c finding-④：逐段记录 (IOVA=裸 guest_address, size, fd_offset)。
-            // fd_offset 用与上面 `map_file` 同一个 `file_offset`（alias-off 时 == base_addr，
-            // 保证 IOVA==fd_offset；alias-on 已被 do_share 排除）。仅 do_share 时收集。
+            // W6c finding-④：逐段记录 (IOVA=裸 guest_address, size, fd_offset=裸 guest_address)。
+            // fd_offset 用裸 base_addr（mshv_vtl_low **直接视图** offset=gpa），**非**上面
+            // underhill 自身用的 aliased `file_offset`——见 do_share 处注释 + W6c 真机 POC
+            // （offset=gpa 在 alias-on VM 上读出真 guest 数据）。IOVA 与 fd_offset 都 = 裸 gpa。
             if do_share {
-                shareable_ranges.push((base_addr, entry.range.len(), file_offset));
+                shareable_ranges.push((base_addr, entry.range.len(), base_addr));
             }
 
             if let Some((bitmaps, state)) = permission_bitmaps
