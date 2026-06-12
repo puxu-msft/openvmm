@@ -350,6 +350,8 @@ impl VpciRelay {
                             mmio,
                             self.vmbus.as_ref(),
                             interrupt_mapper,
+                            // VF 中继的 VPCI 设备无运行时热插拔命令（行为不变）。
+                            None,
                         )
                         .await?;
 

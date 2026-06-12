@@ -119,11 +119,15 @@ pub struct VpciBusConfig {
 impl VpciBusDevice {
     /// Returns a new VPCI bus device, along with the vmbus channel used for bus
     /// communications.
+    ///
+    /// `cmd_rx`：**可选**的运行时命令 receiver（透传给 [`VpciChannel`]）。`None` = 通道
+    /// 行为与历史逐字节等价；`Some` = 启用 graceful EJECT 等运行时热插拔命令（C2-0）。
     pub fn new(
         config: VpciBusConfig,
         device: Arc<CloseableMutex<dyn ChipsetDevice>>,
         register_mmio: &mut dyn RegisterMmioIntercept,
         msi_controller: VpciInterruptMapper,
+        cmd_rx: Option<mesh::Receiver<crate::device::HotplugCommand>>,
     ) -> Result<(Self, VpciChannel), NotPciDevice> {
         let instance_id = config.instance_id;
         let config_space = VpciConfigSpace::new(
@@ -141,6 +145,7 @@ impl VpciBusDevice {
             config_space,
             msi_controller,
             config.vnode,
+            cmd_rx,
         )?;
 
         let this = Self {
@@ -163,6 +168,10 @@ impl VpciBusDevice {
 
 impl VpciBus {
     /// Creates a new VPCI bus.
+    ///
+    /// `cmd_rx`：**可选**的运行时命令 receiver。`None`（host-VF / MANA / storage /
+    /// pcie_remote 等现有静态单设备 VPCI 设备）= 行为与历史逐字节等价；`Some`
+    /// （vfio_user 运行时热插拔）= 启用 graceful EJECT（C2-0）。
     pub async fn new(
         driver_source: &VmTaskDriverSource,
         config: VpciBusConfig,
@@ -170,12 +179,14 @@ impl VpciBus {
         register_mmio: &mut dyn RegisterMmioIntercept,
         vmbus: &dyn vmbus_channel::bus::ParentBus,
         msi_controller: VpciInterruptMapper,
+        cmd_rx: Option<mesh::Receiver<crate::device::HotplugCommand>>,
     ) -> Result<Self, CreateBusError> {
         let (bus, channel) = VpciBusDevice::new(
             config,
             device.clone(),
             register_mmio,
             msi_controller.clone(),
+            cmd_rx,
         )
         .map_err(CreateBusError::NotPci)?;
         let channel = offer_simple_device(driver_source, vmbus, channel)
@@ -586,6 +597,7 @@ mod tests {
             device.clone(),
             &mut ExternallyManagedMmioIntercepts,
             VpciInterruptMapper::new(msi_controller),
+            None,
         )
         .unwrap();
 

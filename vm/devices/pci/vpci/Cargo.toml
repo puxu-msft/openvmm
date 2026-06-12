@@ -29,6 +29,7 @@ task_control.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true
+futures.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
 tracelimit.workspace = true

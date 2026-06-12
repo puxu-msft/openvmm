@@ -2628,6 +2628,8 @@ impl InitializedVm {
                                 &mut services.register_mmio(),
                                 vmbus,
                                 crate::partition::VpciDevice::interrupt_mapper(hv_device),
+                                // OpenVMM 静态 VPCI 设备无运行时热插拔命令（行为不变）。
+                                None,
                             )
                             .await
                         })

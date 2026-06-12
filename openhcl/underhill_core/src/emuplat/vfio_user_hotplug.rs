@@ -62,8 +62,10 @@ use anyhow::Context as _;
 use chipset_device::ChipsetDevice;
 use closeable_mutex::CloseableMutex;
 use cvm_tracing::CVM_ALLOWED;
+use futures::FutureExt as _;
 use futures::StreamExt as _;
 use guestmem::GuestMemory;
+use pal_async::timer::PolledTimer;
 use pci_core::bus_range::AssignedBusRange;
 use pci_core::msi::MsiConnection;
 use state_unit::StateUnits;
@@ -125,10 +127,28 @@ pub struct VfioUserHotplug {
     /// 当前 VpciBus 的 unit；`Some` = 已 add（盘对 guest 可见），`None` = 未 add（Lost / 初始）。
     bus_unit: Option<DynamicDeviceUnit>,
 
+    /// 当前 VpciBus 通道的运行时命令 sender（C2-0 graceful EJECT 用）。
+    ///
+    /// **每个 `add_bus` 重建一个 channel**：sender 存这里、receiver 经
+    /// `VpciBus::new(.., Some(cmd_rx))` 交给新 VpciChannel。`remove_bus` 经它发
+    /// [`vpci::HotplugCommand::Eject`] 给 guest，等 `EJECT_COMPLETE`（带超时）后再拆通道。
+    /// `None` = 当前无 bus（与 `bus_unit` 同步）。拆通道后清回 `None`。
+    /// 为什么每周期重建：VpciBus 在 remove 时整体 drop，其 receiver 也随之失效；
+    /// 下一个 Live 边沿的新 VpciBus 需要一个全新的命令通道。
+    cmd_tx: Option<mesh::Sender<vpci::HotplugCommand>>,
+
     /// device 的 Live/Lost 边沿通知 receiver（device shim 的 `SharedState` 在转
     /// Live/Lost 时投递新状态）。
     edge_rx: mesh::Receiver<DeviceState>,
 }
+
+/// graceful EJECT 等 `EJECT_COMPLETE` 的超时上限。
+///
+/// guest 驱动卡住 / 后端（usnvmemu）已死导致 flush 收尾迟滞时，**绝不能**让 reconcile
+/// 无限等待（会卡死整条 dispatch 主循环）。超时后退化为直接走 rescind 拆除——graceful
+/// 尝试尽力而为，超时即放弃。1.5s 取自 finding-⑥ 真机观测的 query-remove 量级（NTFS
+/// flush+dismount 通常亚秒级；留余量但不至于拖垮热插拔响应）。C2-2 抖动加固时可再调。
+const EJECT_COMPLETE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// 抽掉 `UhPartition` 的具体类型：reconcile 只需要「能造虚拟设备」这一能力。
 ///
@@ -258,6 +278,7 @@ impl VfioUserHotplug {
             driver_source: driver_source.clone(),
             interrupt_mapper,
             bus_unit: None,
+            cmd_tx: None,
             edge_rx,
         })
     }
@@ -317,6 +338,11 @@ impl VfioUserHotplug {
         let vtom = self.vtom;
         let bus_name: Arc<str> = format!("vfio_user_nvme:vpci-{instance_id}").into();
 
+        // 为本代 VpciBus 建一个**全新**的运行时命令 channel：sender 存进 self（供
+        // `remove_bus` 发 graceful EJECT），receiver 交给新 VpciChannel。每个 add_bus
+        // 都重建——上一代 bus 已在 remove 时整体 drop，其 receiver 随之失效。
+        let (cmd_tx, cmd_rx) = mesh::channel::<vpci::HotplugCommand>();
+
         let (bus_unit, _bus) = chipset_devices
             .add_dyn_device(
                 driver_source,
@@ -325,12 +351,17 @@ impl VfioUserHotplug {
                 async |register_mmio| {
                     let bus = vpci::bus::VpciBus::new(
                         driver_source,
-                        instance_id,
+                        vpci::bus::VpciBusConfig {
+                            instance_id,
+                            vtom,
+                            vnode: None,
+                        },
                         device,
                         register_mmio,
                         vmbus.as_ref(),
                         interrupt_mapper,
-                        vtom,
+                        // 启用 graceful EJECT：本代 bus 的运行时命令 receiver。
+                        Some(cmd_rx),
                     )
                     .await?;
                     anyhow::Ok(bus)
@@ -340,6 +371,7 @@ impl VfioUserHotplug {
             .context("failed to add vfio_user VpciBus")?;
 
         self.bus_unit = Some(bus_unit);
+        self.cmd_tx = Some(cmd_tx);
         // add_dyn_device 加入的 unit 初始 stopped；若 VM 在跑则启动它（VpciBus offer
         // 在 new 内已发生，这里启动 channel state unit）。
         state_units.start_stopped_units().await;
@@ -352,10 +384,69 @@ impl VfioUserHotplug {
         Ok(())
     }
 
-    /// Lost 边沿：用 [`DynamicDeviceUnit::remove`] 拆 VpciBus（连 chipset device unit +
+    /// Lost 边沿：**先**经命令 channel 发 graceful `EJECT` 给 guest 并等 `EJECT_COMPLETE`
+    /// （带超时），**再**用 [`DynamicDeviceUnit::remove`] 拆 VpciBus（连 chipset device unit +
     /// MMIO config 区域一起拆 → 无泄漏；drop VpciBus → SimpleDeviceHandle Drop = rescind
     /// → guest PnP 移盘）。**绝不**用 `revoke`。
+    ///
+    /// # 为什么要 graceful EJECT 前置（finding-⑥）
+    ///
+    /// C0 真机暴露：直接 rescind（surprise-removal）一个**挂载 + 脏数据**的 NTFS 卷会
+    /// 让 guest 偶发 BSOD→reboot。graceful EJECT 给 guest 一个 query-remove 窗口先
+    /// flush + dismount 卷，再撤通道，避免 surprise。
+    ///
+    /// # ⑥ 最微妙点：后端已死时的收尾
+    ///
+    /// ⑥ 触发时 usnvmemu（vfio-user server）通常已被 kill（device shim 转 Lost）。此时
+    /// guest 的 flush 会打到 Lost device shim（C-2 MMIO 门控返 Err），**flush 必然失败**。
+    /// 但 graceful EJECT 仍给 guest 一个**有序 dismount** 的机会（即便数据 flush 失败，
+    /// 卷状态机能干净走完 remove，不至于 surprise-removal 崩内核）——这正是 C2-0 真机门 0
+    /// 要验的核心。
+    ///
+    /// # 超时退化
+    ///
+    /// 若 guest 在 [`EJECT_COMPLETE_TIMEOUT`] 内不回 `EJECT_COMPLETE`（驱动卡死 / 不支持），
+    /// 放弃等待直接拆——graceful 是尽力而为，**绝不**因 guest 不配合而挂死 reconcile。
     async fn remove_bus(&mut self) {
+        // 先尝试 graceful EJECT（仅当确有命令 channel，即 bus 由本路径 add）。
+        if let Some(cmd_tx) = self.cmd_tx.take() {
+            let (done_tx, done_rx) = mesh::oneshot::<()>();
+            cmd_tx.send(vpci::HotplugCommand::Eject { done: done_tx });
+
+            // 等 EJECT_COMPLETE 或超时，二者先到先得。超时兜底**必须有**。
+            let mut timer = PolledTimer::new(&self.driver_source.simple());
+            let timed_out = futures::select_biased! {
+                r = done_rx.fuse() => {
+                    // `Ok(())` = guest 回了 EJECT_COMPLETE；`Err` = 通道在确认前退出
+                    //（sender drop），也视作「不必再等」。
+                    if r.is_err() {
+                        tracelimit::warn_ratelimited!(
+                            instance_id = %self.instance_id,
+                            "vfio_user hotplug: EJECT channel closed before EJECT_COMPLETE; proceeding to rescind"
+                        );
+                    }
+                    false
+                }
+                _ = timer.sleep(EJECT_COMPLETE_TIMEOUT).fuse() => true,
+            };
+
+            if timed_out {
+                tracing::warn!(
+                    CVM_ALLOWED,
+                    instance_id = %self.instance_id,
+                    timeout_ms = EJECT_COMPLETE_TIMEOUT.as_millis() as u64,
+                    "vfio_user hotplug: graceful EJECT timed out; proceeding to rescind (guest may surprise-remove)"
+                );
+            } else {
+                tracing::info!(
+                    CVM_ALLOWED,
+                    instance_id = %self.instance_id,
+                    "vfio_user hotplug: graceful EJECT acknowledged by guest"
+                );
+            }
+            // cmd_tx 在此 drop（已 take 出）——本代 bus 命令 channel 关闭。
+        }
+
         if let Some(bus_unit) = self.bus_unit.take() {
             bus_unit.remove().await;
             tracing::info!(

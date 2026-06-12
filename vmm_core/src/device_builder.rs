@@ -85,6 +85,8 @@ pub async fn build_vpci_device(
                     &mut services.register_mmio(),
                     vmbus,
                     interrupt_mapper,
+                    // 静态单设备 VPCI 设备无运行时热插拔命令（行为与历史逐字节等价）。
+                    None,
                 )
                 .await?;
 

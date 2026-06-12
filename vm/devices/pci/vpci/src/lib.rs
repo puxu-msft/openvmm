@@ -9,3 +9,5 @@ pub mod bus;
 pub mod bus_control;
 mod device;
 pub mod test_helpers;
+
+pub use device::HotplugCommand;

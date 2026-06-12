@@ -8,6 +8,7 @@ use chipset_device::ChipsetDevice;
 use chipset_device::io::IoResult;
 use chipset_device::mmio::ControlMmioIntercept;
 use closeable_mutex::CloseableMutex;
+use futures::FutureExt;
 use guestmem::AccessError;
 use guestmem::MemoryRead;
 use guid::Guid;
@@ -249,6 +250,38 @@ enum PacketData {
         slot: SlotNumber,
         request: DeviceRequest,
     },
+    /// 入站 `EJECT_COMPLETE`（guest VSC 确认 graceful eject 完成）。
+    ///
+    /// 这是 **生产侧 VSP** 此前从未处理过的入站消息：旧实现里它会落到
+    /// `parse_packet` 的 `UnknownType` 分支，从而**杀掉整条 vmbus 通道**。Layer C C2-0
+    /// 的 graceful EJECT 需要它来收尾「发了 EJECT → 等 guest 回 EJECT_COMPLETE」这一握手。
+    /// 消费侧先例见 `vpci_client`（`MessageType::EJECT` 处理 + `send_eject_complete`），
+    /// 这里是镜像的生产侧。
+    EjectComplete {
+        slot: SlotNumber,
+    },
+}
+
+/// 外部（热插拔编排方）下发给某条 VPCI 通道的运行时命令。
+///
+/// C2-0 只需要 [`HotplugCommand::Eject`]（graceful EJECT 前置）；后续 C2-1 会在此
+/// 追加 `SetPresent(bool)` 用于 `device_count` 0↔1 模型。命令经一个**可选**的
+/// `mesh::Receiver<HotplugCommand>` 投递：4 个现有 `VpciBus::new` 调用方传 `None`，
+/// 行为与历史**逐字节等价**（见 `ReadyState::run` 的 select pending 臂）。
+#[derive(Debug)]
+pub enum HotplugCommand {
+    /// 向 guest 发一个 graceful `EJECT`（slot 0），并在收到 `EJECT_COMPLETE`（或调用方
+    /// 超时）后由 `done` oneshot 通知发起方。
+    ///
+    /// `done` 在以下任一情况 fire：
+    /// - guest 回了 `EJECT_COMPLETE`（正常路径）；
+    /// - 通道侧无法等待（如发送 EJECT 失败）——也会立即 fire 让发起方别空等
+    ///   （发起方自身仍带超时兜底，双重保险）。
+    Eject {
+        /// eject 完成（或放弃等待）的一次性通知。`Sender` 被 drop（通道退出）时，
+        /// 发起方的 `recv()` 会得到 `Err(RecvError::Closed)`，等价于「别再等了」。
+        done: mesh::OneshotSender<()>,
+    },
 }
 
 #[derive(Debug)]
@@ -489,6 +522,15 @@ fn parse_packet<T: RingMem>(packet: &queue::DataPacket<'_, T>) -> Result<PacketD
                 request: DeviceRequest::Reset,
             }
         }
+        protocol::MessageType::EJECT_COMPLETE => {
+            // guest 对我们发出的 graceful `EJECT` 的确认。复用 `PdoMessage`
+            // 布局（与 `vpci_client` 发 `EJECT_COMPLETE` 时构造的一致：message_type + slot）。
+            // **必须**在此显式识别，否则会落 `UnknownType` 杀通道（C2-0 BLOCKING）。
+            let msg = protocol::PdoMessage::read_from_prefix(buf)
+                .map_err(|_| PacketError::PacketTooSmall("eject_complete"))?
+                .0;
+            PacketData::EjectComplete { slot: msg.slot }
+        }
         protocol::MessageType::VPCI_TDISP_COMMAND => {
             let (header, rest) = Ref::<_, protocol::VpciTdispCommandHeader>::from_prefix(buf)
                 .map_err(|_| PacketError::PacketTooSmall("tdisp_command_header"))?;
@@ -616,6 +658,13 @@ struct ReadyState {
     send_device: bool,
     send_completion: Option<u64>,
     vpci_version: protocol::ProtocolVersion,
+    /// 已发出 graceful `EJECT`、正在等 guest 回 `EJECT_COMPLETE` 的发起方通知句柄。
+    ///
+    /// `Some` 表示「eject 进行中」：当 [`PacketData::EjectComplete`] 到达时，取出并
+    /// `send(())` 通知发起方。C2-0 同时只会有一个 in-flight eject（slot 0 单设备）；
+    /// 若在等待期间又收到一个 `Eject` 命令（理论上不应发生），用新句柄覆盖旧句柄，
+    /// 旧句柄被 drop → 旧发起方 `recv()` 得到 `Closed`，等价于「放弃等待」（其自身有超时兜底）。
+    pending_eject: Option<mesh::OneshotSender<()>>,
 }
 
 impl<T: RingMem> VpciChannelState<T> {
@@ -659,6 +708,7 @@ impl<T: RingMem> VpciChannelState<T> {
                                 vpci_version: version,
                                 send_device: false,
                                 send_completion: None,
+                                pending_eject: None,
                             });
                         }
                     } else {
@@ -730,6 +780,49 @@ impl ReadyState {
         Ok(())
     }
 
+    /// 处理一条来自外部热插拔编排方的 [`HotplugCommand`]。
+    ///
+    /// C2-0 只有 [`HotplugCommand::Eject`]：向 guest 发一个 graceful `EJECT`（slot 0），
+    /// 并把发起方的完成句柄存进 `self.pending_eject`，待 guest 回 `EJECT_COMPLETE`
+    /// （见 `handle_packet` 的 [`PacketData::EjectComplete`] 分支）时 fire。
+    ///
+    /// 这是**生产侧 VSP** 主动发起 `EJECT` —— 本仓此前只有 `vpci_client`（消费侧 VSC）
+    /// 处理入站 `EJECT` 的先例。EJECT packet 用 `InBandNoCompletion`（与
+    /// `send_child_device` 发 `BUS_RELATIONS` 同样是无 completion 的 in-band 通知），
+    /// slot 固定 0（VpciBus 单设备）。
+    async fn handle_command(
+        &mut self,
+        command: HotplugCommand,
+        conn: &mut Connection<impl RingMem>,
+        dev: &mut VpciChannel,
+    ) -> Result<(), WorkerError> {
+        match command {
+            HotplugCommand::Eject { done } => {
+                tracing::info!(instance_id = ?dev.instance_id, "vpci: sending graceful EJECT to guest");
+                let eject = protocol::PdoMessage {
+                    message_type: protocol::MessageType::EJECT,
+                    slot: SlotNumber::new(),
+                };
+                // 发 EJECT。注意 `send_packet` 第二段 payload 为空 `&()`，与
+                // `vpci_client::send_eject_complete` 单 `PdoMessage` 负载布局一致。
+                if let Err(err) = conn.send_packet(&eject, &()).await {
+                    // 发送失败（通道异常）→ 立即 fire `done`，让发起方别空等（其自身
+                    // 仍有超时兜底）。然后把错误上抛终止通道。
+                    tracelimit::warn_ratelimited!(
+                        error = &err as &dyn std::error::Error,
+                        instance_id = ?dev.instance_id,
+                        "vpci: failed to send EJECT; signalling completion early"
+                    );
+                    done.send(());
+                    return Err(err);
+                }
+                // 记下完成句柄，等 EJECT_COMPLETE。`send()` 在 `handle_packet` 里发生。
+                self.pending_eject = Some(done);
+            }
+        }
+        Ok(())
+    }
+
     async fn run(
         &mut self,
         conn: &mut Connection<impl RingMem>,
@@ -752,13 +845,62 @@ impl ReadyState {
                 .instrument(tracing::trace_span!("vpci_wait_for_completion_space", instance_id = ?dev.instance_id))
                 .await?;
 
-            let (packet, transaction_id) = {
+            // 等待下一个「事件」：要么 guest 在 ring 上发来一个 packet，要么外部热插拔
+            // 编排方经 `dev.cmd_rx` 下发一条 [`HotplugCommand`]。
+            //
+            // **`None` 分支逐字节等价于历史行为**：当 `dev.cmd_rx` 为 `None`（4 个现有
+            // `VpciBus::new` 调用方），命令臂是 `std::future::pending()`——永不就绪。
+            // 配合 `select_biased!`（先轮询 packet 臂），等价于过去裸 `queue.read().await`：
+            // 命令臂从不返回 `Ready`，select 必然且只能走 packet 臂。借用上：packet 臂只借
+            // `conn.queue`（参数，与 `self`/`dev` 不相交），命令臂只借 `dev.cmd_rx`（与 `conn`
+            // 及 `self` 不相交）；race future 在本块结束即 drop，之后才 `&mut self` 调
+            // `handle_packet`，无 borrow 冲突。
+            enum Event {
+                Packet(Result<PacketData, PacketError>, Option<u64>),
+                Command(HotplugCommand),
+            }
+
+            let event = {
                 let (mut queue, _) = conn.queue.split();
-                let packet = queue.read().await.map_err(WorkerError::Queue)?;
-                let IncomingPacket::Data(data) = packet.as_ref() else {
-                    return Err(WorkerError::InvalidPacketType);
-                };
-                (parse_packet(data), data.transaction_id())
+                let mut read = std::pin::pin!(queue.read().fuse());
+                let mut command = std::pin::pin!(
+                    async {
+                        match dev.cmd_rx.as_mut() {
+                            // 有 receiver：等下一条命令。channel 关闭（发送端被 drop）→
+                            // `recv()` 返回 `Err`，此时退化为 `pending()`（不再唤醒本臂，
+                            // 通道继续只服务 ring packet），不污染 packet 路径。
+                            Some(rx) => match rx.recv().await {
+                                Ok(cmd) => cmd,
+                                Err(_) => std::future::pending().await,
+                            },
+                            // 无 receiver（历史路径）：永远 pending —— 等价于此臂不存在。
+                            None => std::future::pending().await,
+                        }
+                    }
+                    .fuse()
+                );
+                futures::select_biased! {
+                    // 先轮询 packet 臂：保证 `None` 分支与旧 `queue.read().await` 完全一致。
+                    packet = read => {
+                        let packet = packet.map_err(WorkerError::Queue)?;
+                        let IncomingPacket::Data(data) = packet.as_ref() else {
+                            return Err(WorkerError::InvalidPacketType);
+                        };
+                        Event::Packet(parse_packet(data), data.transaction_id())
+                    }
+                    cmd = command => Event::Command(cmd),
+                }
+            };
+
+            let (packet, transaction_id) = match event {
+                Event::Packet(packet, transaction_id) => (packet, transaction_id),
+                Event::Command(cmd) => {
+                    let span =
+                        tracing::trace_span!("vpci_handle_command", instance_id = ?dev.instance_id);
+                    self.handle_command(cmd, conn, dev).instrument(span).await?;
+                    // 命令已处理；回到循环顶部继续等待（命令不产生需要 completion 的 packet）。
+                    continue;
+                }
             };
 
             let r = match packet {
@@ -981,6 +1123,31 @@ impl ReadyState {
                                 &[],
                             )?;
                         }
+                    }
+                }
+            }
+            PacketData::EjectComplete { slot } => {
+                // guest 确认了我们发出的 graceful `EJECT`。fire 发起方的完成句柄
+                // （`remove_bus` 据此结束等待、继续拆通道）。`EJECT_COMPLETE` 是
+                // `InBandNoCompletion`，无需回 completion。
+                if u32::from(slot) != 0 {
+                    // 单设备 bus，只可能是 slot 0；非 0 视作协议异常但不杀通道。
+                    tracelimit::warn_ratelimited!(
+                        ?slot,
+                        instance_id = ?dev.instance_id,
+                        "vpci: EJECT_COMPLETE for unexpected slot"
+                    );
+                }
+                match self.pending_eject.take() {
+                    Some(done) => {
+                        tracing::info!(instance_id = ?dev.instance_id, "vpci: received EJECT_COMPLETE from guest");
+                        done.send(());
+                    }
+                    None => {
+                        tracelimit::warn_ratelimited!(
+                            instance_id = ?dev.instance_id,
+                            "vpci: received EJECT_COMPLETE with no pending eject"
+                        );
                     }
                 }
             }
@@ -1240,6 +1407,14 @@ pub struct VpciChannel {
     bars_set: bool,
     #[inspect(iter_by_index)]
     interrupts: Vec<MsiAddressData>,
+
+    /// **可选**的运行时命令 receiver（热插拔编排方下发 [`HotplugCommand`]）。
+    ///
+    /// `None`（4 个现有 `VpciBus::new` 调用方）= 通道行为与历史**逐字节等价**
+    /// （`ReadyState::run` 的命令臂退化为 `pending()`）。`Some`（vfio_user 热插拔）=
+    /// 启用 graceful EJECT 等运行时命令。
+    #[inspect(skip)]
+    cmd_rx: Option<mesh::Receiver<HotplugCommand>>,
 }
 
 /// Virtual PCI Config Space
@@ -1346,6 +1521,7 @@ impl VpciChannel {
         config_space: VpciConfigSpace,
         msi_mapper: VpciInterruptMapper,
         vnode: Option<u16>,
+        cmd_rx: Option<mesh::Receiver<HotplugCommand>>,
     ) -> Result<Self, NotPciDevice> {
         let (hardware_ids, bar_masks);
         {
@@ -1366,6 +1542,7 @@ impl VpciChannel {
             device: device.clone(),
             bars_set: false,
             interrupts: Vec::new(),
+            cmd_rx,
         })
     }
 }
@@ -1515,6 +1692,7 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
     enum ReadPacketInfo {
         None,
         NewTransaction,
@@ -1532,6 +1710,17 @@ mod tests {
         driver: &impl SpawnDriver,
         device: Arc<CloseableMutex<dyn ChipsetDevice>>,
         msi_mapper: Arc<TestVpciInterruptController>,
+    ) -> MockVpciGuestDevice {
+        connected_device_with_commands(driver, device, msi_mapper, None)
+    }
+
+    /// 同 [`connected_device`]，但允许注入一个 [`HotplugCommand`] receiver，用于验证
+    /// graceful EJECT（`Some` 路径）。`None` 即与历史行为逐字节等价。
+    fn connected_device_with_commands(
+        driver: &impl SpawnDriver,
+        device: Arc<CloseableMutex<dyn ChipsetDevice>>,
+        msi_mapper: Arc<TestVpciInterruptController>,
+        cmd_rx: Option<mesh::Receiver<super::HotplugCommand>>,
     ) -> MockVpciGuestDevice {
         let (host, guest) = connected_queues(16384);
         let (hardware_ids, bar_masks);
@@ -1556,6 +1745,7 @@ mod tests {
             device,
             bars_set: false,
             interrupts: Vec::new(),
+            cmd_rx,
         };
         let mut worker = VpciChannelState {
             conn: Connection { queue: host },
@@ -1786,6 +1976,32 @@ mod tests {
             (reply.interrupt.address, reply.interrupt.data_payload)
         }
 
+        /// 读取服务端发来的下一个 in-band（无 completion）`PdoMessage`，断言其
+        /// `message_type` 等于 `expected`。用于验证 graceful `EJECT`。
+        async fn read_pdo_message(
+            &mut self,
+            expected: protocol::MessageType,
+        ) -> protocol::PdoMessage {
+            let mut pkt_info = ReadPacketInfo::None;
+            let msg: protocol::PdoMessage = self.read_packet(&mut pkt_info).await.unwrap();
+            match pkt_info {
+                ReadPacketInfo::NewTransaction => {}
+                _ => panic!("expected in-band PdoMessage, got {pkt_info:?}"),
+            }
+            assert_eq!(msg.message_type, expected, "unexpected PdoMessage type");
+            msg
+        }
+
+        /// 模拟 guest VSC 对 graceful `EJECT` 的确认：发回一个 `EJECT_COMPLETE`
+        /// （`InBandNoCompletion`，与生产侧 `vpci_client::send_eject_complete` 一致）。
+        async fn send_eject_complete(&mut self, slot: SlotNumber) {
+            let complete = protocol::PdoMessage {
+                message_type: protocol::MessageType::EJECT_COMPLETE,
+                slot,
+            };
+            self.write_packet(None, &complete).await.unwrap();
+        }
+
         /// Serializes `command` to a `VPCI_TDISP_COMMAND` vmbus packet, sends it
         /// to the server requesting a completion, then reads the completion and
         /// deserializes the payload back to a [`tdisp::GuestToHostResponse`].
@@ -1914,6 +2130,95 @@ mod tests {
         let mut guest_driver = connected_device(&driver, pci.clone(), msi_controller);
         let base_address = 0x140000000;
         guest_driver.start_device(base_address).await;
+    }
+
+    /// C2-0 回归：显式以 `cmd_rx = None` 构造通道，验证 `ReadyState::run` 的 select
+    /// `None` 臂（`pending()`）下整条设备生命周期（版本协商 + D0 entry + BUS_RELATIONS2
+    /// + 完成）与历史**逐字节等价**。这是「不破坏 4 个现有 VpciBus::new 调用方」的硬约束的
+    /// 锁定测试——`verify_simple_device` 走的也是 `None`，此处再加一条显式命名的回归以防
+    /// 未来误改 select 的 `None` 分支语义。
+    #[async_test]
+    async fn verify_simple_device_none_command_arm_unchanged(driver: DefaultDriver) {
+        let msi_controller = TestVpciInterruptController::new();
+        let pci_config = HardwareIds {
+            vendor_id: 0x123,
+            device_id: 0x789,
+            revision_id: 1,
+            prog_if: ProgrammingInterface::NONE,
+            base_class: ClassCode::BASE_SYSTEM_PERIPHERAL,
+            sub_class: Subclass::BASE_SYSTEM_PERIPHERAL_OTHER,
+            type0_sub_vendor_id: 0x456,
+            type0_sub_system_id: 0x1,
+        };
+
+        let pci = Arc::new(CloseableMutex::new(NullDevice {
+            config_space: ConfigSpaceType0Emulator::new(
+                pci_config,
+                Vec::new(),
+                Vec::new(),
+                DeviceBars::new(),
+            ),
+        }));
+        // 显式 None：等价于现有 VpciBus::new 调用方。
+        let mut guest_driver =
+            connected_device_with_commands(&driver, pci.clone(), msi_controller, None);
+        let base_address = 0x140000000;
+        // 完整握手必须照常完成（命令臂永不就绪，select 必走 packet 臂）。
+        guest_driver.start_device(base_address).await;
+    }
+
+    /// C2-0 核心：`Some` 命令臂 + 下发 [`HotplugCommand::Eject`] →
+    /// 1) 服务端向 guest 发出一个 `EJECT`（slot 0）packet；
+    /// 2) guest 回 `EJECT_COMPLETE` 后，发起方的 `done` oneshot fire。
+    /// 验证生产侧 VSP 的 graceful EJECT 握手闭环（发 EJECT → 收 EJECT_COMPLETE → 通知）。
+    #[async_test]
+    async fn verify_graceful_eject_emits_packet_and_completes(driver: DefaultDriver) {
+        let msi_controller = TestVpciInterruptController::new();
+        let pci_config = HardwareIds {
+            vendor_id: 0x123,
+            device_id: 0x789,
+            revision_id: 1,
+            prog_if: ProgrammingInterface::NONE,
+            base_class: ClassCode::BASE_SYSTEM_PERIPHERAL,
+            sub_class: Subclass::BASE_SYSTEM_PERIPHERAL_OTHER,
+            type0_sub_vendor_id: 0x456,
+            type0_sub_system_id: 0x1,
+        };
+
+        let pci = Arc::new(CloseableMutex::new(NullDevice {
+            config_space: ConfigSpaceType0Emulator::new(
+                pci_config,
+                Vec::new(),
+                Vec::new(),
+                DeviceBars::new(),
+            ),
+        }));
+
+        let (cmd_tx, cmd_rx) = mesh::channel::<super::HotplugCommand>();
+        let mut guest_driver =
+            connected_device_with_commands(&driver, pci.clone(), msi_controller, Some(cmd_rx));
+
+        // 先完成标准握手（设备进入 Ready 态，run 进入 select 循环）。
+        let base_address = 0x140000000;
+        guest_driver.start_device(base_address).await;
+
+        // 下发 graceful Eject 命令。
+        let (done_tx, done_rx) = mesh::oneshot::<()>();
+        cmd_tx.send(super::HotplugCommand::Eject { done: done_tx });
+
+        // 服务端应向 guest 发出一个 EJECT（slot 0）。
+        let eject = guest_driver
+            .read_pdo_message(protocol::MessageType::EJECT)
+            .await;
+        assert_eq!(eject.slot, SlotNumber::new());
+
+        // 此时 done 尚未 fire（还没回 EJECT_COMPLETE）。回 EJECT_COMPLETE。
+        guest_driver.send_eject_complete(SlotNumber::new()).await;
+
+        // 发起方的完成通知应 fire。
+        done_rx
+            .await
+            .expect("eject completion should fire after EJECT_COMPLETE");
     }
 
     #[async_test]
