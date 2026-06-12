@@ -1842,6 +1842,14 @@ pub struct InitialControllers {
     pub ide_controller: Option<IdeControllerConfig>,
     pub vmbus_devices: Vec<Resource<VmbusDeviceHandleKind>>,
     pub vpci_devices: Vec<UhVpciDeviceConfig>,
+    /// Layer C C0：vfio_user emulated NVMe 设备**单独**收集（**不**进 `vpci_devices`），
+    /// 交给 underhill 的运行时热插拔路径（`emuplat/vfio_user_hotplug`）。若仍 push 进
+    /// `vpci_devices`，会被 boot-time 静态 `build_vpci_device` offer 抢先（冷插不可用、
+    /// 无法随 usnvmemu Live/Lost 动态 add/remove），故必须分流。
+    ///
+    /// 直接持**具体** `VfioUserNvmeHandle`（非 type-erased `Resource`）：热插拔路径要按
+    /// 字段（unix_path/bar0_size/msix_count）装配 device shim，无需经 resolver 解析。
+    pub vfio_user_nvme_devices: Vec<vfio_user_pci_resources::VfioUserNvmeHandle>,
     pub mana: Vec<NicConfig>,
     pub device_interfaces: DeviceInterfaces,
 }
@@ -1911,6 +1919,9 @@ impl InitialControllers {
 
         // 把 OPENHCL_PCIE_REMOTE_INSTANCE 注入的实例也作为 vpci 设备登记。
         // CVM / servicing 跳过。
+        // Layer C C0：vfio_user 实例**单列**到 `vfio_user_nvme_devices`，不进 `vpci_devices`。
+        let mut vfio_user_nvme_devices: Vec<vfio_user_pci_resources::VfioUserNvmeHandle> =
+            Vec::new();
         if !cvm_skip_pcie_remote && !is_restoring {
             for cfg in pcie_remote_cli_instances {
                 vpci_devices.push(UhVpciDeviceConfig {
@@ -1924,16 +1935,14 @@ impl InitialControllers {
                 });
             }
             // OPENHCL_VFIO_USER_NVME 注入的实例（W6b）。CVM / servicing 跳过。
+            // **C0 改动**：收进 `vfio_user_nvme_devices`（运行时热插拔路径，持具体
+            // handle），**不**push 进 `vpci_devices`（否则被 boot-time 静态 offer 抢先）。
             for cfg in vfio_user_nvme_cli_instances {
-                vpci_devices.push(UhVpciDeviceConfig {
+                vfio_user_nvme_devices.push(vfio_user_pci_resources::VfioUserNvmeHandle {
                     instance_id: cfg.instance_id,
-                    resource: vfio_user_pci_resources::VfioUserNvmeHandle {
-                        instance_id: cfg.instance_id,
-                        unix_path: cfg.unix_path.clone(),
-                        bar0_size: cfg.bar0_size,
-                        msix_count: cfg.msix_count,
-                    }
-                    .into_resource(),
+                    unix_path: cfg.unix_path.clone(),
+                    bar0_size: cfg.bar0_size,
+                    msix_count: cfg.msix_count,
                 });
             }
         }
@@ -1974,6 +1983,7 @@ impl InitialControllers {
             vmbus_devices,
             mana,
             vpci_devices,
+            vfio_user_nvme_devices,
             device_interfaces: DeviceInterfaces {
                 scsi_dvds,
                 scsi_request,

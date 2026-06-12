@@ -8700,6 +8700,7 @@ dependencies = [
  "pal_async",
  "pal_uring",
  "parking_lot",
+ "pci_core",
  "pcie_remote_device",
  "pcie_remote_resources",
  "profiler_worker",

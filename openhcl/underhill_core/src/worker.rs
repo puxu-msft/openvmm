@@ -2406,7 +2406,9 @@ async fn new_underhill_vm(
         vfio_user_pci_resources::VfioUserNvmeHandle,
         _,
     >(vfio_user_pci_device::VfioUserPciResolver::new(
-        vfio_user_nvme_worker_tasks,
+        // clone：同一 Arc 容器既给 resolver 路径，也给 Layer C C0 热插拔路径
+        // （build_device_shim 把 worker/connector task push 进同一容器保活）。
+        vfio_user_nvme_worker_tasks.clone(),
     ));
 
     let periodic_telemetry_task = tp.spawn(
@@ -3659,6 +3661,54 @@ async fn new_underhill_vm(
             .await
             .context("failed to relay initial vpci channels")?;
     }
+
+    // Layer C C0：vfio_user emulated NVMe 设备的运行时热插拔。
+    //
+    // 与上面的 vpci_relay 初始 process 同处 build() 之后的上下文（`add_dyn_device` 是
+    // `ChipsetDevices` 的运行时 API，必须 build() 之后才能调）。这里只装配**长存**
+    // device shim（初始 Connecting，对 guest show-absent，bus 尚未 offer）；bus 在首个
+    // Live 边沿由 dispatch loop 的 reconcile 臂 add（见 `dispatch/mod.rs`）。
+    // 设备 shim 的 worker/connector/irq task 进 `vfio_user_nvme_worker_tasks` 保活
+    // （已在上文注册 resolver 时创建；此处复用同一容器，持到进程退出）。
+    #[cfg(feature = "vpci")]
+    let vfio_user_hotplug = {
+        let mut hotplugs = Vec::new();
+        if !controllers.vfio_user_nvme_devices.is_empty() {
+            let vmbus = vmbus_server
+                .as_ref()
+                .context("vfio_user_nvme devices require vmbus redirection to be enabled")?;
+            // partition erase 成 DeviceBuilderPartition trait object（reconcile 只需
+            // 「能造虚拟设备」这一能力）。
+            let hotplug_partition: Arc<
+                dyn crate::emuplat::vfio_user_hotplug::DeviceBuilderPartition,
+            > = partition.clone();
+            for handle in controllers.vfio_user_nvme_devices {
+                let instance_id = handle.instance_id;
+                let hotplug = crate::emuplat::vfio_user_hotplug::VfioUserHotplug::assemble(
+                    &devices,
+                    &state_units,
+                    &driver_source,
+                    &vfio_user_nvme_worker_tasks,
+                    handle,
+                    device_memory,
+                    vmbus.control().clone(),
+                    hotplug_partition.clone(),
+                    vtom,
+                )
+                .await
+                .with_context(|| {
+                    format!("failed to assemble vfio_user hotplug for {instance_id}")
+                })?;
+                hotplugs.push(hotplug);
+            }
+        }
+        hotplugs
+    };
+    #[cfg(not(feature = "vpci"))]
+    if !controllers.vfio_user_nvme_devices.is_empty() {
+        anyhow::bail!("vfio_user_nvme devices configured but built without vpci support");
+    }
+
     let (halt_notify_send, halt_notify_recv) = mesh::channel();
     let halt_task = tp.spawn(
         "halt",
@@ -3746,6 +3796,8 @@ async fn new_underhill_vm(
         vmbus_client,
         vmbus_filter,
         vpci_relay,
+        #[cfg(feature = "vpci")]
+        vfio_user_hotplug,
         vtl0_memory_map,
 
         vmbus_server,

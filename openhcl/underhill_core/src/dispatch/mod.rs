@@ -158,6 +158,12 @@ pub(crate) struct LoadedVm {
     pub vmbus_client: Option<vmbus_client::VmbusClient>,
     pub vmbus_filter: Option<vmbus_client::filter::ClientFilter>,
     pub vpci_relay: Option<vpci_relay::VpciRelay>,
+    /// Layer C C0：vfio_user emulated NVMe 设备的运行时热插拔上下文（每条一个）。
+    /// 每个 `VfioUserHotplug` 持长存 device shim + 重建上下文，reconcile 在 dispatch
+    /// loop 的 select 臂里随 device 的 Live/Lost 边沿 add/remove guest VpciBus。
+    /// 仅 vpci feature 编入；未设 OPENHCL_VFIO_USER_NVME 时为空 vec（零行为变化）。
+    #[cfg(feature = "vpci")]
+    pub vfio_user_hotplug: Vec<crate::emuplat::vfio_user_hotplug::VfioUserHotplug>,
     /// Memory map with IGVM types for each range.
     pub vtl0_memory_map: Vec<(MemoryRangeWithNode, MemoryMapEntryType)>,
 
@@ -213,6 +219,27 @@ pub struct LoadedVmState<T> {
 }
 
 impl LoadedVm {
+    /// Layer C C0：reconcile 第 `idx` 条 vfio_user 热插拔上下文（按 device 当前态幂等
+    /// 收敛 bus 的 add/remove）。在 dispatch loop 单点串行调用（select! 返回后），
+    /// 独占 `&self.chipset_devices` + `&mut self.state_units`，零并发危险。
+    #[cfg(feature = "vpci")]
+    async fn process_vfio_user_hotplug(&mut self, idx: usize) {
+        if let Err(err) = self.vfio_user_hotplug[idx]
+            .process(&self.chipset_devices, &mut self.state_units)
+            .await
+        {
+            tracing::error!(
+                CVM_ALLOWED,
+                error = err.as_ref() as &dyn std::error::Error,
+                "failed to process vfio_user hotplug"
+            );
+        }
+    }
+
+    /// Layer C C0：非 vpci feature 下不可达（`wait_vfio_user_hotplug` 永不返回）。
+    #[cfg(not(feature = "vpci"))]
+    async fn process_vfio_user_hotplug(&mut self, _idx: usize) {}
+
     /// Start running the VM which will start running VTL0.
     pub async fn run<T: 'static + MeshPayload + Send>(
         mut self,
@@ -275,6 +302,10 @@ impl LoadedVm {
                 ShutdownRequest(Rpc<ShutdownParams, ShutdownResult>),
                 ShutdownResponse(<PendingRpc<ShutdownResult> as Future>::Output),
                 VpciRelayReady,
+                /// Layer C C0：第 `usize` 条 vfio_user 热插拔上下文报告了一个 Live/Lost
+                /// 边沿，需要 reconcile（add/remove guest VpciBus）。非 vpci feature 下
+                /// 对应 future 永远 pending，本变体不会被构造。
+                VfioUserHotplug(usize),
             }
 
             let event: Event<T> = futures::select! { // merge semantics
@@ -290,6 +321,35 @@ impl LoadedVm {
                         std::future::pending().await
                     }
                 }.fuse() => Event::VpciRelayReady,
+                // Layer C C0：等待任一 vfio_user 热插拔上下文的下一个 Live/Lost 边沿。
+                // 借用纪律（关键）：本 async 块**只**借 `self.vfio_user_hotplug` 这一字段
+                // （edition 2021 闭包按字段精确捕获），与其它 `select!` 臂借的 disjoint
+                // 字段（`self.crash_notification_recv` / `self.shutdown_relay`）不冲突；
+                // **不能**改成 `self.method()`（那会借整个 `&mut self`，撞其它臂）。
+                // 空 vec / 非 vpci feature → 永远 pending（本臂不唤醒）。fire 后该借用在
+                // `select!` 返回 owned `Event` 时释放，match 臂才用索引重借单条。
+                idx = async {
+                    #[cfg(feature = "vpci")]
+                    {
+                        if self.vfio_user_hotplug.is_empty() {
+                            std::future::pending::<usize>().await
+                        } else {
+                            let futures = self
+                                .vfio_user_hotplug
+                                .iter_mut()
+                                .map(|h| Box::pin(h.wait_event()));
+                            // DeviceState 值丢弃：`process` 重读 `state.load()` 做幂等
+                            // 决策，避免边沿值与拿 chipset/state_units 之间状态漂移误判。
+                            let (_state, idx, _rest) =
+                                futures::future::select_all(futures).await;
+                            idx
+                        }
+                    }
+                    #[cfg(not(feature = "vpci"))]
+                    {
+                        std::future::pending::<usize>().await
+                    }
+                }.fuse() => Event::VfioUserHotplug(idx),
                 message = async {
                     if self.shutdown_relay.is_none() {
                         std::future::pending::<()>().await;
@@ -554,6 +614,13 @@ impl LoadedVm {
                             "failed to process VPCI relay"
                         );
                     }
+                }
+                // Layer C C0：reconcile 第 `idx` 条 vfio_user 热插拔上下文。
+                // 委托给 cfg-gated 的 `process_vfio_user_hotplug`（非 vpci feature 下
+                // 此变体不可达，helper 是 no-op）。在 dispatch loop 单点串行运行，
+                // 独占 `&self.chipset_devices` + `&mut self.state_units`，零并发危险。
+                Event::VfioUserHotplug(idx) => {
+                    self.process_vfio_user_hotplug(idx).await;
                 }
             }
         };

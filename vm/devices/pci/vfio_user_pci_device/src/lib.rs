@@ -31,6 +31,7 @@ pub use reconnect::ReconnectChannels;
 pub use reconnect::reconnect_loop;
 pub use resolver::VfioUserPciResolver;
 pub use resolver::WorkerTasks;
+pub use resolver::build_device_shim;
 pub use state::DeviceState;
 pub use state::SharedState;
 pub use worker::DeviceRequest;

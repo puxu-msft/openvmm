@@ -165,6 +165,8 @@ pcie_remote_device.workspace = true
 pcie_remote_resources.workspace = true
 vfio_user_pci_device.workspace = true
 vfio_user_pci_resources.workspace = true
+# Layer C C0 热插拔：MsiConnection/MsiTarget（device shim 长存的持久 MSI 目标）。
+pci_core.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true

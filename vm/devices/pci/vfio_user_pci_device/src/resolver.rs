@@ -37,6 +37,7 @@ use crate::worker::DeviceRequest;
 use crate::worker::ReconnectEvent;
 use crate::worker::SharedWorkerStats;
 use crate::worker::Worker;
+use anyhow::Context as _;
 use async_trait::async_trait;
 use cvm_tracing::CVM_ALLOWED;
 use guestmem::ShareableRegion;
@@ -105,21 +106,63 @@ async fn resolve_one(
     handle: VfioUserNvmeHandle,
     params: ResolvePciDeviceHandleParams<'_>,
 ) -> ResolvedPciDevice {
-    assemble_device(worker_tasks, handle, params).await
+    // resolver 路径（build_vpci_device）：无边沿通知（`edge_tx = None`）——boot-time
+    // 静态 offer 不需要运行时热插拔 reconcile。装配失败 → AbsentPcieDevice 兜底。
+    match build_device_shim(
+        worker_tasks,
+        &handle,
+        params.register_mmio,
+        params.msi_target,
+        params.driver_source,
+        params.guest_memory,
+        None,
+    )
+    .await
+    {
+        Ok((device, _state)) => device.into(),
+        Err(e) => {
+            tracing::error!(
+                CVM_ALLOWED,
+                instance_id = %handle.instance_id,
+                error = e.as_ref() as &dyn std::error::Error,
+                "vfio_user_pci: device shim 装配失败；serving AbsentPcieDevice"
+            );
+            AbsentPcieDevice::new().into()
+        }
+    }
 }
 
-/// 装配完整 `VfioUserPciDevice`：MsixEmulator + DeviceBars + cfg_space + 持久 MSI-X
-/// eventfd（irq task + connector 各持一份）+ spawn worker / irq tasks / 重连引擎。
+/// 装配完整 `VfioUserPciDevice` 的**可复用**核心（W6b resolver 路径 + Layer C C0
+/// 热插拔路径共用）。
 ///
-/// 设备初始状态 `Connecting`（C-2 show-absent-until-Live）；connector 首次连接成功
-/// 后经 `reconnect` channel 把 transport 交给 worker → worker 转 Live。装配失败
-/// （`PolledWait::new`）一律发放 `AbsentPcieDevice` 兜底，绝不 panic boot。
-async fn assemble_device(
+/// 相对旧 `assemble_device`：入参从 `ResolvePciDeviceHandleParams` 拆成显式的几样
+/// 「装配原料」（`register_mmio` / `msi_target` / `driver_source` / `guest_memory`），
+/// 使其既能被 resolver 在 `build_vpci_device` 路径调用（用 `services.register_mmio()`），
+/// 也能被 underhill 的 C0 热插拔路径在 `ChipsetDevices::add_dyn_device` 闭包里调用
+/// （闭包同样提供一个 `&mut dyn RegisterMmioIntercept`）。
+///
+/// **返回**：成功 → `(VfioUserPciDevice, SharedState)`。device shim 是长存 guest-facing
+/// 仿真器；`SharedState` 句柄交给调用方（C0 路径据它驱动 Live/Lost reconcile）。
+/// 失败（仅 `PolledWait::new` epoll 注册错）→ `Err`：resolver 路径转 `AbsentPcieDevice`，
+/// C0 路径上抛给 `add_dyn_device`（add 失败，不 panic boot）。
+///
+/// `edge_tx`：可选边沿通知 sender。`Some` 时（C0 路径）device 转 Live/Lost 会投递新状态；
+/// `None` 时（resolver 路径）零通知开销，行为同旧 `assemble_device`。
+///
+/// 装配内容（不变）：MsixEmulator + DeviceBars + cfg_space + 持久 MSI-X eventfd
+/// （irq task + connector 各持一份，C-3）+ spawn worker / irq tasks / 重连引擎。
+/// 设备初始状态 `Connecting`（C-2 show-absent-until-Live）。worker + connector tasks
+/// push 进 `worker_tasks`（调用方持到设备生命周期结束 / 进程退出）。
+pub async fn build_device_shim(
     worker_tasks: &WorkerTasks,
-    handle: VfioUserNvmeHandle,
-    params: ResolvePciDeviceHandleParams<'_>,
-) -> ResolvedPciDevice {
-    let driver = params.driver_source.simple(); // VmTaskDriver：既是 Driver 又能 Spawn。
+    handle: &VfioUserNvmeHandle,
+    register_mmio: &mut (dyn chipset_device::mmio::RegisterMmioIntercept + Send),
+    msi_target: &pci_core::msi::MsiTarget,
+    driver_source: &vmcore::vm_task::VmTaskDriverSource,
+    guest_memory: &guestmem::GuestMemory,
+    edge_tx: Option<mesh::Sender<DeviceState>>,
+) -> anyhow::Result<(VfioUserPciDevice, SharedState)> {
+    let driver = driver_source.simple(); // VmTaskDriver：既是 Driver 又能 Spawn。
     let instance_id = handle.instance_id;
 
     // 声明几何（CLI override 或内置默认）。connector 据此做 identity 校验上界；
@@ -128,7 +171,7 @@ async fn assemble_device(
     let msix_count = declared.msix_count;
 
     // 1. MSI-X emulator（BAR4）。
-    let (msix, msix_cap) = MsixEmulator::new(MSIX_BAR_INDEX, msix_count, params.msi_target);
+    let (msix, msix_cap) = MsixEmulator::new(MSIX_BAR_INDEX, msix_count, msi_target);
 
     // 2. interrupts vec：每个 MSI-X 槽位一个 Interrupt 句柄。
     let interrupts: Vec<Interrupt> = (0..msix_count)
@@ -143,15 +186,11 @@ async fn assemble_device(
     let bars = DeviceBars::new()
         .bar0(
             declared.bar0_size,
-            BarMemoryKind::Intercept(
-                params
-                    .register_mmio
-                    .new_io_region("bar0", declared.bar0_size),
-            ),
+            BarMemoryKind::Intercept(register_mmio.new_io_region("bar0", declared.bar0_size)),
         )
         .bar4(
             msix.bar_len(),
-            BarMemoryKind::Intercept(params.register_mmio.new_io_region("msix", msix.bar_len())),
+            BarMemoryKind::Intercept(register_mmio.new_io_region("msix", msix.bar_len())),
         );
 
     // 4. cfg_space（身份用声明默认值；连接器另读 firmware 真身份做校验，但 guest-facing
@@ -179,22 +218,12 @@ async fn assemble_device(
 
     // 7. 每个 MSI-X 向量一个 eventfd-wait task：PolledWait(event) 唤醒 →
     //    interrupt.deliver()。PolledWait::new 失败（极罕见，epoll 注册错）→ 放弃
-    //    装配，发 AbsentPcieDevice（优雅降级，不 panic boot）。
+    //    装配，上抛 Err（调用方决定兜底：resolver → Absent；C0 → add 失败）。
     let mut irq_tasks = Vec::new();
     for (i, event) in events.into_iter().enumerate() {
-        let waiter = match PolledWait::new(&driver, event) {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::error!(
-                    CVM_ALLOWED,
-                    %instance_id,
-                    vector = i,
-                    error = %e,
-                    "vfio_user_pci: PolledWait::new failed; serving AbsentPcieDevice"
-                );
-                return AbsentPcieDevice::new().into();
-            }
-        };
+        let waiter = PolledWait::new(&driver, event).with_context(|| {
+            format!("vfio_user_pci: PolledWait::new failed for vector {i} (instance {instance_id})")
+        })?;
         let interrupt = interrupts[i].clone();
         irq_tasks.push(driver.spawn(
             format!("vfio_user_irq_{instance_id}_{i}"),
@@ -207,7 +236,13 @@ async fn assemble_device(
     let stats: SharedWorkerStats = Arc::new(Default::default());
     // C-2 初始 Connecting：backend 未连上前对 guest show-absent；connector 连上
     // 后经 reconnect channel 交付 transport，worker 转 Live。
-    let state = SharedState::new(DeviceState::Connecting);
+    //
+    // C0：若调用方给了 `edge_tx`，则用 `with_edge_notifier` 构造 —— device 转 Live/Lost
+    // 时投递新状态，underhill reconcile 据此 add/remove VpciBus。`None` 时退化为旧行为。
+    let state = match edge_tx {
+        Some(tx) => SharedState::with_edge_notifier(DeviceState::Connecting, tx),
+        None => SharedState::new(DeviceState::Connecting),
+    };
     // shutdown 通道：v1 不主动关 worker；靠 reconnect channel 关闭 / 设备 unbind。
     // forget sender 避免立刻 drop 让 worker 主循环误以为收到 shutdown。
     let (shutdown_tx, shutdown_rx) = mesh::channel::<()>();
@@ -233,7 +268,7 @@ async fn assemble_device(
     //      - 非隔离 VTL0 的 `sharing()` 返回 `Some`（mapping.rs no-bitmap 路径）；
     //      - 理论上非隔离不会是 `None`，但稳健起见：`None` → 空 vec + warn（设备
     //        仍装配，guest 可枚举，只是 DMA 不可用），绝不 panic boot。
-    let dma_regions: Vec<ShareableRegion> = match params.guest_memory.sharing() {
+    let dma_regions: Vec<ShareableRegion> = match guest_memory.sharing() {
         Some(sharing) => match sharing.get_regions().await {
             Ok(regions) => {
                 tracing::info!(
@@ -298,7 +333,10 @@ async fn assemble_device(
         unix_path = handle.unix_path.as_str(),
         "vfio_user_pci: device assembled (Connecting), worker + irq + reconnect tasks spawned"
     );
-    VfioUserPciDevice::new(state, to_worker, cfg_space, msix, stats).into()
+    Ok((
+        VfioUserPciDevice::new(state.clone(), to_worker, cfg_space, msix, stats),
+        state,
+    ))
 }
 
 #[cfg(test)]

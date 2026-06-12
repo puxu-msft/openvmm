@@ -11,6 +11,9 @@ pub mod non_volatile_store;
 pub mod pm_timer_assist;
 pub mod tpm;
 pub mod uefi;
+// Layer C C0：emulated vfio-user NVMe 设备 guest 运行时热插拔（仅 vpci feature）。
+#[cfg(feature = "vpci")]
+pub mod vfio_user_hotplug;
 pub mod vga_proxy;
 pub mod watchdog;
 

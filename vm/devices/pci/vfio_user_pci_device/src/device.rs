@@ -19,15 +19,12 @@
 //!   - write → [`ReqKind::MmioWrite`] **fire-and-forget**，立即 `IoResult::Ok`
 //!     让 guest driver 继续；worker 异步发 REGION_WRITE。
 //! - C-2「config 恒呈真身份 + 仅 MMIO 按 Live 门控」（2026-06-12 真机 finding-③
-//!   修订，见 `usnvmemu/experiments/2026-06-12-w6b-reconnect-real-vm/RESULT.md`）：
+//!   修订，见 `usnvmemu/experiments/2026-06-12-w6b-reconnect-real-vm/RESULT.md`；
+//!   **Layer C C0 更新见下「offer 时机」**）：
 //!   - **cfg_read/cfg_write 恒走真实 `cfg_space`**（不论 `Connecting`/`Live`/`Lost`），
 //!     让 guest 在 **offer/枚举时刻**就看到真实 `VEN_1414&DEV_00A9` NVMe 控制器并
-//!     加载 stornvme.sys。**为何必须如此**：VPCI offer 在 `assemble_device`
-//!     （state=`Connecting`，usnvmemu 连上**之前**）就发生，Windows 在枚举时
-//!     一次性钉死 devnode 的 vendor/device；旧 C-2 让 Connecting cfg 返
-//!     `Err`/absent → offer 捕获到 DEV_0000/Unknown → **不加载任何驱动、不建 NVMe
-//!     盘**，即便之后 Live 也不重触 offer（冷插=Layer C，当前不可用）。config 读是
-//!     无副作用的身份/BAR-window 读，恒呈真只是让 guest 能枚举，是安全的。
+//!     加载 stornvme.sys。config 读是无副作用的身份/BAR-window 读，恒呈真只是让
+//!     guest 能枚举，是安全的。
 //!   - **mmio_read/mmio_write 按 `Live` 门控**：非 `Live`（`Connecting` 或 `Lost`）
 //!     一律返 `Err(IoError::InvalidRegister)`，**绝不 `Defer`**（`Defer` 才是
 //!     291d8645 OS-hang 的根因——driver 等不到完成 → IRP 卡死 → 整个 OS 停响应；
@@ -41,6 +38,20 @@
 //!     若 Live（usnvmemu 已起）→ 真 NVMe 应答 → controller init → 盘 + IO；
 //!     若非 Live → MMIO `Err` → driver init 失败/重试，非 hang；usnvmemu 起后转
 //!     Live → 后续 MMIO 命中真 NVMe → 恢复（reconnect revive）。
+//!
+//!   **offer 时机（Layer C C0，2026-06-12）**：本 device shim 现在有两种装配路径。
+//!   路径①是 W6b resolver 路径（`build_vpci_device`）：VPCI offer 在 `assemble_device`
+//!   （state=`Connecting`）就发生，**cfg-恒呈真是这条路径的承重前提**（offer 时刻仍
+//!   Connecting，若返 absent 则 guest 钉死 DEV_0000/Unknown 永不加载驱动）。
+//!   路径②是 **Layer C C0 热插拔路径**（`underhill_core::emuplat::vfio_user_hotplug`）：
+//!   device shim 经 `add_dyn_device` 长存，**VpciBus 只在 device 转 `Live` 时才经
+//!   `add_dyn_device` offer**（Lost 时 `DynamicDeviceUnit::remove` 拆掉）。此路径下
+//!   offer 时刻 device **已 Live**，guest 枚举即见就绪控制器 → 顺带解掉旧 disable/enable
+//!   缺口（盘自动出现）。
+//!   两条路径下 **cfg-恒呈真 + MMIO-Live-门控都保留不变**：C0 路径在「offer 后、
+//!   worker 万一转 Lost」的竞态窗口里，仍靠 MMIO-Live-门控（非 Live 返 `Err` 不
+//!   `Defer`）防 guest MMIO hang；cfg 恒呈真对 C0 无害（offer 时已 Live，恒呈真只是
+//!   多余的安全冗余），对 resolver 路径仍是承重前提。
 //!
 //! 相对模板删掉：`next_seq`（vfio-user 的 msg_id 由 worker 分配，不在 device 侧）、
 //! `side_effect_offsets`（无 cfg 转发）。
@@ -110,6 +121,15 @@ impl VfioUserPciDevice {
             msix,
             worker_stats,
         }
+    }
+
+    /// 返回设备状态机句柄的克隆（Connecting/Live/Lost）。
+    ///
+    /// Layer C C0 用：device shim 经 `add_dyn_device` 装配后长存，underhill 的热插拔
+    /// reconcile 据此句柄观察 Live/Lost 边沿（配合 `with_edge_notifier` 注入的 channel）
+    /// 并读当前态做幂等 add/remove 决策。`SharedState` 是 `Arc` 包裹，克隆共享同一状态。
+    pub fn shared_state(&self) -> SharedState {
+        self.state.clone()
     }
 }
 
