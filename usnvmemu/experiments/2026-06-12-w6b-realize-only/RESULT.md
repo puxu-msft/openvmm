@@ -59,3 +59,17 @@ listening**。本会话验证了外挂 firmware 的两条路都**不行**：
   但 W6b 的 client 是 **underhill_core 自身**（非 W5a 的外挂 test client）。
 - VM `pcie-remote-exp` 的 FirmwareFile/cmdline 已被本验证改为 W6b IGVM；如需复跑 pcie_remote
   e2e，按 hyperv_interop harness 的 `FORCE_DEPLOY=1` 重新部署即可。
+
+---
+
+## ⚠️ 更正（2026-06-12，reconnect 真机调试时发现）
+
+**本 realize-only "PASS" 是 false-PASS。** 它只验了 ① VTL2 可达（ohcldiag-dev run）+ ② Hyper-V State=Running，**没验 underhill `control_state==running` 或 guest 枚举**。
+
+真相：`cargo xflowey build-igvm x64`（默认）**不带 vpci feature**（只 `--features gdb,tpm`）。一旦配了 `OPENHCL_VFIO_USER_NVME`，vtl2_settings 会把 handle push 进 vpci_devices，而 underhill `worker.rs` 在 `#[cfg(not(feature="vpci"))]` 下 `bail!("built without vpci support")` → worker_new ERROR → **control_state 卡 "starting"**。但 VTL2 diag server 仍起来（run 可达）+ Hyper-V 仍 Running，所以本 harness 的两个判据都"真"，漏报了 worker init 失败。
+
+kmsg 实证：`underhill_core::worker: ERROR ... failed to start VM error=built without vpci support`。
+
+**正确做法**：① IGVM 必须 `cargo xflowey build-igvm x64 --override-openvmm-hcl-feature vpci`；② 真机判据必须查 `ohcldiag-dev inspect control_state`（应 `running`，非 `starting`）或 guest 枚举，**不能只查 VTL2 可达**。详见 `../2026-06-12-w6b-reconnect-real-vm/RESULT.md`。
+
+（realize-only 验的"connect retry→cap→AbsentPcieDevice 兜底→boot 不挂"逻辑本身没错；但当时设备其实因缺 vpci feature 根本没装配，且 worker init 已 ERROR——只是没被这套判据发现。）
