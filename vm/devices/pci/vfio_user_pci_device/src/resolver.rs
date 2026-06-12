@@ -39,6 +39,7 @@ use crate::worker::SharedWorkerStats;
 use crate::worker::Worker;
 use async_trait::async_trait;
 use cvm_tracing::CVM_ALLOWED;
+use guestmem::ShareableRegion;
 use pal_async::task::Spawn;
 use pal_async::task::Task;
 use pal_async::wait::PolledWait;
@@ -226,8 +227,47 @@ async fn assemble_device(
         worker.run(shutdown_rx),
     );
 
+    // 8.5. W6c finding-④：取 VTL0 guest RAM 的可共享区间（逐 ram() 段），交给
+    //      connector，每次重连经 vfio-user DMA_MAP 把每段 ship 给 VTL2 server，
+    //      实现零拷贝 DMA。
+    //      - 非隔离 VTL0 的 `sharing()` 返回 `Some`（mapping.rs no-bitmap 路径）；
+    //      - 理论上非隔离不会是 `None`，但稳健起见：`None` → 空 vec + warn（设备
+    //        仍装配，guest 可枚举，只是 DMA 不可用），绝不 panic boot。
+    let dma_regions: Vec<ShareableRegion> = match params.guest_memory.sharing() {
+        Some(sharing) => match sharing.get_regions().await {
+            Ok(regions) => {
+                tracing::info!(
+                    CVM_ALLOWED,
+                    %instance_id,
+                    region_count = regions.len(),
+                    "vfio_user_pci: collected {} shareable guest-RAM region(s) for DMA_MAP",
+                    regions.len()
+                );
+                regions
+            }
+            Err(e) => {
+                tracing::warn!(
+                    CVM_ALLOWED,
+                    %instance_id,
+                    error = e.as_ref() as &dyn std::error::Error,
+                    "vfio_user_pci: get_regions failed; device assembled without DMA mapping"
+                );
+                Vec::new()
+            }
+        },
+        None => {
+            tracing::warn!(
+                CVM_ALLOWED,
+                %instance_id,
+                "vfio_user_pci: guest_memory.sharing() returned None; device assembled without DMA mapping (DMA unavailable)"
+            );
+            Vec::new()
+        }
+    };
+
     // 9. spawn 持久重连引擎（首次连接 + 后续掉线重连）。connector 持 connector_events
-    //    做 C-3 set_irqs；与 worker 经 reconnect/lost 两条 channel 协作。
+    //    做 C-3 set_irqs + dma_regions 做 W6c finding-④ DMA_MAP；与 worker 经
+    //    reconnect/lost 两条 channel 协作。
     let connector_task = driver.spawn(
         format!("vfio_user_reconnect_{instance_id}"),
         reconnect_loop(
@@ -235,6 +275,7 @@ async fn assemble_device(
             handle.unix_path.clone(),
             declared,
             connector_events,
+            dma_regions,
             ReconnectChannels {
                 reconnect_tx,
                 lost_rx,

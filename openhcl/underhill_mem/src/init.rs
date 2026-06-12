@@ -538,6 +538,11 @@ pub async fn init(params: &Init<'_>) -> anyhow::Result<MemoryMappings> {
             Arc::new(
                 GuestMemoryMapping::builder(base_address)
                     .for_kernel_access(true)
+                    // W6c finding-④：仅此非隔离 VTL0 mapping opt-in fd 共享（vfio-user
+                    // DMA_MAP 零拷贝把 guest RAM 交给 VTL2 server）。VTL1 / CVM / 隔离
+                    // mapping 一律不设——隔离安全的显式标记（见 mapping.rs 不变量）。
+                    // 真共享仍需 build() 里 no-bitmap + alias-off 两项成立。
+                    .shareable(true)
                     .dma_base_address(Some(base_address))
                     .ignore_registration_failure(params.boot_init.is_none())
                     .build_without_bitmap(&gpa_fd, params.mem_layout)

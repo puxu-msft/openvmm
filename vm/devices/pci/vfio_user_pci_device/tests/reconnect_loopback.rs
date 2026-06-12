@@ -491,7 +491,8 @@ fn spawn_engine(
             driver.clone(),
             unix_path,
             declared,
-            eventfds, // 空 → 跳过 set_irqs；非空 → 每次连接 set_irqs（C-3）。
+            eventfds,   // 空 → 跳过 set_irqs；非空 → 每次连接 set_irqs（C-3）。
+            Vec::new(), // W6c finding-④ DMA regions：loopback 无真 guest RAM，传空跳过 DMA_MAP。
             ReconnectChannels {
                 reconnect_tx,
                 lost_rx,

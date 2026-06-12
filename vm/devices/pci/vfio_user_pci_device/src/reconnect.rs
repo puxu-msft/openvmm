@@ -23,16 +23,20 @@
 //!   5. **C-3**：用**持久 eventfd**（`eventfds`，owned `pal_event::Event` clone）重新
 //!      `set_irqs`——每次重连都是全新 client/socket，必须在 `into_channel` 之前重新把
 //!      同一批 eventfd 配给 firmware，否则 revive 后 MSI-X 形同虚设（err → backoff）
-//!   6. `into_channel` 拆全双工读写半
-//!   7. `reconnect_tx.send(Connected{writer,reader})`（Err = worker 已退出 → 整个
+//!   6. **W6c finding-④**：逐 `regions` 段 `dma_map`——把 VTL0 guest RAM（经 underhill
+//!      dup 的 `/dev/mshv_vtl_low` fd）经 SCM_RIGHTS ship 给 VTL2 server 做零拷贝 DMA。
+//!      与 set_irqs 同理：**每次重连都重发**（server 重启后 DMA 表空），且必须在
+//!      `into_channel` 之前（借 `&mut client`）（err → backoff）
+//!   7. `into_channel` 拆全双工读写半
+//!   8. `reconnect_tx.send(Connected{writer,reader})`（Err = worker 已退出 → 整个
 //!      loop return）
-//!   8. 重置 backoff
-//!   9. `lost_rx.next().await` 等下次掉线（`None` = worker 已退出 → return）→ 回到 1
+//!   9. 重置 backoff
+//!   10. `lost_rx.next().await` 等下次掉线（`None` = worker 已退出 → return）→ 回到 1
 //!
 //! **backoff**：指数退避 100ms → 2s（每次失败翻倍，封顶 2s）；连接成功后重置回 100ms。
 //!
-//! 本模块纯 safe（无 SCM_RIGHTS 裸 fd 操作——`set_irqs` 的 fd 传递封在 W6a
-//! `vfio_user_device` 内）。
+//! 本模块纯 safe（无 SCM_RIGHTS 裸 fd 操作——`set_irqs` / `dma_map` 的 fd 传递封在
+//! W6a `vfio_user_device` 内；本模块只经 `AsFd`/`BorrowedFd` 安全传引用）。
 
 #![forbid(unsafe_code)]
 
@@ -43,6 +47,7 @@ use crate::identity::validate_identity;
 use crate::worker::ReconnectEvent;
 use cvm_tracing::CVM_ALLOWED;
 use futures::StreamExt as _;
+use guestmem::ShareableRegion;
 use mesh::Receiver;
 use mesh::Sender;
 use pal_async::driver::Driver;
@@ -51,6 +56,7 @@ use std::os::fd::AsFd;
 use std::os::fd::BorrowedFd;
 use std::time::Duration;
 use vfio_user_device::VfioUserClient;
+use vfio_user_wire::proto::dma_map_flags;
 use vfio_user_wire::proto::pci_irq;
 use vfio_user_wire::proto::pci_region;
 
@@ -84,12 +90,16 @@ fn next_backoff(cur: Duration) -> Duration {
 /// - `eventfds`：**持久** MSI-X eventfd（owned `pal_event::Event` clone，与 irq task
 ///   共享同一批底层 fd）；每次重连 C-3 重新 `set_irqs` 用。空 vec = 无 MSI-X，跳过
 ///   set_irqs。
+/// - `regions`：**W6c finding-④** VTL0 guest RAM 可共享区间（逐 ram() 段，含 dup'd
+///   `/dev/mshv_vtl_low` fd）；每次重连逐段 `dma_map` 给 VTL2 server 做零拷贝 DMA。
+///   空 vec = 无 DMA 映射（如 `sharing()` 返回 None 或 loopback 测试），跳过 DMA_MAP。
 /// - `ch`：connector 侧 channel 端点。
 pub async fn reconnect_loop(
     driver: impl Driver + Clone,
     unix_path: String,
     declared: DeclaredGeometry,
     eventfds: Vec<pal_event::Event>,
+    regions: Vec<ShareableRegion>,
     ch: ReconnectChannels,
 ) {
     let ReconnectChannels {
@@ -182,11 +192,51 @@ pub async fn reconnect_loop(
             }
         }
 
-        // ── 6. 拆全双工读写半（注意顺序：set_irqs 借 &mut client 在前，
+        // ── 6. W6c finding-④：逐 region 重发 DMA_MAP（把 VTL0 guest RAM 映射给
+        //       VTL2 server）。必须在 into_channel 之前（借 &mut client）。
+        //       **每次重连都重发**：每轮都是全新 client/socket，且 server 重启后其
+        //       DMA 表清空——与 C-3 set_irqs 同理，不重发则 revive 后 server 无法触达
+        //       guest RAM，所有 NVMe IO 的 PRP/SGL 数据传输都会失败。
+        //       `region.file.as_fd()` 是 safe（`AsFd`），保持 `#![forbid(unsafe_code)]`。
+        //       IOVA = 裸 `guest_address`；fd_offset = underhill 算好的 `file_offset`
+        //       （含 alias-map bit），二者在 alias-off 时相等。
+        {
+            let mut dma_failed = false;
+            for region in &regions {
+                if let Err(e) = client
+                    .dma_map(
+                        region.guest_address,
+                        region.size,
+                        dma_map_flags::READABLE | dma_map_flags::WRITEABLE,
+                        region.file.as_fd(),
+                        region.file_offset,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        CVM_ALLOWED,
+                        error = %e,
+                        gpa = region.guest_address,
+                        size = region.size,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "vfio_user_pci reconnect: dma_map failed; backing off"
+                    );
+                    dma_failed = true;
+                    break;
+                }
+            }
+            if dma_failed {
+                PolledTimer::new(&driver).sleep(backoff).await;
+                backoff = next_backoff(backoff);
+                continue;
+            }
+        }
+
+        // ── 7. 拆全双工读写半（注意顺序：set_irqs / dma_map 借 &mut client 在前，
         //       into_channel consume client 在后）──
         let (writer, reader) = client.into_channel();
 
-        // ── 7. 投递新连接给 worker（C-1：两半同一条消息）──
+        // ── 8. 投递新连接给 worker（C-1：两半同一条消息）──
         // mesh `Sender::send` 是 fire-and-forget（返 `()`）；用 `is_closed()` 检测
         // worker 是否已退出（其 `reconnect_rx` 被 drop）。已退出 → connector 收工。
         reconnect_tx.send(ReconnectEvent::Connected { writer, reader });
@@ -203,10 +253,10 @@ pub async fn reconnect_loop(
             "vfio_user_pci reconnect: connected, handed transport to worker"
         );
 
-        // ── 8. 连接成功，重置 backoff ──
+        // ── 9. 连接成功，重置 backoff ──
         backoff = BACKOFF_MIN;
 
-        // ── 9. 等下次掉线边沿信号（None = worker 退出 → 收工）──
+        // ── 10. 等下次掉线边沿信号（None = worker 退出 → 收工）──
         if lost_rx.next().await.is_none() {
             tracing::info!(
                 CVM_ALLOWED,
