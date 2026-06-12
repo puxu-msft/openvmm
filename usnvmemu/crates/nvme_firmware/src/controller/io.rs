@@ -1109,14 +1109,20 @@ impl NvmeController {
                             tracing::warn!(nsid, "B6b-4 N>2 READ 需 PRP2（指向 PRP-list 页）");
                             return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                         }
-                        if (prp1 & (NVME_PAGE_SIZE - 1)) != 0 || (prp2 & (NVME_PAGE_SIZE - 1)) != 0
-                        {
+                        // #4c-a：PRP1 可带任意页内偏移（spec §4.1.1）；PRP2 指向 PRP-list
+                        // 页，必须页对齐（非对齐 → PRP_OFFSET_INVALID）。MPTR 连续 buffer 任意 OK。
+                        if (prp2 & (NVME_PAGE_SIZE - 1)) != 0 {
                             tracing::warn!(
-                                prp1 = format_args!("{:#x}", prp1),
                                 prp2 = format_args!("{:#x}", prp2),
-                                "B6b-4 READ 要求 PRP1/PRP2 页对齐（教学边界；MPTR 连续 buffer 任意 offset OK）"
+                                "B6b-4 READ：PRP2（PRP-list 页指针）须页对齐"
                             );
-                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                            return Some(Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::PRP_OFFSET_INVALID,
+                            ));
                         }
                         let pi_type = ns.pi_type;
                         let pi_first = ns.pi_first;
@@ -1204,9 +1210,28 @@ impl NvmeController {
                         // 全 OK → 构造 PrpListOp（data_pages 已填齐 N 页，sep_meta.meta 已是
                         // tuple concat 待写 MPTR），fetch PRP list 页 + 起 PRP1 dma_write。
                         let op_id = self.alloc_op_id();
-                        let total_pages = nlb;
-                        let prp_data_pages: Vec<Option<Vec<u8>>> =
-                            data_pages.into_iter().map(Some).collect();
+                        // #4c-a：scatter 按 host-page 边界（PRP1 偏移 O → 首段 page−O、后续
+                        // 整页、末段 partial），与 LBA-data 边界不再一一对应。把 N 个已验证
+                        // 的 LBA-data 块拼回连续流，再按 prp::page_size 重切成 host 页 buffer
+                        // 供 scatter。O=0 时每页恰 1 LBA，与旧 per-LBA 路径逐字节一致。
+                        let prp_off = crate::controller::prp::prp1_offset(prp1);
+                        let total_data_bytes = nlb as u64 * data_bytes as u64;
+                        let total_pages =
+                            crate::controller::prp::total_pages(prp_off, total_data_bytes);
+                        let mut full = Vec::with_capacity(total_data_bytes as usize);
+                        for d in &data_pages {
+                            full.extend_from_slice(d);
+                        }
+                        let mut prp_data_pages: Vec<Option<Vec<u8>>> =
+                            Vec::with_capacity(total_pages as usize);
+                        let mut seg_off = 0usize;
+                        for p in 0..total_pages {
+                            let seg =
+                                crate::controller::prp::page_size(p, prp_off, total_data_bytes)
+                                    as usize;
+                            prp_data_pages.push(Some(full[seg_off..seg_off + seg].to_vec()));
+                            seg_off += seg;
+                        }
                         let mptr = sqe.mptr;
                         self.prp_list_ops.insert(
                             op_id,
@@ -2170,14 +2195,20 @@ impl NvmeController {
                             tracing::warn!(nsid, "B6b-4 N>2 WRITE 需 PRP2（指向 PRP-list 页）");
                             return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                         }
-                        if (prp1 & (NVME_PAGE_SIZE - 1)) != 0 || (prp2 & (NVME_PAGE_SIZE - 1)) != 0
-                        {
+                        // #4c-a：PRP1 可带任意页内偏移（spec §4.1.1）；PRP2 指向 PRP-list
+                        // 页，必须页对齐（非对齐 → PRP_OFFSET_INVALID）。MPTR 连续 buffer 任意 OK。
+                        if (prp2 & (NVME_PAGE_SIZE - 1)) != 0 {
                             tracing::warn!(
-                                prp1 = format_args!("{:#x}", prp1),
                                 prp2 = format_args!("{:#x}", prp2),
-                                "B6b-4 WRITE 要求 PRP1/PRP2 页对齐（教学边界；MPTR 连续 buffer 任意 offset OK）"
+                                "B6b-4 WRITE：PRP2（PRP-list 页指针）须页对齐"
                             );
-                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                            return Some(Cqe::error(
+                                cid,
+                                sq_id,
+                                sq_head,
+                                phase,
+                                sc::PRP_OFFSET_INVALID,
+                            ));
                         }
                         let block_bytes = ns.block_bytes() as u64;
                         let data_bytes = ns.data_bytes() as u64;
@@ -2215,7 +2246,13 @@ impl NvmeController {
                         let pi_first = ns.pi_first;
                         let mptr = sqe.mptr;
                         let prchk = crate::pi::PrChk::from_cdw12(cdw12);
-                        let total_pages = nlb; // data_bytes == NVME_PAGE_SIZE → 每 LBA 一页
+                        // #4c-a：PRP1 偏移 O → 首段 page−O、后续整页、末段 partial；
+                        // data 平面总字节 = nlb × data_bytes（=4096，metadata 经 MPTR）。
+                        // O=0 时 total_pages==nlb、每页恰 1 LBA，与旧路径一致。
+                        let prp_off = crate::controller::prp::prp1_offset(prp1);
+                        let total_data_bytes = nlb as u64 * data_bytes;
+                        let total_pages =
+                            crate::controller::prp::total_pages(prp_off, total_data_bytes);
                         let data_pages: Vec<Option<Vec<u8>>> = vec![None; total_pages as usize];
                         let op_id = self.alloc_op_id();
                         self.prp_list_ops.insert(
@@ -2262,8 +2299,10 @@ impl NvmeController {
                                 op: PendingOp::NvmWritePrpListFetch { op_id },
                             },
                         );
-                        // fetch PRP1 数据页（page_idx 0）
-                        let tok_prp1 = self.guest_read(ctx, prp1, NVME_PAGE_SIZE as u32);
+                        // fetch PRP1 数据页（page_idx 0）：首段 = 页 − PRP1 偏移。
+                        let first_seg =
+                            crate::controller::prp::page_size(0, prp_off, total_data_bytes);
+                        let tok_prp1 = self.guest_read(ctx, prp1, first_seg);
                         self.pending_ios.insert(
                             tok_prp1,
                             PendingIo {

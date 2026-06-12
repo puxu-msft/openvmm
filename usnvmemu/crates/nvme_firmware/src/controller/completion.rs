@@ -316,23 +316,31 @@ impl NvmeController {
             let pi_first = sm.pi_first;
             let block_bytes = sm.block_bytes as usize;
             let data_bytes = sm.data_bytes as usize;
-            let all_data_ok = op.data_pages.len() == num_blocks
-                && op
-                    .data_pages
-                    .iter()
-                    .all(|p| p.as_ref().map(|d| d.len()) == Some(data_bytes));
+            // #4c-a：data_pages 是 host-page-segmented（PRP1 偏移 O → 首段 page−O、
+            // 后续整页、末段 partial），与 LBA-data 边界不再一一对应。拼回连续 data
+            // 流（nlb × data_bytes）后按 data_bytes 重切 N 个 LBA-data 块（offset-
+            // agnostic）。O=0 时每页恰 1 LBA，与旧 per-LBA 路径逐字节一致。
+            let total_data = num_blocks * data_bytes;
+            let mut full = Vec::with_capacity(total_data);
+            for b in op.data_pages.iter().flatten() {
+                full.extend_from_slice(b);
+            }
+            let all_data_ok = full.len() >= total_data;
             if !all_data_ok || meta.len() < num_blocks * 8 {
                 tracing::warn!(
                     num_blocks,
+                    got = full.len(),
+                    want = total_data,
                     meta_len = meta.len(),
                     "PRP-list sep-meta WRITE DMA 长度不符"
                 );
                 Cqe::error(op.cid, op.sq_id, op.sq_head, phase, sc::DATA_TRANSFER_ERROR)
             } else {
+                full.truncate(total_data);
                 // ── ① verify 全部 N 块（任一失败 → 全不落盘，原子）──
                 let mut verify_err: Option<crate::pi::PiCheck> = None;
                 for i in 0..num_blocks {
-                    let data = op.data_pages[i].as_ref().unwrap();
+                    let data = &full[i * data_bytes..(i + 1) * data_bytes];
                     let tuple_arr: [u8; 8] = meta[i * 8..i * 8 + 8].try_into().unwrap();
                     let host_tuple = crate::pi::PiTuple::from_bytes(&tuple_arr);
                     match host_tuple.verify(data, op.lba + i as u64, pi_type, sm.prchk) {
@@ -364,7 +372,7 @@ impl NvmeController {
                     // ── ② 全通过 → interleave 逐块存盘 ──
                     let mut store_err = false;
                     for i in 0..num_blocks {
-                        let data = op.data_pages[i].as_ref().unwrap();
+                        let data = &full[i * data_bytes..(i + 1) * data_bytes];
                         let tuple_arr: [u8; 8] = meta[i * 8..i * 8 + 8].try_into().unwrap();
                         let mut block = vec![0u8; block_bytes];
                         if pi_first {

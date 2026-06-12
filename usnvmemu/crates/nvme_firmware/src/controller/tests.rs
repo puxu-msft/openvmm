@@ -2371,6 +2371,234 @@ fn b6b_n_gt_2_prp_list_separate_meta() {
     // 负例（block 2 坏）漏过 → 落盘 → "全不落盘"断言转红。两侧已实测，恢复后绿。
 }
 
+/// **#4c-a — separate-metadata（PRACT=0，N>2，PRP-list data）PRP1 页内偏移** 差分 oracle。
+///
+/// spec § 4.1.1：仅 PRP1 可带页内偏移，PRP2（PRP-list 页指针）/list-entry 须页对齐。
+/// separate NS 的 data 平面经 PRP（data_bytes=4096），metadata 经 MPTR 单条 DMA。
+/// PRP1 偏移 O 把 data 流（nlb×4096）按 host 页重分段——首段 page−O、后续整页、末段
+/// partial——与 LBA-data(4096)边界**不再一一对应**，故 controller 必须拼回连续流再按
+/// data_bytes 重切 N 块（WRITE finalize）/ 按 host 页重切 scatter（READ）。
+///
+/// 取 nlb=3、O=0x200：data 流 12288B 分 4 段 [3584,4096,4096,512]（比 O=0 多 1 页）。
+///   - WRITE：feed 4 段 → 拼回 → 切 3×4096 → 逐块 verify host PI → interleave 落盘；
+///     **独立 oracle 同时断 controller 请求的 DmaRead 段长 == [3584,4096,4096,512]**
+///     （封堵 page0 读成固定 4096 的盲点，B6c-3 HIGH 同类）。
+///   - READ：盘上 verify-all → 拼回 → 按 host 页重切 scatter；断 DmaWrite 段长 + 重组
+///     == data 流、MPTR == tuple concat。
+/// revert-verify：把 WRITE page0 读 / READ scatter 重切退回固定 4096 → 段长断言转红。
+#[test]
+fn b6b_n_gt_2_separate_meta_prp1_offset() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    const O: u64 = 0x200; // 512B 偏移
+    const PRP1: u64 = 0x4000 + O;
+    const LIST: u64 = 0x9000;
+    const PG1: u64 = 0x5000;
+    const PG2: u64 = 0x6000;
+    const PG3: u64 = 0x8000;
+    const MPTR: u64 = 0x7000;
+    // 段边界（spec 公式，独立 oracle）：首段 = 4096-O = 3584；中间整页；末段 partial。
+    let seg: [usize; 4] = [
+        4096 - O as usize,
+        4096,
+        4096,
+        3 * 4096 - (4096 - O as usize) - 4096 - 4096,
+    ];
+    fn sep_ns() -> NvmeController {
+        let mut c = make_ctrl_with_tmp("b6b_sep_off");
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+        ns.pi_first = true;
+        ns.meta_inline = false;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / ns.block_bytes();
+        c.cqs.insert(
+            1,
+            crate::regs::CompletionQueue {
+                base_gpa: 0x1_0000,
+                size: 64,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 0,
+                interrupt_enabled: false,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        c
+    }
+    let datas: Vec<Vec<u8>> = (0..3)
+        .map(|b| {
+            (0..4096)
+                .map(|i| ((i * (b + 3) * 5 + 13) & 0xff) as u8)
+                .collect()
+        })
+        .collect();
+    let tuples: Vec<[u8; 8]> = (0..3)
+        .map(|b| crate::pi::PiTuple::compute(&datas[b], b as u64, 1).to_bytes())
+        .collect();
+    let mut meta_concat = Vec::with_capacity(24);
+    for t in &tuples {
+        meta_concat.extend_from_slice(t);
+    }
+    // data-only 连续流（separate：metadata 不在流里）。
+    let mut stream = Vec::with_capacity(3 * 4096);
+    for d in &datas {
+        stream.extend_from_slice(d);
+    }
+    // PRP-list 页：3 个 entry（PG1/PG2/PG3）——偏移使页数从 3 升到 4。
+    let mut list_page = vec![0u8; 4096];
+    list_page[0..8].copy_from_slice(&PG1.to_le_bytes());
+    list_page[8..16].copy_from_slice(&PG2.to_le_bytes());
+    list_page[16..24].copy_from_slice(&PG3.to_le_bytes());
+    // 段 i 在流中的切片。
+    let seg_slice = |i: usize| -> Vec<u8> {
+        let start: usize = seg[..i].iter().sum();
+        stream[start..start + seg[i]].to_vec()
+    };
+
+    // ── WRITE：偏移 gather → verify → interleave 落盘 ──
+    {
+        let mut c = sep_ns();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x01, 1, 0, 3, PRP1, false, 0xC0);
+            sqe.prp2 = LIST;
+            sqe.mptr = MPTR;
+            let r = c.dispatch_io(&mut ctx, 1, sqe, 0xC0, 0, 1);
+            assert!(r.is_none(), "偏移 N>2 separate WRITE 走异步 PRP-list");
+            enum T {
+                List,
+                Data(u32),
+                Meta,
+            }
+            let init: Vec<(u64, T)> = c
+                .pending_ios
+                .iter()
+                .map(|(&t, p)| match p.op {
+                    PendingOp::NvmWritePrpListFetch { .. } => (t, T::List),
+                    PendingOp::NvmWritePrpListData { page_idx, .. } => (t, T::Data(page_idx)),
+                    PendingOp::NvmWritePrpListSepMeta { .. } => (t, T::Meta),
+                    _ => unreachable!(),
+                })
+                .collect();
+            for (t, tag) in init {
+                match tag {
+                    T::List => c.on_dma_complete_impl(&mut ctx, t, true, list_page.clone()),
+                    T::Data(p) => c.on_dma_complete_impl(&mut ctx, t, true, seg_slice(p as usize)),
+                    T::Meta => c.on_dma_complete_impl(&mut ctx, t, true, meta_concat.clone()),
+                }
+            }
+            let rest: Vec<(u64, u32)> = c
+                .pending_ios
+                .iter()
+                .filter_map(|(&t, p)| match p.op {
+                    PendingOp::NvmWritePrpListData { page_idx, .. } => Some((t, page_idx)),
+                    _ => None,
+                })
+                .collect();
+            for (t, p) in rest {
+                c.on_dma_complete_impl(&mut ctx, t, true, seg_slice(p as usize));
+            }
+        }
+        // **独立 oracle（防 page0 固定 4096 盲点）**：data-page DMA-read 段长须 == 偏移分段。
+        let mut reads: Vec<(u64, u32)> = cap
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                TransportEvent::DmaRead { gpa, len, .. }
+                    if *gpa == PRP1 || *gpa == PG1 || *gpa == PG2 || *gpa == PG3 =>
+                {
+                    Some((*gpa, *len))
+                }
+                _ => None,
+            })
+            .collect();
+        reads.sort();
+        assert_eq!(
+            reads,
+            vec![
+                (PRP1, seg[0] as u32),
+                (PG1, seg[1] as u32),
+                (PG2, seg[2] as u32),
+                (PG3, seg[3] as u32),
+            ],
+            "WRITE gather 请求段长须含 PRP1 偏移（首段 page-O，非固定 4096）"
+        );
+        let ns = c.namespaces.get(&1).unwrap();
+        for b in 0..3 {
+            let mut buf = vec![0u8; 4104];
+            ns.read_at(&mut buf, (b * 4104) as u64).unwrap();
+            assert_eq!(&buf[0..8], &tuples[b][..], "偏移 sep WRITE block {b} tuple");
+            assert_eq!(
+                &buf[8..4104],
+                &datas[b][..],
+                "偏移 sep WRITE block {b} data"
+            );
+        }
+    }
+
+    // ── READ：盘上 verify-all → 偏移 scatter → host 重组 ──
+    {
+        let mut c = sep_ns();
+        {
+            let ns = c.namespaces.get_mut(&1).unwrap();
+            for b in 0..3 {
+                let mut block = vec![0u8; 4104];
+                block[0..8].copy_from_slice(&tuples[b]);
+                block[8..4104].copy_from_slice(&datas[b]);
+                ns.write_at(&block, (b * 4104) as u64).unwrap();
+            }
+        }
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x02, 1, 0, 3, PRP1, false, 0xC1);
+            sqe.prp2 = LIST;
+            sqe.mptr = MPTR;
+            let r = c.dispatch_io(&mut ctx, 1, sqe, 0xC1, 0, 1);
+            assert!(r.is_none(), "偏移 N>2 separate READ 走异步 scatter");
+            let t_list = *c.pending_ios.keys().next().unwrap();
+            c.on_dma_complete_impl(&mut ctx, t_list, true, list_page.clone());
+            // 4 data scatter + 1 MPTR write。
+            assert_eq!(c.pending_ios.len(), 5, "4 data scatter + 1 MPTR write");
+            let toks: Vec<u64> = c.pending_ios.keys().copied().collect();
+            for t in toks {
+                c.on_dma_complete_impl(&mut ctx, t, true, Vec::new());
+            }
+        }
+        let mut writes: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+        for e in cap.events() {
+            if let TransportEvent::DmaWrite { gpa, data, .. } = e {
+                writes.insert(*gpa, data.clone());
+            }
+        }
+        // 段长：PRP1 收首段 page-O，PG1/PG2 整页，PG3 末段。
+        assert_eq!(
+            writes.get(&PRP1).map(|d| d.len()),
+            Some(seg[0]),
+            "PRP1 首段"
+        );
+        assert_eq!(writes.get(&PG1).map(|d| d.len()), Some(seg[1]), "PG1 整页");
+        assert_eq!(writes.get(&PG2).map(|d| d.len()), Some(seg[2]), "PG2 整页");
+        assert_eq!(writes.get(&PG3).map(|d| d.len()), Some(seg[3]), "PG3 末段");
+        let mut got = Vec::new();
+        got.extend_from_slice(&writes[&PRP1]);
+        got.extend_from_slice(&writes[&PG1]);
+        got.extend_from_slice(&writes[&PG2]);
+        got.extend_from_slice(&writes[&PG3]);
+        assert_eq!(got, stream, "偏移 sep READ 重组 == 盘上 data 流");
+        assert_eq!(
+            writes.get(&MPTR).map(|d| &d[..]),
+            Some(&meta_concat[..]),
+            "N×8 PI tuple concat → MPTR"
+        );
+    }
+}
+
 /// **C1① MDTS 计入 inline metadata（spec § 5.17.2.2 / § 8.x）差分 oracle** —
 /// extended-LBA（内联 metadata）的 host 传输大小 = block_bytes(data+meta)，MDTS
 /// 须计入 metadata。PI 格式 4104 B/LBA，MDTS=128 KiB：
