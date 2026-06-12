@@ -59,6 +59,32 @@ pub(crate) async fn read_message(sock: &AsyncSocket) -> anyhow::Result<WireMessa
     Ok(WireMessage { header, payload })
 }
 
+/// **CMB-P4 (map 模式)** — 读一帧并**捕获**随首字节到达的 SCM_RIGHTS fd（map 模式
+/// `GET_REGION_INFO` reply 带 CMB region memfd）。返回 `(WireMessage, Vec<OwnedFd>)`。
+///
+/// fd 仅随 header（首字节）到达，故 header 段用 [`AsyncSocket::recv_exact_with_fds`]
+/// 捕获；payload 段无 fd（用普通 `recv_exact`）。普通 reply 无 fd → 返回空 Vec，与
+/// [`read_message`] 等价（故只在确实期待 fd 的 map 路径用本函数）。
+pub(crate) async fn read_message_with_fds(
+    sock: &AsyncSocket,
+) -> anyhow::Result<(WireMessage, Vec<std::os::fd::OwnedFd>)> {
+    let mut hdr_buf = [0u8; HEADER_LEN];
+    let fds = sock
+        .recv_exact_with_fds(&mut hdr_buf)
+        .await
+        .context("read_message_with_fds: read header + fds")?;
+    let header = decode_header(&hdr_buf).context("read_message_with_fds: decode_header")?;
+    let msg_size = header.msg_size as usize;
+    let payload_len = msg_size
+        .checked_sub(HEADER_LEN)
+        .context("read_message_with_fds: msg_size < HEADER_LEN")?;
+    let mut payload = vec![0u8; payload_len];
+    sock.recv_exact(&mut payload)
+        .await
+        .context("read_message_with_fds: read payload")?;
+    Ok((WireMessage { header, payload }, fds))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

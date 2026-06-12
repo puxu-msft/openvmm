@@ -28,4 +28,5 @@ pcie_device_core = { path = "../pcie_device_core" }
 # W3 loopback 测的 "guest RAM" backing file（避开 client 侧 mmap/unsafe，用 FileExt 读写）。
 tempfile = "3"
 # W4 loopback 测建/读 MSI-X eventfd（client 只发 BorrowedFd，不再依赖 nix 收发 → nix 降为 dev）。
-nix = { version = "0.30", features = ["socket", "uio", "event"] }
+# CMB-P4: `fs` feature 供 recv_exact_with_fds 测建 memfd（memfd_create）。
+nix = { version = "0.30", features = ["socket", "uio", "event", "fs"] }

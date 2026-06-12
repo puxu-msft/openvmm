@@ -11,6 +11,7 @@ use crate::async_socket::split_full_duplex;
 use crate::channel::VfioUserReader;
 use crate::channel::VfioUserWriter;
 use crate::framing::read_message;
+use crate::framing::read_message_with_fds;
 use crate::framing::write_message;
 use anyhow::Context as _;
 use anyhow::anyhow;
@@ -254,6 +255,40 @@ impl VfioUserClient {
         };
         let reply = self.request(Command::DeviceGetRegionInfo, &req).await?;
         Self::decode_reply_payload(&reply, Command::DeviceGetRegionInfo)
+    }
+
+    /// **CMB-P4 (map 模式)** — 查 region info 并**捕获** map 模式 reply 附带的 region fd。
+    ///
+    /// 返回 `(RegionInfoPayload, Vec<OwnedFd>)`：若 server 在 map 模式置 `FLAG_MMAP` 并
+    /// 经 SCM_RIGHTS 附 CMB region memfd → `fds` 含该 fd（caller `mmap` 它即可零拷贝直访
+    /// 同一物理页）；trap/降级模式（无 MMAP）→ `fds` 空。与 [`get_region_info`] 的区别
+    /// 仅在收 reply 时捕获 fd（普通查询用前者即可）。
+    ///
+    /// [`get_region_info`]: Self::get_region_info
+    pub async fn get_region_info_with_fd(
+        &mut self,
+        index: u32,
+    ) -> anyhow::Result<(RegionInfoPayload, Vec<std::os::fd::OwnedFd>)> {
+        let msg_id = self.alloc_msg_id();
+        let req = RegionInfoPayload {
+            argsz: core::mem::size_of::<RegionInfoPayload>() as u32,
+            index,
+            ..Default::default()
+        };
+        let hdr = Header::command(
+            msg_id,
+            Command::DeviceGetRegionInfo,
+            req.as_bytes().len() as u32,
+        );
+        write_message(&self.sock, &hdr, req.as_bytes(), &[])
+            .await
+            .context("send GET_REGION_INFO (with fd)")?;
+        let (reply, fds) = read_message_with_fds(&self.sock)
+            .await
+            .context("recv GET_REGION_INFO reply (with fd)")?;
+        Self::expect_reply(&reply, msg_id, Command::DeviceGetRegionInfo)?;
+        let info = Self::decode_reply_payload(&reply, Command::DeviceGetRegionInfo)?;
+        Ok((info, fds))
     }
 
     /// DEVICE_GET_IRQ_INFO：查某 IRQ type 的向量数 / flags。

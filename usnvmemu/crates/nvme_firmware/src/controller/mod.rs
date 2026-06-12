@@ -2374,6 +2374,45 @@ impl NvmeController {
     /// 校验（architect 复核 #8）：size 须为 unit 的非零倍数且 SZ（bits31:12）不溢出
     /// 20 位；bir 不得为 0（BAR0 是 doorbell/MSI-X 区，CMB 绝不能与之重叠）。
     pub fn enable_cmb(&mut self, size_bytes: u64, bir: u8) -> anyhow::Result<()> {
+        let backing: Box<dyn SharedRamRegion> = Box::new(VecRamRegion::new(size_bytes as usize));
+        self.enable_cmb_with_backing(backing, bir)
+    }
+
+    /// **CMB-P4 (map 模式)** — 用**外部注入的** [`SharedRamRegion`] backing 启用 CMB。
+    ///
+    /// firmware core 是 runtime-agnostic + `forbid(unsafe_code)`，**不能自造 memfd**；
+    /// 故 map 模式下由 transport（`vfio_user_transport`，允许 unsafe）造
+    /// `MemfdRamRegion`（可经 fd 暴露给 client mmap）注入。trap/测试路径仍用
+    /// [`enable_cmb`](Self::enable_cmb)（内部造 `VecRamRegion`，`as_fd` 返 None）。
+    ///
+    /// CMB 的 `size_bytes` 取自 `backing.len()`（backing 即真相源，避免"声明 size 与
+    /// 实际 backing 长度漂移"——CmbState 仍 debug_assert 二者相等）。校验同 `enable_cmb`：
+    /// size 为 4 KiB 非零倍数 + 2 的幂 + SZ 不溢出；bir ∈ [1,5]。backing 是否可 mmap
+    /// （`as_fd` Some/None）由 transport 在 `GET_REGION_INFO` 时决定 map vs 降级 trap，
+    /// **不影响 firmware 控制逻辑**（两模一致，设计 §2）。
+    pub fn enable_cmb_with_backing(
+        &mut self,
+        backing: Box<dyn SharedRamRegion>,
+        bir: u8,
+    ) -> anyhow::Result<()> {
+        let size_bytes = backing.len() as u64;
+        let sz_units = Self::validate_cmb_params(size_bytes, bir)?;
+        self.cmb = Some(CmbState::new(backing, bir));
+        // 重建 CAP 以置 CMBS（保留当前 MQES）。
+        let entries = (self.cap & 0xffff) as u32 + 1;
+        self.cap = crate::regs::build_cap(entries, true);
+        tracing::info!(
+            size_bytes,
+            bir,
+            sz_units,
+            "CMB enabled（advertise CAP.CMBS）"
+        );
+        Ok(())
+    }
+
+    /// CMB 参数校验（`enable_cmb` / `enable_cmb_with_backing` 共用单一真相源）。
+    /// 成功返回 `sz_units`（CMBSZ.SZ 字段值，供日志）。
+    fn validate_cmb_params(size_bytes: u64, bir: u8) -> anyhow::Result<u32> {
         const CMB_SZU: u32 = 0; // 教学版固定 4 KiB size unit
         let unit = crate::regs::cmbsz::unit_bytes(CMB_SZU);
         if size_bytes == 0 || !size_bytes.is_multiple_of(unit) {
@@ -2402,18 +2441,7 @@ impl NvmeController {
         if bir > 5 {
             return Err(anyhow::anyhow!("cmb bir {bir} 非法：BAR 索引须 ∈ [1, 5]"));
         }
-        let backing: Box<dyn SharedRamRegion> = Box::new(VecRamRegion::new(size_bytes as usize));
-        self.cmb = Some(CmbState::new(backing, bir));
-        // 重建 CAP 以置 CMBS（保留当前 MQES）。
-        let entries = (self.cap & 0xffff) as u32 + 1;
-        self.cap = crate::regs::build_cap(entries, true);
-        tracing::info!(
-            size_bytes,
-            bir,
-            sz_units,
-            "CMB enabled（advertise CAP.CMBS）"
-        );
-        Ok(())
+        Ok(sz_units as u32)
     }
 
     /// **2026-06-09** — 运行时设置本次模拟的 **IO queue 对数上限**（Set Features
@@ -4305,6 +4333,22 @@ impl PcieDevice for NvmeController {
         // 与 `MAX_SHADOW_POLL_ITERS` 自喂防护同栈外纪律）。
         self.drain_cmb_completions(ctx);
     }
+
+    /// **CMB-P4 (map 模式)** — 暴露 CMB BAR 的可 mmap fd（若 backing 是 memfd-backed）。
+    ///
+    /// transport 在 `GET_REGION_INFO` 时调用：`bar == cmb.bir` 且 backing 的
+    /// [`as_fd`](pcie_device_core::SharedRamRegion::as_fd) 为 `Some`（map 模式注入了
+    /// `MemfdRamRegion`）→ 返回该 fd → transport 置 FLAG_MMAP + 附 fd（零拷贝）；
+    /// backing 是 `VecRamRegion`（trap/测试）→ `as_fd` 返 None → transport 降级 trap。
+    /// 非 CMB BAR / CMB 未启用 → None。firmware 控制逻辑两模一致（设计 §2）。
+    fn cmb_region_fd(&self, bar: u32) -> Option<std::os::fd::BorrowedFd<'_>> {
+        let cmb = self.cmb.as_ref()?;
+        if bar == cmb.bir as u32 {
+            cmb.backing.as_fd()
+        } else {
+            None
+        }
+    }
 }
 
 /// Parse a PRP list page (4 KiB = 512 u64 entries) into Vec<u64>。
@@ -5339,6 +5383,42 @@ mod cmb_tests {
         assert!(c.enable_cmb(3 * 4096, 2).is_err());
         // 合法。
         assert!(c.enable_cmb(CMB_SIZE, 2).is_ok());
+    }
+
+    /// **CMB-P4** — `enable_cmb_with_backing` 接受外部注入的 `SharedRamRegion`：
+    /// CMB size 取自 `backing.len()`，校验同 `enable_cmb`，并据此 advertise CAP.CMBS
+    /// 与 describe() 出 CMB BAR。证明 firmware-core 不自造 backing 也能启用 CMB（map
+    /// 模式下 transport 注入 memfd-backed region）。
+    #[test]
+    fn enable_cmb_with_injected_backing() {
+        use pcie_device_core::VecRamRegion;
+        let mut c = mk();
+        // 注入一段外部 backing（这里用 Vec 代 memfd；真 memfd 注入在 transport/e2e 验）。
+        let backing: Box<dyn pcie_device_core::SharedRamRegion> =
+            Box::new(VecRamRegion::new(CMB_SIZE as usize));
+        assert!(c.enable_cmb_with_backing(backing, CMB_BIR).is_ok());
+        // CAP.CMBS + describe CMB BAR 与 enable_cmb 路径一致。
+        let d = c.describe();
+        let cmb_bar = d.bars.iter().find(|b| b.index == CMB_BIR).expect("CMB BAR");
+        assert_eq!(
+            cmb_bar.size, CMB_SIZE,
+            "注入 backing 的 size 取自 backing.len()"
+        );
+    }
+
+    /// **CMB-P4** — 注入 backing 路径同样校验 size/bir（非法 bir 被拒），确保两入口
+    /// 共用同一校验真相源（`validate_cmb_params`）。
+    #[test]
+    fn enable_cmb_with_backing_validates_params() {
+        use pcie_device_core::VecRamRegion;
+        let mut c = mk();
+        let backing: Box<dyn pcie_device_core::SharedRamRegion> =
+            Box::new(VecRamRegion::new(CMB_SIZE as usize));
+        // bir=0（BAR0 禁用）→ 拒。
+        assert!(c.enable_cmb_with_backing(backing, 0).is_err());
+        // 非 2 的幂 size（3×4 KiB）→ 拒。
+        let bad: Box<dyn pcie_device_core::SharedRamRegion> = Box::new(VecRamRegion::new(3 * 4096));
+        assert!(c.enable_cmb_with_backing(bad, 2).is_err());
     }
 
     // ---------------- 3) CMBLOC/CMBSZ 编码（CRE 置位后反映真值） ----------------

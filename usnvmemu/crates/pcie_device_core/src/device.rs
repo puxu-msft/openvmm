@@ -120,6 +120,24 @@ pub trait PcieDevice: 'static {
     fn on_dma_complete(&mut self, ctx: &mut DeviceCtx<'_>, token: u64, ok: bool, data: Vec<u8>) {
         let _ = (ctx, token, ok, data);
     }
+
+    /// **CMB-P4 (map 模式)** — 若给定 BAR 是一条 **map 模式可零拷贝** 的数据 BAR
+    /// （如 NVMe CMB，其 backing 由可 mmap 的 fd 支撑），返回该 fd 的 [`BorrowedFd`]；
+    /// 否则 `None`。
+    ///
+    /// transport 在 `GET_REGION_INFO` 时调用：返回 `Some(fd)` → 置 `FLAG_MMAP` + 经
+    /// SCM_RIGHTS 把 fd 附在 reply 里（client mmap → guest 零拷贝直访）；返回 `None`
+    /// → **降级 trap 模式**（不置 MMAP、不附 fd，访问走 REGION_READ/WRITE 转发到
+    /// `mmio_read/write`），功能仍正确、只是非零拷贝。
+    ///
+    /// **default `None`**：绝大多数 BAR（寄存器、MSI-X、trap-only CMB）无可共享 fd。
+    /// 这是 transport-neutral hook：firmware 把它实现为"当 `bar == cmb.bir` 且 CMB
+    /// backing 的 [`SharedRamRegion::as_fd`](crate::SharedRamRegion::as_fd) 为 Some 时返回
+    /// 它"——backing 是否 memfd-backed（map）还是 Vec-backed（trap 降级）由注入决定。
+    fn cmb_region_fd(&self, bar: u32) -> Option<std::os::fd::BorrowedFd<'_>> {
+        let _ = bar;
+        None
+    }
 }
 
 /// 设备实现可调用的上下文。挂载在 `mmio_write` / `tick` / `on_dma_complete`

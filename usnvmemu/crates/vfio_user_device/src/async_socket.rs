@@ -123,6 +123,34 @@ impl AsyncSocket {
     pub(crate) fn into_polled(self) -> PolledSocket<UnixStream> {
         self.socket.into_inner()
     }
+
+    /// **CMB-P4 (map 模式)** — 收满 `buf.len()` 字节，并**捕获**随首字节到达的 SCM_RIGHTS
+    /// fd（vfio-user spec：所有 fd 跟首字节走）。返回收到的 [`OwnedFd`]（drop 自动 close）。
+    ///
+    /// 与 [`recv_exact`](Self::recv_exact)（丢弃意外 fd）的区别：本方法**期待**并保留 fd
+    /// （map 模式的 `GET_REGION_INFO` reply 带 CMB region memfd）。fd 仅在首段（含首字节）
+    /// 收集——续读段若再带 fd（spec 不应发生）由 [`recv_exact`] 语义 drop 防泄漏。
+    pub(crate) async fn recv_exact_with_fds(&self, buf: &mut [u8]) -> io::Result<Vec<OwnedFd>> {
+        let mut read = 0;
+        let mut fds: Vec<OwnedFd> = Vec::new();
+        while read < buf.len() {
+            let first = read == 0;
+            let (n, got) = poll_fn(|cx| {
+                self.socket
+                    .lock()
+                    .poll_io(cx, InterestSlot::Read, PollEvents::IN, |socket| {
+                        try_recv_collect_fds(socket.get(), &mut buf[read..], first)
+                    })
+            })
+            .await?;
+            if n == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            fds.extend(got);
+            read += n;
+        }
+        Ok(fds)
+    }
 }
 
 /// 把一条 `PolledSocket` 拆成全双工读写半（W6b）。两半经 pal_async 内部 `Arc` 共享同一
@@ -324,6 +352,80 @@ fn try_recv(socket: &UnixStream, buf: &mut [u8]) -> io::Result<usize> {
     Ok(n as usize)
 }
 
+/// **CMB-P4** — recvmsg 收字节并**捕获** SCM_RIGHTS fd（仅 `collect=true` 的首段；续段
+/// 仍 drop 任何意外 fd 防泄漏）。返回 `(读到字节数, 收到的 OwnedFd)`。可能 `WouldBlock`
+/// （poll_io 重试）。镜像 [`try_recv`] 的截断/非 SCM_RIGHTS 处理，仅在 `collect` 时把
+/// SCM_RIGHTS fd 转成 `OwnedFd` 返回而非 drop。
+#[expect(clippy::allow_attributes)]
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "libc::cmsghdr 在 gnu vs musl 上类型定义不同"
+)]
+fn try_recv_collect_fds(
+    socket: &UnixStream,
+    buf: &mut [u8],
+    collect: bool,
+) -> io::Result<(usize, Vec<OwnedFd>)> {
+    assert!(!buf.is_empty());
+    let mut iov = IoSliceMut::new(buf);
+
+    // SAFETY: type has no invariants
+    let mut cmsg: CmsgScmRights = unsafe { std::mem::zeroed() };
+    // SAFETY: type has no invariants
+    let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    hdr.msg_iov = std::ptr::from_mut(&mut iov).cast::<libc::iovec>();
+    hdr.msg_iovlen = 1;
+    hdr.msg_control = std::ptr::from_mut(&mut cmsg).cast::<libc::c_void>();
+    hdr.msg_controllen = size_of_val(&cmsg) as _;
+
+    // SAFETY: 用正确初始化的缓冲调用 recvmsg。
+    let n = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut hdr, libc::MSG_CMSG_CLOEXEC) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if n == 0 {
+        return Ok((0, Vec::new()));
+    }
+
+    // 截断：先 close 已安装的部分 fd 再返 EMSGSIZE（防泄漏，对齐 try_recv）。
+    if hdr.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+        if hdr.msg_controllen > 0
+            && cmsg.hdr.cmsg_level == libc::SOL_SOCKET
+            && cmsg.hdr.cmsg_type == libc::SCM_RIGHTS
+        {
+            let fd_count = ((cmsg.hdr.cmsg_len as usize).saturating_sub(size_of_val(&cmsg.hdr))
+                / size_of::<RawFd>())
+            .min(MAX_FDS);
+            for &raw_fd in &cmsg.fds[..fd_count] {
+                // SAFETY: 内核已把这些 fd 所有权转移给我们；drop 关闭。
+                drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+            }
+        }
+        return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
+    }
+
+    let mut fds: Vec<OwnedFd> = Vec::new();
+    if hdr.msg_controllen > 0 {
+        if cmsg.hdr.cmsg_level != libc::SOL_SOCKET || cmsg.hdr.cmsg_type != libc::SCM_RIGHTS {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let fd_count = ((cmsg.hdr.cmsg_len as usize).saturating_sub(size_of_val(&cmsg.hdr))
+            / size_of::<RawFd>())
+        .min(MAX_FDS);
+        for &raw_fd in &cmsg.fds[..fd_count] {
+            // SAFETY: 内核已把这些 fd 所有权转移给我们。collect 时返回（owner 给 caller），
+            // 否则 drop 关闭防泄漏。
+            let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+            if collect {
+                fds.push(owned);
+            } else {
+                drop(owned);
+            }
+        }
+    }
+    Ok((n as usize, fds))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +465,52 @@ mod tests {
             let mut got = vec![0u8; payload.len()];
             sb.recv_exact(&mut got).await.unwrap();
             assert_eq!(got, payload);
+        });
+    }
+
+    /// **CMB-P4** — `recv_exact_with_fds` 捕获随首字节到达的 SCM_RIGHTS fd：peer 发
+    /// payload + 1 个 memfd（写了 marker），client 收字节 **且** 拿到 OwnedFd；经捕获的
+    /// fd 读文件应读到 peer 写的 marker（证 fd 真传达 + 同一 memfd）。这是 map 模式
+    /// client 收 region fd 的底层能力（真零拷贝 mmap 闭环由 nvme_firmware 的 map e2e 证）。
+    #[test]
+    fn recv_exact_with_fds_captures_memfd() {
+        use std::io::Read as _;
+        use std::io::Seek as _;
+        use std::io::Write as _;
+        DefaultPool::run_with(async |driver| {
+            let (a, b) = UnixStream::pair().unwrap();
+            let client = AsyncSocket::new(PolledSocket::new(&driver, a).unwrap());
+            // peer 建 memfd，写 marker，经 SCM_RIGHTS 发出。
+            let memfd =
+                nix::sys::memfd::memfd_create(c"recv-fd-test", nix::sys::memfd::MFdFlags::empty())
+                    .unwrap();
+            let mut f = std::fs::File::from(memfd);
+            let marker = 0xABCD_1234_5678_9999u64;
+            f.write_all(&marker.to_le_bytes()).unwrap();
+            f.flush().ok();
+            let memfd = std::os::fd::OwnedFd::from(f);
+
+            let payload = b"region-fd-msg!!!".to_vec();
+            let iov = [IoSlice::new(&payload)];
+            let peer = AsyncSocket::new(PolledSocket::new(&driver, b).unwrap());
+            peer.send_with_fds(&iov, &[memfd.as_fd()]).await.unwrap();
+
+            // client 收字节 + 捕获 fd。
+            let mut got = vec![0u8; payload.len()];
+            let fds = client.recv_exact_with_fds(&mut got).await.unwrap();
+            assert_eq!(got, payload);
+            assert_eq!(fds.len(), 1, "应捕获到 1 个 region fd");
+
+            // 经捕获的 fd 读文件（同一 memfd）→ 读到 peer 写的 marker。
+            let mut cf = std::fs::File::from(fds.into_iter().next().unwrap());
+            cf.seek(std::io::SeekFrom::Start(0)).unwrap();
+            let mut buf = [0u8; 8];
+            cf.read_exact(&mut buf).unwrap();
+            assert_eq!(
+                u64::from_le_bytes(buf),
+                marker,
+                "经捕获 fd 读到 peer 写入的 marker（同一 memfd）"
+            );
         });
     }
 

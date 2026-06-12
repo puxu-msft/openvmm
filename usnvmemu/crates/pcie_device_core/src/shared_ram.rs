@@ -37,6 +37,22 @@ pub trait SharedRamRegion {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// **CMB-P4 (map 模式)** — 若本 backing 由一个**可被对端 mmap 的 fd** 支撑
+    /// （如 memfd），返回它的 [`BorrowedFd`]；否则 `None`。
+    ///
+    /// 这是 map-based CMB 零拷贝的唯一承重点：transport 在 map 模式下把该 fd 经
+    /// SCM_RIGHTS 附在 `GET_REGION_INFO` reply 里，client `mmap` 后 guest 零拷贝直访
+    /// 同一物理页（server 经自己的 [`as_bytes`](Self::as_bytes) 看到同一内存）。
+    ///
+    /// **default `None`**：`#![forbid(unsafe_code)]` 的本 domain core 只定义这个**安全**
+    /// 接口；纯内存 backing（如 [`VecRamRegion`]）无可共享 fd → 返 `None` → transport
+    /// **降级 trap 模式**（不置 FLAG_MMAP、不附 fd），功能仍正确、只是非零拷贝。真正
+    /// 能 mmap 的 backing（memfd）由各 transport adapter 在自己（允许 unsafe 的）crate
+    /// 里实现并 override 本方法。
+    fn as_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        None
+    }
 }
 
 /// `Vec<u8>` backed 的中立 [`SharedRamRegion`]：测试 / 无 transport 时用。
@@ -107,5 +123,18 @@ mod tests {
         boxed.as_bytes_mut()[0] = 0x5A;
         assert_eq!(boxed.as_bytes()[0], 0x5A);
         assert_eq!(boxed.len(), 16);
+    }
+
+    /// **CMB-P4** — Vec backing（纯内存，无可共享 fd）的 `as_fd` 默认返 `None`，
+    /// 故 transport 见 `None` 时降级 trap 模式（不 mmap）。这是降级路径的判据。
+    #[test]
+    fn vec_region_as_fd_is_none() {
+        let r = VecRamRegion::new(4096);
+        assert!(
+            r.as_fd().is_none(),
+            "Vec backing 无可 mmap 的 fd → None → 降级 trap"
+        );
+        let boxed: Box<dyn SharedRamRegion> = Box::new(VecRamRegion::new(8));
+        assert!(boxed.as_fd().is_none(), "trait object 路径同样返 None");
     }
 }

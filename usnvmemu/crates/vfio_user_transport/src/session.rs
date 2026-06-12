@@ -350,9 +350,8 @@ impl VfioUserSession {
         // 故 CMB 数据 BAR（index = CMBLOC.BIR）天然被纳入。先把 size 抽到 owned local，
         // 结束 describe 借用，再 match（match 臂里的 send_err 需 &mut self）。
         let region_size = Self::region_size(self.describe_for(device), idx);
-        let (flags, size) = match idx {
-            // 任何在 describe() 出现的 BAR / CONFIG → R/W；size>0 即服务。CMB BAR 是
-            // **trap 模式**：回 (READ|WRITE)，**不**置 FLAG_MMAP（mmap 是 P4 的事）。
+        let (mut flags, size) = match idx {
+            // 任何在 describe() 出现的 BAR / CONFIG → R/W；size>0 即服务。
             _ if idx < pci_region::NUM_REGIONS => {
                 if region_size == 0 {
                     (0u32, 0u64)
@@ -370,17 +369,45 @@ impl VfioUserSession {
                 return Ok(());
             }
         };
+        // **CMB-P4 (map 模式)** — 若本 region 是一条 map 模式可零拷贝的数据 BAR（CMB
+        // backing 由 memfd 支撑），`device.cmb_region_fd(idx)` 返 `Some(fd)`：置 FLAG_MMAP
+        // 并把 fd 经 SCM_RIGHTS 附在 reply 里，client mmap 后 guest 零拷贝直访（无 REGION_RW
+        // 往返）。返 `None`（Vec backing / 非 CMB BAR / CMB 未启用）→ **降级 trap 模式**：
+        // 不置 MMAP、不附 fd，访问走 REGION_READ/WRITE。
+        // **降级在 session 层静默**（reviewer M3）：`None` 多义（绝大多数普通 BAR 本就返
+        // None），session 无法区分"本应 map 却无 fd（异常）"vs"本就 trap-only（正常）"，
+        // 在此对所有 None 打 warn 会对正常配置 spurious 噪声。是否告警由**知道意图的上层**
+        // 决定（P5：CLI `--cmb-mode map` 在 transport 不支持时的协商降级告警）。
+        //
+        // 注：fd 借 `device`（&D），reply 借 `&mut self`，两者不相交，借用安全。
+        let region_fd = if size > 0 {
+            device.cmb_region_fd(idx)
+        } else {
+            None
+        };
+        let map_mode = region_fd.is_some();
+        if map_mode {
+            flags |= region_flags::MMAP;
+        }
         let pl = RegionInfoPayload {
             argsz: core::mem::size_of::<RegionInfoPayload>() as u32,
             flags,
             index: idx,
             cap_offset: 0,
             size,
+            // 整-region mmap：从 region 起点（offset 0）映射整段，无 sparse cap。
             offset: 0,
         };
         let hdr = Header::reply_ok(id, Command::DeviceGetRegionInfo, pl.as_bytes().len() as u32);
-        self.reply(no_reply, &hdr, pl.as_bytes())
-            .context("write GET_REGION_INFO reply")
+        match region_fd {
+            // map 模式：带 fd 的 reply（现 `reply()` helper 不带 fd，故直调 write_message）。
+            Some(fd) => self
+                .reply_with_fd(no_reply, &hdr, pl.as_bytes(), fd)
+                .context("write GET_REGION_INFO reply (map mode, with fd)"),
+            None => self
+                .reply(no_reply, &hdr, pl.as_bytes())
+                .context("write GET_REGION_INFO reply"),
+        }
     }
 
     fn handle_get_irq_info<D: PcieDevice>(
@@ -669,6 +696,26 @@ impl VfioUserSession {
         write_message(&mut self.stream, hdr, payload, &[])
     }
 
+    /// **CMB-P4 (map 模式)** — 发一条**带单个 fd 的成功 reply**（经 SCM_RIGHTS）。
+    /// 当前唯一用途：map 模式的 `GET_REGION_INFO` reply 附 CMB region memfd，client
+    /// mmap 它 → guest 零拷贝直访（设计 §4.2）。posted（`no_reply`）时静默返回 Ok，
+    /// 绝不写 wire（与 [`reply`](Self::reply) 同纪律）。`fd` 是 borrowed（owner 是
+    /// device 的 CMB backing）；`sendmsg(SCM_RIGHTS)` 把它 **dup** 给内核投递给 client，
+    /// 本端 fd 所有权不变（backing 仍持有，生命周期 ≥ client 映射，设计 §9#4）。
+    fn reply_with_fd(
+        &mut self,
+        no_reply: bool,
+        hdr: &Header,
+        payload: &[u8],
+        fd: std::os::fd::BorrowedFd<'_>,
+    ) -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        if no_reply {
+            return Ok(());
+        }
+        write_message(&mut self.stream, hdr, payload, &[fd.as_raw_fd()])
+    }
+
     /// **NO_REPLY 修复** — 发送一条 **error reply**，除非 posted。参数错（如 driver
     /// 探测越界）对普通命令回 errno 让 driver 看到；posted 命令则静默丢弃（QEMU
     /// 没在听该 msg_id 的任何 reply）。
@@ -807,6 +854,7 @@ mod tests {
     use pcie_device_core::DeviceCtx;
     use pcie_device_core::DeviceDescribe;
     use pcie_device_core::PcieDevice as Pde;
+    use std::os::fd::AsRawFd as _;
     use std::os::unix::net::UnixStream;
     use std::thread;
 
@@ -1944,5 +1992,200 @@ mod tests {
         let errno = reply.header.error_no;
         assert_eq!(errno, libc::EINVAL as u32);
         assert!(h.join().unwrap().unwrap(), "越界不应 close session");
+    }
+
+    // ───────────────────────── CMB-P4: map 模式（FLAG_MMAP + fd reply） ─────────────────────────
+    //
+    // map-based CMB 的 transport 半边：CMB BAR 的 backing 由 memfd 支撑（`cmb_region_fd`
+    // 返 Some(memfd)），GET_REGION_INFO 置 FLAG_MMAP + 经 SCM_RIGHTS 附 fd；client mmap
+    // 该 fd → 与 server backing 共享同一物理页（零拷贝，无 REGION_RW 往返）。降级：backing
+    // 是 Vec（`cmb_region_fd` 返 None）→ 不置 MMAP、不附 fd（回退 trap，对称 P3a）。
+
+    /// 一个 CMB BAR backing 由 **memfd** 支撑的设备（map 模式）。`cmb_region_fd(2)` 返
+    /// memfd 的 BorrowedFd；其余 BAR / 未启用 → None。模拟 transport 注入 MemfdRamRegion
+    /// 后 firmware 经 `PcieDevice::cmb_region_fd` 暴露 CMB fd。
+    struct MapCmbDev {
+        /// CMB backing 的 memfd（server 自持，经 as_fd 暴露给 client mmap）。
+        fd: std::os::fd::OwnedFd,
+        /// server 本地映射（写 marker 供 client 经共享 mmap 读到 → 证零拷贝）。
+        view: memmap2::MmapMut,
+    }
+    const MAP_CMB_BAR: u32 = 2;
+    const MAP_CMB_SIZE: u64 = 4096;
+    impl MapCmbDev {
+        fn new() -> Self {
+            use std::os::fd::AsFd as _;
+            let fd =
+                nix::sys::memfd::memfd_create(c"map-cmb-test", nix::sys::memfd::MFdFlags::empty())
+                    .unwrap();
+            let f = std::fs::File::from(fd);
+            f.set_len(MAP_CMB_SIZE).unwrap();
+            let fd = std::os::fd::OwnedFd::from(f);
+            let mut opts = memmap2::MmapOptions::new();
+            opts.len(MAP_CMB_SIZE as usize);
+            #[allow(unsafe_code)]
+            // SAFETY: 测试自建 memfd，已 set_len，[0,len) 有页 backing；单线程顺序访问。
+            let view = unsafe { opts.map_mut(fd.as_fd().as_raw_fd()) }.unwrap();
+            Self { fd, view }
+        }
+    }
+    impl Pde for MapCmbDev {
+        fn describe(&self) -> DeviceDescribe {
+            DeviceDescribe {
+                vendor_id: 0x1234,
+                device_id: 0xc0de,
+                class_code: 0x01_08_02,
+                revision: 1,
+                subsystem_vendor: 0,
+                subsystem_device: 0,
+                bars: vec![
+                    BarLayout {
+                        index: 0,
+                        size: 8192,
+                        kind: BarKind::Mmio32,
+                        prefetchable: false,
+                    },
+                    BarLayout {
+                        index: MAP_CMB_BAR as u8,
+                        size: MAP_CMB_SIZE,
+                        kind: BarKind::Mmio32,
+                        prefetchable: false,
+                    },
+                ],
+                msix_count: 1,
+                capabilities: vec![],
+                cfg_write_side_effect_offsets: vec![],
+            }
+        }
+        fn mmio_read(&mut self, _bar: u32, _offset: u64, _size: u32) -> u64 {
+            0
+        }
+        fn mmio_write(
+            &mut self,
+            _ctx: &mut DeviceCtx<'_>,
+            _bar: u32,
+            _offset: u64,
+            _size: u32,
+            _value: u64,
+        ) {
+        }
+        fn cmb_region_fd(&self, bar: u32) -> Option<std::os::fd::BorrowedFd<'_>> {
+            use std::os::fd::AsFd as _;
+            if bar == MAP_CMB_BAR {
+                Some(self.fd.as_fd())
+            } else {
+                None
+            }
+        }
+    }
+
+    /// **CMB-P4** — map 模式：GET_REGION_INFO 对 memfd-backed CMB BAR 回
+    /// (READ|WRITE|**MMAP**, size) 且 reply **附 1 个 fd**（SCM_RIGHTS）。client mmap
+    /// 该 fd → 读到 server 经本地 view 写的 marker（**server→client 零拷贝可见**），
+    /// 改 marker → server 经本地 view 看到（**client→server 零拷贝可见**）。这是 map
+    /// 模式零拷贝的 session 层闭环（对称 P3a 的 trap REGION_RW）。
+    #[test]
+    fn get_region_info_cmb_bar_map_mode_with_fd() {
+        use std::os::fd::AsFd as _;
+        const MARKER_OFF: usize = 0x80;
+        const SRV_MARKER: u64 = 0xDEAD_BEEF_0000_1111;
+        const CLI_MARKER: u64 = 0x2222_3333_4444_5555;
+
+        let (server, mut client) = pair();
+        let mut sess = VfioUserSession::new(server, neg());
+        let mut dev = MapCmbDev::new();
+        // server 本地写 marker（入共享页）。
+        dev.view[MARKER_OFF..MARKER_OFF + 8].copy_from_slice(&SRV_MARKER.to_le_bytes());
+        dev.view.flush().ok();
+
+        // server 线程 pump 一条 GET_REGION_INFO。dev 含非 Send 的 MmapMut → 留在 spawn
+        // 线程内 move（dev move 进闭包），pump 后把 dev 交回。
+        let h = thread::spawn(move || {
+            sess.pump_one(&mut dev).unwrap();
+            dev // 交回，主线程回读 server 视图
+        });
+
+        let req = RegionInfoPayload {
+            argsz: core::mem::size_of::<RegionInfoPayload>() as u32,
+            flags: 0,
+            index: MAP_CMB_BAR,
+            cap_offset: 0,
+            size: 0,
+            offset: 0,
+        };
+        let hdr = Header::command(1, Command::DeviceGetRegionInfo, req.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, req.as_bytes(), &[]).unwrap();
+        let reply = read_message(&mut client).unwrap();
+        let pl: RegionInfoPayload = decode_payload(&reply.payload).unwrap();
+        let (pf, ps) = (pl.flags, pl.size);
+        assert_eq!(
+            pf,
+            region_flags::READ | region_flags::WRITE | region_flags::MMAP,
+            "map 模式应置 FLAG_MMAP"
+        );
+        assert_eq!(ps, MAP_CMB_SIZE);
+        assert_eq!(
+            reply.fds.len(),
+            1,
+            "map 模式 reply 应附带 1 个 region memfd"
+        );
+
+        // client mmap 收到的 fd，读 server marker（零拷贝可见）。
+        let client_fd = &reply.fds[0];
+        let mut opts = memmap2::MmapOptions::new();
+        opts.len(MAP_CMB_SIZE as usize);
+        #[allow(unsafe_code)]
+        // SAFETY: fd 是 server 经 SCM_RIGHTS 传来的 memfd（已 set_len），[0,size) 有页
+        // backing；测试单线程顺序访问，纯 u8 memcpy 无 typed UB。
+        let mut cview = unsafe { opts.map_mut(client_fd.as_fd().as_raw_fd()) }.unwrap();
+        let seen = u64::from_le_bytes(cview[MARKER_OFF..MARKER_OFF + 8].try_into().unwrap());
+        assert_eq!(
+            seen, SRV_MARKER,
+            "client mmap 读到 server marker（零拷贝同页）"
+        );
+
+        // client 写回 → server 本地 view 看到。
+        cview[MARKER_OFF..MARKER_OFF + 8].copy_from_slice(&CLI_MARKER.to_le_bytes());
+        cview.flush().ok();
+
+        let dev = h.join().unwrap();
+        let back = u64::from_le_bytes(dev.view[MARKER_OFF..MARKER_OFF + 8].try_into().unwrap());
+        assert_eq!(
+            back, CLI_MARKER,
+            "server 经本地 view 看到 client 写入（零拷贝同页）"
+        );
+    }
+
+    /// **CMB-P4 降级** — CMB BAR backing 无可 mmap fd（`cmb_region_fd` 返 None，如 Vec
+    /// backing / 未注入 memfd）→ GET_REGION_INFO **不置 MMAP**、**不附 fd**（回退 trap，
+    /// 访问走 REGION_RW）。这是降级路径的判据，对称 trap 模式 P3a。
+    #[test]
+    fn get_region_info_cmb_bar_no_fd_downgrades_to_trap() {
+        let (server, mut client) = pair();
+        let mut sess = VfioUserSession::new(server, neg());
+        // CmbBarDev（Vec 风格 backing，无 cmb_region_fd override → 默认返 None）。
+        let mut dev = CmbBarDev::new();
+        let h = thread::spawn(move || sess.pump_one(&mut dev));
+        let req = RegionInfoPayload {
+            argsz: core::mem::size_of::<RegionInfoPayload>() as u32,
+            flags: 0,
+            index: CMB_BAR_IDX,
+            cap_offset: 0,
+            size: 0,
+            offset: 0,
+        };
+        let hdr = Header::command(1, Command::DeviceGetRegionInfo, req.as_bytes().len() as u32);
+        fw_write(&mut client, &hdr, req.as_bytes(), &[]).unwrap();
+        let reply = read_message(&mut client).unwrap();
+        let pl: RegionInfoPayload = decode_payload(&reply.payload).unwrap();
+        let pf = pl.flags;
+        assert_eq!(
+            pf,
+            region_flags::READ | region_flags::WRITE,
+            "降级 trap：R/W 不含 MMAP"
+        );
+        assert_eq!(pf & region_flags::MMAP, 0, "无 fd → 不置 FLAG_MMAP");
+        assert_eq!(reply.fds.len(), 0, "降级 trap：reply 不附 fd");
+        assert!(h.join().unwrap().unwrap());
     }
 }
