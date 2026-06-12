@@ -5687,7 +5687,10 @@ mod cmb_datapath_tests {
             !c.cmb_completions.iter().any(|c| c.token == token),
             "溢出 gpa 不应入 CMB 合成队列"
         );
-        assert!(!cap.events().is_empty(), "溢出 gpa 判 Miss → 走 transport DMA");
+        assert!(
+            !cap.events().is_empty(),
+            "溢出 gpa 判 Miss → 走 transport DMA"
+        );
     }
 
     // ---------------- (c) 非-CMB gpa 仍走 ctx.dma ----------------
@@ -5946,5 +5949,280 @@ mod cmb_datapath_tests {
         c.write_cmbmsc((new_cba & cmbmsc::CBA_MASK) | cmbmsc::CRE);
         assert_eq!(c.cmb.as_ref().unwrap().cba, new_cba, "非 live 改 CBA 合法");
         assert!(!c.cmb.as_ref().unwrap().cbai, "非 live 改 CBA 不置 CBAI");
+    }
+
+    // ================= CMB-P2: SGL CMB-relative 数据指针 e2e =================
+    //
+    // 这些测试把 P2 的"SGL sub_type=1 放行 + 偏移 rebase"串成 driver 视角的闭环：
+    // CMB live 时，一条带 CMB-relative SGL data pointer 的 IO 命令，其数据真落进 /
+    // 真读自 CMB backing（经 P1b 的 guest_* dispatch），全程无 transport DMA。
+    //
+    // 独立 oracle = CMB backing 字节（直接 as_bytes()）+ CQE status（success），
+    // 而非自家记账。CMB live 用 `mk_cmb_live`，IO 用 `dispatch_io` 直驱 + 顶层 drain。
+
+    use crate::cmd::Sqe;
+    use crate::regs::CompletionQueue;
+
+    /// 构造一条 IO SQE（cdw0 含 opcode+cid、PSDT、nsid、slba、nlb），供 CMB-P2 e2e 用。
+    /// `psdt`：0=PRP、1=inline SGL、2=SGL segment。`prp1`/`prp2` 由 caller 按 PSDT 填。
+    fn cmb_io_sqe(
+        opc: u8,
+        cid: u16,
+        nsid: u32,
+        slba: u64,
+        nlb: u32,
+        psdt: u8,
+        prp1: u64,
+        prp2: u64,
+    ) -> Sqe {
+        let zero = [0u8; 64];
+        let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+        // cdw0：opcode bits 7:0、PSDT bits 15:14、cid bits 31:16。
+        sqe.cdw0 = (opc as u32) | ((psdt as u32) << 14) | ((cid as u32) << 16);
+        sqe.nsid = nsid;
+        sqe.cdw10 = slba as u32;
+        sqe.cdw11 = (slba >> 32) as u32;
+        sqe.cdw12 = nlb - 1; // 0-based
+        sqe.prp1 = prp1;
+        sqe.prp2 = prp2;
+        sqe
+    }
+
+    /// 在 CMB 内放一个 IO CQ（base 在 CMB 窗口内），让命令 CQE 也落 CMB backing。
+    fn insert_cmb_cq(c: &mut NvmeController, cq_id: u16, cq_off: usize) {
+        c.cqs.insert(
+            cq_id,
+            CompletionQueue {
+                base_gpa: CBA + cq_off as u64,
+                size: 64,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 0,
+                interrupt_enabled: false,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+    }
+
+    /// **CMB-P2 (inline PSDT=01)** — 一条 READ，数据指针是 **CMB-relative inline SGL**
+    /// （sub_type=1，address=CMB 偏移）。CMB live → classifier 放行 + rebase 成
+    /// `cba+offset` → READ 的 device→host 数据经 `guest_write` 落进 CMB backing。
+    ///
+    /// 独立 oracle：先把已知 pattern 写进 NS backing 的 LBA 0；命令完成后断言 **CMB
+    /// backing** 在 `data_off` 处 == 该 pattern（数据从盘读出、scatter 到 CMB），且
+    /// 全程无 transport DMA（数据落 CMB，CQE 也在 CMB）。
+    #[test]
+    fn cmb_relative_inline_sgl_read_lands_in_cmb_backing() {
+        let mut c = mk_cmb_live();
+        c.csts |= csts::RDY;
+        insert_cmb_cq(&mut c, 1, 0x10_0000);
+
+        // NS LBA 0 预置已知 pattern（512B 扇区）。
+        let mut sector = vec![0u8; SECTOR_SIZE as usize];
+        for (i, b) in sector.iter_mut().enumerate() {
+            *b = (0xA0 ^ i) as u8;
+        }
+        c.ns_mut(1).unwrap().write_at(&sector, 0).unwrap();
+
+        // inline SGL data pointer：CMB 偏移 data_off、sub_type=1（Offset/CMB-relative）。
+        // bytes 24..40 = prp1(address) + prp2((id<<56)|length)。id_byte 0x01 = type 0
+        // Data Block + sub_type 1。length=512（恰 1 个 512B LBA，合法 ≤1 page）。
+        let data_off = 0x4000u64;
+        let prp1 = data_off; // CMB 内偏移（rebase 前）
+        let prp2 = (0x01u64 << 56) | SECTOR_SIZE;
+
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let r = {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let sqe = cmb_io_sqe(0x02, 0x55, 1, 0, 1, 1, prp1, prp2);
+            let r = c.dispatch_io(&mut ctx, 1, sqe, 0x55, 0, 1);
+            c.drain_cmb_completions(&mut ctx);
+            r
+        };
+        // READ 是同步从盘读 + guest_write 落 CMB；dispatch_io 经合成 completion 异步
+        // 完成（返 None，由 drain 推进），故 r 为 None。
+        assert!(r.is_none(), "CMB-relative READ 经合成 completion 异步完成");
+
+        // 数据真落进 CMB backing 的 data_off 处（== NS pattern）。
+        let backing = c.cmb.as_ref().unwrap().backing.as_bytes();
+        assert_eq!(
+            &backing[data_off as usize..data_off as usize + SECTOR_SIZE as usize],
+            &sector[..],
+            "CMB-relative inline SGL READ 数据落进 cba+offset（CMB backing）"
+        );
+        // 全程无 transport DMA（数据 + CQE 都在 CMB）。
+        assert!(
+            cap.events().is_empty(),
+            "CMB-relative SGL READ 全在 CMB → 无 transport outbound"
+        );
+        assert!(c.cmb_completions.is_empty(), "drain 后队列空");
+    }
+
+    /// **CMB-P2 (reviewer M-1) — 越界 CMB-relative offset 的实测行为（lenient）**。
+    /// offset ≥ CMB size → rebase 成 `cba+offset ≥ win_end` → `cmb_hit` 判 Miss →
+    /// **走 transport DMA**（对真实 guest GPA），**非** straddle/0x16 拒。此测试钉死
+    /// 当前 lenient 行为（非内存安全问题：guest 自有 RAM）。**P5 TODO**：SGLS advertise
+    /// 后应改严格返 SGL_OFFSET_INVALID(0x16)，届时本测试改为断言 0x16。
+    #[test]
+    fn cmb_relative_offset_out_of_window_falls_to_dma_lenient() {
+        let mut c = mk_cmb_live();
+        c.csts |= csts::RDY;
+        insert_cmb_cq(&mut c, 1, 0x10_0000);
+        // offset 越过 CMB 窗口（≥ size）→ rebase 出窗口。
+        let prp1 = CMB_SIZE + 0x1000;
+        let prp2 = (0x01u64 << 56) | SECTOR_SIZE; // Data Block + sub_type=1
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let sqe = cmb_io_sqe(0x02, 0x55, 1, 0, 1, 1, prp1, prp2);
+            let _ = c.dispatch_io(&mut ctx, 1, sqe, 0x55, 0, 1);
+            c.drain_cmb_completions(&mut ctx);
+        }
+        // 越界 CMB-relative → Miss → transport DMA（lenient），而非落 CMB backing。
+        assert!(
+            !cap.events().is_empty(),
+            "越界 CMB-relative offset 当前走 transport DMA（lenient，P5 改严格 0x16）"
+        );
+    }
+
+    /// **CMB-P2 (inline PSDT=01, WRITE)** — 镜像方向：一条 WRITE，inline SGL
+    /// CMB-relative data pointer（sub_type=1）。host→device 数据经 `guest_read`
+    /// 从 CMB backing 取出，写进 NS backing。
+    ///
+    /// 独立 oracle：先把已知 pattern 写进 **CMB backing** 的 data_off 处；命令完成后
+    /// 断言 NS backing LBA 0 == 该 pattern（数据从 CMB 读出、落盘）。
+    #[test]
+    fn cmb_relative_inline_sgl_write_reads_from_cmb_backing() {
+        let mut c = mk_cmb_live();
+        c.csts |= csts::RDY;
+        insert_cmb_cq(&mut c, 1, 0x10_0000);
+
+        // CMB backing 预置 pattern（host 把要写的数据放在 CMB 内）。
+        let data_off = 0x5000usize;
+        let mut payload = vec![0u8; SECTOR_SIZE as usize];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (0x5A ^ i) as u8;
+        }
+        c.cmb.as_mut().unwrap().backing.as_bytes_mut()[data_off..data_off + SECTOR_SIZE as usize]
+            .copy_from_slice(&payload);
+
+        let prp1 = data_off as u64; // CMB 偏移
+        let prp2 = (0x01u64 << 56) | SECTOR_SIZE;
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let sqe = cmb_io_sqe(0x01, 0x56, 1, 0, 1, 1, prp1, prp2);
+            let _ = c.dispatch_io(&mut ctx, 1, sqe, 0x56, 0, 1);
+            c.drain_cmb_completions(&mut ctx);
+        }
+        // NS backing LBA 0 == CMB 里的 payload（数据经 guest_read 从 CMB 取出后落盘）。
+        let mut readback = vec![0u8; SECTOR_SIZE as usize];
+        c.ns_mut(1).unwrap().read_at(&mut readback, 0).unwrap();
+        assert_eq!(
+            readback, payload,
+            "CMB-relative inline SGL WRITE：数据从 CMB backing 读出并落盘"
+        );
+        // host→device 数据读自 CMB（无 transport DMA-read 取数据）。CQE 也在 CMB。
+        assert!(
+            cap.events().is_empty(),
+            "CMB-relative SGL WRITE 数据 + CQE 全在 CMB → 无 transport outbound"
+        );
+    }
+
+    /// **CMB-P2 (反例)** — CMB **未 live**（CMSE=0）时，inline CMB-relative SGL
+    /// （sub_type=1）必须仍被拒（`SGL_INVALID_USE_OF_CMB` 0x12）——放行只在 CMB 启用时。
+    /// 守住"CMB 未启用 → 保持现状 reject"的边界（与现有 e2e reject 测试同语义，但在
+    /// 同一 controller 上隔离 CMB 启用变量）。
+    #[test]
+    fn cmb_relative_inline_sgl_rejected_when_cmb_not_live() {
+        // CMB enable 但未 live（仅 CRE，CMSE=0）。
+        let mut c = mk();
+        c.enable_cmb(CMB_SIZE, CMB_BIR).unwrap();
+        c.write_cmbmsc(cmbmsc::CRE);
+        c.csts |= csts::RDY;
+        insert_cmb_cq(&mut c, 1, 0x10_0000);
+        assert!(c.cmb_window().is_none(), "CMSE=0 → cmb_window None");
+
+        let prp1 = 0x4000u64;
+        let prp2 = (0x01u64 << 56) | SECTOR_SIZE;
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let cqe = {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let sqe = cmb_io_sqe(0x02, 0x57, 1, 0, 1, 1, prp1, prp2);
+            c.dispatch_io(&mut ctx, 1, sqe, 0x57, 0, 1)
+        };
+        // CMB 未 live → sub_type=1 被 classifier 拒，dispatch_io 同步返 error CQE。
+        let cqe = cqe.expect("CMB 未 live → CMB-relative 同步拒，返 CQE");
+        // 从 CQE dw3 解 status（SC bits 8:1 在 [17..25)、SCT bits 11:9 在 [25..28)）。
+        let status = (((cqe.dw3 >> 17) & 0xff) | (((cqe.dw3 >> 25) & 0x7) << 8)) as u16;
+        assert_eq!(
+            status,
+            crate::cmd::sc::SGL_INVALID_USE_OF_CMB,
+            "CMB 未 live → CMB-relative SGL 返 SGL Invalid Use of CMB (0x12)"
+        );
+    }
+
+    /// **CMB-P2 (segment PSDT=10)** — SGL segment 路径：embedded SGL1 Last Segment
+    /// 指针**自身**驻留 CMB（CMB-relative），指向的 segment 页里有一个 **CMB-relative**
+    /// Data Block。验证 SGL1 指针 rebase + segment 页内 fragment 偏移 rebase 双重生效：
+    /// segment 页从 CMB 读（SGL1 rebase）、数据落 CMB（fragment rebase），全在 CMB backing。
+    ///
+    /// 这覆盖了 `parse_sgl1_segment`（SGL1 指针 rebase）+ `parse_sgl_list`（fragment
+    /// rebase）两条 CMB-P2 路径，是 segment 链的 CMB-relative 闭环。
+    #[test]
+    fn cmb_relative_segment_sgl_read_resolves_all_in_cmb() {
+        use crate::regs::NVME_PAGE_SIZE;
+        let mut c = mk_cmb_live();
+        c.csts |= csts::RDY;
+        insert_cmb_cq(&mut c, 1, 0x10_0000);
+
+        // NS LBA 0 预置 pattern（512B）。
+        let mut sector = vec![0u8; SECTOR_SIZE as usize];
+        for (i, b) in sector.iter_mut().enumerate() {
+            *b = (0x3C ^ i) as u8;
+        }
+        c.ns_mut(1).unwrap().write_at(&sector, 0).unwrap();
+
+        // segment 页放在 CMB 偏移 seg_off：里面是一个 CMB-relative Data Block descriptor
+        // （指向 data_off，sub_type=1，length=512）。
+        let seg_off = 0x2_0000usize;
+        let data_off = 0x3_0000u64;
+        let mut frag = [0u8; 16];
+        frag[0..8].copy_from_slice(&data_off.to_le_bytes()); // address = CMB 偏移
+        frag[8..12].copy_from_slice(&(SECTOR_SIZE as u32).to_le_bytes()); // length
+        frag[15] = 0x01; // type 0 Data Block + sub_type 1 (Offset)
+        c.cmb.as_mut().unwrap().backing.as_bytes_mut()[seg_off..seg_off + 16]
+            .copy_from_slice(&frag);
+
+        // embedded SGL1（Last Segment 指针）：address=seg_off（CMB 偏移）、sub_type=1、
+        // length=16（1 个 descriptor）。id_byte 0x31 = type 3 Last Segment + sub_type 1。
+        let prp1 = seg_off as u64;
+        let prp2 = (0x31u64 << 56) | 16u64;
+
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            // PSDT=10 segment 路径。NS 是 512B plain → is_plain 成立，走 dispatch_sgl_read。
+            let sqe = cmb_io_sqe(0x02, 0x58, 1, 0, 1, 2, prp1, prp2);
+            let _ = c.dispatch_io(&mut ctx, 1, sqe, 0x58, 0, 1);
+            c.drain_cmb_completions(&mut ctx);
+        }
+        // 数据落进 CMB backing 的 data_off（fragment rebase 生效）。
+        let backing = c.cmb.as_ref().unwrap().backing.as_bytes();
+        assert_eq!(
+            &backing[data_off as usize..data_off as usize + SECTOR_SIZE as usize],
+            &sector[..],
+            "CMB-relative segment SGL READ：数据落进 cba+data_off（fragment rebase）"
+        );
+        // 全程无 transport DMA：segment 页读自 CMB（SGL1 rebase）、数据落 CMB、CQE 在 CMB。
+        assert!(
+            cap.events().is_empty(),
+            "SGL1 指针 + fragment 都 CMB-relative → 全在 CMB，无 transport"
+        );
+        // 防御：确认数据没被误写到 transport（NVME_PAGE_SIZE 仅作引用，避免未用告警）。
+        let _ = NVME_PAGE_SIZE;
+        assert!(c.cmb_completions.is_empty(), "drain 后队列空");
     }
 }

@@ -309,7 +309,15 @@ pub(crate) enum DataPointer {
 ///   * 其他 type (Bit Bucket / Segment / Keyed) → reject
 /// - PSDT=10 (SGL Segment pointer)：返 `SglSegment`，caller 走 R2 segment walk
 /// - PSDT=11 reserved → INVALID_FIELD
-pub(crate) fn resolve_data_pointers(sqe: &Sqe) -> Result<DataPointer, u16> {
+///
+/// **CMB-P2**：`cmb` = controller 当前 CMB 窗口 `Some((cba, size))`（CMSE=1 时）/ `None`。
+/// 经共享 `sgl::subtype_to_sc(sub_type, cmb.is_some())` 判 sub_type 合法性——CMB 启用时
+/// sub_type=1（Offset/CMB-relative）放行，其 address（CMB 内偏移）经 `sgl::resolve_sgl_address`
+/// rebase 成 `cba+offset` 当 prp1（自然命中 CMB backing）；CMB 未启用时 sub_type=1 仍返 0x12。
+pub(crate) fn resolve_data_pointers(
+    sqe: &Sqe,
+    cmb: Option<(u64, u64)>,
+) -> Result<DataPointer, u16> {
     let psdt = sqe.psdt();
     let prp1 = sqe.prp1;
     let prp2 = sqe.prp2;
@@ -323,8 +331,9 @@ pub(crate) fn resolve_data_pointers(sqe: &Sqe) -> Result<DataPointer, u16> {
                 None => return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID),
             };
             // sub_type 校验经共享 classifier（与 parse_sgl_list / validate_segment_pointer
-            // 同判据）：sub_type=1 (CMB-relative) → 0x12，≥2 (reserved) → 0x11。
-            if let Some(err_sc) = crate::sgl::subtype_to_sc(desc.sub_type) {
+            // 同判据）：CMB 启用时 sub_type=1 (CMB-relative) 放行，未启用 → 0x12；
+            // ≥2 (reserved) → 0x11。
+            if let Some(err_sc) = crate::sgl::subtype_to_sc(desc.sub_type, cmb.is_some()) {
                 return Err(err_sc);
             }
             match desc.sgl_type {
@@ -340,8 +349,10 @@ pub(crate) fn resolve_data_pointers(sqe: &Sqe) -> Result<DataPointer, u16> {
                         );
                         return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID);
                     }
+                    // **CMB-P2** — CMB-relative（sub_type=1）的 address 是 CMB 内偏移，
+                    // rebase 成实际 GPA `cba+offset` 当 prp1；sub_type=0 原样。
                     Ok(DataPointer::Prp {
-                        prp1: desc.address,
+                        prp1: crate::sgl::resolve_sgl_address(desc.sub_type, desc.address, cmb),
                         prp2: 0,
                     })
                 }
@@ -381,17 +392,24 @@ pub(crate) fn resolve_data_pointers(sqe: &Sqe) -> Result<DataPointer, u16> {
 /// `is_last` = true 表示 Last Segment（被指向段全是数据 descriptor，无 chain）；
 /// false 表示 Segment（被指向段末位仍是 continuation，见 R2b）。
 ///
-/// 校验：sub_type=0 (Address)、type ∈ {Segment, Last Segment}、length 16 倍数 /
-/// 非零 / ≤ 1 page（教学单段上限）。
+/// 校验：sub_type∈{0 Address, 1 CMB-relative（CMB 启用时）}、type ∈ {Segment,
+/// Last Segment}、length 16 倍数 / 非零 / ≤ 1 page（教学单段上限）。
+///
+/// **CMB-P2**：`cmb` = controller CMB 窗口（`Some` 时 CMSE=1）。sub_type 合法性经共享
+/// `sgl::subtype_to_sc(sub_type, cmb.is_some())`——SGL1/continuation **指针**本身也可
+/// CMB-relative（segment 列表驻留 CMB）。**注意**：本函数只校验，不返 address；指针的
+/// rebase 由 caller（`parse_sgl1_segment` / completion.rs continuation）经
+/// `sgl::resolve_sgl_address` 完成。
 pub(crate) fn validate_segment_pointer(
     desc: &crate::sgl::SglDescriptor,
+    cmb: Option<(u64, u64)>,
 ) -> Result<(u32, bool), u16> {
     // sub_type 校验经共享 classifier（与 parse_sgl_list / resolve_data_pointers 同判据）：
-    // sub_type=1 (CMB-relative) → SGL_INVALID_USE_OF_CMB (0x12)，≥2 (reserved) → 0x11。
-    if let Some(err_sc) = crate::sgl::subtype_to_sc(desc.sub_type) {
+    // CMB 启用时 sub_type=1 (CMB-relative) 放行，未启用 → 0x12；≥2 (reserved) → 0x11。
+    if let Some(err_sc) = crate::sgl::subtype_to_sc(desc.sub_type, cmb.is_some()) {
         tracing::warn!(
             sub_type = desc.sub_type,
-            "SGL segment 指针 sub_type 非 0 (仅 Address)"
+            "SGL segment 指针 sub_type 非法（仅 Address，或 CMB 启用时 CMB-relative）"
         );
         return Err(err_sc);
     }
@@ -412,12 +430,16 @@ pub(crate) fn validate_segment_pointer(
 }
 
 /// **Phase R2** — 解析 PSDT=10 的 embedded SGL1 descriptor（必须是 Segment /
-/// Last Segment，sub_type=0）。返 `(segment_addr, segment_len, is_last)`。
+/// Last Segment，sub_type∈{0 Address, 1 CMB-relative}）。返 `(segment_addr, segment_len, is_last)`。
 /// 校验逻辑见 `validate_segment_pointer`。
-fn parse_sgl1_segment(bytes: &[u8; 16]) -> Result<(u64, u32, bool), u16> {
+///
+/// **CMB-P2**：CMB-relative（sub_type=1）的 segment_addr 经 `sgl::resolve_sgl_address`
+/// rebase 成 `cba+offset`（SGL 列表本身驻留 CMB 时）。
+fn parse_sgl1_segment(bytes: &[u8; 16], cmb: Option<(u64, u64)>) -> Result<(u64, u32, bool), u16> {
     let desc = crate::sgl::SglDescriptor::parse(bytes).ok_or(sc::SGL_DESCRIPTOR_TYPE_INVALID)?;
-    let (len, is_last) = validate_segment_pointer(&desc)?;
-    Ok((desc.address, len, is_last))
+    let (len, is_last) = validate_segment_pointer(&desc, cmb)?;
+    let addr = crate::sgl::resolve_sgl_address(desc.sub_type, desc.address, cmb);
+    Ok((addr, len, is_last))
 }
 
 /// **Phase S1** — Write-protection guard：所有写类 IO (WRITE/WRITE_ZEROES/
@@ -490,10 +512,11 @@ impl NvmeController {
             return Some(cqe);
         }
         // 解析 embedded SGL1 → 必须 Last Segment（R2a 单段）。
-        let (seg_addr, seg_len, is_last) = match parse_sgl1_segment(&sqe.embedded_sgl_bytes()) {
-            Ok(t) => t,
-            Err(sc_byte) => return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte)),
-        };
+        let (seg_addr, seg_len, is_last) =
+            match parse_sgl1_segment(&sqe.embedded_sgl_bytes(), self.cmb_window()) {
+                Ok(t) => t,
+                Err(sc_byte) => return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte)),
+            };
         // **R2b** — SGL1 既可是 Last Segment（单段）也可是 Segment（chain 首段）；
         // `is_last` 透传给 NvmSglFetch 决定本段是否末段。
         // 一次性把 backing 读到 data buffer（READ：先读盘再 scatter）。
@@ -588,10 +611,11 @@ impl NvmeController {
         {
             return Some(cqe);
         }
-        let (seg_addr, seg_len, is_last) = match parse_sgl1_segment(&sqe.embedded_sgl_bytes()) {
-            Ok(t) => t,
-            Err(sc_byte) => return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte)),
-        };
+        let (seg_addr, seg_len, is_last) =
+            match parse_sgl1_segment(&sqe.embedded_sgl_bytes(), self.cmb_window()) {
+                Ok(t) => t,
+                Err(sc_byte) => return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte)),
+            };
         // **R2b** — SGL1 既可 Last Segment（单段）也可 Segment（chain 首段）。
         let op_id = self.alloc_op_id();
         self.sgl_ops.insert(
@@ -703,7 +727,8 @@ impl NvmeController {
                 //   Data Block 时 address→prp1 复用现有 PRP 路径；否则 reject。
                 // PSDT=10 (SGL Segment) → is_sgl=true，走平行 SGL scatter 路径。
                 // PSDT=11 → reject (reserved)。
-                let (prp1, prp2, is_sgl) = match resolve_data_pointers(&sqe) {
+                let cmb_win = self.cmb_window();
+                let (prp1, prp2, is_sgl) = match resolve_data_pointers(&sqe, cmb_win) {
                     Ok(DataPointer::Prp { prp1, prp2 }) => (prp1, prp2, false),
                     Ok(DataPointer::SglSegment) => (0, 0, true),
                     Err(sc_byte) => {
@@ -1813,7 +1838,8 @@ impl NvmeController {
                 let slba = cdw10 as u64 | ((cdw11 as u64) << 32);
                 let nlb = (cdw12 & 0xffff) as u32 + 1;
                 // **Phase R1/R2** — PSDT dispatch（同 READ 路径，参 resolve_data_pointers）
-                let (prp1, prp2, is_sgl) = match resolve_data_pointers(&sqe) {
+                let cmb_win = self.cmb_window();
+                let (prp1, prp2, is_sgl) = match resolve_data_pointers(&sqe, cmb_win) {
                     Ok(DataPointer::Prp { prp1, prp2 }) => (prp1, prp2, false),
                     Ok(DataPointer::SglSegment) => (0, 0, true),
                     Err(sc_byte) => {

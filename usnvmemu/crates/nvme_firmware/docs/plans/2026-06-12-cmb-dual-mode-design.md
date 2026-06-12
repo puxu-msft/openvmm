@@ -140,7 +140,7 @@ client 第二 BAR 暴露(若独立 BAR);(map 模式)client 收 region fd + mmap 
 | **P2** | SGL CMB-relative 放行 + Identify 位 + CMB 内 SQ/CQ/data 端到端(本地) | nvme_firmware | 低 | —— | ✅ |
 | **P3** | trap 模式 transport:CMB BAR region_info(READ\|WRITE)+ REGION_READ/WRITE 服务 backing + memfd impl | vfio_user_transport | 低 | —— | ✅ QEMU e2e(trap) |
 | **P4** | map 模式 transport:FLAG_MMAP + 带 fd reply;client 收 fd mmap | vfio_user_transport + vfio_user_device | 中 | **region-mmap fd-pass**(Linux 原生,POC-1 镜像) | ✅ QEMU e2e(map,零拷贝) |
-| **P5** | CLI `--cmb-mode/size/bir` + 模式协商/降级日志 | nvme_firmware | 低 | —— | ✅ |
+| **P5** | CLI `--cmb-mode/size/bir` + 模式协商/降级日志；**+ P2 复核遗留**：① 条件化置 Identify SGLS "offset support" 位（CMB 启用时才 advertise，否则 driver 不发 CMB-relative SGL，功能就绪但无人触发）；② CMB-relative offset ≥ size 改严格返 `SGL_OFFSET_INVALID`(0x16)（现 lenient 走 DMA，见 sgl.rs `resolve_sgl_address` 与测试 `cmb_relative_offset_out_of_window_falls_to_dma_lenient`） | nvme_firmware | 低 | —— | ✅ |
 | **P6**(独立) | map-on-OpenHCL §5 真机 POC | experiment | 高 | **create_ram_gpa_range 别名可写窗口**(真 Hyper-V) | 真机 |
 
 **节奏纪律**:P1→P5 顺序推进(P4 依赖 P3);每 Phase 结尾过对应 subagent review(rust-reviewer)再 commit

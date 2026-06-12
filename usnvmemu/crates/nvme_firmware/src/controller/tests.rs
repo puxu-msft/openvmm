@@ -5316,7 +5316,7 @@ fn sgl_inline_data_block_resolves_to_prp() {
     let DataPointer::Prp {
         prp1: resolved_prp1,
         prp2: resolved_prp2,
-    } = resolve_data_pointers(&sqe).unwrap()
+    } = resolve_data_pointers(&sqe, None).unwrap()
     else {
         panic!("inline single Data Block 应解析成 Prp");
     };
@@ -5334,7 +5334,7 @@ fn psdt_zero_passes_through_prp() {
     sqe.cdw0 = 0x0042_0002; // PSDT=00
     sqe.prp1 = 0xBEEF_0000;
     sqe.prp2 = 0xBEEF_1000;
-    let DataPointer::Prp { prp1: p1, prp2: p2 } = resolve_data_pointers(&sqe).unwrap() else {
+    let DataPointer::Prp { prp1: p1, prp2: p2 } = resolve_data_pointers(&sqe, None).unwrap() else {
         panic!("PSDT=00 应解析成 Prp");
     };
     assert_eq!(p1, 0xBEEF_0000);
@@ -5350,7 +5350,10 @@ fn psdt_segment_pointer_routes_to_sgl() {
     let zero = [0u8; 64];
     let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
     sqe.cdw0 = 0x0042_8002; // PSDT=10 (bits 15:14 = 10 = 0x8000)
-    assert_eq!(resolve_data_pointers(&sqe), Ok(DataPointer::SglSegment));
+    assert_eq!(
+        resolve_data_pointers(&sqe, None),
+        Ok(DataPointer::SglSegment)
+    );
 }
 
 /// **advertise⟺implement** — inline Bit Bucket (Type 1) 被拒（故 SGLS 不 advertise bit16）。
@@ -5364,7 +5367,7 @@ fn sgl_inline_bit_bucket_rejected() {
     // descriptor byte 15 (= SQE byte 39 = prp2 高字节) = 0x10 → Type=1 Bit Bucket, sub=0。
     sqe.prp2 = (0x10u64 << 56) | 4096; // length=4096 + ID 0x10
     assert_eq!(
-        resolve_data_pointers(&sqe),
+        resolve_data_pointers(&sqe, None),
         Err(crate::cmd::sc::SGL_DESCRIPTOR_TYPE_INVALID)
     );
 }
@@ -5379,7 +5382,7 @@ fn sgl_inline_data_block_over_one_page_rejected() {
     sqe.prp1 = 0xCAFE_1000;
     sqe.prp2 = 8192; // length=8192 (>1 page)，ID byte=0 (Data Block sub 0)
     assert_eq!(
-        resolve_data_pointers(&sqe),
+        resolve_data_pointers(&sqe, None),
         Err(crate::cmd::sc::SGL_DESCRIPTOR_TYPE_INVALID)
     );
 }
@@ -6580,7 +6583,7 @@ proptest! {
     /// （Ok ⇒ len%16==0 且 count==len/16）。不可信 host 内存解析面。
     #[test]
     fn pt_parse_sgl_list_no_panic(buf in prop::collection::vec(any::<u8>(), 0..256)) {
-        if let Ok(v) = crate::sgl::parse_sgl_list(&buf) {
+        if let Ok(v) = crate::sgl::parse_sgl_list(&buf, None) {
             prop_assert_eq!(buf.len() % 16, 0);
             prop_assert_eq!(v.len(), buf.len() / 16);
         }

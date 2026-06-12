@@ -39,6 +39,26 @@
 //! - Keyed Data Block / Transport-specific：NVMe-oF 专属，本地 PCIe 不用。
 //! - PSDT=10 (Segment pointer)：留 R2，见
 //!   `docs/plans/2026-06-10-sgl-r2-segment-chains-detailed.md`。
+//!
+//! ## CMB-P2（2026-06-12，CMB-relative SGL 放行）
+//!
+//! 上述 R1 限制中的"只接受 sub_type=0"已被 **CMB-P2** 放宽：当 controller 的 CMB
+//! **已启用**（CMBMSC.CMSE=1）时，sub_type=1（Offset/CMB-relative）也合法——其 address
+//! 字段是**相对 CMB 起点（CMBMSC.CBA）的偏移**（spec § 4.4 SGL Offset sub-type），经
+//! [`resolve_sgl_address`] rebase 成实际 GPA `cba+offset` 后交 `guest_*`（命中 CMB
+//! backing）。CMB **未启用**时 sub_type=1 仍返 `SGL_INVALID_USE_OF_CMB` (0x12)（现状）。
+//! 三条 SGL 路径（inline / segment 指针 / segment 页 Data Block）共用 [`subtype_to_sc`]
+//! 的 `cmb_enabled` 入参 + [`resolve_sgl_address`] 的 rebase 规则，判据自动一致。
+//!
+//! **SGLS 位（Identify Controller offset 536）裁定**：NVMe Base 2.0 § 5.1.13.2 的 SGLS
+//! 字段有一个 "SGL Address Field Specifies an Offset"（CMB-relative）支持位。本次 P2
+//! **不动** `cmd.rs` 的 `id.sgls`（保持 `0x0001_0001`），理由：① 该 advertise 须**条件化**
+//! 于运行时 CMB 是否启用（`--cmb-mode off` 默认下不能宣告 offset 支持，否则违反本仓库
+//! advertise⟺implement 纪律）——需把 CMB 状态穿进 `IdentifyController` builder，是 cmd.rs
+//! 的非局部改动；② 该 builder 所在 cmd.rs 正由并行会话修改（共享树纪律：不碰他人正改的
+//! 文件）；③ CMB-relative SGL 的**功能正确性不依赖该位**——driver 依 CMBLOC/CMBSZ 存在性
+//! 决定是否用 CMB-relative，本 controller 经 classifier 正确放行/拒绝。待 CMB CLI（P5）
+//! 落地、Identify 改动窗口安全时，再条件化置位。
 
 /// SGL Descriptor Type (high nibble of byte 15)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,27 +114,71 @@ impl SglDescriptor {
 }
 
 /// **CMB-SGL spec-completeness 共享 classifier** — 把一个 SGL descriptor 的
-/// sub_type（byte 15 低 nibble）映射到"是否非法 + 精确 NVMe Status Code"。
+/// sub_type（byte 15 低 nibble）+ **CMB 当前是否启用**映射到"是否非法 + 精确
+/// NVMe Status Code"。
 ///
 /// 三条 SGL 路径共用本判据，使**同一非法 sub_type 跨路径返同一 SC**，不再漂移：
 /// - `parse_sgl_list`（PSDT=10 segment 页里的 Data Block descriptor）
 /// - `controller/io.rs::resolve_data_pointers`（PSDT=01 inline 单 Data Block）
 /// - `controller/io.rs::validate_segment_pointer`（PSDT=10 SGL1 / chain continuation 指针）
 ///
-/// 映射（spec § 4.4 SGL Descriptor sub-type）：
-/// - `0`（Address，host 内存）→ `None`：合法，放行。
-/// - `1`（Offset，CMB-relative）→ `Some(SGL_INVALID_USE_OF_CMB)` (0x12)：本 controller
-///   **无 CMB**（Identify/CMBLOC/CMBSZ 全 0），其 address 字段是 CMB 内偏移而非 GPA，
-///   放行会被误当 GPA 解引用 → 必须以 generic status 0x12 拒（spec generic status 0x12
-///   "SGL Invalid Use of CMB"）。
+/// **CMB-P2（CMB-relative 放行）**：`cmb_enabled` = CMB 是否启用（CMBMSC.CMSE=1）。
+/// sub_type=1（Offset/CMB-relative）的合法性**取决于运行时是否有可用 CMB**——三路径
+/// 统一从 controller 的 CMB 状态取同一个 `cmb_enabled` 入参，故放行/拒绝判据跨三路径
+/// 自动一致（classifier 集中化纪律）。
+///
+/// 映射（spec § 4.4 SGL Descriptor sub-type；NVMe Base 2.0 § 4.4 "Address Field
+/// Specifies an Offset"）：
+/// - `0`（Address，host 内存）→ `None`：合法，放行（与 CMB 无关）。
+/// - `1`（Offset，CMB-relative）：
+///   * `cmb_enabled == true` → `None`：放行。其 address 字段是**相对 CMB 起点
+///     （CMBMSC.CBA）的偏移**，调用方经 [`resolve_sgl_address`] 解析成实际 GPA
+///     `cba + offset` 后交 `guest_read`/`guest_write`（自然命中 CMB backing）。
+///     偏移越界由 `guest_*` 的 `cmb_hit`（straddle 判定）兜底。
+///   * `cmb_enabled == false` → `Some(SGL_INVALID_USE_OF_CMB)` (0x12)：无可用 CMB
+///     （Identify/CMBLOC/CMBSZ 全 0 或 CMSE 未置），偏移无从解析为 GPA，放行会被误当
+///     GPA 解引用 → 必须以 generic status 0x12 拒（spec generic status 0x12 "SGL
+///     Invalid Use of CMB"）。
 /// - `≥2`（reserved/vendor）→ `Some(SGL_DESCRIPTOR_TYPE_INVALID)` (0x11)：本教学实现
-///   一律以 Descriptor Type Invalid 拒。
-pub(crate) fn subtype_to_sc(sub_type: u8) -> Option<u16> {
+///   一律以 Descriptor Type Invalid 拒（与 CMB 无关）。
+pub(crate) fn subtype_to_sc(sub_type: u8, cmb_enabled: bool) -> Option<u16> {
     use crate::cmd::sc;
     match sub_type {
         0 => None,
+        1 if cmb_enabled => None,
         1 => Some(sc::SGL_INVALID_USE_OF_CMB),
         _ => Some(sc::SGL_DESCRIPTOR_TYPE_INVALID),
+    }
+}
+
+/// **CMB-P2** — 把一个 SGL descriptor 的 address 字段按 sub_type 解析成实际
+/// guest 物理地址（GPA），供 `guest_read`/`guest_write` 使用。三条 SGL 路径
+/// （inline / segment 指针 / segment 页内 Data Block）**共用本一处** rebase 规则，
+/// 与 [`subtype_to_sc`] 同样集中，避免某路径忘了 rebase 而把 CMB 偏移误当 GPA。
+///
+/// 规则（spec § 4.4 SGL Offset sub-type）：
+/// - sub_type=0（Address）→ 原样返回（address 本就是 GPA）。
+/// - sub_type=1（Offset/CMB-relative）→ `cba + offset`（CMB 在 guest 地址空间的实际
+///   位置 = CMBMSC.CBA + descriptor 内偏移）。
+///   * `cmb` 为 `Some((cba, _size))` 时正常 rebase（`cba + offset`）。**越界行为（reviewer
+///     M-1 实测，非"判 straddle"）**：① offset ≥ size（起点已出窗口）→ `cba+offset ≥ win_end`
+///     且 `≥ cba` → `cmb_hit` 判 **Miss → 走 DMA**（对一个真实 guest GPA 发 DMA，lenient；
+///     非内存安全问题——是 guest 自有 RAM，且巨偏移 saturating 后溢出仍 Miss→transport 拒）；
+///     ② offset < size 但 offset+len 越尾 → `cmb_hit` 判 **Straddle → ok=false**。
+///     **P5 TODO**：CMB-relative offset ≥ size 严格应返 `SGL_OFFSET_INVALID`(0x16) 而非 DMA；
+///     待 P5 SGLS advertise 后 CMB-relative 才被 driver 触发，届时把本函数改 `Result` 严格拒。
+///   * `cmb` 为 `None`（CMB 未启用）时**不该到达**（`subtype_to_sc` 已先拒 sub_type=1），
+///     防御性地原样返回偏移（后续 `cmb_hit` Miss → 走 DMA，行为可预测、不 panic）。
+///
+/// **注意**：本函数只处理 sub_type∈{0,1}；sub_type≥2 由 `subtype_to_sc` 在更早处拒，
+/// 不会带着非法 sub_type 走到这里。
+pub(crate) fn resolve_sgl_address(sub_type: u8, address: u64, cmb: Option<(u64, u64)>) -> u64 {
+    match (sub_type, cmb) {
+        // CMB-relative：偏移 + CMB 基址 → 实际 GPA。saturating_add 防恶意巨偏移溢出
+        // panic（溢出后必落出窗口 → cmb_hit Miss/Straddle，行为可预测）。
+        (1, Some((cba, _size))) => cba.saturating_add(address),
+        // Address（sub_type=0）或防御性 fallback：原样。
+        _ => address,
     }
 }
 
@@ -126,13 +190,22 @@ pub(crate) fn subtype_to_sc(sub_type: u8) -> Option<u16> {
 /// 直接透传给 `finish_sgl_error` → CQE，无需在调用点再手挑 SC：
 /// - 字节数非 16 倍数 → `INVALID_SGL_SEGMENT_DESCRIPTOR` (0x0d)
 /// - `SglDescriptor::parse` 返 None（type 高 nibble 未识别）→ `SGL_DESCRIPTOR_TYPE_INVALID` (0x11)
-/// - sub_type=1（Offset / CMB-relative）→ `SGL_INVALID_USE_OF_CMB` (0x12)；本 controller
-///   无 CMB，故永远非法（见函数体注释）
+/// - sub_type=1（Offset / CMB-relative）→ **CMB 启用时放行并 rebase**（见下）；CMB 未启用
+///   时 `SGL_INVALID_USE_OF_CMB` (0x12)
 /// - sub_type≥2（reserved/vendor）→ `SGL_DESCRIPTOR_TYPE_INVALID` (0x11)
+///
+/// **CMB-P2**：`cmb` = controller 当前 CMB 窗口 `Some((cba, size))`（CMSE=1 时）/ `None`。
+/// 经共享 [`subtype_to_sc`]`(sub_type, cmb.is_some())` 判合法性，并对放行的 sub_type=1
+/// descriptor 用 [`resolve_sgl_address`] **就地把偏移 rebase 成实际 GPA**（`cba + offset`），
+/// 使 caller（completion.rs 的 fragment walk）拿到的 `address` 直接是可喂 `guest_*` 的 GPA，
+/// 自然命中 CMB backing。三路径同一 rebase 规则。
 ///
 /// **Phase R2a** 起已 wire：`controller/completion.rs::NvmSglFetch` 用本函数
 /// 解析 PSDT=10 segment 页里的 descriptor 数组。
-pub(crate) fn parse_sgl_list(buf: &[u8]) -> Result<Vec<SglDescriptor>, u16> {
+pub(crate) fn parse_sgl_list(
+    buf: &[u8],
+    cmb: Option<(u64, u64)>,
+) -> Result<Vec<SglDescriptor>, u16> {
     // 错误现在直接返**精确 NVMe SC**（u16，含 SCT 高字节），caller 透传给 CQE，
     // 不再在调用点手填一个粗粒度 SC——与 cmd.rs sc 模块"以 spec 源为准"同一纪律。
     use crate::cmd::sc;
@@ -142,15 +215,18 @@ pub(crate) fn parse_sgl_list(buf: &[u8]) -> Result<Vec<SglDescriptor>, u16> {
     let mut out = Vec::with_capacity(buf.len() / 16);
     for chunk in buf.chunks_exact(16) {
         let arr: [u8; 16] = chunk.try_into().unwrap();
-        let desc = SglDescriptor::parse(&arr).ok_or(sc::SGL_DESCRIPTOR_TYPE_INVALID)?;
+        let mut desc = SglDescriptor::parse(&arr).ok_or(sc::SGL_DESCRIPTOR_TYPE_INVALID)?;
         // ── 逐 descriptor sub_type 校验（spec § 4.4 SGL Descriptor sub-type）──
         // 经共享 `subtype_to_sc` classifier 判（三条 SGL 路径同判据，见其 doc）：
-        // sub_type=0 (Address) 放行；sub_type=1 (Offset, CMB-relative) → 本 controller
-        // 无 CMB，address 是 CMB 内偏移而非 GPA，返 generic status 0x12 = SGL Invalid
-        // Use of CMB；sub_type≥2 (reserved/vendor) → Descriptor Type Invalid (0x11)。
-        if let Some(err_sc) = subtype_to_sc(desc.sub_type) {
+        // sub_type=0 (Address) 放行；sub_type=1 (Offset, CMB-relative) → CMB 启用时
+        // 放行 + rebase（cba+offset），未启用时 generic status 0x12 = SGL Invalid Use
+        // of CMB；sub_type≥2 (reserved/vendor) → Descriptor Type Invalid (0x11)。
+        if let Some(err_sc) = subtype_to_sc(desc.sub_type, cmb.is_some()) {
             return Err(err_sc);
         }
+        // **CMB-P2** — 放行的 CMB-relative descriptor：就地把偏移 rebase 成实际 GPA，
+        // 使下游 fragment walk 拿到的 address 直接可喂 `guest_*`（命中 CMB backing）。
+        desc.address = resolve_sgl_address(desc.sub_type, desc.address, cmb);
         out.push(desc);
     }
     Ok(out)
@@ -175,6 +251,14 @@ pub(crate) fn flatten_data_blocks(
 ) -> Result<Vec<SglFragment>, &'static str> {
     let mut out = Vec::with_capacity(descriptors.len());
     for d in descriptors {
+        // **CMB-P2 一致性锚（dead-code R2 scaffolding）** — 本函数当前**无生产调用点**
+        // （仅测试引用）。此处 `sub_type != 0` 是 R1 遗留的**本地**判据，**未**走集中
+        // classifier `subtype_to_sc`，故对 CMB-relative（sub_type=1）会一律 Err——与三条
+        // live SGL 路径（parse_sgl_list / resolve_data_pointers / validate_segment_pointer
+        // 已 CMB-aware）**不一致**。若将来 R2 wiring 采用本函数，**必须**改为经
+        // `subtype_to_sc(d.sub_type, cmb_enabled)` 判 + `resolve_sgl_address(.., cmb)` rebase
+        // （即把 `cmb` 窗口穿进来），否则会悄悄重新引入 CMB-relative 误拒。保留现状仅因
+        // 它不在任何 live 路径上（classifier 集中化纪律：单一裁决点）。
         if d.sub_type != 0 {
             return Err("SGL sub_type != 0 (only Address subtype supported)");
         }
@@ -315,42 +399,75 @@ mod tests {
     #[test]
     fn parse_sgl_list_count_and_alignment() {
         // 非 16 倍数 → Err（守卫取反会让本断言红）。
-        assert!(parse_sgl_list(&[0u8; 17]).is_err());
-        assert!(parse_sgl_list(&[0u8; 15]).is_err());
+        assert!(parse_sgl_list(&[0u8; 17], None).is_err());
+        assert!(parse_sgl_list(&[0u8; 15], None).is_err());
         // 3 个合法 Data Block descriptor（48 字节）→ Ok 且 count==3（返 Ok(vec![])
         // 的 mutant 会让 len 断言红）。
         let mut buf = vec![0u8; 48];
         buf[8..12].copy_from_slice(&512u32.to_le_bytes()); // desc0 length
         buf[16 + 8..16 + 12].copy_from_slice(&1024u32.to_le_bytes()); // desc1 length
-        let descs = parse_sgl_list(&buf).unwrap();
+        let descs = parse_sgl_list(&buf, None).unwrap();
         assert_eq!(descs.len(), 3);
         assert_eq!(descs[0].length, 512);
         assert_eq!(descs[1].length, 1024);
         // 含未知 type（high nibble 0x6）→ Err。
         let mut bad = vec![0u8; 16];
         bad[15] = 0x60;
-        assert!(parse_sgl_list(&bad).is_err());
+        assert!(parse_sgl_list(&bad, None).is_err());
     }
 
     /// **共享 classifier 单测** — `subtype_to_sc` 是三条 SGL 路径（parse_sgl_list /
     /// resolve_data_pointers / validate_segment_pointer）共用的 sub_type→SC 判据；
     /// 直锁其映射，防三处漂移。值经 `cmd::sc`（已 M1-anchor 到 nvme_spec）间接锚定。
+    /// **CMB-P2**：无 CMB（`cmb_enabled=false`）时 sub_type=1 → 0x12（现状）。
     #[test]
     fn subtype_to_sc_maps_each_subtype() {
         use crate::cmd::sc;
         // 0 = Address（host 内存）→ 合法，None。
-        assert_eq!(subtype_to_sc(0), None);
-        // 1 = Offset（CMB-relative）→ SGL_INVALID_USE_OF_CMB (0x12)。
-        assert_eq!(subtype_to_sc(1), Some(sc::SGL_INVALID_USE_OF_CMB));
+        assert_eq!(subtype_to_sc(0, false), None);
+        // 1 = Offset（CMB-relative），CMB 未启用 → SGL_INVALID_USE_OF_CMB (0x12)。
+        assert_eq!(subtype_to_sc(1, false), Some(sc::SGL_INVALID_USE_OF_CMB));
         // ≥2 = reserved/vendor → SGL_DESCRIPTOR_TYPE_INVALID (0x11)。逐值锁，
-        // 防"只 match 2、漏 15"之类的部分实现。
+        // 防"只 match 2、漏 15"之类的部分实现（CMB 状态不影响 reserved 判定）。
         for st in 2u8..=15 {
             assert_eq!(
-                subtype_to_sc(st),
+                subtype_to_sc(st, false),
                 Some(sc::SGL_DESCRIPTOR_TYPE_INVALID),
                 "sub_type={st} 应返 Descriptor Type Invalid"
             );
+            assert_eq!(
+                subtype_to_sc(st, true),
+                Some(sc::SGL_DESCRIPTOR_TYPE_INVALID),
+                "sub_type={st} 即使 CMB 启用仍 Descriptor Type Invalid"
+            );
         }
+    }
+
+    /// **CMB-P2 classifier 放行 + rebase** — CMB 启用（`cmb_enabled=true`）时
+    /// sub_type=1（Offset/CMB-relative）放行（`None`，非 0x12）；sub_type=0/≥2 不受 CMB
+    /// 状态影响。`resolve_sgl_address` 把放行的 CMB-relative 偏移 rebase 成 `cba+offset`。
+    #[test]
+    fn cmb_relative_subtype_allowed_and_rebased_when_cmb_enabled() {
+        // 放行：CMB 启用 → sub_type=1 合法。
+        assert_eq!(subtype_to_sc(1, true), None, "CMB 启用 → sub_type=1 放行");
+        // sub_type=0 (Address) 与 CMB 无关，恒放行。
+        assert_eq!(subtype_to_sc(0, true), None);
+        assert_eq!(subtype_to_sc(0, false), None);
+
+        // rebase：sub_type=1 + CMB 窗口 (cba=0x8000_0000, size=2 MiB) → cba+offset。
+        let cba = 0x8000_0000u64;
+        let cmb = Some((cba, 2 * 1024 * 1024u64));
+        assert_eq!(
+            resolve_sgl_address(1, 0x1000, cmb),
+            cba + 0x1000,
+            "CMB-relative 偏移 rebase 成 cba+offset"
+        );
+        // sub_type=0：address 本就是 GPA，原样（即使传了 cmb 窗口）。
+        assert_eq!(resolve_sgl_address(0, 0xDEAD_0000, cmb), 0xDEAD_0000);
+        // CMB 未启用（None）：防御性原样返回偏移（subtype_to_sc 已先拒，不该到达）。
+        assert_eq!(resolve_sgl_address(1, 0x1000, None), 0x1000);
+        // 恶意巨偏移：saturating_add 不 panic（溢出后落出窗口 → cmb_hit 兜底）。
+        assert_eq!(resolve_sgl_address(1, u64::MAX, cmb), u64::MAX);
     }
 
     /// **CMB-SGL spec-completeness（unit anchor）** — 本 controller 无 CMB
@@ -364,29 +481,51 @@ mod tests {
     #[test]
     fn parse_sgl_list_rejects_cmb_relative_subtype() {
         use crate::cmd::sc;
-        // sub_type=1（id_byte 0x01 = type 0 Data Block + sub 1 Offset）→ 0x12。
+        // sub_type=1（id_byte 0x01 = type 0 Data Block + sub 1 Offset），CMB 未启用
+        // （None）→ 0x12。
         let mut cmb = [0u8; 16];
         cmb[8..12].copy_from_slice(&4096u32.to_le_bytes());
         cmb[15] = 0x01;
         assert_eq!(
-            parse_sgl_list(&cmb).unwrap_err(),
+            parse_sgl_list(&cmb, None).unwrap_err(),
             sc::SGL_INVALID_USE_OF_CMB,
-            "sub_type=1 (CMB-relative) 必返 SGL_INVALID_USE_OF_CMB (0x12)"
+            "sub_type=1 (CMB-relative) + 无 CMB 必返 SGL_INVALID_USE_OF_CMB (0x12)"
         );
         // sub_type=0（id_byte 0x00 = type 0 Data Block + sub 0 Address）→ Ok。
         let mut addr = [0u8; 16];
         addr[8..12].copy_from_slice(&4096u32.to_le_bytes());
         addr[15] = 0x00;
-        let ok = parse_sgl_list(&addr).expect("sub_type=0 (Address) 应 Ok");
+        let ok = parse_sgl_list(&addr, None).expect("sub_type=0 (Address) 应 Ok");
         assert_eq!(ok.len(), 1);
         assert_eq!(ok[0].sub_type, 0);
         // sub_type=2（id_byte 0x02 = type 0 Data Block + sub 2 reserved）→ 0x11。
         let mut rsvd = [0u8; 16];
         rsvd[15] = 0x02;
         assert_eq!(
-            parse_sgl_list(&rsvd).unwrap_err(),
+            parse_sgl_list(&rsvd, None).unwrap_err(),
             sc::SGL_DESCRIPTOR_TYPE_INVALID,
             "sub_type≥2 (reserved) 必返 SGL_DESCRIPTOR_TYPE_INVALID (0x11)"
+        );
+    }
+
+    /// **CMB-P2** — CMB 启用时 `parse_sgl_list` 放行 sub_type=1 并就地 rebase
+    /// descriptor.address 成 `cba+offset`（segment-页 Data Block 路径）。
+    #[test]
+    fn parse_sgl_list_rebases_cmb_relative_when_enabled() {
+        let cba = 0x8000_0000u64;
+        let cmb = Some((cba, 2 * 1024 * 1024u64));
+        // 单 Data Block：offset=0x1000、length=4096、sub_type=1（CMB-relative）。
+        let mut d = [0u8; 16];
+        d[0..8].copy_from_slice(&0x1000u64.to_le_bytes());
+        d[8..12].copy_from_slice(&4096u32.to_le_bytes());
+        d[15] = 0x01;
+        let descs = parse_sgl_list(&d, cmb).expect("CMB 启用 → sub_type=1 放行");
+        assert_eq!(descs.len(), 1);
+        assert_eq!(descs[0].sub_type, 1, "sub_type 保留（供下游辨识）");
+        assert_eq!(
+            descs[0].address,
+            cba + 0x1000,
+            "address 已 rebase 成 cba+offset（下游直接喂 guest_*）"
         );
     }
 }

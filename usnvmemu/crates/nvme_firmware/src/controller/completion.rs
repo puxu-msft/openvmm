@@ -2641,10 +2641,13 @@ impl NvmeController {
                     // 全段 walk 完后（is_last 段处理完）启动逐 fragment 传输。
                     //
                     // R2a：仅 Data Block。Bit Bucket → R2c；Keyed → reject。
-                    let descs = match crate::sgl::parse_sgl_list(&data) {
+                    // **CMB-P2** — segment 页解析传入 CMB 窗口：CMB 启用时放行 sub_type=1
+                    // 并就地 rebase descriptor.address 成 cba+offset（含数据 Data Block 与
+                    // 末位 continuation 指针；下游 guest_* 直接命中 CMB backing）。
+                    let descs = match crate::sgl::parse_sgl_list(&data, self.cmb_window()) {
                         Ok(d) => d,
                         Err(sc) => {
-                            // parse_sgl_list 现返精确 SC（CMB-relative sub_type=1 →
+                            // parse_sgl_list 现返精确 SC（CMB-relative sub_type=1 + 无 CMB →
                             // SGL_INVALID_USE_OF_CMB 0x12、非 16 倍数 → 0x0d、未知 type /
                             // reserved sub_type → 0x11）；直接透传给 CQE，不再手填粗粒度 SC。
                             tracing::warn!(op_id, sc, "SGL segment 解析失败");
@@ -2686,15 +2689,17 @@ impl NvmeController {
                     };
                     // 处理数据 descriptor → append op.frags（stream offset 由
                     // firmware 自算的 walk_offset 决定，非 driver 输入）。
+                    //
+                    // **CMB-P2** — 此处**不再**重复 `d.sub_type != 0` 粗检：sub_type 的
+                    // 合法性已由 `parse_sgl_list`（上面）经共享 `subtype_to_sc` classifier
+                    // 统一裁决（sub_type=0 放行；=1 仅 CMB 启用时放行并已就地 rebase 成
+                    // cba+offset；≥2 已拒）。返回的 descriptor 的 `address` 对 CMB-relative
+                    // 已是实际 GPA，可直接喂 `guest_*`。保留此处旧的 `!=0` 检查会把已放行的
+                    // CMB-relative fragment 误拒（classifier 集中化纪律：单一裁决点）。
                     let mut walk_err: Option<u16> = None;
                     {
                         let op = self.sgl_ops.get_mut(&op_id).unwrap();
                         for d in data_descs {
-                            if d.sub_type != 0 {
-                                tracing::warn!(sub_type = d.sub_type, "SGL fragment sub_type 非 0");
-                                walk_err = Some(sc::SGL_DESCRIPTOR_TYPE_INVALID);
-                                break;
-                            }
                             match d.sgl_type {
                                 crate::sgl::SglType::DataBlock => {
                                     // 0 长度 Data Block 无数据传输：跳过（不 push
@@ -2752,8 +2757,15 @@ impl NvmeController {
                             // **R2b** — 末位 continuation：用与 SGL1 同一份 wire
                             // 校验谓词（type ∈ {Segment, Last Segment}、sub_type=0、
                             // length 16 倍数 / 非零 / ≤1 page）后 DMA-read 下一段。
+                            // **CMB-P2** — `c` 来自 parse_sgl_list，其 `.address` 若是
+                            // CMB-relative 已被就地 rebase 成 cba+offset（见上）。这里仅再
+                            // 校验 type/length/sub_type（传 cmb 窗口让 classifier 放行
+                            // CMB-relative 指针）；不重复 rebase。
                             let (next_len, next_is_last) =
-                                match crate::controller::io::validate_segment_pointer(c) {
+                                match crate::controller::io::validate_segment_pointer(
+                                    c,
+                                    self.cmb_window(),
+                                ) {
                                     Ok(t) => t,
                                     Err(sc_byte) => {
                                         self.finish_sgl_error(ctx, op_id, sc_byte);

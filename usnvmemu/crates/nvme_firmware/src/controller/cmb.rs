@@ -44,6 +44,20 @@ enum CmbHit {
 }
 
 impl NvmeController {
+    /// **CMB-P2** — 当前 CMB 窗口 `(cba, size)`，仅在 CMB **已启用**（CMBMSC.CMSE=1）
+    /// 时为 `Some`；否则 `None`（无 CMB / 仅 CRE / 未编程）。SGL 三路径用它统一判
+    /// CMB-relative 是否放行（`subtype_to_sc(_, cmb.is_some())`）+ rebase 偏移
+    /// （`resolve_sgl_address(_, _, cmb)`）。语义与 `cmb_hit` 的"CMSE 未置 → 不拦截"
+    /// 一致（同一启用判据，避免 classifier 放行了而 dispatch 又当 Miss 的不一致）。
+    pub(super) fn cmb_window(&self) -> Option<(u64, u64)> {
+        let cmb = self.cmb.as_ref()?;
+        if cmb.cmse {
+            Some((cmb.cba, cmb.size))
+        } else {
+            None
+        }
+    }
+
     /// **CMB-P1b** — CMB 合成 token 的高位 tag（bit 63）。见模块文档命名空间说明。
     pub(super) const CMB_TOKEN_TAG: u64 = 1u64 << 63;
 
