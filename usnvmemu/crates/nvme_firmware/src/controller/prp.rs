@@ -93,7 +93,6 @@ pub(crate) fn tier(offset: u64, total_len: u64) -> PrpTier {
 /// PRP2 在某 tier 下的语义（spec § 4.1.1 / § 4.4）—— "tier → PRP2 解读"的**唯一裁决点**。
 /// 供所有 dispatch 路径共用，消灭各路径各自 if/else 判 PRP2 对齐/非零的散落逻辑。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // #4c-b P0 地基；P1+ 在 dispatch 入口消费
 pub(crate) enum Prp2Role {
     /// Single 档：PRP2 未使用（可为 0，不校验）。
     Unused,
@@ -107,7 +106,6 @@ pub(crate) enum Prp2Role {
 /// caller 据此统一校验 PRP2（Unused 不校验；DataPage/ListPage 须非 0 且页对齐，否则
 /// 非对齐→`PRP_OFFSET_INVALID`、0→`INVALID_FIELD`）。
 #[inline]
-#[allow(dead_code)] // #4c-b P0 地基；P1+ 消费
 pub(crate) fn prp2_role(offset: u64, total_len: u64) -> Prp2Role {
     match tier(offset, total_len) {
         PrpTier::Single => Prp2Role::Unused,

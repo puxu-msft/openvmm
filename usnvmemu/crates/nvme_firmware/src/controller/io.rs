@@ -282,6 +282,29 @@ pub(crate) fn advance_zns_wp(ns: &mut crate::controller::Namespace, lba: u64, nl
     }
 }
 
+/// **#4c-b 统一 PRP2 校验**（spec § 4.1.1）—— 按 PRP2 在当前 tier 下的语义
+/// （`prp::prp2_role`）统一裁定，返回需 error 的 SC（`None` = 通过）：
+/// - `Unused`（Single 档）：PRP2 不参与，不校验；
+/// - `DataPage`（Dual 档）/ `ListPage`（List 档）：PRP2 必须非 0（否则 `INVALID_FIELD`）
+///   且页对齐（否则 `PRP_OFFSET_INVALID`）——仅 PRP1 可带页内偏移。
+///
+/// 消灭 plain READ/WRITE 与各 PI dispatch 路径手写的重复 PRP2 判定（曾散落 8+ 处）。
+#[inline]
+pub(crate) fn validate_prp2(prp2: u64, offset: u64, total_len: u64) -> Option<u16> {
+    match crate::controller::prp::prp2_role(offset, total_len) {
+        crate::controller::prp::Prp2Role::Unused => None,
+        crate::controller::prp::Prp2Role::DataPage | crate::controller::prp::Prp2Role::ListPage => {
+            if prp2 == 0 {
+                Some(sc::INVALID_FIELD)
+            } else if (prp2 & (NVME_PAGE_SIZE - 1)) != 0 {
+                Some(sc::PRP_OFFSET_INVALID)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// **Phase R1/R2** — data pointer 解析结果。
 ///
 /// PRP 路径（PSDT=00 / PSDT=01 inline 单 Data Block）返 `(prp1, prp2)`，复用
@@ -1740,30 +1763,16 @@ impl NvmeController {
                 // 统一计算（O=0 时与 legacy 逐字节一致）。
                 let prp_off = crate::controller::prp::prp1_offset(prp1);
                 // **#4f spec 硬化（PRP_OFFSET_INVALID，spec § 4.1.1）**：非 Single 档时 PRP2
-                // 是数据指针（Dual）或 PRP-list 页指针（List），二者都必须页对齐——offset
-                // 支持仅 PRP1 允许偏移。host 违反则返 PRP_OFFSET_INVALID 而非 silent 错位。
-                let prp_tier = crate::controller::prp::tier(prp_off, bytes);
-                if prp_tier != crate::controller::prp::PrpTier::Single {
-                    // 非 Single 档必需 PRP2（Dual 数据指针 / List 页指针）：缺失 → INVALID_FIELD；
-                    // 非页对齐 → PRP_OFFSET_INVALID（reviewer #4f M-1：prp2==0 也要拦）。
-                    if prp2 == 0 {
-                        tracing::warn!("READ：非 Single 档缺 PRP2 → INVALID_FIELD");
-                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
-                    }
-                    if (prp2 & (NVME_PAGE_SIZE - 1)) != 0 {
-                        tracing::warn!(
-                            prp2 = format_args!("{:#x}", prp2),
-                            "READ：PRP2（数据/list 指针）须页对齐 → PRP_OFFSET_INVALID"
-                        );
-                        return Some(Cqe::error(
-                            cid,
-                            sq_id,
-                            sq_head,
-                            phase,
-                            sc::PRP_OFFSET_INVALID,
-                        ));
-                    }
+                // 是数据指针（Dual）或 PRP-list 页指针（List），二者都必须非 0 且页对齐——
+                // 偏移仅 PRP1 允许。**#4c-b**：校验收敛到 `validate_prp2`（prp2_role 单点裁决）。
+                if let Some(sc_byte) = validate_prp2(prp2, prp_off, bytes) {
+                    tracing::warn!(
+                        prp2 = format_args!("{:#x}", prp2),
+                        "READ：PRP2 校验失败（非 Single 档须非 0 且页对齐）"
+                    );
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte));
                 }
+                let prp_tier = crate::controller::prp::tier(prp_off, bytes);
                 match prp_tier {
                     crate::controller::prp::PrpTier::Single => {
                         let tok = self.guest_write(ctx, prp1, buf);
@@ -2620,29 +2629,16 @@ impl NvmeController {
                 // **#4 非页对齐**：档位/分段经 prp 模块统一计算（PRP1 偏移 O 把首段缩到
                 // page-O；O=0 时与 legacy 逐字节一致）。
                 let prp_off = crate::controller::prp::prp1_offset(prp1);
-                // **#4f spec 硬化（PRP_OFFSET_INVALID）**：非 Single 档 PRP2 须页对齐（同 READ）。
-                let prp_tier = crate::controller::prp::tier(prp_off, bytes);
-                if prp_tier != crate::controller::prp::PrpTier::Single {
-                    // 非 Single 档必需 PRP2：缺失 → INVALID_FIELD；非页对齐 → PRP_OFFSET_INVALID
-                    // （reviewer #4f M-1：prp2==0 也要拦）。
-                    if prp2 == 0 {
-                        tracing::warn!("WRITE：非 Single 档缺 PRP2 → INVALID_FIELD");
-                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
-                    }
-                    if (prp2 & (NVME_PAGE_SIZE - 1)) != 0 {
-                        tracing::warn!(
-                            prp2 = format_args!("{:#x}", prp2),
-                            "WRITE：PRP2（数据/list 指针）须页对齐 → PRP_OFFSET_INVALID"
-                        );
-                        return Some(Cqe::error(
-                            cid,
-                            sq_id,
-                            sq_head,
-                            phase,
-                            sc::PRP_OFFSET_INVALID,
-                        ));
-                    }
+                // **#4f spec 硬化（PRP_OFFSET_INVALID）**：非 Single 档 PRP2 须非 0 且页对齐
+                // （同 READ）。**#4c-b**：校验收敛到 `validate_prp2`（prp2_role 单点裁决）。
+                if let Some(sc_byte) = validate_prp2(prp2, prp_off, bytes) {
+                    tracing::warn!(
+                        prp2 = format_args!("{:#x}", prp2),
+                        "WRITE：PRP2 校验失败（非 Single 档须非 0 且页对齐）"
+                    );
+                    return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte));
                 }
+                let prp_tier = crate::controller::prp::tier(prp_off, bytes);
                 match prp_tier {
                     crate::controller::prp::PrpTier::Single => {
                         let tok = self.guest_read(ctx, prp1, bytes as u32);

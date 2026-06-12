@@ -2888,6 +2888,64 @@ fn prp2_misaligned_returns_prp_offset_invalid() {
     }
 }
 
+/// **#4c-b P1（validate_prp2 单点裁决）** — 非 Single 档（Dual/List）缺 PRP2（=0）
+/// 必返 INVALID_FIELD（与非页对齐的 PRP_OFFSET_INVALID 是 validate_prp2 的另一 error
+/// 分支）。补齐 `prp2==0` known-answer，使「Single 放行 / prp2==0→INVALID_FIELD /
+/// 非对齐→PRP_OFFSET_INVALID」三态齐备，守住 P2/P3 收敛更多路径时的单点正确性。
+#[test]
+fn prp2_zero_on_dual_returns_invalid_field() {
+    use pcie_device_core::DeviceCtx;
+    fn plain_ns() -> NvmeController {
+        let mut c = make_ctrl_with_tmp("prp2_zero");
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 0;
+        ns.pi_type = 0;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / (1u64 << ns.lbads);
+        c.cqs.insert(
+            1,
+            crate::regs::CompletionQueue {
+                base_gpa: 0x1_0000,
+                size: 64,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 0,
+                interrupt_enabled: false,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        c
+    }
+    // nlb=2 (8192B, O=0) → Dual：PRP2 是第二数据页指针，缺失（=0）→ INVALID_FIELD。
+    for opc in [0x02u8, 0x01u8] {
+        let mut c = plain_ns();
+        let mut cap = pcie_device_core::CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let mut sqe = io_sqe(opc, 1, 0, 2, 0x4000, false, 0xD1);
+        sqe.prp2 = 0; // 非 Single 档缺 PRP2
+        let cqe = c
+            .dispatch_io(&mut ctx, 1, sqe, 0xD1, 0, 1)
+            .expect("Dual 档缺 PRP2 → 同步错误 CQE");
+        assert_eq!(
+            cqe_status(&cqe),
+            crate::cmd::sc::INVALID_FIELD,
+            "opc={opc:#x}：Dual 档 prp2==0 → INVALID_FIELD(0x0002)"
+        );
+        // 不应发出任何 DMA（拒在 dispatch 期）。
+        assert!(
+            !cap.events().iter().any(|e| matches!(
+                e,
+                pcie_device_core::TransportEvent::DmaRead { .. }
+                    | pcie_device_core::TransportEvent::DmaWrite { .. }
+            )),
+            "opc={opc:#x}：校验失败不应发 DMA"
+        );
+    }
+}
+
 /// **C1① WRITE-site 守门（reviewer CRITICAL-1 回归保护）** — sub-MDTS 多 LBA PI
 /// WRITE 必须正确完成。PRACT=1 时 host PRP 只传 data（N×4096），controller 自动
 /// 插 PI tuple；MDTS 门用 block_bytes 但 host 传输 / PRP 路由 / buffer 必须用
