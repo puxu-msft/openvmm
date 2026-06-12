@@ -2272,7 +2272,7 @@ impl NvmeController {
                             let take = (tot - 1) as usize; // PRP1 已 dispatch
                             (tot, ent.into_iter().take(take).collect())
                         });
-                    let Some((total_pages, list)) = needed else {
+                    let Some((_total_pages, list)) = needed else {
                         tracing::warn!(op_id, "PRP list fetch for unknown op_id");
                         return;
                     };
@@ -2280,28 +2280,28 @@ impl NvmeController {
                         op.list_entries = Some(list.clone());
                     }
                     // Issue sub-DMA reads for each list entry (page_idx 1..total)
+                    // 总传输字节按本 op 真实形态算——inline-PI（extended-LBA）流是
+                    // num_blocks × block_bytes（含 inline metadata，4104/块）；plain / sep-meta
+                    // （data 经 PRP，meta 经 MPTR）是 num_blocks × sector（纯 data）。
+                    // **误用 sector 当 inline 总字节会让末页 size 算成 0 → inline nlb≥2 WRITE
+                    // silent 丢末页数据**（reviewer B6c-3 HIGH，C1① 同类教训）。
+                    // **#4 非页对齐**：每页 want_bytes 经 prp::page_size（PRP1 偏移 O 把首段
+                    // 缩到 page-O、后续整页、末页 partial）；O=0 时与 legacy 一致。
+                    let (total_bytes, prp_off) = {
+                        let op = &self.prp_list_ops[&op_id];
+                        let tb = if let Some(ipi) = op.inline_pi.as_ref() {
+                            op.num_blocks as u64 * ipi.block_bytes as u64
+                        } else {
+                            let sector =
+                                1u64 << self.namespaces.get(&op.nsid).map_or(9u8, |n| n.lbads);
+                            op.num_blocks as u64 * sector
+                        };
+                        (tb, crate::controller::prp::prp1_offset(op.prp1_gpa))
+                    };
                     for (i, gpa) in list.iter().enumerate() {
                         let page_idx = (i + 1) as u32;
-                        let want_bytes = if page_idx == total_pages - 1 {
-                            // 末页可能不满 4 KiB。**关键**：总传输字节按本 op 真实形态算——
-                            // inline-PI（extended-LBA）流是 num_blocks × block_bytes（含 inline
-                            // metadata，4104/块）；plain / sep-meta（data 经 PRP，meta 经 MPTR）
-                            // 是 num_blocks × sector（纯 data）。**误用 sector 当 inline 总字节
-                            // 会让末页 size 算成 0 → inline nlb≥2 WRITE silent 丢末页数据**
-                            // （reviewer B6c-3 HIGH，C1① 同类教训）。
-                            let op = &self.prp_list_ops[&op_id];
-                            let total_bytes = if let Some(ipi) = op.inline_pi.as_ref() {
-                                op.num_blocks as u64 * ipi.block_bytes as u64
-                            } else {
-                                let sector =
-                                    1u64 << self.namespaces.get(&op.nsid).map_or(9u8, |n| n.lbads);
-                                op.num_blocks as u64 * sector
-                            };
-                            let last = total_bytes - (page_idx as u64) * NVME_PAGE_SIZE;
-                            last as u32
-                        } else {
-                            NVME_PAGE_SIZE as u32
-                        };
+                        let want_bytes =
+                            crate::controller::prp::page_size(page_idx, prp_off, total_bytes);
                         let tok = ctx.dma_read(*gpa, want_bytes);
                         // 借用 PendingIo 共用字段 sq_id/cid/sq_head/cq_id/nsid
                         let (sq_id, cid, sq_head, cq_id, nsid) = {

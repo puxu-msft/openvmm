@@ -1685,90 +1685,100 @@ impl NvmeController {
                 //   ≤ 1 page (4 KiB)：单 PRP1
                 //   ≤ 2 page (8 KiB)：PRP1 + PRP2 直接指针
                 //   > 2 page (≤ MDTS)：PRP1 + PRP2 指向 PRP list 页
-                if bytes <= NVME_PAGE_SIZE {
-                    let tok = ctx.dma_write(prp1, buf);
-                    self.pending_ios.insert(
-                        tok,
-                        PendingIo {
-                            sq_id,
-                            cid,
-                            sq_head,
-                            cq_id,
-                            nsid,
-                            op: PendingOp::NvmReadDmaWrite { num_blocks: nlb },
-                        },
-                    );
-                } else if bytes <= 2 * NVME_PAGE_SIZE {
-                    let half = NVME_PAGE_SIZE as usize;
-                    let (b1, b2) = buf.split_at(half);
-                    let tok1 = ctx.dma_write(prp1, b1.to_vec());
-                    let tok2 = ctx.dma_write(prp2, b2.to_vec());
-                    self.pending_ios.insert(
-                        tok1,
-                        PendingIo {
-                            sq_id,
-                            cid,
-                            sq_head,
-                            cq_id,
-                            nsid,
-                            op: PendingOp::NvmReadDualPrpSiblingHalf,
-                        },
-                    );
-                    self.pending_ios.insert(
-                        tok2,
-                        PendingIo {
-                            sq_id,
-                            cid,
-                            sq_head,
-                            cq_id,
-                            nsid,
-                            op: PendingOp::NvmReadDmaWrite { num_blocks: nlb },
-                        },
-                    );
-                } else {
-                    // **Phase E** — PRP list path (Read > 2 page)。
-                    let total_pages = bytes.div_ceil(NVME_PAGE_SIZE) as u32;
-                    let mut data_pages: Vec<Option<Vec<u8>>> =
-                        Vec::with_capacity(total_pages as usize);
-                    for i in 0..total_pages {
-                        let off = i as usize * NVME_PAGE_SIZE as usize;
-                        let end = ((i + 1) as usize * NVME_PAGE_SIZE as usize).min(buf.len());
-                        data_pages.push(Some(buf[off..end].to_vec()));
+                // **#4 非页对齐**：PRP1 可带页内偏移 O，首段=page-O；档位/分段经 prp 模块
+                // 统一计算（O=0 时与 legacy 逐字节一致）。
+                let prp_off = crate::controller::prp::prp1_offset(prp1);
+                match crate::controller::prp::tier(prp_off, bytes) {
+                    crate::controller::prp::PrpTier::Single => {
+                        let tok = ctx.dma_write(prp1, buf);
+                        self.pending_ios.insert(
+                            tok,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmReadDmaWrite { num_blocks: nlb },
+                            },
+                        );
                     }
-                    let op_id = self.alloc_op_id();
-                    self.prp_list_ops.insert(
-                        op_id,
-                        crate::controller::PrpListOp {
-                            sq_id,
-                            cid,
-                            sq_head,
-                            cq_id,
-                            nsid,
-                            lba: slba,
-                            num_blocks: nlb,
-                            is_write: false,
-                            prp1_gpa: prp1,
-                            list_entries: None,
-                            total_pages,
-                            pages_done: 0,
-                            data_pages,
-                            list_pages_fetched: 0,
-                            sep_meta: None,
-                            inline_pi: None,
-                        },
-                    );
-                    let tok = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
-                    self.pending_ios.insert(
-                        tok,
-                        PendingIo {
-                            sq_id,
-                            cid,
-                            sq_head,
-                            cq_id,
-                            nsid,
-                            op: PendingOp::NvmReadPrpListFetch { op_id },
-                        },
-                    );
+                    crate::controller::prp::PrpTier::Dual => {
+                        let s = crate::controller::prp::first_seg_len(prp_off, bytes) as usize;
+                        let (b1, b2) = buf.split_at(s);
+                        let tok1 = ctx.dma_write(prp1, b1.to_vec());
+                        let tok2 = ctx.dma_write(prp2, b2.to_vec());
+                        self.pending_ios.insert(
+                            tok1,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmReadDualPrpSiblingHalf,
+                            },
+                        );
+                        self.pending_ios.insert(
+                            tok2,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmReadDmaWrite { num_blocks: nlb },
+                            },
+                        );
+                    }
+                    crate::controller::prp::PrpTier::List => {
+                        // **Phase E** — PRP list path (Read > 2 page)。按 prp::page_size 分段
+                        // （首段含偏移），data_pages[i] = 该页逻辑切片。
+                        let total_pages = crate::controller::prp::total_pages(prp_off, bytes);
+                        let mut data_pages: Vec<Option<Vec<u8>>> =
+                            Vec::with_capacity(total_pages as usize);
+                        let mut off = 0usize;
+                        for i in 0..total_pages {
+                            let sz = crate::controller::prp::page_size(i, prp_off, bytes) as usize;
+                            let end = (off + sz).min(buf.len());
+                            data_pages.push(Some(buf[off..end].to_vec()));
+                            off += sz;
+                        }
+                        let op_id = self.alloc_op_id();
+                        self.prp_list_ops.insert(
+                            op_id,
+                            crate::controller::PrpListOp {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                lba: slba,
+                                num_blocks: nlb,
+                                is_write: false,
+                                prp1_gpa: prp1,
+                                list_entries: None,
+                                total_pages,
+                                pages_done: 0,
+                                data_pages,
+                                list_pages_fetched: 0,
+                                sep_meta: None,
+                                inline_pi: None,
+                            },
+                        );
+                        let tok = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+                        self.pending_ios.insert(
+                            tok,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmReadPrpListFetch { op_id },
+                            },
+                        );
+                    }
                 }
                 None
             }
@@ -2514,125 +2524,130 @@ impl NvmeController {
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                 }
                 // 三档 PRP 分流（同 READ 路径）：≤1page / ≤2page / PRP list。
-                if bytes <= NVME_PAGE_SIZE {
-                    let tok = ctx.dma_read(prp1, bytes as u32);
-                    self.pending_ios.insert(
-                        tok,
-                        PendingIo {
-                            sq_id,
-                            cid,
-                            sq_head,
-                            cq_id,
-                            nsid,
-                            op: PendingOp::NvmWriteDmaRead {
+                // **#4 非页对齐**：档位/分段经 prp 模块统一计算（PRP1 偏移 O 把首段缩到
+                // page-O；O=0 时与 legacy 逐字节一致）。
+                let prp_off = crate::controller::prp::prp1_offset(prp1);
+                match crate::controller::prp::tier(prp_off, bytes) {
+                    crate::controller::prp::PrpTier::Single => {
+                        let tok = ctx.dma_read(prp1, bytes as u32);
+                        self.pending_ios.insert(
+                            tok,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmWriteDmaRead {
+                                    lba: slba,
+                                    num_blocks: nlb,
+                                },
+                            },
+                        );
+                    }
+                    crate::controller::prp::PrpTier::Dual => {
+                        let op_id = self.alloc_op_id();
+                        self.dual_prp_writes.insert(
+                            op_id,
+                            WriteAccum {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
                                 lba: slba,
                                 num_blocks: nlb,
+                                prp1_data: None,
+                                prp2_data: None,
                             },
-                        },
-                    );
-                } else if bytes <= 2 * NVME_PAGE_SIZE {
-                    let op_id = self.alloc_op_id();
-                    self.dual_prp_writes.insert(
-                        op_id,
-                        WriteAccum {
-                            sq_id,
-                            cid,
-                            sq_head,
-                            cq_id,
-                            nsid,
-                            lba: slba,
-                            num_blocks: nlb,
-                            prp1_data: None,
-                            prp2_data: None,
-                        },
-                    );
-                    let prp2_bytes = (bytes - NVME_PAGE_SIZE) as u32;
-                    let tok1 = ctx.dma_read(prp1, NVME_PAGE_SIZE as u32);
-                    let tok2 = ctx.dma_read(prp2, prp2_bytes);
-                    self.pending_ios.insert(
-                        tok1,
-                        PendingIo {
-                            sq_id,
-                            cid,
-                            sq_head,
-                            cq_id,
-                            nsid,
-                            op: PendingOp::NvmWriteDualPrp {
-                                op_id,
-                                is_prp1: true,
+                        );
+                        let first = crate::controller::prp::first_seg_len(prp_off, bytes);
+                        let prp2_bytes = (bytes - first) as u32;
+                        let tok1 = ctx.dma_read(prp1, first as u32);
+                        let tok2 = ctx.dma_read(prp2, prp2_bytes);
+                        self.pending_ios.insert(
+                            tok1,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmWriteDualPrp {
+                                    op_id,
+                                    is_prp1: true,
+                                },
                             },
-                        },
-                    );
-                    self.pending_ios.insert(
-                        tok2,
-                        PendingIo {
-                            sq_id,
-                            cid,
-                            sq_head,
-                            cq_id,
-                            nsid,
-                            op: PendingOp::NvmWriteDualPrp {
-                                op_id,
-                                is_prp1: false,
+                        );
+                        self.pending_ios.insert(
+                            tok2,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmWriteDualPrp {
+                                    op_id,
+                                    is_prp1: false,
+                                },
                             },
-                        },
-                    );
-                } else {
-                    // **Phase E** — PRP list path (Write > 2 page)。
-                    let total_pages = bytes.div_ceil(NVME_PAGE_SIZE) as u32;
-                    let op_id = self.alloc_op_id();
-                    let mut data_pages: Vec<Option<Vec<u8>>> =
-                        Vec::with_capacity(total_pages as usize);
-                    for _ in 0..total_pages {
-                        data_pages.push(None);
+                        );
                     }
-                    self.prp_list_ops.insert(
-                        op_id,
-                        crate::controller::PrpListOp {
-                            sq_id,
-                            cid,
-                            sq_head,
-                            cq_id,
-                            nsid,
-                            lba: slba,
-                            num_blocks: nlb,
-                            is_write: true,
-                            prp1_gpa: prp1,
-                            list_entries: None,
-                            total_pages,
-                            pages_done: 0,
-                            data_pages,
-                            list_pages_fetched: 0,
-                            sep_meta: None,
-                            inline_pi: None,
-                        },
-                    );
-                    // 先 fetch PRP list 页本身
-                    let tok_list = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
-                    self.pending_ios.insert(
-                        tok_list,
-                        PendingIo {
-                            sq_id,
-                            cid,
-                            sq_head,
-                            cq_id,
-                            nsid,
-                            op: PendingOp::NvmWritePrpListFetch { op_id },
-                        },
-                    );
-                    // 同时 fetch PRP1 数据页（页 idx 0）
-                    let tok_prp1 = ctx.dma_read(prp1, NVME_PAGE_SIZE as u32);
-                    self.pending_ios.insert(
-                        tok_prp1,
-                        PendingIo {
-                            sq_id,
-                            cid,
-                            sq_head,
-                            cq_id,
-                            nsid,
-                            op: PendingOp::NvmWritePrpListData { op_id, page_idx: 0 },
-                        },
-                    );
+                    crate::controller::prp::PrpTier::List => {
+                        // **Phase E** — PRP list path (Write > 2 page)。
+                        let total_pages = crate::controller::prp::total_pages(prp_off, bytes);
+                        let op_id = self.alloc_op_id();
+                        let data_pages: Vec<Option<Vec<u8>>> = vec![None; total_pages as usize];
+                        self.prp_list_ops.insert(
+                            op_id,
+                            crate::controller::PrpListOp {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                lba: slba,
+                                num_blocks: nlb,
+                                is_write: true,
+                                prp1_gpa: prp1,
+                                list_entries: None,
+                                total_pages,
+                                pages_done: 0,
+                                data_pages,
+                                list_pages_fetched: 0,
+                                sep_meta: None,
+                                inline_pi: None,
+                            },
+                        );
+                        // 先 fetch PRP list 页本身
+                        let tok_list = ctx.dma_read(prp2, NVME_PAGE_SIZE as u32);
+                        self.pending_ios.insert(
+                            tok_list,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmWritePrpListFetch { op_id },
+                            },
+                        );
+                        // 同时 fetch PRP1 数据页（页 idx 0）—— 含偏移时首段 = page-O。
+                        let first = crate::controller::prp::first_seg_len(prp_off, bytes) as u32;
+                        let tok_prp1 = ctx.dma_read(prp1, first);
+                        self.pending_ios.insert(
+                            tok_prp1,
+                            PendingIo {
+                                sq_id,
+                                cid,
+                                sq_head,
+                                cq_id,
+                                nsid,
+                                op: PendingOp::NvmWritePrpListData { op_id, page_idx: 0 },
+                            },
+                        );
+                    }
                 }
                 None
             }

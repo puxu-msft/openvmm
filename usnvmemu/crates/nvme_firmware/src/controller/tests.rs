@@ -2464,6 +2464,150 @@ fn mdts_counts_inline_metadata() {
     }
 }
 
+/// **#4 PRP1 非页对齐（plain 数据路径，spec NVMe Base § 4.1.1）差分 oracle** —— PRP1 带
+/// 页内偏移 O（只有 PRP1 可非页对齐；PRP2/list 页对齐）。1 LBA(4096B) 读/写、PRP1 偏移
+/// O=0x200 → 跨页 → dual-PRP：首段 = page-O = 3584 走 PRP1（偏移地址），余 512 走 PRP2。
+///   READ：盘上 data → 按 (3584, 512) 切散到 prp1(偏移)/prp2（capture 重组 == 盘上）。
+///   WRITE：host 经 (3584, 512) 两段供 data → gather 重组写盘（盘上 == host data）。
+///
+/// 独立 oracle：capture DmaWrite 重组 / backing 字节。
+/// revert-verify：把 plain READ/WRITE 的 prp::first_seg_len 退回 NVME_PAGE_SIZE（legacy
+/// 固定 4096 切分）→ 偏移下首段算成 4096（越过 PRP1 所在页尾、且 PRP2 段=0）→ 重组/落盘
+/// 错位 → 断言转红。
+#[test]
+fn plain_prp1_offset_dual_roundtrip() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    const O: u64 = 0x200; // 512B 页内偏移
+    const PRP1: u64 = 0x4000 + O; // 非页对齐
+    const PRP2: u64 = 0x5000; // 页对齐
+    const FIRST: usize = 4096 - O as usize; // 3584
+    fn plain_ns() -> NvmeController {
+        let mut c = make_ctrl_with_tmp("prp1_offset");
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 0;
+        ns.pi_type = 0;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / (1u64 << ns.lbads);
+        c.cqs.insert(
+            1,
+            crate::regs::CompletionQueue {
+                base_gpa: 0x1_0000,
+                size: 64,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 0,
+                interrupt_enabled: false,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        c
+    }
+    let data: Vec<u8> = (0..4096).map(|i| ((i * 31 + 7) & 0xff) as u8).collect();
+
+    // ── READ：偏移 dual scatter ──
+    {
+        let mut c = plain_ns();
+        c.namespaces
+            .get_mut(&1)
+            .unwrap()
+            .write_at(&data, 0)
+            .unwrap();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x02, 1, 0, 1, PRP1, false, 0xC0);
+            sqe.prp2 = PRP2;
+            let r = c.dispatch_io(&mut ctx, 1, sqe, 0xC0, 0, 1);
+            assert!(r.is_none(), "offset dual READ 走异步");
+            let toks: Vec<u64> = c.pending_ios.keys().copied().collect();
+            assert_eq!(toks.len(), 2, "dual：两段 DMA-write");
+            for t in toks {
+                c.on_dma_complete_impl(&mut ctx, t, true, Vec::new());
+            }
+        }
+        let mut writes: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+        for e in cap.events() {
+            if let TransportEvent::DmaWrite { gpa, data, .. } = e {
+                writes.insert(*gpa, data.clone());
+            }
+        }
+        // 首段（3584B）→ PRP1（偏移地址）；余段（512B）→ PRP2。
+        assert_eq!(
+            writes.get(&PRP1).map(|d| d.len()),
+            Some(FIRST),
+            "首段 = page-O = 3584 → PRP1(偏移)"
+        );
+        assert_eq!(
+            writes.get(&PRP2).map(|d| d.len()),
+            Some(512),
+            "余段 512 → PRP2"
+        );
+        let mut got = Vec::new();
+        got.extend_from_slice(&writes[&PRP1]);
+        got.extend_from_slice(&writes[&PRP2]);
+        assert_eq!(got, data, "重组 == 盘上 data（偏移切分正确）");
+    }
+
+    // ── WRITE：偏移 dual gather ──
+    {
+        let mut c = plain_ns();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x01, 1, 0, 1, PRP1, false, 0xC1);
+            sqe.prp2 = PRP2;
+            let r = c.dispatch_io(&mut ctx, 1, sqe, 0xC1, 0, 1);
+            assert!(r.is_none(), "offset dual WRITE 走异步");
+            // feed 两段（按各自 prp1/prp2 角色喂对应切片）。
+            let toks: Vec<(u64, u64)> = c
+                .pending_ios
+                .iter()
+                .map(|(&t, p)| {
+                    (
+                        t,
+                        if matches!(p.op, PendingOp::NvmWriteDualPrp { is_prp1: true, .. }) {
+                            1
+                        } else {
+                            0
+                        },
+                    )
+                })
+                .collect();
+            for (t, is_p1) in toks {
+                let seg = if is_p1 == 1 {
+                    data[0..FIRST].to_vec()
+                } else {
+                    data[FIRST..4096].to_vec()
+                };
+                c.on_dma_complete_impl(&mut ctx, t, true, seg);
+            }
+        }
+        // controller 请求两段 dma_read：首段 3584 @ PRP1、余 512 @ PRP2。独立 oracle 断
+        // 请求长度（防退回固定 4096 切分；ctx 已 drop 后读 cap 避免借用冲突）。
+        let mut req: Vec<(u64, u32)> = cap
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                TransportEvent::DmaRead { gpa, len, .. } => Some((*gpa, *len)),
+                _ => None,
+            })
+            .collect();
+        req.sort();
+        // PRP1=0x4200 < PRP2=0x5000 → 排序后 [(PRP1, 3584), (PRP2, 512)]。
+        assert_eq!(
+            req,
+            vec![(PRP1, FIRST as u32), (PRP2, 512)],
+            "请求段 (PRP1=3584, PRP2=512)"
+        );
+        let mut buf = vec![0u8; 4096];
+        c.namespaces.get(&1).unwrap().read_at(&mut buf, 0).unwrap();
+        assert_eq!(buf, data, "偏移 gather 重组写盘 == host data");
+    }
+}
+
 /// **C1① WRITE-site 守门（reviewer CRITICAL-1 回归保护）** — sub-MDTS 多 LBA PI
 /// WRITE 必须正确完成。PRACT=1 时 host PRP 只传 data（N×4096），controller 自动
 /// 插 PI tuple；MDTS 门用 block_bytes 但 host 传输 / PRP 路由 / buffer 必须用

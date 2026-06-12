@@ -44,6 +44,7 @@ mod enable;
 mod io;
 mod logs;
 mod mmio;
+mod prp;
 mod reservation;
 
 use crate::cmd::*;
