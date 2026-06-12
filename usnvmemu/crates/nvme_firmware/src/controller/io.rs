@@ -1079,16 +1079,11 @@ impl NvmeController {
                             tracing::warn!(nsid, "B6b-4 N>2 READ 需 PRP2（指向 PRP-list 页）");
                             return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                         }
-                        if (prp1 & (NVME_PAGE_SIZE - 1)) != 0
-                            || (prp2 & (NVME_PAGE_SIZE - 1)) != 0
-                            || (sqe.mptr & (NVME_PAGE_SIZE - 1)) != 0
-                        {
-                            let mptr_dbg = sqe.mptr;
+                        if (prp1 & (NVME_PAGE_SIZE - 1)) != 0 || (prp2 & (NVME_PAGE_SIZE - 1)) != 0 {
                             tracing::warn!(
                                 prp1 = format_args!("{:#x}", prp1),
                                 prp2 = format_args!("{:#x}", prp2),
-                                mptr = format_args!("{:#x}", mptr_dbg),
-                                "B6b-4 READ 要求 PRP1/PRP2/MPTR 页对齐（教学边界）"
+                                "B6b-4 READ 要求 PRP1/PRP2 页对齐（教学边界；MPTR 连续 buffer 任意 offset OK）"
                             );
                             return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                         }
@@ -1688,7 +1683,29 @@ impl NvmeController {
                 // **#4 非页对齐**：PRP1 可带页内偏移 O，首段=page-O；档位/分段经 prp 模块
                 // 统一计算（O=0 时与 legacy 逐字节一致）。
                 let prp_off = crate::controller::prp::prp1_offset(prp1);
-                match crate::controller::prp::tier(prp_off, bytes) {
+                let prp_tier = crate::controller::prp::tier(prp_off, bytes);
+                if prp_tier != crate::controller::prp::PrpTier::Single {
+                    // 非 Single 档必需 PRP2（Dual 数据指针 / List 页指针）：缺失 → INVALID_FIELD；
+                    // 非页对齐 → PRP_OFFSET_INVALID（reviewer #4f M-1：prp2==0 也要拦）。
+                    if prp2 == 0 {
+                        tracing::warn!("READ：非 Single 档缺 PRP2 → INVALID_FIELD");
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                    }
+                    if (prp2 & (NVME_PAGE_SIZE - 1)) != 0 {
+                        tracing::warn!(
+                            prp2 = format_args!("{:#x}", prp2),
+                            "READ：PRP2（数据/list 指针）须页对齐 → PRP_OFFSET_INVALID"
+                        );
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::PRP_OFFSET_INVALID,
+                        ));
+                    }
+                }
+                match prp_tier {
                     crate::controller::prp::PrpTier::Single => {
                         let tok = ctx.dma_write(prp1, buf);
                         self.pending_ios.insert(
@@ -2112,16 +2129,11 @@ impl NvmeController {
                             tracing::warn!(nsid, "B6b-4 N>2 WRITE 需 PRP2（指向 PRP-list 页）");
                             return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                         }
-                        if (prp1 & (NVME_PAGE_SIZE - 1)) != 0
-                            || (prp2 & (NVME_PAGE_SIZE - 1)) != 0
-                            || (sqe.mptr & (NVME_PAGE_SIZE - 1)) != 0
-                        {
-                            let mptr_dbg = sqe.mptr;
+                        if (prp1 & (NVME_PAGE_SIZE - 1)) != 0 || (prp2 & (NVME_PAGE_SIZE - 1)) != 0 {
                             tracing::warn!(
                                 prp1 = format_args!("{:#x}", prp1),
                                 prp2 = format_args!("{:#x}", prp2),
-                                mptr = format_args!("{:#x}", mptr_dbg),
-                                "B6b-4 WRITE 要求 PRP1/PRP2/MPTR 页对齐（教学边界）"
+                                "B6b-4 WRITE 要求 PRP1/PRP2 页对齐（教学边界；MPTR 连续 buffer 任意 offset OK）"
                             );
                             return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                         }
@@ -2527,7 +2539,29 @@ impl NvmeController {
                 // **#4 非页对齐**：档位/分段经 prp 模块统一计算（PRP1 偏移 O 把首段缩到
                 // page-O；O=0 时与 legacy 逐字节一致）。
                 let prp_off = crate::controller::prp::prp1_offset(prp1);
-                match crate::controller::prp::tier(prp_off, bytes) {
+                let prp_tier = crate::controller::prp::tier(prp_off, bytes);
+                if prp_tier != crate::controller::prp::PrpTier::Single {
+                    // 非 Single 档必需 PRP2：缺失 → INVALID_FIELD；非页对齐 → PRP_OFFSET_INVALID
+                    // （reviewer #4f M-1：prp2==0 也要拦）。
+                    if prp2 == 0 {
+                        tracing::warn!("WRITE：非 Single 档缺 PRP2 → INVALID_FIELD");
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                    }
+                    if (prp2 & (NVME_PAGE_SIZE - 1)) != 0 {
+                        tracing::warn!(
+                            prp2 = format_args!("{:#x}", prp2),
+                            "WRITE：PRP2（数据/list 指针）须页对齐 → PRP_OFFSET_INVALID"
+                        );
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::PRP_OFFSET_INVALID,
+                        ));
+                    }
+                }
+                match prp_tier {
                     crate::controller::prp::PrpTier::Single => {
                         let tok = ctx.dma_read(prp1, bytes as u32);
                         self.pending_ios.insert(

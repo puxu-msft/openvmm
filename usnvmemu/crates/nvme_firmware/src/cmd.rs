@@ -246,6 +246,10 @@ pub mod sc {
     pub const SUCCESS: u16 = 0x0000;
     pub const INVALID_OPCODE: u16 = 0x0001;
     pub const INVALID_FIELD: u16 = 0x0002;
+    /// PRP Offset Invalid（Generic 0x13）—— 非 PRP1 段（PRP2 作数据指针 / PRP-list 内
+    /// entry）带了非零页内偏移（spec § 4.1.1 要求其页对齐）。#4 PRP 偏移支持依赖该不变量，
+    /// host 违反时返此码而非 silent 错位。
+    pub const PRP_OFFSET_INVALID: u16 = 0x0013;
     pub const DATA_TRANSFER_ERROR: u16 = 0x0004;
     pub const INTERNAL_ERROR: u16 = 0x0006;
     /// Command Abort Requested（Generic 0x07）—— host 发 Abort 命中本命令，
@@ -1123,6 +1127,13 @@ mod sc_queue_anchor {
         assert_eq!(
             sc::COMPLETION_QUEUE_INVALID,
             Status::COMPLETION_QUEUE_INVALID.0
+        );
+        // **#4** PRP_OFFSET_INVALID（Generic 0x13）锚定 canonical nvme_spec。
+        assert_eq!(sc::PRP_OFFSET_INVALID, Status::PRP_OFFSET_INVALID.0);
+        assert_eq!(
+            sc::PRP_OFFSET_INVALID >> 8,
+            0,
+            "PRP_OFFSET_INVALID 须 Generic (SCT=0)"
         );
         assert_eq!(
             sc::INVALID_QUEUE_IDENTIFIER,

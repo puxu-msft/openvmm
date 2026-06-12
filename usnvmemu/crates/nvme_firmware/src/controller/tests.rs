@@ -2608,6 +2608,58 @@ fn plain_prp1_offset_dual_roundtrip() {
     }
 }
 
+/// **#4f PRP_OFFSET_INVALID（spec § 4.1.1，Generic 0x13）差分 oracle** —— offset 支持仅
+/// PRP1 允许偏移；PRP2（Dual 时数据指针 / List 时 list-页指针）非页对齐是非法，须返
+/// PRP_OFFSET_INVALID 而非 silent 错位（offset 分段现依赖此不变量）。
+///   nlb=2 plain（8192B → Dual）+ 非页对齐 PRP2(0x5001) → READ/WRITE 均同步 PRP_OFFSET_INVALID。
+///
+/// 独立 oracle：CQE status == sc::PRP_OFFSET_INVALID(0x0013，已锚 nvme_spec)。
+/// revert-verify：删 dispatch 的 PRP2 对齐校验 → 命令照常异步（r.is_none）→ 期望的
+/// 同步错误 CQE 不出现 → 断言转红。
+#[test]
+fn prp2_misaligned_returns_prp_offset_invalid() {
+    use pcie_device_core::DeviceCtx;
+    fn plain_ns() -> NvmeController {
+        let mut c = make_ctrl_with_tmp("prp2_misalign");
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 0;
+        ns.pi_type = 0;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / (1u64 << ns.lbads);
+        c.cqs.insert(
+            1,
+            crate::regs::CompletionQueue {
+                base_gpa: 0x1_0000,
+                size: 64,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 0,
+                interrupt_enabled: false,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        c
+    }
+    // nlb=2 (8192B) → Dual；PRP2 非页对齐（0x5001）→ PRP_OFFSET_INVALID。
+    for opc in [0x02u8, 0x01u8] {
+        let mut c = plain_ns();
+        let mut cap = pcie_device_core::CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let mut sqe = io_sqe(opc, 1, 0, 2, 0x4000, false, 0xD0);
+        sqe.prp2 = 0x5001; // 非页对齐
+        let cqe = c.dispatch_io(&mut ctx, 1, sqe, 0xD0, 0, 1);
+        let cqe = cqe.expect("非页对齐 PRP2 → 同步错误 CQE");
+        assert_eq!(
+            cqe_status(&cqe),
+            crate::cmd::sc::PRP_OFFSET_INVALID,
+            "opc={opc:#x}：非页对齐 PRP2 → PRP_OFFSET_INVALID(0x0013)"
+        );
+    }
+}
+
 /// **C1① WRITE-site 守门（reviewer CRITICAL-1 回归保护）** — sub-MDTS 多 LBA PI
 /// WRITE 必须正确完成。PRACT=1 时 host PRP 只传 data（N×4096），controller 自动
 /// 插 PI tuple；MDTS 门用 block_bytes 但 host 传输 / PRP 路由 / buffer 必须用
