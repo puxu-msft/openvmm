@@ -1,0 +1,34 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# **nested workspace** —— nvme_firmware 被根 workspace exclude（standalone），故本 fuzz
+# crate 自带 `[workspace]` 空表脱离根，并**显式 pin 所有原本会从根继承的键**（不能照抄
+# nvme_driver/fuzz 的 `.workspace = true`，那靠根 member 继承，本 nested 无继承源）。
+[workspace]
+
+[package]
+name = "nvme_firmware_fuzz"
+publish = false
+edition = "2024"
+rust-version = "1.95"
+
+[dependencies]
+# step 1/2 用 observable-only oracle（无 panic + 迭代有界），暂不开 `fuzzing` feature；
+# 待 step 6 加不变量访问器时再 `features = ["fuzzing"]`（见 plan §4 step6）。
+nvme_firmware = { path = ".." }
+pcie_device_core = { path = "../../pcie_device_core" }
+arbitrary = { version = "1.3", features = ["derive"] }
+xtask_fuzz = { path = "../../../../xtask/xtask_fuzz" }
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libfuzzer-sys = "0.4"
+
+[package.metadata]
+cargo-fuzz = true
+
+[[bin]]
+name = "fuzz_sgl_chain"
+path = "fuzz_sgl_chain.rs"
+test = false
+doc = false
+doctest = false
