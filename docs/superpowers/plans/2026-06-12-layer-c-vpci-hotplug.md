@@ -68,34 +68,59 @@ in-flight IO 时 rescind 安全吗？
 - **门**：若 guest 不接受 rescind/re-offer（蓝屏/stuck/不重枚举）→ 整个路径 A 假设崩，
   回退重评估（[[poc-before-settling-design]]）。**过了才做 C1+。**
 
-### Task C1 — reconcile task 骨架（边沿订阅，无 debounce）
-- 给 `SharedState` 加 Live 边沿 channel（仿 `worker.rs:187` lost_tx，新增 live_tx 在 `:273`
-  `store(Live)` 旁）。reconcile task（`emuplat/vfio_user_hotplug.rs`，照 `netvsp.rs:1181-1265`
-  worker 模式）：串行 select { live→add bus / lost→remove bus }，持 `Option<bus_unit>` +
-  重建上下文（device shim Arc + msi/vtom/instance_id/driver_source/vmbus + `&ChipsetDevices`
-  + `&mut StateUnits`）。standalone loopback 测：usnvmemu 起→add；kill→remove；重起→re-add。
+### C0 + C1 ✅ 已完成（commits 5f871cd6 / 4494df06，真机 POC）
+C0 把 C1（live_tx 边沿订阅 + dispatch select-arm add/remove）一并做了。真机证：**offer-on-Live
+→ guest 自动出盘 + IO 双 oracle（核心 win，解掉 W6c disable/enable 缺口）**；re-add device_id
+bug 修（虚拟设备 assemble **一次性**建、`VpciInterruptMapper.clone()` 复用）。**但暴露 2 个
+guest-PnP 硬伤**（归档 `usnvmemu/experiments/2026-06-12-layer-c-c0-real-vm/RESULT.md`）：
+- finding-⑥：surprise-remove 一个**挂载+脏数据**的 NTFS 卷 → guest BSOD→reboot（intermittent；RAW 盘安全）。
+- finding-⑦：surprise-rescind 后用**同 instance_id** re-offer → guest 不重枚举（pnputil 也唤不回）。
 
-### Task C2 — debounce + 抖动加固
-- Lost→Live settle 窗口（`PolledTimer` backoff，仿 `netvsp.rs:1240-1252` VfReconfigBackoff），
-  防 usnvmemu 抖动引发 add/remove 风暴打爆 guest PnP。竞态加固（add 进行中又 Lost 等）。
-  真机：usnvmemu 反复重启压测，guest 盘稳定 appear/disappear，PnP 不卡。
+### C2 — 干净热插拔（据 ⑥⑦，architect 评审定 **路径 B + graceful EJECT**）
+**路径 B**（standard VPCI PnP：BUS_RELATIONS2 device_count 0↔1，**vmbus 通道恒在**）从根修⑦
+（通道/instance_id 恒定 = 同盘 in/out，无 phantom devnode），优于路径 A 换 instance_id（永久
+phantom 债、错抽象）。两路都需 **graceful EJECT** 修⑥（device_count=0 不保证优雅，Windows 可能
+仍 surprise）。**最小侵入**：VpciChannel 只需 "0/1 设备"（非 N），加**可选** command receiver；
+4 个现有 `VpciBus::new` 调用方传 `None` = 零变化（blast radius 受控，architect grep 确认）。
 
-### Task C3 — at-boot-absent 冷插完整化
-- 确认 boot 时 usnvmemu 没起则 **不** add bus（guest 启动无盘）；运行时起 usnvmemu →
-  reconcile add → guest 冷插出盘。这是 Layer C 完整目标。
+- **C2-0（真机门 0，最先——最便宜验最危险的未知）**：仅 graceful EJECT，不改 device_count 模型。
+  - `vpci/src/device.rs`：`parse_packet`（:309-511）认入站 `EJECT_COMPLETE`（现落 `UnknownType`
+    杀通道，**必补**）；`ReadyState`（:615）加外部 command receiver，`run`（:749 `queue.read().await`）
+    换 `select!`（**`None` 分支另一臂 `pending()`；借用/pending 正确性 unit test 锁死**——最敏感处）；
+    命令 `Eject` → 发 `EJECT{slot:0}` 等 `EJECT_COMPLETE`（超时兜底）。
+  - `VpciChannel::new`/`VpciBusDevice::new`/`VpciBus::new` 加 `Option<Receiver<HotplugCommand>>`。
+  - `vfio_user_hotplug.rs` `remove_bus`：先经 channel 发 `Eject` 等 complete/超时 → **再**
+    `bus_unit.remove()`。
+  - **门 0**：热-add → 格式化 NTFS+写+flush（**造⑥脏卷条件**）→ graceful remove → **guest 不
+    BSOD/reboot**？最微妙点：⑥触发时 usnvmemu 已 kill（后端死）→ guest flush 打到 Lost device
+    shim（C-2 MMIO 返 Err）→ 观察 guest 能否仍干净 dismount。**过→C2-1；不过→生产侧 EJECT 无效，回退。**
+- **C2-1（真机门 1——验⑦修）**：`device_present` 0↔1 模型 + `send_child_device` 变长 device_count +
+  外部臂**主动重发 BUS_RELATIONS2**（**非** INVALIDATE_DEVICE——两侧均未实现，复用 C0 已验的
+  send_child_device）。VpciBus **恒 add 一次不 remove**；Live/Lost 改发 `SetPresent(true/false)`。
+  - **门 1**：add → graceful remove → **re-add → guest 重枚举 + 盘回来 + 再 IO + host oracle**？
+    **过→⑥⑦双修**；不过→才考虑换 instance_id 兜底。
+- **C2-2（抖动加固）**：debounce（Lost→Live settle，仿 `netvsp.rs:1240-1252`）+ 命令序列化（EJECT
+  进行中又 SetPresent(true) 竞态）。usnvmemu 反复重启压测，盘稳定 appear/disappear、无 phantom、PnP 不卡。
 
----
+### C3 — at-boot-absent 冷插完整化（C2 后）
+boot 无 usnvmemu → guest 无盘；运行时起 → 冷插出盘。
 
-## 风险（architect 评审）
-- guest PnP 对 rescind/re-offer 的实际行为（C0 门验）。
-- surprise-remove 时 guest 未决 IO 的收尾（C0 验；underhill 侧 go_lost drain 已 complete_error 不 hang）。
-- re-offer 同 instance_id guest 是否认新设备（C0 验）。
-- reconcile 必须串行（单 task），不并发 add/remove。
+## 必验真机未知（C2，源码不可知 Windows guest 行为）
+- guest 对**生产侧** EJECT 的反应（本仓只有 `vpci_client` 消费侧 EJECT 先例，生产侧 VSP `device.rs` 从未发过）。
+- device_count 1→0 优雅性 + 0→1 重枚举（路径 B 修⑦核心假设）。
+- EJECT_COMPLETE 超时 + **usnvmemu-已死时 graceful flush 的收尾**（⑥最微妙点）。
+- 盘符/挂载点跨 re-add 稳定性（路径 B 保 instance_id+serial_num 恒定，Windows 持久化策略未知）。
+
+## blast radius（architect grep 确认受控）
+`VpciBus::new` 4 调用方：`device_builder.rs:80` / `openvmm dispatch.rs:2469` / `vpci_relay:342`
+→ 传 `None` 零变化；`vfio_user_hotplug:326` → 传 `Some` 启用。`VpciChannel` 仅 `bus.rs:128`
++ 测试构造（无第三方直接构造）。
 
 ## 参考 file:line
-- 蓝图 `vm/devices/pci/vpci_relay/src/lib.rs:114-118,326-368`
-- API `vmm_core/vmotherboard/src/chipset/builder/mod.rs:66,99`；`state_unit/src/lib.rs:962`
-- 摘出点 `openhcl/underhill_core/src/worker.rs:3467-3500`；`dispatch/vtl2_settings_worker.rs:1927`
-- 留存 `openhcl/underhill_core/src/dispatch/mod.rs:149,165`
-- reconcile 范本 `openhcl/underhill_core/src/emuplat/netvsp.rs:1181-1265,1240-1252`
-- C-2/C-3 `vm/devices/pci/vfio_user_pci_device/src/device.rs:21-43,187,231`；`worker.rs:187,273,476`
+- 蓝图 `vm/devices/pci/vpci_relay/src/lib.rs:114-118,326-368`；EJECT 消费侧先例
+  `vpci_client/src/lib.rs:1092-1109,163-180`；协议 EJECT/INVALIDATE/BUS_RELATIONS2
+  `vpci_protocol/src/lib.rs:50-111`（PdoMessage :803-810）。
+- VpciChannel 单设备硬编码 `vpci/src/device.rs`：`ReadyState`:615-619 / `send_child_device`:674-723
+  (device_count 写死 695/708) / `run`:725-783(唯一 await 749) / slot 检查 816-819 / parse_packet 309-511。
+- API `vmm_core/vmotherboard/src/chipset/builder/mod.rs:66,99`；reconcile 范本
+  `netvsp.rs:1181-1265,1240-1252`；C-2/C-3 `vfio_user_pci_device/src/device.rs:21-54`。
