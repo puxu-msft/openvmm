@@ -18,14 +18,29 @@
 //!     发给 firmware，reply 到达后 complete token。
 //!   - write → [`ReqKind::MmioWrite`] **fire-and-forget**，立即 `IoResult::Ok`
 //!     让 guest driver 继续；worker 异步发 REGION_WRITE。
-//! - C-2「show-absent-until-Live」：backend（usnvmemu）真正 connect 成功
-//!   （state 进 `Live`）之前，对 guest 一律呈「设备不存在」。`Connecting` 与
-//!   `Lost` 在 cfg/MMIO 表面行为**完全一致**：cfg_read 返
-//!   `Err(InvalidRegister)`（让 vpci `compute_config_writes` 的 `now_or_never`
-//!   走 fill(!0) 路径，guest 读到全 1）；MMIO 同样 Err；cfg_write 静默 Ok。
-//!   只有 `Live` 才放行真实 cfg_space / MMIO 路径。理由见 `pci_cfg_read` 注释
-//!   的 291d8645 OS-hang 说明：若启动期就让 guest 看到合法身份，NVMe 驱动会
-//!   bind 到尚未联通的 controller，首个 MMIO 永远等不到应答 → OS 停响应。
+//! - C-2「config 恒呈真身份 + 仅 MMIO 按 Live 门控」（2026-06-12 真机 finding-③
+//!   修订，见 `usnvmemu/experiments/2026-06-12-w6b-reconnect-real-vm/RESULT.md`）：
+//!   - **cfg_read/cfg_write 恒走真实 `cfg_space`**（不论 `Connecting`/`Live`/`Lost`），
+//!     让 guest 在 **offer/枚举时刻**就看到真实 `VEN_1414&DEV_00A9` NVMe 控制器并
+//!     加载 stornvme.sys。**为何必须如此**：VPCI offer 在 `assemble_device`
+//!     （state=`Connecting`，usnvmemu 连上**之前**）就发生，Windows 在枚举时
+//!     一次性钉死 devnode 的 vendor/device；旧 C-2 让 Connecting cfg 返
+//!     `Err`/absent → offer 捕获到 DEV_0000/Unknown → **不加载任何驱动、不建 NVMe
+//!     盘**，即便之后 Live 也不重触 offer（冷插=Layer C，当前不可用）。config 读是
+//!     无副作用的身份/BAR-window 读，恒呈真只是让 guest 能枚举，是安全的。
+//!   - **mmio_read/mmio_write 按 `Live` 门控**：非 `Live`（`Connecting` 或 `Lost`）
+//!     一律返 `Err(IoError::InvalidRegister)`，**绝不 `Defer`**（`Defer` 才是
+//!     291d8645 OS-hang 的根因——driver 等不到完成 → IRP 卡死 → 整个 OS 停响应；
+//!     `Err` 让 driver 读到全 1 / 收到错误 → init 失败或优雅重试，**不挂**）。只有
+//!     `Live` 才把 MMIO defer/转发给 worker。这是标准的「设备在、控制器未就绪」
+//!     行为（等同一块没响应的 NVMe 盘）。
+//!   - MSI-X 专用 BAR（[`MSIX_BAR_INDEX`]）的 table/PBA 是**本地状态**，恒在本地
+//!     服务（不依赖 backend，无 hang 风险），与「config 是本地仿真」同理。其余
+//!     host-declared BAR 的 MMIO 才按 `Live` 门控转发 worker。
+//!   - 净 guest 行为：枚举即加载 stornvme → driver 做 BAR0 MMIO（CAP/CSTS/CC）。
+//!     若 Live（usnvmemu 已起）→ 真 NVMe 应答 → controller init → 盘 + IO；
+//!     若非 Live → MMIO `Err` → driver init 失败/重试，非 hang；usnvmemu 起后转
+//!     Live → 后续 MMIO 命中真 NVMe → 恢复（reconnect revive）。
 //!
 //! 相对模板删掉：`next_seq`（vfio-user 的 msg_id 由 worker 分配，不在 device 侧）、
 //! `side_effect_offsets`（无 cfg 转发）。
@@ -134,50 +149,46 @@ impl ChipsetDevice for VfioUserPciDevice {
 
 impl PciConfigSpace for VfioUserPciDevice {
     fn pci_cfg_read(&mut self, offset: u16, value: &mut u32) -> IoResult {
-        match self.state.load() {
-            // C-2 不变量「show-absent-until-Live」：在 backend（usnvmemu）真正
-            // connect 成功（state 进 Live）之前，对 guest 呈「设备不存在」。
-            // Connecting 必须与 Lost 表现完全一致 —— cfg read 返
-            // Err(InvalidRegister)，让 vpci `compute_config_writes` 的
-            // `now_or_never` 走 fill(!0) 路径（guest 读到全 1 = 设备消失）。
-            //
-            // 若 Connecting 落到真实 cfg_space.read_u32，guest 会看到合法
-            // vendor/device 而把 NVMe 驱动 bind 到一个尚未联通的 controller，
-            // 随后首个 MMIO（如写 CC.EN）永远等不到 firmware 应答 → IRP 卡死 →
-            // 整个 OS 停响应（291d8645 OS-hang 类故障）。故只有 Live 走真实 cfg。
-            DeviceState::Connecting | DeviceState::Lost => IoResult::Err(IoError::InvalidRegister),
-            // vfio-user 模型：config 纯本地仿真，不转发 firmware。
-            DeviceState::Live => self.cfg_space.read_u32(offset, value),
-        }
+        // C-2 修订（真机 finding-③）：config **恒呈真**，不论 Connecting/Live/Lost。
+        // VPCI offer 在 assemble_device（Connecting 态）发生，guest 据 offer 时刻的
+        // config 钉死 devnode 身份；若此刻返 Err/absent，guest 枚举成 DEV_0000/Unknown
+        // → 永不加载 NVMe 驱动（之后 Live 也不重触 offer）。故 cfg 恒走真实
+        // cfg_space —— config 读是无副作用的身份/BAR-window 读，恒呈真只让 guest 能
+        // 枚举 VEN_1414&DEV_00A9 并加载 stornvme.sys，是安全的。
+        //
+        // 启动期半死 controller 的防护**移到 MMIO 门控**（见 mmio_read/mmio_write）：
+        // 非 Live 时 MMIO 返 Err（而非旧设计让 cfg 整体 absent），driver init 优雅
+        // 失败/重试而非 hang。vfio-user 模型：config 纯本地仿真，不转发 firmware。
+        self.cfg_space.read_u32(offset, value)
     }
 
     fn pci_cfg_write(&mut self, offset: u16, value: u32) -> IoResult {
-        match self.state.load() {
-            // 同 C-2：未 Live 之前静默丢弃写（Ok 但不落地），与 Lost 行为一致。
-            DeviceState::Connecting | DeviceState::Lost => IoResult::Ok,
-            // 纯本地，不转发 firmware（删掉模板的 side-effect CfgAccess 转发）。
-            DeviceState::Live => self.cfg_space.write_u32(offset, value),
-        }
+        // 同 cfg_read：config 恒走真实 cfg_space（不论状态）。写 BAR/command 等是
+        // 本地仿真状态更新，无副作用转发 firmware（删掉模板的 side-effect CfgAccess
+        // 转发）；让 guest 在 Connecting 态也能正常配置 BAR 窗口完成枚举。
+        self.cfg_space.write_u32(offset, value)
     }
 }
 
 impl MmioIntercept for VfioUserPciDevice {
     fn mmio_read(&mut self, addr: u64, data: &mut [u8]) -> IoResult {
-        // C-2「show-absent-until-Live」：只有 Live 才让 MMIO 走真实路径。
-        // Connecting 与 Lost 一律 Err —— backend 未联通时绝不让 guest 驱动
-        // 通过 MMIO 触达半死 controller（见 pci_cfg_read 的 291d8645 说明）。
-        if !matches!(self.state.load(), DeviceState::Live) {
-            return IoResult::Err(IoError::InvalidRegister);
-        }
         match self.cfg_space.find_bar(addr) {
             Some((MSIX_BAR_INDEX, offset)) => {
-                // MSI-X 表/PBA 永远在本地仿真；绝不转发给 firmware。
+                // MSI-X 表/PBA 是**本地状态**，恒在本地服务（与 config 同理，不依赖
+                // backend、无 hang 风险）；绝不转发给 firmware，也不按 Live 门控。
                 read_as_u32_chunks(offset, data, |o| self.msix.read_u32(o));
                 IoResult::Ok
             }
             Some((bar, offset)) => {
-                // 其它 BAR → 投递给 worker；defer 返回 token，firmware 回
-                // REGION_READ reply 后 complete。
+                // C-2 修订：其余 host-declared BAR 的 MMIO 才按 Live 门控。非 Live
+                // （Connecting 或 Lost）→ 返 Err(InvalidRegister)，**绝不 Defer**：
+                // backend 未联通时 driver 读到全 1 / 收错误 → init 失败或优雅重试，
+                // **不挂**（Defer 才是 291d8645 OS-hang 根因——等不到完成 → IRP 卡死）。
+                if !matches!(self.state.load(), DeviceState::Live) {
+                    return IoResult::Err(IoError::InvalidRegister);
+                }
+                // Live：投递给 worker；defer 返回 token，firmware 回 REGION_READ
+                // reply 后 complete。
                 let access_size = data.len();
                 if !matches!(access_size, 1 | 2 | 4 | 8) {
                     // PCIe MMIO 必须是 1/2/4/8 字节。
@@ -202,13 +213,9 @@ impl MmioIntercept for VfioUserPciDevice {
     }
 
     fn mmio_write(&mut self, addr: u64, data: &[u8]) -> IoResult {
-        // C-2「show-absent-until-Live」：同 mmio_read，只有 Live 放行。
-        if !matches!(self.state.load(), DeviceState::Live) {
-            return IoResult::Err(IoError::InvalidRegister);
-        }
         match self.cfg_space.find_bar(addr) {
             Some((MSIX_BAR_INDEX, offset)) => {
-                // MSI-X 写也本地处理。
+                // MSI-X 写也本地处理（本地状态，恒服务、不门控）。
                 write_as_u32_chunks(offset, data, |o, ty| match ty {
                     ReadWriteRequestType::Read => Some(self.msix.read_u32(o)),
                     ReadWriteRequestType::Write(val) => {
@@ -219,6 +226,11 @@ impl MmioIntercept for VfioUserPciDevice {
                 IoResult::Ok
             }
             Some((bar, offset)) => {
+                // C-2 修订：其余 BAR 的 MMIO write 按 Live 门控。非 Live → Err，
+                // **绝不 Defer**（见 mmio_read 的 291d8645 说明）。
+                if !matches!(self.state.load(), DeviceState::Live) {
+                    return IoResult::Err(IoError::InvalidRegister);
+                }
                 let access_size = data.len();
                 if !matches!(access_size, 1 | 2 | 4 | 8) {
                     return IoResult::Err(IoError::InvalidAccessSize);
@@ -290,30 +302,84 @@ mod tests {
     }
 
     #[test]
-    fn lost_cfg_read_returns_err() {
+    fn lost_cfg_read_returns_real_config() {
+        // C-2 修订：config 恒呈真，Lost 态 cfg_read 也返真实 vendor/device（与 Live
+        // 一致）。仅 MMIO 按 Live 门控；config 永远本地、无副作用、恒呈真。
         let mut dev = build_test_device(DeviceState::Lost);
-        let mut v = 0;
+        let mut v = 0u32;
         let r = <VfioUserPciDevice as PciConfigSpace>::pci_cfg_read(&mut dev, 0, &mut v);
-        assert!(matches!(r, IoResult::Err(IoError::InvalidRegister)));
+        assert!(
+            matches!(r, IoResult::Ok),
+            "Lost cfg 应恒呈真（Ok），got {r:?}"
+        );
+        assert_eq!(v & 0xffff, 0x1414, "Lost cfg vendor 应为真值 0x1414");
+        assert_eq!(
+            (v >> 16) & 0xffff,
+            0x00a9,
+            "Lost cfg device 应为真值 0x00a9"
+        );
     }
 
     #[test]
-    fn connecting_cfg_read_returns_err_like_lost() {
+    fn connecting_cfg_read_returns_real_config() {
+        // C-2 修订（真机 finding-③）：Connecting 态 cfg_read 必须返**真实** config，
+        // 使 VPCI offer（在 Connecting 态发生）捕获 DEV_00A9 → guest 加载 stornvme。
+        // 这是对旧 C-2「Connecting show-absent」的修订：旧设计让 offer 捕获
+        // DEV_0000/Unknown → 永不加载驱动。
         let mut dev = build_test_device(DeviceState::Connecting);
         let mut v = 0u32;
         let r = <VfioUserPciDevice as PciConfigSpace>::pci_cfg_read(&mut dev, 0, &mut v);
         assert!(
-            matches!(r, IoResult::Err(IoError::InvalidRegister)),
-            "Connecting 必须对 guest 呈不存在（C-2），got {r:?}"
+            matches!(r, IoResult::Ok),
+            "Connecting cfg 必须呈真让 guest 枚举（C-2 修订），got {r:?}"
+        );
+        assert_eq!(v & 0xffff, 0x1414, "Connecting cfg vendor 应为真值 0x1414");
+        assert_eq!(
+            (v >> 16) & 0xffff,
+            0x00a9,
+            "Connecting cfg device 应为真值 0x00a9"
         );
     }
 
     #[test]
     fn connecting_mmio_read_returns_err() {
+        // C-2 修订：MMIO 仍按 Live 门控——Connecting 态对已映射 BAR 的 MMIO 返
+        // Err（绝不 Defer，291d8645 hang-safety）。先程式化 BAR0 + 启 MEM，使
+        // find_bar 命中 BAR0（而非走 unmapped-None 路径），才真正测到 Live-gate。
         let mut dev = build_test_device(DeviceState::Connecting);
+        let bar_addr: u32 = 0x4000_0000;
+        let _ = <VfioUserPciDevice as PciConfigSpace>::pci_cfg_write(&mut dev, 0x10, bar_addr);
+        let _ = <VfioUserPciDevice as PciConfigSpace>::pci_cfg_write(&mut dev, 4, 0x0002);
         let mut buf = [0u8; 4];
-        let r = <VfioUserPciDevice as MmioIntercept>::mmio_read(&mut dev, 0x4000_0000, &mut buf);
-        assert!(matches!(r, IoResult::Err(IoError::InvalidRegister)));
+        let r =
+            <VfioUserPciDevice as MmioIntercept>::mmio_read(&mut dev, bar_addr as u64, &mut buf);
+        assert!(
+            matches!(r, IoResult::Err(IoError::InvalidRegister)),
+            "Connecting 态映射 BAR 的 MMIO read 应 Err（Live-gate，非 Defer），got {r:?}"
+        );
+    }
+
+    /// C-2 修订：MSI-X 专用 BAR（BAR4）的 table/PBA 是本地状态，**恒服务**——
+    /// 即便 Connecting（backend 未联通）也直接本地读返 Ok，不按 Live 门控、不
+    /// 转发 firmware（与「config 本地恒呈真」同理）。这条锁定"MSI-X-BAR 不被
+    /// Live-gate 误伤"的行为。
+    #[test]
+    fn connecting_msix_bar_read_served_locally() {
+        let mut dev = build_test_device(DeviceState::Connecting);
+        // 程式化 BAR4（MSI-X，offset 0x20）+ 启 MEM，使 find_bar 命中 MSIX_BAR_INDEX。
+        let msix_bar_addr: u32 = 0x5000_0000;
+        let _ = <VfioUserPciDevice as PciConfigSpace>::pci_cfg_write(&mut dev, 0x20, msix_bar_addr);
+        let _ = <VfioUserPciDevice as PciConfigSpace>::pci_cfg_write(&mut dev, 4, 0x0002);
+        let mut buf = [0u8; 4];
+        let r = <VfioUserPciDevice as MmioIntercept>::mmio_read(
+            &mut dev,
+            msix_bar_addr as u64,
+            &mut buf,
+        );
+        assert!(
+            matches!(r, IoResult::Ok),
+            "Connecting 态 MSI-X BAR 本地读应恒服务返 Ok（不被 Live-gate），got {r:?}"
+        );
     }
 
     #[test]
@@ -328,10 +394,39 @@ mod tests {
     }
 
     #[test]
-    fn lost_cfg_write_is_ok() {
+    fn lost_cfg_write_is_real_ok() {
+        // C-2 修订：config 恒呈真，Lost 态 cfg_write 走真实 cfg_space.write_u32
+        // （不再静默丢弃），返 Ok。写命令寄存器（offset 4）是本地仿真状态更新。
         let mut dev = build_test_device(DeviceState::Lost);
         let r = <VfioUserPciDevice as PciConfigSpace>::pci_cfg_write(&mut dev, 4, 0xffff_ffff);
-        assert!(matches!(r, IoResult::Ok));
+        assert!(
+            matches!(r, IoResult::Ok),
+            "Lost cfg_write 应真实落地返 Ok，got {r:?}"
+        );
+    }
+
+    /// C-2 修订关键回归：not-Live 态 cfg_write 必须**真正写穿透**到 cfg_space
+    /// （非旧设计的静默丢弃）。这是 VPCI offer 正确性的承重前提：VPCI 在
+    /// assemble（Connecting）态经 `probe_bar_masks` 对 BAR 寄存器做
+    /// write-all-1s → read-back → restore 来探 BAR 尺寸/类型掩码（源见
+    /// `pci_core::chipset_device_ext::probe_hardware_ids`/`probe_bar_masks`），
+    /// 若 Connecting cfg_write 被丢弃，则 BAR 程式化失效 → guest 误算 MMIO 窗口。
+    /// 旧 `lost_cfg_write_is_real_ok` 只断言 Ok，区分不出"写穿透"与旧"静默丢弃"
+    /// （两者都 Ok）；本测试直接读回 BAR0 证明写已落地。
+    #[test]
+    fn connecting_cfg_write_actually_writes_through() {
+        let mut dev = build_test_device(DeviceState::Connecting);
+        let bar_addr: u32 = 0x4000_0000;
+        let _ = <VfioUserPciDevice as PciConfigSpace>::pci_cfg_write(&mut dev, 0x10, bar_addr);
+        let mut v = 0u32;
+        let _ = <VfioUserPciDevice as PciConfigSpace>::pci_cfg_read(&mut dev, 0x10, &mut v);
+        // BAR0 低位是类型 bits（64-bit mem），掩码后应反映写入的基址，
+        // 证明 Connecting 态写已穿透到真实 cfg_space（而非被丢弃）。
+        assert_eq!(
+            v & 0xffff_fff0,
+            bar_addr & 0xffff_fff0,
+            "Connecting cfg_write 应真实落地（读回 BAR0 反映写入），got {v:#x}"
+        );
     }
 
     /// 关键回归测试（commit 291d8645）：MMIO write 必须立即返
@@ -362,15 +457,20 @@ mod tests {
         );
     }
 
-    /// MMIO write 在 Lost 状态返 Err，不是 Ok / Defer。
+    /// MMIO write 在 Lost 状态返 Err，不是 Ok / Defer（C-2 MMIO 门控）。
     #[test]
     fn mmio_write_lost_returns_err() {
         let mut dev = build_test_device(DeviceState::Lost);
-        // 即使 BAR 没分配（Lost 状态优先检查），mmio_write 都直接 Err。
-        let r = <VfioUserPciDevice as MmioIntercept>::mmio_write(&mut dev, 0x4000_0000, &[0; 4]);
+        // 先程式化 BAR0 + 启 MEM，使 find_bar 命中 BAR0，才真正测到 Lost 的
+        // Live-gate（而非走 unmapped-None 的 Err 路径）。cfg 恒呈真，Lost 也可写 BAR。
+        let bar_addr: u32 = 0x4000_0000;
+        let _ = <VfioUserPciDevice as PciConfigSpace>::pci_cfg_write(&mut dev, 0x10, bar_addr);
+        let _ = <VfioUserPciDevice as PciConfigSpace>::pci_cfg_write(&mut dev, 4, 0x0002);
+        let r =
+            <VfioUserPciDevice as MmioIntercept>::mmio_write(&mut dev, bar_addr as u64, &[0; 4]);
         assert!(
             matches!(r, IoResult::Err(IoError::InvalidRegister)),
-            "Lost state must return Err, got {r:?}"
+            "Lost 态映射 BAR 的 MMIO write 应 Err（Live-gate，非 Defer），got {r:?}"
         );
     }
 
