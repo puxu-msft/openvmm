@@ -77,3 +77,92 @@ scenario7（idle peer-death loopback）仍是有效回归守卫（PASS 证 idle-
 **涟漪 + 下一步**：① device.rs 改（cfg 恒真 + MMIO 仅 Live；revert 部分 C-2）；② 更新 device.rs 单测（`connecting_cfg_read_returns_err_like_lost` 等需改为"Connecting cfg 呈真、MMIO Err"）+ loopback；③ subagent review（boot-safety 不退 + 不引入 291d8645 hang）；④ rebuild vpci IGVM；⑤ 真机复验：clean guest（或 remove 旧 VEN_1414 node）+ race-start usnvmemu→Live→guest 枚举 DEV_00A9 + stornvme 加载 + NVMe disk + 真 IO（host backing-file 独立 oracle）+ revive。
 
 **注**：本 guest 已被多轮历史实验污染（stale VEN_1414 DEV_C0DE/v1 nodes）；复验最好用干净 guest 或先清 stale node。
+
+---
+
+## ✅ 发现③ 已修复并真机 PROVEN（commit bbdfd7cc）
+
+C-2 修订（cfg 恒呈真 + MMIO 仅 Live 门控）实现 + rust-reviewer APPROVE（hang-safe：
+non-Live MMIO 路径无 Defer）+ VPCI 源码追踪确认机制（`VpciChannel::new` 经
+`probe_hardware_ids`/`probe_bar_masks` 调设备自身 `pci_cfg_read` 在 assemble 态一次性
+latch 身份；`vpci/src/device.rs:1339-1345` + `chipset_device_ext.rs:47-76`）。rebuild
+vpci IGVM（增量）→ 真机复验：
+
+- **boot（proven 配置，device cmdline，无 wait-for-start）** → VTL2 kmsg：
+  `vfio_user_pci_device::resolver: device assembled (Connecting) msix_count=0x4
+  bar0_size=0x4000`（C-2 修订码）+ 持久连接器 backoff 重试。
+- **push musl usnvmemu（base64-stdin，remote_size=3148048 校验）+ launch（setsid 脱离）**
+  → usnvmemu：listening → client connected → VERSION ok → namespace registered
+  (524288 LBA) → **DEVICE_SET_IRQS count=4 fd_cnt=4**（C-3）→ underhill kmsg
+  `reconnect: connected, handed transport to worker` + **`worker: reconnected, Live`**。
+  （reconnect 生命周期在 C-2 修订码上无退化。）
+- **guest PSDirect 枚举（决定性证据）**：
+  ```
+  Status Class       FriendlyName                    InstanceId
+  Error  SCSIAdapter Standard NVM Express Controller PCI\VEN_1414&DEV_00A9&SUBSYS_00000000&REV_01\...
+  ```
+  **= 修复前 DEV_0000/Unknown/无驱动 → 修复后 DEV_00A9 + "Standard NVM Express
+  Controller" + stornvme.sys 绑定（Class=SCSIAdapter）**。finding-③ 真机 FIXED。
+  Status=Error + disk=0 是 C-2 设计的预期行为：stornvme 在 boot 期（device 尚
+  Connecting，[107.9]s 才 Live）就 init 控制器 → MMIO Live-gate 返 Err → init 失败。
+- **disable→enable devnode（device 已 Live）→ 重 init**：MMIO 现命中 Live 控制器
+  （kmsg/usnvmemu 日志确认 CC.EN/CSTS/doorbell/admin-queue setup 全通），证 MMIO 数据
+  路径真通。但 disk 仍 0 → 暴露 **发现④**（见下）。
+
+**教训补充（VTL2 push）**：`ohcldiag-dev <vm> run` 的 clap 会吞 `-c`，须 `run -- sh -c '...'`
+（`--` 标记 positional）。base64-stdin push 经 `run --` 转发 host stdin 到 VTL2 进程，
+remote_size 校验确认完整。
+
+---
+
+## 发现④（真机暴露的集成缺口）：W6b underhill 设备从不发 DMA_MAP → 控制器 DMA 失败
+
+**现象**：finding-③ 修复后 MMIO 全通（CC.EN/CSTS/doorbell），usnvmemu 起好 admin
+queue（`asq=0xeae2b000`），但取 admin SQ entry 时 DMA 失败：
+```
+WARN vfio_user_transport::session: VfioUserSession.dma_read failed
+     error=DMA_READ 0xeae2b000+64 not in any DMA region gpa=0xeae2b000 len=64
+WARN nvme_firmware::controller::completion: DMA failed token=32768
+```
+usnvmemu 收到 **0 个 DMA_MAP**（`grep -c DMA_MAP=0`）→ 控制器无法读 guest RAM 里的
+NVMe 队列/缓冲 → Identify 永不完成 → 无 namespace → 无 disk。devnode 停在 Error。
+
+**根因**：W6b underhill 设备 worker **只发 REGION_READ/REGION_WRITE（MMIO）**，DMA 被显式
+推迟（`worker.rs:14-15` 注释："无 control-socket DMA；Phase 3 走 dma_map 零拷贝 —— 删"
+/ "ReadGpa/WriteGpa/guest_memory … 删"）。即 reconnect 生命周期 + 枚举（DEV_00A9）已通，
+但**真正的 NVMe 数据路径（DMA_MAP 零拷贝）从未接进 underhill 集成**。这是 W6b "drive it"
+的核心缺口 = **W6c**。
+
+**scope（subagent 源码追踪，verdict=(b) medium——非架构级）**：硬件件全在且真机验过——
+- 进程内 fd 在：`MshvVtlLow`（`underhill_mem/src/init.rs:221` gpa_fd；`hcl/src/ioctl.rs:683-708`
+  exposes `get()->&File`，可 dup 给 SCM_RIGHTS）。
+- client send API 在：`VfioUserClient::dma_map(gpa,size,flags,fd:BorrowedFd,fd_offset)`
+  （`vfio_user_device/src/client.rs:362-391`）。
+- server mmap 侧已处理 mshv_vtl_low 字符设备 fd（W5a fstat 修已在 `vfio_user_transport/src/dma.rs:456-516`）。
+- **W5a 已在真 OpenHCL VM PROVEN 这条 dma_map(/dev/mshv_vtl_low fd) 零拷贝**
+  （`experiments/2026-06-12-openhcl-vtl2-deploy/`）。
+- 生产参考：`vhost_user_frontend` 走 `guest_memory.sharing()→get_regions()→ship fds`
+  （`vm/devices/virtio/vhost_user_frontend/src/lib.rs:327-340,731-766`）。
+
+**决定性 gap**：`params.guest_memory: &GuestMemory` 在 resolver 已可达
+（`pci_resources/src/lib.rs:42`），但 underhill 的 VTL0 `GuestMemoryView`
+（`underhill_mem/src/mapping.rs:115`）**未实现 `sharing()`**（继承默认 `None`）。故需 plumb。
+
+**两策略（W6c 设计 either-or，待 brainstorm/review）**：
+- **A**：给 underhill VTL0 `GuestMemoryView` 实现 `sharing()`（更干净、OS-portable、复用
+  vhost pattern）。承重 caveat：`ShareableRegion` "全 commit、无 bitmap-gating" 契约 vs
+  underhill bitmap-gated VTL0 mapping——非隔离路径基本 OK，CVM 需审。
+- **B**：经 handle/resolver 显式传 `MshvVtlLow` fd / `GuestMemorySharing`（blast radius 小、
+  literal 照搬 W5a）。
+
+**reconnect 涟漪**：DMA_MAP 必须每次重连重发（server 重启＝新进程，DMA 表空）——正是 C-3
+set_irqs 重发的同一生命周期理由，挂在 `reconnect.rs:169-187` 同处。
+
+**待 POC 的承重假设**：① 单/多 DMA_MAP 能否覆盖高 GPA（0xeae2b000≈3.67GiB；W5a 只验过
+0x100000 处 64KiB）——应按 `memory_layout.ram()` 每段一个 region；② `file_offset` 在
+SHARED_MEMORY_FLAG/iova_offset/vtom 各情形的正确性（非-CVM 线性，已验；CVM 需 POC）；
+③ ShareableRegion committed 契约 vs bitmap-gating（非隔离 OK，CVM 是真问题）。
+
+**下一步（W6c）**：POC 假设① loosest-first（扩 W5a 客户端映射高 GPA）→ 决 A/B（brainstorm
++architect review）→ spec/plan → 实现（resolver 取 regions + reconnect 重发 DMA_MAP，照 C-3）
+→ rebuild → 真机复验 guest disk + 4MiB IO（VTL2-backing 独立 oracle）+ revive。
