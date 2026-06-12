@@ -1,5 +1,14 @@
 # Layer C — emulated vfio-user NVMe 设备 guest 运行时热插拔 实现计划
 
+> **⚠️ 终局状态（2026-06-13，commit `b7bd5459d`）：本计划的「hot-remove/re-add」核心模型
+> 经真机证伪——Windows pci.sys 只在 guest 自己重上电 bus FDO 时才重枚举 VPCI 子设备，VSP 侧
+> 任何 push（C0 同-instance re-offer / C2-1 device_count / C2-1-fix INVALIDATE_BUS）都不重枚举，
+> 四方法真机全败。已弃热插拔模型、改采 Option B「usnvmemu 视为 transient 后端停顿：设备恒在 +
+> C-3 透明重连」（real-VM 验证通过）。完整结论见
+> `usnvmemu/experiments/2026-06-12-layer-c-c0-real-vm/RESULT.md`（⑦深挖 + Option B 节）+
+> memory `vfio-user-underhill-state`。下文 C2/C3 的 device_count/re-offer 设计**已作废**，仅留作
+> 调试历程记录。**
+
 > **For agentic workers:** 用 superpowers:subagent-driven-development 逐 task 执行。
 > 设计已经过 ecc:architect 评审（纠正了 2 个 CRITICAL 错误，见下），承重 POC（源码）+
 > 前置条件（ChipsetDevices/StateUnits 运行时留存）已核验。**C0 是真机 POC 门，必须先过。**
