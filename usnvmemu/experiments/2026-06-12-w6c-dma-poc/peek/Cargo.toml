@@ -1,0 +1,15 @@
+[package]
+name = "w6c_peek"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# experiments 独立 crate（不进 workspace；自解析 deps）。
+[workspace]
+
+[dependencies]
+nix = { version = "0.30", features = ["mman"] }
+anyhow = "1.0"
+
+[profile.release]
+strip = true
