@@ -264,8 +264,9 @@ enum PacketData {
 
 /// 外部（热插拔编排方）下发给某条 VPCI 通道的运行时命令。
 ///
-/// C2-0 只需要 [`HotplugCommand::Eject`]（graceful EJECT 前置）；后续 C2-1 会在此
-/// 追加 `SetPresent(bool)` 用于 `device_count` 0↔1 模型。命令经一个**可选**的
+/// C2-0 有 [`HotplugCommand::Eject`]（graceful EJECT 前置）；C2-1 追加
+/// [`HotplugCommand::SetPresent`]，用于 `device_count` 0↔1 模型（路径 B：vmbus 通道
+/// 恒在、靠重发变长 `BUS_RELATIONS2` 切换设备在/不在）。命令经一个**可选**的
 /// `mesh::Receiver<HotplugCommand>` 投递：4 个现有 `VpciBus::new` 调用方传 `None`，
 /// 行为与历史**逐字节等价**（见 `ReadyState::run` 的 select pending 臂）。
 #[derive(Debug)]
@@ -282,6 +283,18 @@ pub enum HotplugCommand {
         /// 发起方的 `recv()` 会得到 `Err(RecvError::Closed)`，等价于「别再等了」。
         done: mesh::OneshotSender<()>,
     },
+    /// 切换设备在总线上的「在/不在」（C2-1，`device_count` 0↔1 模型）。
+    ///
+    /// 收到后置 `self.device_present = b` + `self.send_device = true`，下一轮 `run`
+    /// 循环顶部即**主动**重发一条 `BUS_RELATIONS2`（`true` → `device_count=1` 含单个
+    /// `DeviceDescription2`；`false` → `device_count=0` 空 payload）。这是生产侧 VSP
+    /// 主动 push relations 给 guest（无需等 guest query），复用 C0 已验的
+    /// `send_child_device` in-band 单向通知路径。
+    ///
+    /// 路径 B 的核心：vmbus 通道 + instance_id 恒定不变，只靠 `device_count` 的
+    /// 0↔1 让 guest 走标准 PnP add/remove —— re-add 时 `device_count` 0→1 让 guest
+    /// 干净重枚举（修 finding-⑦：同 instance_id re-offer 不重枚举）。
+    SetPresent(bool),
 }
 
 #[derive(Debug)]
@@ -665,6 +678,18 @@ struct ReadyState {
     /// 若在等待期间又收到一个 `Eject` 命令（理论上不应发生），用新句柄覆盖旧句柄，
     /// 旧句柄被 drop → 旧发起方 `recv()` 得到 `Closed`，等价于「放弃等待」（其自身有超时兜底）。
     pending_eject: Option<mesh::OneshotSender<()>>,
+    /// 设备当前是否「在总线上」（C2-1，`device_count` 0↔1 模型）。
+    ///
+    /// **初始 `true`**：VpciBus 仅在设备已就绪（Live）时才被 add（见
+    /// `vfio_user_hotplug` Part B 的 add-once 语义），故首次 offer/枚举即 `device_count=1`。
+    /// 这也保证 4 个现有 `VpciBus::new` 调用方（`cmd_rx = None`、静态 VPCI 设备本就恒在）
+    /// 行为与历史**逐字节等价**：`device_present` 恒 `true`（无 `SetPresent` 命令可改它），
+    /// `send_child_device` 始终发 `device_count=1`。
+    ///
+    /// 经 [`HotplugCommand::SetPresent`] 在 0↔1 之间切换：`false` → 下一次
+    /// `send_child_device` 发 `device_count=0`（空 payload，guest PnP 移除）；
+    /// `true` → 发 `device_count=1`（guest PnP add/重枚举）。
+    device_present: bool,
 }
 
 impl<T: RingMem> VpciChannelState<T> {
@@ -709,6 +734,9 @@ impl<T: RingMem> VpciChannelState<T> {
                                 send_device: false,
                                 send_completion: None,
                                 pending_eject: None,
+                                // C2-1：初始在线（device_count=1）。bus 仅在设备就绪时 add；
+                                // `None` 调用方无 SetPresent 命令 → 恒 true，逐字节等价历史。
+                                device_present: true,
                             });
                         }
                     } else {
@@ -738,43 +766,59 @@ impl ReadyState {
             sub_vendor_id: hardware_ids.type0_sub_vendor_id,
             sub_system_id: hardware_ids.type0_sub_system_id,
         };
+        // C2-1：`device_count` 取自 `device_present`（路径 B 的 0↔1 模型）。
+        // - `true` → `device_count=1` + 单个 DeviceDescription[2] payload（设备在线）；
+        // - `false` → `device_count=0` + **空** payload（总线上无设备 → guest PnP 移除）。
+        // 消费侧（`vpci_client`）按 `device_count` 读对应个数的 DeviceDescription2，
+        // 0 即「当前设备集为空」，已声明的 slot 被 disable+drop —— 标准 VPCI PnP 语义。
+        // wire 格式不变：`QueryBusRelations[2]` header 的 `device: [_; 0]` 是零长数组
+        // （8 字节 header），device_count=0 时第二段 payload 为空即合法。
+        let device_count = u32::from(self.device_present);
         if self.vpci_version < protocol::ProtocolVersion::VB {
             let relations = protocol::QueryBusRelations {
                 message_type: protocol::MessageType::BUS_RELATIONS,
-                device_count: 1,
+                device_count,
                 device: [],
             };
-            let device = protocol::DeviceDescription {
-                pnp_id,
-                slot: SlotNumber::new(),
-                serial_num: dev.serial_num,
-            };
-
-            conn.send_packet(&relations, &device).await?;
+            if self.device_present {
+                let device = protocol::DeviceDescription {
+                    pnp_id,
+                    slot: SlotNumber::new(),
+                    serial_num: dev.serial_num,
+                };
+                conn.send_packet(&relations, &device).await?;
+            } else {
+                // device_count=0：只发 header，无 DeviceDescription（空 payload）。
+                conn.send_packet(&relations, &[0u8; 0]).await?;
+            }
         } else {
             let relations = protocol::QueryBusRelations2 {
                 message_type: protocol::MessageType::BUS_RELATIONS2,
-                device_count: 1,
+                device_count,
                 device: [],
             };
-            let (flags, numa_node) = if let Some(vnode) = dev.vnode {
-                (
-                    protocol::DeviceDescription2Flags::new().with_numa_affinity_specified(true),
-                    vnode,
-                )
+            if self.device_present {
+                let (flags, numa_node) = if let Some(vnode) = dev.vnode {
+                    (
+                        protocol::DeviceDescription2Flags::new().with_numa_affinity_specified(true),
+                        vnode,
+                    )
+                } else {
+                    (protocol::DeviceDescription2Flags::new(), 0)
+                };
+                let device = protocol::DeviceDescription2 {
+                    pnp_id,
+                    slot: SlotNumber::new(),
+                    serial_num: dev.serial_num,
+                    flags,
+                    numa_node,
+                    rsvd: 0,
+                };
+                conn.send_packet(&relations, &device).await?;
             } else {
-                (protocol::DeviceDescription2Flags::new(), 0)
-            };
-            let device = protocol::DeviceDescription2 {
-                pnp_id,
-                slot: SlotNumber::new(),
-                serial_num: dev.serial_num,
-                flags,
-                numa_node,
-                rsvd: 0,
-            };
-
-            conn.send_packet(&relations, &device).await?;
+                // device_count=0：只发 header，无 DeviceDescription2（空 payload）。
+                conn.send_packet(&relations, &[0u8; 0]).await?;
+            }
         }
 
         Ok(())
@@ -782,14 +826,16 @@ impl ReadyState {
 
     /// 处理一条来自外部热插拔编排方的 [`HotplugCommand`]。
     ///
-    /// C2-0 只有 [`HotplugCommand::Eject`]：向 guest 发一个 graceful `EJECT`（slot 0），
-    /// 并把发起方的完成句柄存进 `self.pending_eject`，待 guest 回 `EJECT_COMPLETE`
-    /// （见 `handle_packet` 的 [`PacketData::EjectComplete`] 分支）时 fire。
+    /// - [`HotplugCommand::Eject`]（C2-0）：向 guest 发一个 graceful `EJECT`（slot 0），
+    ///   并把发起方的完成句柄存进 `self.pending_eject`，待 guest 回 `EJECT_COMPLETE`
+    ///   （见 `handle_packet` 的 [`PacketData::EjectComplete`] 分支）时 fire。
+    /// - [`HotplugCommand::SetPresent`]（C2-1）：切换 `device_present` 并置 `send_device`，
+    ///   下一轮 `run` 循环顶部即重发 `BUS_RELATIONS2`（新 `device_count`）—— 主动 push。
     ///
-    /// 这是**生产侧 VSP** 主动发起 `EJECT` —— 本仓此前只有 `vpci_client`（消费侧 VSC）
-    /// 处理入站 `EJECT` 的先例。EJECT packet 用 `InBandNoCompletion`（与
-    /// `send_child_device` 发 `BUS_RELATIONS` 同样是无 completion 的 in-band 通知），
-    /// slot 固定 0（VpciBus 单设备）。
+    /// 这是**生产侧 VSP** 主动发起 `EJECT` / `BUS_RELATIONS` —— 本仓此前只有
+    /// `vpci_client`（消费侧 VSC）处理入站 `EJECT` 的先例。EJECT packet 用
+    /// `InBandNoCompletion`（与 `send_child_device` 发 `BUS_RELATIONS` 同样是无 completion
+    /// 的 in-band 通知），slot 固定 0（VpciBus 单设备）。
     async fn handle_command(
         &mut self,
         command: HotplugCommand,
@@ -818,6 +864,20 @@ impl ReadyState {
                 }
                 // 记下完成句柄，等 EJECT_COMPLETE。`send()` 在 `handle_packet` 里发生。
                 self.pending_eject = Some(done);
+            }
+            HotplugCommand::SetPresent(present) => {
+                // C2-1：切换设备在/不在，并请求下一轮主动重发 BUS_RELATIONS2。
+                // 实际的 packet 由 `run` 循环顶部的 `send_child_device` 发出（其据
+                // `self.device_present` 决定 device_count 0/1）。这里只置状态/标志，
+                // 不直接发包 —— 与 `QueryRelations` / `FdoD0Entry` 置 `send_device`
+                // 同一机制，复用 C0 已验的 send 路径。
+                tracing::info!(
+                    instance_id = ?dev.instance_id,
+                    present,
+                    "vpci: SetPresent -> re-sending BUS_RELATIONS2 with new device_count"
+                );
+                self.device_present = present;
+                self.send_device = true;
             }
         }
         Ok(())
@@ -1912,6 +1972,29 @@ mod tests {
             assert_eq!(device.rsvd, 0);
         }
 
+        /// 读取服务端**主动**发来的下一个 in-band `BUS_RELATIONS2` 包，只解 8 字节
+        /// 的 `QueryBusRelations2` header 并返回 `device_count`（C2-1 用）。
+        ///
+        /// device_count=0 的包**只有** header（无 trailing `DeviceDescription2`），故必须
+        /// 按 header 单独读（不能用 `Relations2` 那样 header+device 一起读）；device_count=1
+        /// 的包 header 之后还有 `DeviceDescription2`，但此处只关心 `device_count`，多余字节
+        /// 随该 packet 一并丢弃（每次 `read_packet` 弹一个 packet）。
+        async fn read_bus_relations2_device_count(&mut self) -> u32 {
+            let mut pkt_info = ReadPacketInfo::None;
+            let header: protocol::QueryBusRelations2 =
+                self.read_packet(&mut pkt_info).await.unwrap();
+            match pkt_info {
+                ReadPacketInfo::NewTransaction => {}
+                _ => panic!("expected in-band BUS_RELATIONS2, got {pkt_info:?}"),
+            }
+            assert_eq!(
+                header.message_type,
+                protocol::MessageType::BUS_RELATIONS2,
+                "unexpected message type for bus relations"
+            );
+            header.device_count
+        }
+
         async fn start_device(&mut self, base_address: u64) {
             self.negotiate_version().await;
             let transaction_id = self.initiate_power_on(base_address).await;
@@ -2219,6 +2302,118 @@ mod tests {
         done_rx
             .await
             .expect("eject completion should fire after EJECT_COMPLETE");
+    }
+
+    /// C2-1 核心（修 finding-⑦ 的 wire 层判据）：`SetPresent` 主动 push 变长
+    /// `BUS_RELATIONS2`，`device_count` 在 0↔1 之间切换，**通道恒在**。
+    ///
+    /// 序列（同盘 in/out，对应真机 re-add 重枚举）：
+    /// 1. 标准握手 → 首个 `BUS_RELATIONS2` device_count=1（设备初始在线）；
+    /// 2. `SetPresent(false)` → 服务端主动重发 device_count=0（guest PnP 移除）；
+    /// 3. `SetPresent(true)` → 服务端主动重发 device_count=1（guest PnP 重枚举，**修⑦**）。
+    ///
+    /// 注意整个序列**同一条通道、同一 instance_id**（连 `connected_device_with_commands`
+    /// 都只建一次 channel）—— 正是路径 B 区别于「换 instance_id」的根本：设备进出靠
+    /// `device_count`，而非 rescind/re-offer 通道。
+    #[async_test]
+    async fn verify_set_present_toggles_device_count(driver: DefaultDriver) {
+        let msi_controller = TestVpciInterruptController::new();
+        let pci_config = HardwareIds {
+            vendor_id: 0x123,
+            device_id: 0x789,
+            revision_id: 1,
+            prog_if: ProgrammingInterface::NONE,
+            base_class: ClassCode::BASE_SYSTEM_PERIPHERAL,
+            sub_class: Subclass::BASE_SYSTEM_PERIPHERAL_OTHER,
+            type0_sub_vendor_id: 0x456,
+            type0_sub_system_id: 0x1,
+        };
+
+        let pci = Arc::new(CloseableMutex::new(NullDevice {
+            config_space: ConfigSpaceType0Emulator::new(
+                pci_config,
+                Vec::new(),
+                Vec::new(),
+                DeviceBars::new(),
+            ),
+        }));
+
+        let (cmd_tx, cmd_rx) = mesh::channel::<super::HotplugCommand>();
+        let mut guest_driver =
+            connected_device_with_commands(&driver, pci.clone(), msi_controller, Some(cmd_rx));
+
+        // 握手：首个 BUS_RELATIONS2 device_count=1（device_present 初始 true）。
+        let base_address = 0x140000000;
+        guest_driver.start_device(base_address).await;
+
+        // SetPresent(false)：服务端主动重发 device_count=0（无 trailing DeviceDescription2）。
+        cmd_tx.send(super::HotplugCommand::SetPresent(false));
+        assert_eq!(
+            guest_driver.read_bus_relations2_device_count().await,
+            0,
+            "SetPresent(false) should re-send BUS_RELATIONS2 with device_count=0"
+        );
+
+        // SetPresent(true)：服务端主动重发 device_count=1（设备重新出现 → guest 重枚举）。
+        cmd_tx.send(super::HotplugCommand::SetPresent(true));
+        assert_eq!(
+            guest_driver.read_bus_relations2_device_count().await,
+            1,
+            "SetPresent(true) should re-send BUS_RELATIONS2 with device_count=1 (re-enumerate)"
+        );
+    }
+
+    /// C2-1 回归：device_count=1 的重发包**仍带完整 DeviceDescription2**（pnp_id /
+    /// slot / serial / flags 等字段不因 0↔1 改造而 regress）。验证 `SetPresent(true)`
+    /// 后重发的包能被 `Relations2`（header + device 一起读）正确解出且字段齐全。
+    #[async_test]
+    async fn verify_set_present_true_payload_intact(driver: DefaultDriver) {
+        let msi_controller = TestVpciInterruptController::new();
+        let pci_config = HardwareIds {
+            vendor_id: 0x123,
+            device_id: 0x789,
+            revision_id: 1,
+            prog_if: ProgrammingInterface::NONE,
+            base_class: ClassCode::BASE_SYSTEM_PERIPHERAL,
+            sub_class: Subclass::BASE_SYSTEM_PERIPHERAL_OTHER,
+            type0_sub_vendor_id: 0x456,
+            type0_sub_system_id: 0x1,
+        };
+
+        let pci = Arc::new(CloseableMutex::new(NullDevice {
+            config_space: ConfigSpaceType0Emulator::new(
+                pci_config,
+                Vec::new(),
+                Vec::new(),
+                DeviceBars::new(),
+            ),
+        }));
+
+        let (cmd_tx, cmd_rx) = mesh::channel::<super::HotplugCommand>();
+        let mut guest_driver =
+            connected_device_with_commands(&driver, pci.clone(), msi_controller, Some(cmd_rx));
+
+        let base_address = 0x140000000;
+        guest_driver.start_device(base_address).await;
+
+        // 先 SetPresent(false) 消费掉 device_count=0 包。
+        cmd_tx.send(super::HotplugCommand::SetPresent(false));
+        assert_eq!(guest_driver.read_bus_relations2_device_count().await, 0);
+
+        // SetPresent(true) → 重发的包必须 header(count=1) + 完整 DeviceDescription2。
+        cmd_tx.send(super::HotplugCommand::SetPresent(true));
+        let mut pkt_info = ReadPacketInfo::None;
+        let relations: Relations2 = guest_driver.read_packet(&mut pkt_info).await.unwrap();
+        match pkt_info {
+            ReadPacketInfo::NewTransaction => {}
+            _ => panic!("expected in-band BUS_RELATIONS2 with device, got {pkt_info:?}"),
+        }
+        assert_eq!(
+            relations.header.message_type,
+            protocol::MessageType::BUS_RELATIONS2
+        );
+        // device_count=1 + 设备字段与 NullDevice 配置一致（复用握手期的同一校验）。
+        guest_driver.verify_device_relations2(&relations);
     }
 
     #[async_test]

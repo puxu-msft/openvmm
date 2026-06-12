@@ -1,35 +1,51 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Layer C C0：emulated vfio-user NVMe 设备的 **guest 运行时热插拔**。
+//! Layer C：emulated vfio-user NVMe 设备的 **guest 运行时热插拔**。
 //!
-//! # 目标（C0，最小机制门）
+//! # 目标
 //!
-//! 让 vfio_user NVMe 设备的 **VpciBus 层**随 usnvmemu（VTL2 内 vfio-user server）的
-//! Live/Lost 在 guest 里动态 add/remove：
+//! 让 vfio_user NVMe 设备随 usnvmemu（VTL2 内 vfio-user server）的 Live/Lost 在 guest 里
+//! 动态出现/消失：
 //! - usnvmemu 起 → device 转 `Live` → guest 里 PnP 出现 NVMe 盘；
 //! - usnvmemu 停（`pkill`）→ device 转 `Lost` → guest PnP 移盘；
-//! - usnvmemu 重起 → re-add bus → 盘回来。
+//! - usnvmemu 重起 → 盘回来 + 可再 IO。
 //!
 //! 而 **device shim**（`VfioUserPciDevice` + worker + reconnect connector + irq tasks）
 //! **boot 时装配一次、长存**（不随 add/remove 重建）。每周期重建 device shim 会丢
 //! in-flight read / MSI-X 表 / 重启 worker+connector+eventfd（毁 C-3 reconnect 状态）。
-//! 这是 Layer C 区别于 `vpci_relay`（每次全新设备）的核心。
+//!
+//! # C2-1：路径 B（`device_count` 0↔1，**vmbus 通道恒在**）
+//!
+//! C0/C2-0 走 **通道级 rescind/re-offer**（每个 Lost 边沿 `DynamicDeviceUnit::remove` 拆
+//! VpciBus，每个 Live 边沿重 add）。真机暴露 **finding-⑦**：surprise-rescind 后用**同
+//! instance_id** re-offer，guest **不重枚举**（盘不回来，pnputil 也唤不回）。
+//!
+//! C2-1 改为 **路径 B**：**VpciBus channel 只 offer 一次、永不 rescind**；设备的「在/不在」
+//! 靠重发变长 `BUS_RELATIONS2`（`device_count=1` 或 `0`）让 guest 走标准 VPCI PnP add/remove
+//! （见 `vpci::HotplugCommand::SetPresent`）。这样 re-add 是同通道内 `device_count` 0→1，
+//! guest 干净重枚举（**修⑦**：通道/instance_id 恒定 = 同盘 in/out，无 phantom devnode）。
+//! Lost 仍保留 C2-0 的 **graceful EJECT** 前置（**修 finding-⑥**：surprise-remove 挂载+脏数据
+//! 的 NTFS 卷致 guest BSOD）。
+//!
+//! 生命周期对照：
+//! - **device shim**（含虚拟设备 + device_id + MSI 连接）：boot 装配一次，VM 全程长存。
+//! - **VpciBus channel + cmd_tx**：**首个 Live 边沿 add 一次**，VM 全程长存（不随 Lost 拆）。
+//! - 之后 Live/Lost 边沿只发 `SetPresent(true/false)` 命令切换 `device_count`，**不**动通道。
 //!
 //! # 架构（照 `vpci_relay`，**不是** `netvsp`）
 //!
 //! reconcile 作为 **dispatch 主循环的一个 select 臂**运行（见 `dispatch/mod.rs`：
 //! `wait_event()` 在 select 臂、`process(...)` 在 match 臂），**不是**独立 spawned task。
-//! 理由：
-//! - `ChipsetDevices::add_dyn_device(&self, units: &StateUnits, ...)` + 之后
-//!   `StateUnits::start_stopped_units(&mut self)` 需要对 dispatch 长存的
-//!   `chipset_devices` / `state_units` 的（可变）访问。`StateUnits` **非 `Clone`**，
-//!   无法搬进独立 task。dispatch loop **单线程独占**两者 → 在它的一个 select 臂里跑
-//!   reconcile 是唯一能干净拿到 `&ChipsetDevices` + `&mut StateUnits` 的地方，**零并发危险**。
-//! - `netvsp` 的 worker 是独立 task，用 `VpciBusControl::offer_device()/revoke`，**从不**
-//!   碰 ChipsetDevices/StateUnits —— 那是 VF 中继模型，不能 `add_dyn_device`，是错误范本。
-//!   `vpci_relay`（同样用 `add_dyn_device`/`DynamicDeviceUnit::remove` 做 runtime
-//!   add/remove）才是对的范本。
+//! 理由：`ChipsetDevices::add_dyn_device(&self, units: &StateUnits, ...)` + 之后
+//! `StateUnits::start_stopped_units(&mut self)` 需要对 dispatch 长存的 `chipset_devices` /
+//! `state_units` 的（可变）访问。`StateUnits` **非 `Clone`**，无法搬进独立 task。dispatch
+//! loop **单线程独占**两者 → 在它的一个 select 臂里跑 reconcile 是唯一能干净拿到
+//! `&ChipsetDevices` + `&mut StateUnits` 的地方，**零并发危险**。
+//!
+//! 注意 C2-1 后，**只有首个 Live 边沿**真正需要 `add_dyn_device`（add 通道）；后续边沿
+//! 只发 `SetPresent` 命令（不碰 chipset/state_units）。`add_dyn_device` 仍必须在 dispatch
+//! 上下文里做，故 reconcile 仍留在 dispatch 臂。
 //!
 //! # MSI 链 + 虚拟设备的生命周期（C0 真机 POC 修正）
 //!
@@ -40,21 +56,19 @@
 //! 2. `msi_conn.connect(virtual_device)` 把 MSI 投递指向它（持久，之后不再 connect）；
 //! 3. 存下 [`VpciInterruptMapper`]（内部 `Arc`，`Clone`）。
 //!
-//! 之后每个 Live 边沿 `add_bus` 只 `interrupt_mapper.clone()` 交给新建的 `VpciBus`，
-//! **不**重建虚拟设备。**为什么必须一次性**：虚拟设备 + device_id 是分区级资源；若每个
-//! Live 重建，旧的仍被持久 `msi_conn`/`interrupt_mapper` 持有（device_id 未释放），
-//! re-add 时 `build(device_id)` 撞 "device id already in use" —— C0 真机 POC 正是
-//! 撞到这个（kill→重起 usnvmemu 后盘不回来）。故虚拟设备与 device shim 同生命周期长存，
-//! 只有薄壳 `VpciBus` 随 add/remove；`build_vpci_device`（boot 路径）本就一次性建好，
-//! 语义一致。
+//! `add_bus`（仅首个 Live 边沿调用一次）`interrupt_mapper.clone()` 交给新建的 `VpciBus`，
+//! **不**重建虚拟设备。**为什么必须一次性**：虚拟设备 + device_id 是分区级资源；若重建，
+//! 旧的仍被持久 `msi_conn`/`interrupt_mapper` 持有（device_id 未释放），撞 "device id
+//! already in use"（C0 真机 POC 实测）。C2-1 通道恒在后，连这条路径都不再有 re-add 风险了
+//! —— `add_bus` 全程只跑一次。
 //!
-//! # C0 范围
+//! # 拆除（仅 VM teardown）
 //!
-//! **无 debounce**（C2 才加）：先把机制跑通。Live→add，Lost→remove，串行（单一
-//! reconcile 入口，dispatch loop 天然串行）。拆除**必须**用
-//! [`DynamicDeviceUnit::remove`]（连 chipset device unit + 2 个 MMIO config 区域一起拆，
-//! drop `VpciBus` → `SimpleDeviceHandle` Drop = rescind），**绝不**用
-//! `SimpleDeviceHandle::revoke`（只 await offer task，泄漏 device unit + MMIO）。
+//! C2-1 不再在运行时拆 VpciBus。VpciBus unit（`bus_unit`）与 device shim unit
+//! （`_device_unit`）一样持有到 VM teardown（随 `VfioUserHotplug` drop = `SpawnedUnit`
+//! Drop → 移除 unit + drop VpciBus → `SimpleDeviceHandle` Drop = rescind + drop config
+//! MMIO 区域 → unmap，无泄漏）。运行时设备进出全靠 `SetPresent`，**绝不**用 `revoke`
+//! （只 await offer task，泄漏 device unit + MMIO）。
 
 #![cfg(feature = "vpci")]
 
@@ -82,9 +96,10 @@ use vmotherboard::DynamicDeviceUnit;
 
 /// 由 boot 路径（`worker.rs`）造好交给 dispatch 的一条 vfio_user 热插拔上下文。
 ///
-/// 持有**长存** device shim（device unit + Arc + SharedState）+ 重建 VpciBus 所需的
-/// 全部「重建上下文」（持久 MsiConnection、vmbus、vtom、instance_id、driver_source、
-/// partition）+ 当前 bus unit（`Option`，Lost 时为 `None`）+ Live/Lost 边沿 receiver。
+/// 持有**长存** device shim（device unit + Arc + SharedState）、构造 VpciBus 所需的
+/// 全部上下文（持久 MsiConnection、vmbus、vtom、instance_id、driver_source、partition）、
+/// **长存** VpciBus unit（`Option`，首个 Live 边沿 add 后恒 `Some`）、命令 sender、
+/// 编排侧 device_present 视图，以及 Live/Lost 边沿 receiver。
 pub struct VfioUserHotplug {
     /// vpci bus_instance_id（offer 给 guest 的 GUID）。
     instance_id: guid::Guid,
@@ -94,7 +109,7 @@ pub struct VfioUserHotplug {
     device: Arc<CloseableMutex<VfioUserPciDevice>>,
 
     /// device shim 对应的长存 device unit。**只在 VM teardown 时随本结构 drop**
-    /// （drop = `SpawnedUnit` Drop，移除 unit）；add/remove 周期中**绝不**动它。
+    /// （drop = `SpawnedUnit` Drop，移除 unit）；运行时**绝不**动它。
     /// 字段保活，无运行时读取，故 `_` 前缀。
     _device_unit: DynamicDeviceUnit,
 
@@ -115,27 +130,35 @@ pub struct VfioUserHotplug {
     /// 任务驱动源（spawn offer task + VpciBus 内部 task 用）。
     driver_source: VmTaskDriverSource,
 
-    /// 持久 `VpciInterruptMapper`：assemble 时**一次性**造虚拟设备得到，跨 add/remove
-    /// 周期复用 `clone()`。**虚拟设备 + 其 device_id 注册只建一次**——若每个 Live 边沿
-    /// 重建会撞 "device id already in use"（C0 真机 POC 实测：kill→重起 usnvmemu 后
-    /// re-add 时 `new_virtual_device().build(device_id)` 因 device_id 仍被持久 msi_conn
-    /// 持有而失败）。虚拟设备是**分区级资源**，应与 device shim 同生命周期长存，而非
-    /// 随 bus add/remove。`VpciInterruptMapper` 内部 = `Arc<dyn DynMapVpciInterrupt>`，
-    /// `Clone` 即增引用，每个 add_bus clone 一份交给新 VpciBus。
+    /// 持久 `VpciInterruptMapper`：assemble 时**一次性**造虚拟设备得到。**虚拟设备 +
+    /// 其 device_id 注册只建一次**，与 device shim 同生命周期长存（避免撞 "device id
+    /// already in use"，C0 真机 POC 实测根因）。`VpciInterruptMapper` 内部 =
+    /// `Arc<dyn DynMapVpciInterrupt>`，`Clone` 即增引用，`add_bus`（仅一次）clone 一份
+    /// 交给 VpciBus。
     interrupt_mapper: VpciInterruptMapper,
 
-    /// 当前 VpciBus 的 unit；`Some` = 已 add（盘对 guest 可见），`None` = 未 add（Lost / 初始）。
+    /// **长存** VpciBus unit；`None` = 尚未 add（boot 起 usnvmemu 未起 / 首个 Live 之前），
+    /// `Some` = 已 add（**此后恒 `Some`，VM 全程不拆**——C2-1 路径 B 的核心：通道恒在）。
+    /// 运行时设备进出靠 `SetPresent` 切 `device_count`，不拆此 unit。随本结构 drop（VM
+    /// teardown）时才移除。
     bus_unit: Option<DynamicDeviceUnit>,
 
-    /// 当前 VpciBus 通道的运行时命令 sender（C2-0 graceful EJECT 用）。
+    /// VpciBus 通道的运行时命令 sender（graceful EJECT + SetPresent）。
     ///
-    /// **每个 `add_bus` 重建一个 channel**：sender 存这里、receiver 经
-    /// `VpciBus::new(.., Some(cmd_rx))` 交给新 VpciChannel。`remove_bus` 经它发
-    /// [`vpci::HotplugCommand::Eject`] 给 guest，等 `EJECT_COMPLETE`（带超时）后再拆通道。
-    /// `None` = 当前无 bus（与 `bus_unit` 同步）。拆通道后清回 `None`。
-    /// 为什么每周期重建：VpciBus 在 remove 时整体 drop，其 receiver 也随之失效；
-    /// 下一个 Live 边沿的新 VpciBus 需要一个全新的命令通道。
+    /// **`add_bus` 建一次后长存**（与 `bus_unit` 同步）：sender 存这里、receiver 经
+    /// `VpciBus::new(.., Some(cmd_rx))` 交给 VpciChannel。`hide_device` 经它发
+    /// [`vpci::HotplugCommand::Eject`] + `SetPresent(false)`；re-add 经它发
+    /// `SetPresent(true)`。`None` = 尚未 add（与 `bus_unit` 同步）。
+    /// 与 C2-0 不同：通道恒在 → 命令 channel 也恒在，**不**每周期重建。
     cmd_tx: Option<mesh::Sender<vpci::HotplugCommand>>,
+
+    /// **编排侧**对「设备当前是否呈现给 guest（`device_count=1`）」的视图。
+    ///
+    /// 与通道内 `ReadyState::device_present` 镜像，但由编排方独立维护，用于让 `process`
+    /// 的 Live/Lost 收敛**幂等**：仅在真正发生 false↔true 跃迁时才发 `SetPresent`/`Eject`，
+    /// 吸收冗余/抖动的 Live/Lost 通知（C2-2 debounce 之前的基本幂等保证）。
+    /// `add_bus` 后置 `true`（通道初始 `device_count=1`）。
+    device_present: bool,
 
     /// device 的 Live/Lost 边沿通知 receiver（device shim 的 `SharedState` 在转
     /// Live/Lost 时投递新状态）。
@@ -191,8 +214,8 @@ impl VfioUserHotplug {
     ///
     /// 必须在 `chipset_builder.build()` 之后调用（`add_dyn_device` 是 `ChipsetDevices`
     /// 的运行时 API）。boot 时 usnvmemu 未起也照样装配 device shim（初始 Connecting，
-    /// 对 guest show-absent）—— bus 在首个 Live 边沿才 add（冷插由后续 C3 完整化；
-    /// C0 只要 Live→add / Lost→remove 机制通）。
+    /// 对 guest show-absent）—— 通道在首个 Live 边沿才 add（之后恒在）；冷插由后续 C3
+    /// 完整化。
     ///
     /// `worker_tasks`：worker/connector/irq task 保活容器（调用方持到进程退出）。
     #[expect(clippy::too_many_arguments)]
@@ -279,6 +302,8 @@ impl VfioUserHotplug {
             interrupt_mapper,
             bus_unit: None,
             cmd_tx: None,
+            // 尚未 add 通道 → 设备未呈现给 guest。`add_bus` 后置 true。
+            device_present: false,
             edge_rx,
         })
     }
@@ -293,32 +318,74 @@ impl VfioUserHotplug {
         }
     }
 
-    /// 处理一次边沿：按 device 的**当前**状态收敛 bus 的 add/remove（幂等）。
+    /// 处理一次边沿：按 device 的**当前**状态收敛设备对 guest 的呈现（幂等）。
     ///
-    /// **不可取消**（与 `vpci_relay::process` 同纪律：add/remove 半途取消会泄漏/撕裂）。
+    /// **不可取消**（与 `vpci_relay::process` 同纪律：add/SetPresent 半途取消会撕裂状态）。
     /// 串行：本方法只从 dispatch loop 单点调用，不并发。
     ///
-    /// - `Live` 且当前无 bus → `add_bus`（造虚拟设备 + connect + add_dyn_device(VpciBus)
-    ///   + `start_stopped_units`）。
-    /// - 非 `Live`（`Lost`/`Connecting`）且当前有 bus → `remove_bus`
-    ///   （`DynamicDeviceUnit::remove`）。
-    /// - 其余（状态与 bus 已一致）→ no-op（幂等吸收抖动/冗余通知）。
+    /// C2-1 路径 B（通道恒在，`device_count` 0↔1）的收敛表：
+    /// - `Live` 且**通道未 add** → [`add_bus`](Self::add_bus)：offer 通道一次
+    ///   （`device_count` 初始 1 → guest 首次枚举出盘）。此后通道恒在。
+    /// - `Live` 且**通道已 add** 且**当前未呈现** → `SetPresent(true)`
+    ///   （`device_count` 0→1 → guest 重枚举，**修⑦**）。
+    /// - 非 `Live`（`Lost`/`Connecting`）且**通道已 add** 且**当前呈现** →
+    ///   [`hide_device`](Self::hide_device)：graceful `EJECT` + `SetPresent(false)`
+    ///   （`device_count` 1→0 → guest PnP 移除，**修⑥**）。
+    /// - 其余（状态与呈现已一致 / 通道未 add 且非 Live）→ no-op（幂等吸收抖动/冗余通知）。
+    ///
+    /// 用编排侧 `device_present` 视图判跃迁（而非只看 `bus_unit`），因为通道恒在后
+    /// `bus_unit.is_some()` 不再随设备进出变化；真正的「呈现/隐藏」边沿由 `device_present`
+    /// 标记。
     pub async fn process(
         &mut self,
         chipset_devices: &ChipsetDevices,
         state_units: &mut StateUnits,
     ) -> anyhow::Result<()> {
         let live = matches!(self.state.load(), DeviceState::Live);
-        match (live, self.bus_unit.is_some()) {
-            (true, false) => self.add_bus(chipset_devices, state_units).await?,
-            (false, true) => self.remove_bus().await,
+        match (live, self.bus_unit.is_some(), self.device_present) {
+            // 首个 Live：add 通道一次（device_count 初始 1，盘出现）。
+            (true, false, _) => self.add_bus(chipset_devices, state_units).await?,
+            // re-add（通道已在、当前未呈现）：device_count 0→1，guest 重枚举（修⑦）。
+            (true, true, false) => self.set_present(true).await,
+            // Lost（通道已在、当前呈现）：graceful EJECT + device_count 1→0（修⑥）。
+            (false, true, true) => self.hide_device().await,
+            // 其余：状态与呈现已一致，或通道未 add 且非 Live（boot 起 usnvmemu 未起）。
             _ => {}
         }
         Ok(())
     }
 
-    /// Live 边沿：造虚拟设备 + connect MSI + `add_dyn_device` 构造 VpciBus（捕获**已存在**
-    /// 的 device shim Arc + 新 interrupt_mapper）+ `start_stopped_units`。
+    /// 经命令 channel 发 [`vpci::HotplugCommand::SetPresent`]，切换 guest 侧 `device_count`，
+    /// 并更新编排侧 `device_present` 视图。通道恒在，故只发命令、不动 `bus_unit`。
+    ///
+    /// 仅在通道已 add（`cmd_tx` 为 `Some`）时有效；否则记一条 warning（不应发生：调用方
+    /// 已据 `bus_unit.is_some()` 门控）。
+    async fn set_present(&mut self, present: bool) {
+        if let Some(cmd_tx) = self.cmd_tx.as_ref() {
+            cmd_tx.send(vpci::HotplugCommand::SetPresent(present));
+            self.device_present = present;
+            tracing::info!(
+                CVM_ALLOWED,
+                instance_id = %self.instance_id,
+                present,
+                "vfio_user hotplug: SetPresent (device_count toggled, channel stays offered)"
+            );
+        } else {
+            tracelimit::warn_ratelimited!(
+                instance_id = %self.instance_id,
+                present,
+                "vfio_user hotplug: SetPresent with no command channel (bus not added); ignoring"
+            );
+        }
+    }
+
+    /// 首个 Live 边沿（仅一次）：造命令 channel + `add_dyn_device` 构造 VpciBus（捕获
+    /// **已存在**的 device shim Arc + interrupt_mapper）+ `start_stopped_units`。
+    ///
+    /// C2-1 路径 B：本方法**全程只跑一次**（`process` 据 `bus_unit.is_none()` 门控）。
+    /// 通道一旦 offer 即恒在，后续设备进出靠 `SetPresent`，不再 add/remove 通道。
+    /// VpciChannel 的 `device_present` 初始 `true`（见 `device.rs`），故首次 offer 即
+    /// `device_count=1` → guest 枚举出盘。
     async fn add_bus(
         &mut self,
         chipset_devices: &ChipsetDevices,
@@ -327,9 +394,7 @@ impl VfioUserHotplug {
         // coerce 长存 device shim → dyn ChipsetDevice（VpciBus::new 的入参类型）。
         let device: Arc<CloseableMutex<dyn ChipsetDevice>> = self.device.clone();
         // 复用 assemble 时**一次性**造好的持久 interrupt_mapper（`clone()` = 增 Arc
-        // 引用，**不**重建虚拟设备、**不**重注册 device_id）。虚拟设备 + msi 连接在
-        // assemble 已建好长存，跨 add/remove 周期不变（修 C0 真机 POC 暴露的
-        // "device id already in use" re-add 失败）。
+        // 引用，**不**重建虚拟设备、**不**重注册 device_id）。
         let interrupt_mapper = self.interrupt_mapper.clone();
 
         let instance_id = self.instance_id;
@@ -338,9 +403,9 @@ impl VfioUserHotplug {
         let vtom = self.vtom;
         let bus_name: Arc<str> = format!("vfio_user_nvme:vpci-{instance_id}").into();
 
-        // 为本代 VpciBus 建一个**全新**的运行时命令 channel：sender 存进 self（供
-        // `remove_bus` 发 graceful EJECT），receiver 交给新 VpciChannel。每个 add_bus
-        // 都重建——上一代 bus 已在 remove 时整体 drop，其 receiver 随之失效。
+        // 建运行时命令 channel：sender 存进 self（供 `hide_device`/`set_present` 用），
+        // receiver 交给 VpciChannel。**C2-1 通道恒在 → 此 channel 也恒在，只建一次**
+        // （与 C2-0 每周期重建不同）。
         let (cmd_tx, cmd_rx) = mesh::channel::<vpci::HotplugCommand>();
 
         let (bus_unit, _bus) = chipset_devices
@@ -360,7 +425,7 @@ impl VfioUserHotplug {
                         register_mmio,
                         vmbus.as_ref(),
                         interrupt_mapper,
-                        // 启用 graceful EJECT：本代 bus 的运行时命令 receiver。
+                        // 启用运行时热插拔命令（graceful EJECT + SetPresent）。
                         Some(cmd_rx),
                     )
                     .await?;
@@ -372,6 +437,8 @@ impl VfioUserHotplug {
 
         self.bus_unit = Some(bus_unit);
         self.cmd_tx = Some(cmd_tx);
+        // 通道初始 device_count=1 → 设备已呈现给 guest。记录编排侧视图。
+        self.device_present = true;
         // add_dyn_device 加入的 unit 初始 stopped；若 VM 在跑则启动它（VpciBus offer
         // 在 new 内已发生，这里启动 channel state unit）。
         state_units.start_stopped_units().await;
@@ -379,37 +446,38 @@ impl VfioUserHotplug {
         tracing::info!(
             CVM_ALLOWED,
             %instance_id,
-            "vfio_user hotplug: VpciBus offered (device Live, disk should appear in guest)"
+            "vfio_user hotplug: VpciBus offered once (channel stays for VM lifetime; disk should appear in guest)"
         );
         Ok(())
     }
 
     /// Lost 边沿：**先**经命令 channel 发 graceful `EJECT` 给 guest 并等 `EJECT_COMPLETE`
-    /// （带超时），**再**用 [`DynamicDeviceUnit::remove`] 拆 VpciBus（连 chipset device unit +
-    /// MMIO config 区域一起拆 → 无泄漏；drop VpciBus → SimpleDeviceHandle Drop = rescind
-    /// → guest PnP 移盘）。**绝不**用 `revoke`。
+    /// （带超时），**再**发 `SetPresent(false)`（`device_count` 1→0 → guest PnP 移除）。
+    /// **C2-1 路径 B：不再拆 VpciBus**（通道恒在）—— 仅切 `device_count`。
     ///
     /// # 为什么要 graceful EJECT 前置（finding-⑥）
     ///
-    /// C0 真机暴露：直接 rescind（surprise-removal）一个**挂载 + 脏数据**的 NTFS 卷会
-    /// 让 guest 偶发 BSOD→reboot。graceful EJECT 给 guest 一个 query-remove 窗口先
-    /// flush + dismount 卷，再撤通道，避免 surprise。
+    /// C0 真机暴露：直接 surprise-removal 一个**挂载 + 脏数据**的 NTFS 卷会让 guest 偶发
+    /// BSOD→reboot。graceful EJECT 给 guest 一个 query-remove 窗口先 flush + dismount 卷，
+    /// 再降 `device_count`，避免 surprise。`device_count=0` 本身不保证优雅，故 EJECT 仍是
+    /// **必要前置**（与 C2-0 一致，路径 B 不取消此前置）。
     ///
     /// # ⑥ 最微妙点：后端已死时的收尾
     ///
     /// ⑥ 触发时 usnvmemu（vfio-user server）通常已被 kill（device shim 转 Lost）。此时
     /// guest 的 flush 会打到 Lost device shim（C-2 MMIO 门控返 Err），**flush 必然失败**。
     /// 但 graceful EJECT 仍给 guest 一个**有序 dismount** 的机会（即便数据 flush 失败，
-    /// 卷状态机能干净走完 remove，不至于 surprise-removal 崩内核）——这正是 C2-0 真机门 0
-    /// 要验的核心。
+    /// 卷状态机能干净走完 remove，不至于 surprise-removal 崩内核）。
     ///
     /// # 超时退化
     ///
     /// 若 guest 在 [`EJECT_COMPLETE_TIMEOUT`] 内不回 `EJECT_COMPLETE`（驱动卡死 / 不支持），
-    /// 放弃等待直接拆——graceful 是尽力而为，**绝不**因 guest 不配合而挂死 reconcile。
-    async fn remove_bus(&mut self) {
-        // 先尝试 graceful EJECT（仅当确有命令 channel，即 bus 由本路径 add）。
-        if let Some(cmd_tx) = self.cmd_tx.take() {
+    /// 放弃等待直接降 `device_count`——graceful 是尽力而为，**绝不**因 guest 不配合而挂死
+    /// reconcile。
+    async fn hide_device(&mut self) {
+        // 先尝试 graceful EJECT（仅当确有命令 channel，即通道已 add）。
+        // 注意：通道恒在 → `cmd_tx` 不 take（后续 re-add 的 SetPresent(true) 还要用它）。
+        if let Some(cmd_tx) = self.cmd_tx.as_ref() {
             let (done_tx, done_rx) = mesh::oneshot::<()>();
             cmd_tx.send(vpci::HotplugCommand::Eject { done: done_tx });
 
@@ -422,7 +490,7 @@ impl VfioUserHotplug {
                     if r.is_err() {
                         tracelimit::warn_ratelimited!(
                             instance_id = %self.instance_id,
-                            "vfio_user hotplug: EJECT channel closed before EJECT_COMPLETE; proceeding to rescind"
+                            "vfio_user hotplug: EJECT channel closed before EJECT_COMPLETE; proceeding to hide"
                         );
                     }
                     false
@@ -435,7 +503,7 @@ impl VfioUserHotplug {
                     CVM_ALLOWED,
                     instance_id = %self.instance_id,
                     timeout_ms = EJECT_COMPLETE_TIMEOUT.as_millis() as u64,
-                    "vfio_user hotplug: graceful EJECT timed out; proceeding to rescind (guest may surprise-remove)"
+                    "vfio_user hotplug: graceful EJECT timed out; proceeding to set device_count=0 (guest may surprise-remove)"
                 );
             } else {
                 tracing::info!(
@@ -444,16 +512,14 @@ impl VfioUserHotplug {
                     "vfio_user hotplug: graceful EJECT acknowledged by guest"
                 );
             }
-            // cmd_tx 在此 drop（已 take 出）——本代 bus 命令 channel 关闭。
         }
 
-        if let Some(bus_unit) = self.bus_unit.take() {
-            bus_unit.remove().await;
-            tracing::info!(
-                CVM_ALLOWED,
-                instance_id = %self.instance_id,
-                "vfio_user hotplug: VpciBus removed (device Lost, disk should disappear from guest)"
-            );
-        }
+        // 降 device_count 1→0：guest PnP 移除（通道不动）。`set_present` 更新编排侧视图。
+        self.set_present(false).await;
+        tracing::info!(
+            CVM_ALLOWED,
+            instance_id = %self.instance_id,
+            "vfio_user hotplug: device hidden (device_count=0, channel stays offered)"
+        );
     }
 }
