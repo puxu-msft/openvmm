@@ -138,13 +138,14 @@ impl PcieDevice for MockDev {
 // ──────────────────────── server controller ────────────────────────
 
 /// `reconnect_loop` 连上后、发 `Connected` 前会发的 pump 数（empty eventfds → 跳过
-/// set_irqs）：`get_region_info(BAR0)` + `get_irq_info(MSIX)` = 2 条 request/reply。
+/// set_irqs）：`get_region_info(BAR0)` + `get_irq_info(MSIX)` + **CMB-P3b** discover
+/// 扫 region info（index 1/2/3/5，跳过 BAR0 与 MSI-X BAR4）= 2 + 4 = 6 条 request/reply。
 /// "probe-then-deaf" 模式 pump 恰好这么多就到达「worker 即将 Live」的点，之后任何
 /// MMIO read 都会滞留 socket 成为**真在途**请求（server 不再 pump → 不回 reply）。
-const PRELIVE_PROBE_PUMPS: usize = 2;
+const PRELIVE_PROBE_PUMPS: usize = 6;
 
 /// 同上但**非空 eventfds**：reconnect_loop 在 into_channel 前**还会** set_irqs
-/// （C-3），故到 Live 前夜多一条 request/reply（probes 2 + set_irqs 1 = 3）。场景 ⑥
+/// （C-3），故到 Live 前夜多一条 request/reply（probes 6 + set_irqs 1 = 7）。场景 ⑥
 /// 用此 pump 数让连接器把 set_irqs 也发完后再到 Live。
 const PRELIVE_PROBE_PUMPS_WITH_IRQS: usize = PRELIVE_PROBE_PUMPS + 1;
 

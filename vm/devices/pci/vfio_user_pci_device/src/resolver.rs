@@ -26,6 +26,7 @@
 use crate::AbsentPcieDevice;
 use crate::MSIX_BAR_INDEX;
 use crate::VfioUserPciDevice;
+use crate::identity::CmbBarDecision;
 use crate::identity::DeclaredGeometry;
 use crate::identity::declared_hardware_ids;
 use crate::irq::irq_wait_loop;
@@ -182,16 +183,61 @@ pub async fn build_device_shim(
     //    - BAR0 = 声明的 `bar0_size`。**M-1**：`DeviceBars::bar0` 被 pci_core 自动
     //      呈现为 64-bit memory BAR（占用 BAR0+BAR1 寄存器对），这正是 NVMe 所要求
     //      的（NVMe controller registers 走 64-bit BAR0），无需特殊处理。
+    //    - **CMB-P3b（MEDIUM-2 按需）**：CMB 数据 BAR **仅当本设备配置了 CMB**
+    //      （`declared.cmb.is_some()`）才装配——默认 NVMe / Layer C 热插拔的设备走
+    //      `DeclaredGeometry::new()`（`cmb: None`），**不**预留 CMB BAR，guest 拓扑无
+    //      phantom BAR2。配置了 CMB 时按 `CmbBarDecision` 决策：
+    //      * `Reserve { bir, size }`（当前仅 BIR=2）→ 在该槽装 `BarMemoryKind::Intercept`
+    //        的 CMB BAR，window = `size`。与 BAR0 同机制：guest 对该 BAR 的 MMIO 被
+    //        trap → device.rs `find_bar` 命中 → worker `REGION_READ/WRITE(region=bir)`
+    //        透传给 server（firmware P3a `cmb_bar_read/write` backing）。**assemble-always
+    //        纪律**：装配期 backend 可能未连上、无法 discover，故按 declared 预留窗口
+    //        （与 BAR0 用 declared.bar0_size 同纪律）；reconnect discover 校验
+    //        `actual ≤ declared`（reconnect.rs 4b/4c）。pci_core 把每个 BAR 呈现为 64-bit
+    //        （占两 slot）：BAR0→slot0/1、CMB(BIR=2)→slot2/3、MSI-X(BAR4)→slot4/5，不重叠。
+    //      * `Unsupported { bir }`（BIR != 2）→ 跳过 CMB BAR 装配 + 告警（不 panic boot；
+    //        guest 看不到 CMB，与未启用 CMB 等效）。**TODO(CMB-P5)**：见下。
+    //
+    //      **map 模式降级**：OpenHCL client 无 `MemoryMapper`，CMB 永远以 trap（Intercept）
+    //      暴露——绝不 mmap server region fd（设计 §1）。server 即便置 FLAG_MMAP，client 也
+    //      只在 reconnect 记一行降级 warn（reconnect.rs 4c），BAR 装配本身恒为 Intercept。
+    //
+    //    **TODO(CMB-P5)**：当前 CMB 仅支持 BIR=2（`DeviceBars::bar2`）这一槽——`DeviceBars`
+    //      只暴露 bar0/bar2/bar4 builder，且 BAR4 留给 MSI-X。firmware `--cmb-bir` 可配
+    //      1/3/5，要支持需先扩 `DeviceBars` 的 barN builder + P5 config 把 BIR 真正传进
+    //      `DeclaredGeometry::with_cmb`。在此之前 BIR != 2 经 `CmbBarDecision::Unsupported`
+    //      优雅拒绝（warn + 不暴露，绝不 panic）。BIR 不再写死 2 的判断——来自 declared.cmb。
     //    - BAR4 = MSI-X table/PBA。
-    let bars = DeviceBars::new()
-        .bar0(
-            declared.bar0_size,
-            BarMemoryKind::Intercept(register_mmio.new_io_region("bar0", declared.bar0_size)),
-        )
-        .bar4(
-            msix.bar_len(),
-            BarMemoryKind::Intercept(register_mmio.new_io_region("msix", msix.bar_len())),
-        );
+    let mut bars = DeviceBars::new().bar0(
+        declared.bar0_size,
+        BarMemoryKind::Intercept(register_mmio.new_io_region("bar0", declared.bar0_size)),
+    );
+    match declared.cmb_bar_decision() {
+        CmbBarDecision::None => {
+            // 默认 / Layer C 设备：不预留 CMB BAR（无 phantom BAR2）。
+        }
+        CmbBarDecision::Reserve { bir: _, size } => {
+            // 当前 `Reserve` 恒为 BIR=2（见 `cmb_bar_decision`），故用 `bar2` 槽。
+            bars = bars.bar2(
+                size,
+                BarMemoryKind::Intercept(register_mmio.new_io_region("cmb", size)),
+            );
+        }
+        CmbBarDecision::Unsupported { bir } => {
+            tracing::warn!(
+                CVM_ALLOWED,
+                %instance_id,
+                cmb_bir = bir,
+                "vfio_user_pci: configured CMB BIR != 2; DeviceBars only supports bar0/bar2/bar4 \
+                 (bar4=MSI-X). TODO(CMB-P5): extend barN builder + P5 config for BIR=1/3/5. \
+                 Skipping CMB BAR assembly (guest will not see CMB)"
+            );
+        }
+    }
+    let bars = bars.bar4(
+        msix.bar_len(),
+        BarMemoryKind::Intercept(register_mmio.new_io_region("msix", msix.bar_len())),
+    );
 
     // 4. cfg_space（身份用声明默认值；连接器另读 firmware 真身份做校验，但 guest-facing
     //    身份固定 = declared，避免 backend drift 改变 guest 看到的 PCI 身份）。

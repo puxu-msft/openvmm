@@ -17,9 +17,11 @@
 //! 一轮重连的完整步骤（任一步 Err 都 backoff 后重来，期间设备保持非 Live）：
 //!   1. `connect` 到 firmware 的 AF_UNIX socket（err → backoff）
 //!   2. `handshake`（err → backoff）
-//!   3. 读真几何：`get_region_info(BAR0).size` + `get_irq_info(MSIX).count`（err → backoff）
-//!   4. [`validate_identity`]：actual ≤ declared 才放行；`Exceeds` → 错误日志 + backoff，
-//!      **保持非 Live**（防 guest 拿到半映射控制器，决策 b）
+//!   3. 读真几何：`get_region_info(BAR0).size` + `get_irq_info(MSIX).count` +
+//!      **CMB-P3b** discover CMB 数据 BAR（扫 region info）（err → backoff）
+//!   4. [`validate_identity`] + **CMB-P3b** [`validate_cmb`]：actual ≤ declared 才放行；
+//!      `Exceeds` → 错误日志 + backoff，**保持非 Live**（防 guest 拿到半映射控制器，决策 b）；
+//!      CMB map 模式（server 置 FLAG_MMAP）→ OpenHCL 无 mapper，**降级 trap + 告警**
 //!   5. **C-3**：用**持久 eventfd**（`eventfds`，owned `pal_event::Event` clone）重新
 //!      `set_irqs`——每次重连都是全新 client/socket，必须在 `into_channel` 之前重新把
 //!      同一批 eventfd 配给 firmware，否则 revive 后 MSI-X 形同虚设（err → backoff）
@@ -40,9 +42,13 @@
 
 #![forbid(unsafe_code)]
 
+use crate::MSIX_BAR_INDEX;
 use crate::identity::ActualGeometry;
+use crate::identity::CmbGeometry;
 use crate::identity::DeclaredGeometry;
 use crate::identity::IdentityCheck;
+use crate::identity::discover_cmb_geometry;
+use crate::identity::validate_cmb;
 use crate::identity::validate_identity;
 use crate::worker::ReconnectEvent;
 use cvm_tracing::CVM_ALLOWED;
@@ -139,8 +145,8 @@ pub async fn reconnect_loop(
             continue;
         }
 
-        // ── 3. 读真几何（BAR0 size + MSI-X count）──
-        let actual = match read_actual_geometry(&mut client).await {
+        // ── 3. 读真几何（BAR0 size + MSI-X count + CMB-P3b discover CMB BAR）──
+        let (actual, cmb) = match read_actual_geometry(&mut client).await {
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!(
@@ -174,6 +180,68 @@ pub async fn reconnect_loop(
             PolledTimer::new(&driver).sleep(backoff).await;
             backoff = next_backoff(backoff);
             continue;
+        }
+
+        // ── 4b. CMB-P3b：CMB 几何校验（actual ≤ declared 预留槽/窗口才放行）──
+        // 与 BAR0/MSI-X 同纪律（决策 b）：配置了 CMB 的设备装配期按 declared 预留 CMB
+        // BAR 槽（index=declared.cmb.bir、window=declared.cmb.size）；firmware 实报 CMB BAR
+        // 的 BIR 与预留槽不一致、或 size 超窗口 → 拒绝 + stay-non-Live（防 guest 拿到指向
+        // 空 slot 的 CMBLOC.BIR 或半映射 CMB）。actual 未启用 CMB（cmb=None）→ 恒 Ok。
+        // **MEDIUM-2**：declared 未配置 CMB（默认设备）但 server 报 CMB → validate_cmb 返
+        // Ok（不卡 Live），由下方 4c 的 info 分支记「忽略」（BAR 槽未预留，无处暴露）。
+        if let IdentityCheck::Exceeds(why) = validate_cmb(&declared, cmb.as_ref()) {
+            tracing::error!(
+                CVM_ALLOWED,
+                why,
+                actual_cmb_bir = cmb.map(|c| c.bir),
+                declared_cmb_bir = declared.cmb.map(|c| c.bir),
+                actual_cmb_size = cmb.map(|c| c.size),
+                declared_cmb_size = declared.cmb.map(|c| c.size),
+                backoff_ms = backoff.as_millis() as u64,
+                "vfio_user_pci reconnect: CMB geometry incompatible with declared; refusing (stay non-Live)"
+            );
+            PolledTimer::new(&driver).sleep(backoff).await;
+            backoff = next_backoff(backoff);
+            continue;
+        }
+
+        // ── 4c. CMB-P3b：CMB discover 后的日志（含 map 模式优雅降级告警）──
+        // 仅当 server 实报了 CMB（cmb=Some）才记录。分三种情形：
+        // 1. **declared 未配置 CMB**（MEDIUM-2）：本设备装配期未预留 CMB BAR 槽，server
+        //    报的 CMB 无处暴露 → **info 日志「忽略」**（不报错、不卡 Live；BAR 已在 assemble
+        //    定死，无法事后补；对齐 silent-failure 纪律：明示忽略，绝不静默）。
+        // 2. **配置了 CMB 且 server 想走 map 模式**（置 FLAG_MMAP）：OpenHCL client **无
+        //    MemoryMapper**（设计 §1）→ 无法 mmap 那个 region fd。client **不尝试 mmap**
+        //    （会失败/panic），降级为 **trap**（Intercept + REGION_READ/WRITE）+ **warn**。
+        //    worker 转发路径对 trap/map 无差别（都走 REGION_RW），降级仅「丢弃 MMAP hint +
+        //    记一行 warn」，功能上 CMB 仍经 trap 完全可达。
+        // 3. **配置了 CMB 且 server trap 模式**：info「discovered CMB data BAR (trap mode)」。
+        if let Some(c) = &cmb {
+            if declared.cmb.is_none() {
+                tracing::info!(
+                    CVM_ALLOWED,
+                    cmb_bir = c.bir,
+                    cmb_size = c.size,
+                    "vfio_user_pci reconnect: server advertised CMB but this device has no CMB BAR \
+                     configured; ignoring (no BAR slot reserved at assembly, cannot expose)"
+                );
+            } else if c.wants_mmap {
+                tracing::warn!(
+                    CVM_ALLOWED,
+                    cmb_bir = c.bir,
+                    cmb_size = c.size,
+                    "vfio_user_pci reconnect: server advertised CMB FLAG_MMAP (map mode), but \
+                     OpenHCL client has no MemoryMapper; degrading to trap mode (Intercept + \
+                     REGION_READ/WRITE). CMB remains fully reachable, just not zero-copy."
+                );
+            } else {
+                tracing::info!(
+                    CVM_ALLOWED,
+                    cmb_bir = c.bir,
+                    cmb_size = c.size,
+                    "vfio_user_pci reconnect: discovered CMB data BAR (trap mode)"
+                );
+            }
         }
 
         // ── 5. C-3：重新 set_irqs（持久 eventfd），必须在 into_channel 之前 ──
@@ -272,21 +340,46 @@ pub async fn reconnect_loop(
     }
 }
 
-/// 读 firmware 真几何：BAR0 size + MSI-X count。
+/// 读 firmware 真几何：BAR0 size + MSI-X count + **CMB-P3b** discover CMB 数据 BAR。
 ///
 /// packed `RegionInfoPayload` / `IrqInfoPayload` 字段先 copy 到本地（`#[repr(C,packed)]`
 /// 下直接取字段是 E0793）。
-async fn read_actual_geometry(client: &mut VfioUserClient) -> anyhow::Result<ActualGeometry> {
+///
+/// **CMB discover**：除 BAR0/MSI-X 外，逐 region index 查 `GET_REGION_INFO`，把
+/// `(index, flags, size)` 喂给 [`discover_cmb_geometry`]——第一条 R/W 且 size>0 的非保留
+/// BAR 即 CMB 数据 BAR（教学版只一条）。firmware 未启用 CMB → 返 `None`（无 CMB BAR）。
+/// 扫描范围 = 所有可能承载数据 BAR 的 PCI region index `[1, BAR5]`，跳过 BAR0 与 MSI-X BAR。
+async fn read_actual_geometry(
+    client: &mut VfioUserClient,
+) -> anyhow::Result<(ActualGeometry, Option<CmbGeometry>)> {
     let bar0 = client.get_region_info(pci_region::BAR0).await?;
     let bar0_size = bar0.size; // packed copy
 
     let irq = client.get_irq_info(pci_irq::MSIX).await?;
     let msix_count = irq.count as u16; // packed copy
 
-    Ok(ActualGeometry {
-        bar0_size,
-        msix_count,
-    })
+    // CMB discover：扫描 [1, BAR5] 的 region info（跳过 BAR0、MSI-X BAR）。每个 region
+    // 的 (index, flags, size) 喂 discover_cmb_geometry。BAR0 已单查（上方），此处不重查。
+    let mut cmb_candidates: Vec<(u8, u32, u64)> = Vec::new();
+    for index in 1..=pci_region::BAR5 {
+        if index == MSIX_BAR_INDEX as u32 {
+            continue;
+        }
+        let info = client.get_region_info(index).await?;
+        // packed 字段先 copy。
+        let flags = info.flags;
+        let size = info.size;
+        cmb_candidates.push((index as u8, flags, size));
+    }
+    let cmb = discover_cmb_geometry(cmb_candidates, pci_region::BAR0 as u8, MSIX_BAR_INDEX);
+
+    Ok((
+        ActualGeometry {
+            bar0_size,
+            msix_count,
+        },
+        cmb,
+    ))
 }
 
 #[cfg(test)]
