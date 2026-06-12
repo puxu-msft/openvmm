@@ -229,6 +229,16 @@ impl NvmeController {
         // M1: interrupt coalescing 重置默认（无 coalesce）
         self.irq_aggr_time = 0;
         self.irq_aggr_threshold = 0;
+        // **CMB-P1a（spec § 3.1.24 + architect 复核 #4）** — controller reset（CC.EN
+        // 1→0）清 CMBMSC 的 enable 态（CRE/CMSE）+ CBA + CBAI：CMB 须 driver 重新经
+        // CMBMSC 编程才再可用。CMB **backing 不 take**（CMB 内容在 reset 后 spec 规定
+        // "未定义"，可不清；且 CAP.CMBS 仍广告，CMB 仍存在，只是 enable 态复位）。
+        if let Some(cmb) = self.cmb.as_mut() {
+            cmb.cre = false;
+            cmb.cmse = false;
+            cmb.cba = 0;
+            cmb.cbai = false;
+        }
         self.state = CtrlState::Disabled;
         self.csts &= !csts::RDY;
     }

@@ -85,6 +85,10 @@ pub enum Reg {
     Cmbloc = 0x38, // 4 bytes — RO, 0 = no CMB
     /// **Phase L3** — CMB Size (spec § 3.1.14)
     Cmbsz = 0x3c, // 4 bytes — RO, 0 = no CMB
+    /// **Phase Q6/CMB-P1a** — CMB Memory Space Control (spec § 3.1.24)
+    Cmbmsc = 0x50, // 8 bytes — RW: CRE(bit0) + CMSE(bit1) + CBA(bits63:12)
+    /// **Phase Q6/CMB-P1a** — CMB Status (spec § 3.1.25)
+    Cmbsts = 0x58, // 4 bytes — RO: CBAI(bit0) Controller Base Address Invalid
     /// **Phase L3** — Boot Partition Information (spec § 3.1.15)
     Bpinfo = 0x40, // 4 bytes — RO，bits 14:0 = BPSZ (boot partition size in 128 KiB)，bit 15..23 reserved, bits 25:24 = BRS (Read Status)，bits 31:26 = ABPID
     /// **Phase Q5** — Boot Partition Read Select (spec § 3.1.16)
@@ -127,11 +131,90 @@ pub mod csts {
     pub const SHST_COMPLETE: u32 = 0b10 << 2; // 10 = shutdown processing complete
 }
 
+/// CAP (Controller Capabilities) 中本实现会用到的位（64-bit RO）。
+pub mod cap {
+    /// bit 57 = CMBS (Controller Memory Buffer Supported)，spec § 3.1.1。
+    pub const CMBS: u64 = 1 << 57;
+}
+
+/// CMBSZ (CMB Size, offset 0x3C, RO) 位布局 — spec § 3.1.14（NVMe 2.0）。
+///
+/// CMB 总大小 = SZ × (CMB size unit)，size unit 由 SZU 编码（4 KiB × 16^SZU）。
+/// 低位的 SQS/CQS/LISTS/RDS/WDS 声明"CMB 可承载哪些数据类型"。**字段次序严格按
+/// spec 字节布局**（项目纪律 spec-aligned-field-order）。
+pub mod cmbsz {
+    /// bits 3:0 = SZU (Size Units)：0=4 KiB, 1=64 KiB, 2=1 MiB, 3=16 MiB, 4=256 MiB …
+    /// （每 +1 乘 16）。
+    pub const SZU_SHIFT: u32 = 0;
+    pub const SZU_MASK: u32 = 0xf << SZU_SHIFT;
+    /// bit 4 = SQS (Submission Queue Support)：CMB 可放 SQ。
+    pub const SQS: u32 = 1 << 4;
+    /// bit 5 = CQS (Completion Queue Support)：CMB 可放 CQ。
+    pub const CQS: u32 = 1 << 5;
+    /// bit 6 = LISTS (PRP/SGL List Support)：CMB 可放 PRP list / SGL segment。
+    pub const LISTS: u32 = 1 << 6;
+    /// bit 7 = RDS (Read Data Support)：CMB 可作 read 数据源。
+    pub const RDS: u32 = 1 << 7;
+    /// bit 8 = WDS (Write Data Support)：CMB 可作 write 数据宿。
+    pub const WDS: u32 = 1 << 8;
+    // bits 11:9 reserved。
+    /// bits 31:12 = SZ (Size)：CMB 大小（以 SZU 编码的 size unit 为单位）。
+    pub const SZ_SHIFT: u32 = 12;
+    pub const SZ_MASK: u32 = 0xf_ffff << SZ_SHIFT;
+
+    /// SZU 编码 → 每个 size unit 的字节数（4 KiB × 16^szu）。
+    pub fn unit_bytes(szu: u32) -> u64 {
+        (4 * 1024u64) * 16u64.pow(szu)
+    }
+}
+
+/// CMBLOC (CMB Location, offset 0x38, RO) 位布局 — spec § 3.1.13（NVMe 2.0）。
+///
+/// 告诉 driver CMB 落在哪个 BAR（BIR）以及在该 BAR 内的偏移（OFST，以 size unit
+/// 为粒度）。本教学实现 CMB 用独立 BAR、OFST=0。
+pub mod cmbloc {
+    /// bits 2:0 = BIR (Base Indicator Register)：CMB 所在 BAR 索引。
+    pub const BIR_SHIFT: u32 = 0;
+    pub const BIR_MASK: u32 = 0x7 << BIR_SHIFT;
+    // bits 11:3 在 NVMe 2.0 含 CQMMS/CQPDS 等子字段（教学版不广告，留 0）。
+    /// bits 31:12 = OFST (Offset)：CMB 在 BAR 内的偏移（CMBSZ.SZU 为粒度）。
+    pub const OFST_SHIFT: u32 = 12;
+    pub const OFST_MASK: u32 = 0xf_ffff << OFST_SHIFT;
+}
+
+/// CMBMSC (CMB Memory Space Control, offset 0x50, RW, 64-bit) 位布局 —
+/// spec § 3.1.24（NVMe 2.0）。driver 经它**启用** CMB 并编程 Controller Base
+/// Address（CBA = CMB 在 guest 地址空间的基址）。
+pub mod cmbmsc {
+    /// bit 0 = CRE (Capabilities Registers Enabled)：使能 CMBSZ/CMBLOC 反映真值。
+    /// spec 要求 **CRE 先于 CMSE**。
+    pub const CRE: u64 = 1 << 0;
+    /// bit 1 = CMSE (CMB Memory Space Enable)：使能 CMB 内存空间（CBA 生效，CMB
+    /// 可被访问）。置位前 CRE 必须已置（否则非法，见 mmio.rs 校验）。
+    pub const CMSE: u64 = 1 << 1;
+    // bits 11:2 reserved。
+    /// bits 63:12 = CBA (Controller Base Address)：CMB 在 guest 地址空间的基址
+    /// （4 KiB 对齐，低 12 位隐含 0）。
+    pub const CBA_SHIFT: u64 = 12;
+    pub const CBA_MASK: u64 = !0xfffu64; // bits 63:12
+}
+
+/// CMBSTS (CMB Status, offset 0x58, RO) 位布局 — spec § 3.1.25（NVMe 2.0）。
+pub mod cmbsts {
+    /// bit 0 = CBAI (Controller Base Address Invalid)：CMSE 置位时 CBA 非法 →
+    /// controller 置此位拒绝启用。
+    pub const CBAI: u32 = 1 << 0;
+}
+
 /// CAP (Controller Capabilities) — 64 位 RO，启动期一次构造。
 ///
 /// `max_qe` = 队列深度（单 SQ/CQ 最大 entry 数），∈ [1, 65536]。MQES 字段是
 /// **0-based**（存 `max_qe - 1`，≤ 0xFFFF），spec **不要求** 2 的幂。
-pub fn build_cap(max_qe: u32) -> u64 {
+///
+/// `cmb_supported` = 是否广告 CMB（CAP.CMBS bit57，spec § 3.1.1）。**当且仅当**
+/// CMB 启用配置（`--cmb-*` 非 off / `CmbState` 存在）时置位；否则保持 0（与无 CMB
+/// 现状一致）。CMBS 只声明"设备支持 CMB"，CMB 的实际可用还需 driver 编程 CMBMSC。
+pub fn build_cap(max_qe: u32, cmb_supported: bool) -> u64 {
     debug_assert!((1..=65536).contains(&max_qe), "max_qe 须 ∈ [1, 65536]");
     // Queue size minus 1 (MQES) bits 15:0 — 0-based，最大 65535（= 65536 entries）。
     let mqes_minus_1 = (max_qe - 1) as u64;
@@ -150,7 +233,10 @@ pub fn build_cap(max_qe: u32) -> u64 {
     // bits 47:45 reserved.
     // bits 51:48 = MPSMIN, 0 = 4 KiB.
     // bits 55:52 = MPSMAX, 0 = 4 KiB.
-    mqes_minus_1 | cqr | to | dstrd | css
+    // bit 56 = PMRS (Persistent Memory Region Supported), 0 = no PMR.
+    // **bit 57 = CMBS (Controller Memory Buffer Supported)** — spec § 3.1.1。
+    let cmbs = if cmb_supported { cap::CMBS } else { 0 };
+    mqes_minus_1 | cqr | to | dstrd | css | cmbs
 }
 
 /// VS (Version) — NVMe 1.4 = 0x00010400。
@@ -200,4 +286,92 @@ pub struct CompletionQueue {
     pub pending_completions: u32,
     /// 上次 fire interrupt 的时刻（None = 从未 fire 或刚 fire）。
     pub last_fire: Option<std::time::Instant>,
+}
+
+#[cfg(test)]
+mod cmb_reg_tests {
+    use super::*;
+
+    /// CAP.CMBS（bit57）当且仅当 cmb_supported 时置位；其余 CAP 字段不受影响。
+    #[test]
+    fn build_cap_sets_cmbs_only_when_supported() {
+        let no_cmb = build_cap(128, false);
+        let with_cmb = build_cap(128, true);
+        assert_eq!(no_cmb & cap::CMBS, 0, "无 CMB 配置不应置 CAP.CMBS");
+        assert_ne!(with_cmb & cap::CMBS, 0, "CMB 启用应置 CAP.CMBS（bit57）");
+        // CMBS 是唯一差异：清掉 bit57 后两者相等（MQES/CQR/TO/CSS 等不变）。
+        assert_eq!(
+            no_cmb,
+            with_cmb & !cap::CMBS,
+            "CMBS 之外的 CAP 字段不应因 cmb_supported 改变"
+        );
+        // bit57 的绝对位置锚定（spec § 3.1.1）。
+        assert_eq!(cap::CMBS, 1u64 << 57);
+    }
+
+    /// CMBSZ 编码：SZU 在 bits 3:0、SZ 在 bits 31:12，数据类型位各就各位（spec § 3.1.14）。
+    #[test]
+    fn cmbsz_field_offsets_match_spec() {
+        use cmbsz::*;
+        // 位绝对位置（防字段次序漂移 / 与 spec 字节布局对齐）。
+        assert_eq!(SZU_MASK, 0xf);
+        assert_eq!(SQS, 1 << 4);
+        assert_eq!(CQS, 1 << 5);
+        assert_eq!(LISTS, 1 << 6);
+        assert_eq!(RDS, 1 << 7);
+        assert_eq!(WDS, 1 << 8);
+        assert_eq!(SZ_SHIFT, 12);
+        assert_eq!(SZ_MASK, 0xf_ffff << 12);
+        // 组装一个典型 CMBSZ：SZU=0（4 KiB unit）+ SZ=512（→ 2 MiB）+ RDS+WDS+SQS+CQS+LISTS。
+        let szu = 0u32;
+        let sz = 512u32; // 512 × 4 KiB = 2 MiB
+        let v = (szu << SZU_SHIFT) | (sz << SZ_SHIFT) | RDS | WDS | SQS | CQS | LISTS;
+        assert_eq!((v & SZU_MASK) >> SZU_SHIFT, 0);
+        assert_eq!((v & SZ_MASK) >> SZ_SHIFT, 512);
+        assert_ne!(v & RDS, 0);
+        assert_ne!(v & WDS, 0);
+    }
+
+    /// SZU 编码 → size unit 字节数（4 KiB × 16^szu）。
+    #[test]
+    fn cmbsz_unit_bytes_encoding() {
+        assert_eq!(cmbsz::unit_bytes(0), 4 * 1024); // 4 KiB
+        assert_eq!(cmbsz::unit_bytes(1), 64 * 1024); // 64 KiB
+        assert_eq!(cmbsz::unit_bytes(2), 1024 * 1024); // 1 MiB
+        assert_eq!(cmbsz::unit_bytes(3), 16 * 1024 * 1024); // 16 MiB
+    }
+
+    /// CMBLOC：BIR 在 bits 2:0、OFST 在 bits 31:12（spec § 3.1.13）。
+    #[test]
+    fn cmbloc_field_offsets_match_spec() {
+        use cmbloc::*;
+        assert_eq!(BIR_MASK, 0x7);
+        assert_eq!(OFST_SHIFT, 12);
+        // BIR=2（独立 BAR2）、OFST=0。
+        let v = (2u32 << BIR_SHIFT) | (0u32 << OFST_SHIFT);
+        assert_eq!((v & BIR_MASK) >> BIR_SHIFT, 2);
+        assert_eq!((v & OFST_MASK) >> OFST_SHIFT, 0);
+    }
+
+    /// CMBMSC：CRE bit0、CMSE bit1、CBA bits 63:12（spec § 3.1.24）。
+    #[test]
+    fn cmbmsc_field_offsets_match_spec() {
+        use cmbmsc::*;
+        assert_eq!(CRE, 1);
+        assert_eq!(CMSE, 1 << 1);
+        assert_eq!(CBA_SHIFT, 12);
+        assert_eq!(CBA_MASK, !0xfffu64);
+        // 组装 CMBMSC：CBA=0x8000_0000、CMSE=1、CRE=1。
+        let cba = 0x8000_0000u64;
+        let v = (cba & CBA_MASK) | CMSE | CRE;
+        assert_ne!(v & CRE, 0);
+        assert_ne!(v & CMSE, 0);
+        assert_eq!(v & CBA_MASK, cba, "CBA 4 KiB 对齐字段回读一致");
+    }
+
+    /// CMBSTS.CBAI bit0（spec § 3.1.25）。
+    #[test]
+    fn cmbsts_cbai_bit() {
+        assert_eq!(cmbsts::CBAI, 1);
+    }
 }

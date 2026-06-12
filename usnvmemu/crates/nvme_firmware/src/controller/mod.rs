@@ -1543,6 +1543,66 @@ pub struct NvmeController {
     vid: u16,
     ssvid: u16,
     msix_count: u16,
+
+    /// **CMB（Controller Memory Buffer）—— Phase CMB-P1a** — `None` = 不广告 CMB
+    /// （CAP.CMBS=0，CMBLOC/CMBSZ 返 0，与历史现状一致）；`Some` = 广告 CMB 并服务
+    /// 其寄存器。backing 注入留后续 Phase（P1a 用 `Vec`-backed 中立实现 +
+    /// `enable_cmb_for_test` 测试构造入口）。
+    pub(super) cmb: Option<CmbState>,
+}
+
+/// **CMB-P1a** — Controller Memory Buffer 运行时状态。
+///
+/// 持有 CMB 的 backing（一段 firmware 与 guest 共享的 RAM）+ guest 经 CMBMSC 编程的
+/// 控制状态。**CBA 是 firmware 状态、不进 backing 抽象**（architect 复核 #1）：
+/// `SharedRamRegion` 只给"一段可读写内存"，CBA↔offset 映射留在这里。
+///
+/// 数据路径（gpa∈CMB 时直接读写 backing 而非 DMA）是 **P1b** 的事，P1a 只建立
+/// 寄存器/状态/描述骨架，不碰 io.rs 的 dispatch。
+pub struct CmbState {
+    /// CMB 的 backing RAM。trait object 让 transport 注入不同实现（memfd / Vec）。
+    ///
+    /// **P1b scaffolding（暂未读）**：P1a 只建寄存器/状态/描述骨架；数据路径
+    /// （io.rs `access_guest`：gpa∈CMB → 直读写此 backing 而非 DMA）是 **P1b**。
+    /// 字段已就位，P1b 接线即用，故 P1a 阶段 `dead_code` 是预期的前瞻预置。
+    #[allow(dead_code)]
+    pub(super) backing: Box<dyn SharedRamRegion>,
+    /// CMB 大小（字节）。== `backing.len()`，缓存避免每次过 trait。
+    pub(super) size: u64,
+    /// CMB 所在 BAR 索引（CMBLOC.BIR）。教学版用独立 BAR（避开 BAR0 副作用区）。
+    pub(super) bir: u8,
+    /// Controller Base Address：CMB 在 guest 地址空间的基址（CMBMSC.CBA，4 KiB
+    /// 对齐）。driver 经 CMBMSC 编程；CMSE 置位前无意义。
+    pub(super) cba: u64,
+    /// CMBMSC.CRE — Capabilities Registers Enabled。spec 要求先于 CMSE。
+    pub(super) cre: bool,
+    /// CMBMSC.CMSE — CMB Memory Space Enable。置位后 CMB 内存空间可被访问（P1b
+    /// 数据路径据此 dispatch）。
+    pub(super) cmse: bool,
+    /// CMBSTS.CBAI — Controller Base Address Invalid。host 在 CRE 未置时置 CMSE
+    /// （时序违规，spec § 3.1.24 要求 CRE 先于 CMSE）→ controller 拒绝启用并置此位，
+    /// driver 读 CMBSTS 可感知。CRE 正常先行时清 0。
+    pub(super) cbai: bool,
+}
+
+impl CmbState {
+    /// 用一段 [`SharedRamRegion`] backing 构造 CMB 状态（初始未启用：CRE/CMSE=0、
+    /// CBA=0、CBAI=0）。`bir` = CMB 所在 BAR 索引。
+    pub(super) fn new(backing: Box<dyn SharedRamRegion>, bir: u8) -> Self {
+        let size = backing.len() as u64;
+        // `size` 缓存 `backing.len()`；P1a backing 不可 resize 故恒等。锁此不变量，
+        // 防 P1b/reconnect 引入可重映射 backing 后两真相源悄悄漂移（review MEDIUM-2）。
+        debug_assert_eq!(size, backing.len() as u64);
+        Self {
+            backing,
+            size,
+            bir,
+            cba: 0,
+            cre: false,
+            cmse: false,
+            cbai: false,
+        }
+    }
 }
 
 struct FetchCtx {
@@ -2247,8 +2307,62 @@ impl NvmeController {
                 "max_queue_entries {entries} 非法：须 ∈ [{MIN_MAX_QUEUE_ENTRIES}, {MAX_MAX_QUEUE_ENTRIES}]（MQES 0-based 16-bit）"
             ));
         }
-        self.cap = crate::regs::build_cap(entries);
+        self.cap = crate::regs::build_cap(entries, self.cmb.is_some());
         tracing::info!(mqes_entries = entries, "queue depth (MQES) 设置");
+        Ok(())
+    }
+
+    /// **CMB-P1a** — 启用 Controller Memory Buffer：广告 CAP.CMBS + CMBLOC/CMBSZ，
+    /// 服务 CMBMSC/CMBSTS。`size_bytes` = CMB 字节数（须为 CMB size unit 的非零倍数，
+    /// 教学版 SZU=0 即 4 KiB 粒度），`bir` = CMB 所在 BAR 索引（独立数据 BAR，避开
+    /// BAR0 的 doorbell/MSI-X 副作用区）。`open()` 后、enable 前调（CLI `--cmb-*`）。
+    ///
+    /// **P1a backing**：用 `Vec`-backed [`VecRamRegion`] 中立实现；真 transport
+    /// （memfd-backed，可经 fd 暴露给 client mmap）注入留后续 Phase。数据路径
+    /// （gpa∈CMB→直读 backing）是 P1b。
+    ///
+    /// 校验（architect 复核 #8）：size 须为 unit 的非零倍数且 SZ（bits31:12）不溢出
+    /// 20 位；bir 不得为 0（BAR0 是 doorbell/MSI-X 区，CMB 绝不能与之重叠）。
+    pub fn enable_cmb(&mut self, size_bytes: u64, bir: u8) -> anyhow::Result<()> {
+        const CMB_SZU: u32 = 0; // 教学版固定 4 KiB size unit
+        let unit = crate::regs::cmbsz::unit_bytes(CMB_SZU);
+        if size_bytes == 0 || !size_bytes.is_multiple_of(unit) {
+            return Err(anyhow::anyhow!(
+                "cmb size {size_bytes} 非法：须为 CMB size unit ({unit} 字节) 的非零倍数"
+            ));
+        }
+        let sz_units = size_bytes / unit;
+        if sz_units > 0xf_ffff {
+            return Err(anyhow::anyhow!(
+                "cmb size {size_bytes} 过大：SZ 字段（CMBSZ bits31:12）仅 20 位"
+            ));
+        }
+        // PCI BAR 大小必须是 2 的幂——CMB 经 `describe()` 直接当 BAR size 暴露，
+        // 非 2 的幂会在 transport BAR 编码时产生错误窗口。契约在此钉死（review MEDIUM-1）。
+        if !size_bytes.is_power_of_two() {
+            return Err(anyhow::anyhow!(
+                "cmb size {size_bytes} 非法：须为 2 的幂（PCI BAR 大小要求）"
+            ));
+        }
+        if bir == 0 {
+            return Err(anyhow::anyhow!(
+                "cmb bir 0 非法：BAR0 为 doorbell/MSI-X 区，CMB 须用独立 BAR"
+            ));
+        }
+        if bir > 5 {
+            return Err(anyhow::anyhow!("cmb bir {bir} 非法：BAR 索引须 ∈ [1, 5]"));
+        }
+        let backing: Box<dyn SharedRamRegion> = Box::new(VecRamRegion::new(size_bytes as usize));
+        self.cmb = Some(CmbState::new(backing, bir));
+        // 重建 CAP 以置 CMBS（保留当前 MQES）。
+        let entries = (self.cap & 0xffff) as u32 + 1;
+        self.cap = crate::regs::build_cap(entries, true);
+        tracing::info!(
+            size_bytes,
+            bir,
+            sz_units,
+            "CMB enabled（advertise CAP.CMBS）"
+        );
         Ok(())
     }
 
@@ -2411,7 +2525,7 @@ impl NvmeController {
             // 默认 MQES = 128 entries；运行时可经 set_max_queue_entries 调
             // （CLI flag）。SQ/CQ 是 host 分配的内存，逐条 dispatch，深度无本地
             // 数组限制；128 也消掉 Linux "queue_size 128 > sqsize 64 clamping" 警告。
-            cap: build_cap(DEFAULT_MAX_QUEUE_ENTRIES),
+            cap: build_cap(DEFAULT_MAX_QUEUE_ENTRIES, false),
             vs: VS_NVME_1_4,
             intms: 0,
             intmc: 0,
@@ -2496,6 +2610,7 @@ impl NvmeController {
             vid,
             ssvid,
             msix_count: 4, // admin (vec 0) + IO (vec 1) + 2 spare
+            cmb: None,
         })
     }
 
@@ -3925,6 +4040,26 @@ impl NvmeController {
 
 impl PcieDevice for NvmeController {
     fn describe(&self) -> DeviceDescribe {
+        // BAR0 永远在；CMB 启用时追加一条独立 CMB 数据 BAR（BIR 对应、size=cmb_size）。
+        let mut bars = vec![BarLayout {
+            index: 0,
+            size: BAR0_SIZE,
+            // NVMe spec 不强求 64-bit BAR；用 32-bit 简化 cfg space。
+            // BAR0 = MMIO 32 不消耗 BAR1，省 PCIe BAR slots。
+            kind: BarKind::Mmio32,
+            prefetchable: false,
+        }];
+        if let Some(cmb) = &self.cmb {
+            // CMB BAR 用独立 slot（CMBLOC.BIR）。32-bit MMIO（教学版 CMB ≤ 数 MiB，
+            // 32 位地址空间足够；与 BAR0 一致省 slot）。size 须为 2 的幂（PCI 要求）；
+            // enable_cmb 保证 size 是 4 KiB 倍数，调用方应传 2 的幂大小。
+            bars.push(BarLayout {
+                index: cmb.bir,
+                size: cmb.size,
+                kind: BarKind::Mmio32,
+                prefetchable: false,
+            });
+        }
         DeviceDescribe {
             vendor_id: self.vid,
             // PCI Device ID = 0xC0DE — matches OpenHCL noop convention 便于
@@ -3934,14 +4069,7 @@ impl PcieDevice for NvmeController {
             revision: 1,
             subsystem_vendor: self.ssvid,
             subsystem_device: 0,
-            bars: vec![BarLayout {
-                index: 0,
-                size: BAR0_SIZE,
-                // NVMe spec 不强求 64-bit BAR；用 32-bit 简化 cfg space。
-                // BAR0 = MMIO 32 不消耗 BAR1，省 PCIe BAR slots。
-                kind: BarKind::Mmio32,
-                prefetchable: false,
-            }],
+            bars,
             msix_count: self.msix_count as u32,
             // **真 QEMU 11 vfio-user guest e2e 修复（2026-06-10）** — 必须在 config
             // space 暴露 MSI-X capability，否则 QEMU `vfio_pci_add_capabilities` 找不到
@@ -5024,5 +5152,278 @@ mod dbbuf_tests {
             !c.shadow_ring_pending.contains(&(1, false)),
             "garbage 触 CFS 后 pending 标记一并清除"
         );
+    }
+}
+
+/// **CMB（Controller Memory Buffer，spec § 3.1.13/.14/.24/.25）单测** —— 用临时
+/// backing file 构造最小 controller，覆盖 CMB-P1a 全部语义：
+/// 1. CMB 启用/未启用下 CAP.CMBS + CMBLOC/CMBSZ + describe BAR 数量；
+/// 2. CMBSZ 的 SZU/SZ 编码 + 数据类型位；CMBLOC 的 BIR；
+/// 3. CMBMSC 读写（CRE/CMSE/CBA round-trip + size-aware 8/4-byte）；
+/// 4. CRE-before-CMSE 时序：CMSE=1 而 CRE=0 被拒绝（不启用 + CMBSTS.CBAI）；
+/// 5. controller reset（CC.EN 1→0）清 CMB enable 态（CRE/CMSE/CBA/CBAI）。
+#[cfg(test)]
+mod cmb_tests {
+    use super::*;
+    use crate::regs::{cap, cmbloc, cmbmsc, cmbsts, cmbsz, csts};
+    use pcie_device_core::{CaptureTransport, DeviceCtx, PcieDevice as _};
+
+    const CMB_SIZE: u64 = 2 * 1024 * 1024; // 2 MiB
+    const CMB_BIR: u8 = 2;
+
+    /// 构造最小 controller（1 MiB 临时 backing），不启用 CMB。
+    fn mk() -> NvmeController {
+        let path = std::env::temp_dir().join(format!(
+            "nvme_cmb_test_{}_{:?}.img",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(1024 * 1024).unwrap();
+        drop(f);
+        NvmeController::open(&[path.to_str().unwrap().to_string()], 0x1414, 0, &[]).unwrap()
+    }
+
+    /// 构造并启用 CMB（2 MiB / BAR2）。
+    fn mk_cmb() -> NvmeController {
+        let mut c = mk();
+        c.enable_cmb(CMB_SIZE, CMB_BIR).unwrap();
+        c
+    }
+
+    // ---------------- 1) 未启用 CMB：现状不变 ----------------
+
+    #[test]
+    fn no_cmb_caps_and_regs_zero() {
+        let mut c = mk();
+        assert!(c.cmb.is_none());
+        assert_eq!(c.cap & cap::CMBS, 0, "无 CMB → CAP.CMBS=0");
+        assert_eq!(c.mmio_read_impl(0, 0x38, 4), 0, "CMBLOC=0");
+        assert_eq!(c.mmio_read_impl(0, 0x3c, 4), 0, "CMBSZ=0");
+        assert_eq!(c.mmio_read_impl(0, 0x50, 8), 0, "CMBMSC=0");
+        assert_eq!(c.mmio_read_impl(0, 0x58, 4), 0, "CMBSTS=0");
+    }
+
+    #[test]
+    fn describe_without_cmb_has_single_bar() {
+        let c = mk();
+        let d = c.describe();
+        assert_eq!(d.bars.len(), 1, "无 CMB → 仅 BAR0");
+        assert_eq!(d.bars[0].index, 0);
+    }
+
+    // ---------------- 2) 启用 CMB：CAP.CMBS + describe BAR ----------------
+
+    #[test]
+    fn enable_cmb_sets_cap_cmbs() {
+        let c = mk_cmb();
+        assert!(c.cmb.is_some());
+        assert_ne!(c.cap & cap::CMBS, 0, "启用 CMB → CAP.CMBS 置位");
+    }
+
+    #[test]
+    fn describe_with_cmb_adds_independent_bar() {
+        let c = mk_cmb();
+        let d = c.describe();
+        assert_eq!(d.bars.len(), 2, "CMB 启用 → BAR0 + 独立 CMB BAR");
+        let cmb_bar = d.bars.iter().find(|b| b.index == CMB_BIR).expect("CMB BAR");
+        assert_eq!(cmb_bar.size, CMB_SIZE, "CMB BAR size == cmb_size");
+        assert_eq!(cmb_bar.index, CMB_BIR, "CMB BAR index == BIR");
+    }
+
+    #[test]
+    fn enable_cmb_rejects_bad_size_and_bir() {
+        let mut c = mk();
+        // 非 4 KiB 倍数。
+        assert!(c.enable_cmb(4096 + 1, 2).is_err());
+        // 零长。
+        assert!(c.enable_cmb(0, 2).is_err());
+        // BAR0 禁用（doorbell/MSI-X 区）。
+        assert!(c.enable_cmb(CMB_SIZE, 0).is_err());
+        // 越界 BAR 索引。
+        assert!(c.enable_cmb(CMB_SIZE, 6).is_err());
+        // 4 KiB 倍数但非 2 的幂（3×4 KiB）——PCI BAR 须 2 的幂（review MEDIUM-1）。
+        assert!(c.enable_cmb(3 * 4096, 2).is_err());
+        // 合法。
+        assert!(c.enable_cmb(CMB_SIZE, 2).is_ok());
+    }
+
+    // ---------------- 3) CMBLOC/CMBSZ 编码（CRE 置位后反映真值） ----------------
+
+    #[test]
+    fn cmbloc_cmbsz_zero_until_cre_set() {
+        let mut c = mk_cmb();
+        // CRE 未置 → CMBLOC/CMBSZ 仍 0（spec § 3.1.24：Capabilities Registers Enabled）。
+        assert_eq!(c.mmio_read_impl(0, 0x38, 4), 0, "CRE 未置 → CMBLOC=0");
+        assert_eq!(c.mmio_read_impl(0, 0x3c, 4), 0, "CRE 未置 → CMBSZ=0");
+        // 置 CRE。
+        c.write_cmbmsc(cmbmsc::CRE);
+        assert_ne!(c.mmio_read_impl(0, 0x38, 4), 0, "CRE 置 → CMBLOC 反映真值");
+        assert_ne!(c.mmio_read_impl(0, 0x3c, 4), 0, "CRE 置 → CMBSZ 反映真值");
+    }
+
+    #[test]
+    fn cmbloc_encodes_bir() {
+        let mut c = mk_cmb();
+        c.write_cmbmsc(cmbmsc::CRE);
+        let loc = c.mmio_read_impl(0, 0x38, 4) as u32;
+        assert_eq!(
+            (loc & cmbloc::BIR_MASK) >> cmbloc::BIR_SHIFT,
+            CMB_BIR as u32
+        );
+        assert_eq!(
+            (loc & cmbloc::OFST_MASK) >> cmbloc::OFST_SHIFT,
+            0,
+            "独立 BAR → OFST=0"
+        );
+    }
+
+    #[test]
+    fn cmbsz_encodes_szu_sz_and_type_bits() {
+        let mut c = mk_cmb();
+        c.write_cmbmsc(cmbmsc::CRE);
+        let sz = c.mmio_read_impl(0, 0x3c, 4) as u32;
+        // SZU=0（4 KiB unit）。
+        assert_eq!((sz & cmbsz::SZU_MASK) >> cmbsz::SZU_SHIFT, 0, "SZU=0");
+        // SZ = 2 MiB / 4 KiB = 512。
+        assert_eq!(
+            (sz & cmbsz::SZ_MASK) >> cmbsz::SZ_SHIFT,
+            512,
+            "SZ=512 (2 MiB / 4 KiB)"
+        );
+        // 数据类型位全广告。
+        assert_ne!(sz & cmbsz::SQS, 0);
+        assert_ne!(sz & cmbsz::CQS, 0);
+        assert_ne!(sz & cmbsz::LISTS, 0);
+        assert_ne!(sz & cmbsz::RDS, 0);
+        assert_ne!(sz & cmbsz::WDS, 0);
+    }
+
+    // ---------------- 4) CMBMSC 读写 round-trip（size-aware） ----------------
+
+    #[test]
+    fn cmbmsc_roundtrip_qword() {
+        let mut c = mk_cmb();
+        let mut cap_t = CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap_t);
+        // CRE + CMSE + CBA=0x8000_0000（合法时序：CRE 与 CMSE 同写一条，CRE 已含）。
+        let cba = 0x8000_0000u64;
+        let v = (cba & cmbmsc::CBA_MASK) | cmbmsc::CMSE | cmbmsc::CRE;
+        c.mmio_write_impl(&mut ctx, 0, 0x50, 8, v);
+        // 回读全部字段。
+        let rb = c.mmio_read_impl(0, 0x50, 8);
+        assert_ne!(rb & cmbmsc::CRE, 0, "CRE 回读");
+        assert_ne!(rb & cmbmsc::CMSE, 0, "CMSE 回读（合法时序）");
+        assert_eq!(rb & cmbmsc::CBA_MASK, cba, "CBA 回读");
+        // 内部状态。
+        let cmb = c.cmb.as_ref().unwrap();
+        assert!(cmb.cre && cmb.cmse);
+        assert_eq!(cmb.cba, cba);
+        assert!(!cmb.cbai, "合法时序 → CBAI=0");
+    }
+
+    #[test]
+    fn cmbmsc_roundtrip_split_dword() {
+        let mut c = mk_cmb();
+        let mut cap_t = CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap_t);
+        let cba = 0x1_0000_0000u64; // >4 GiB，验高 32 位不截断
+        let v = (cba & cmbmsc::CBA_MASK) | cmbmsc::CMSE | cmbmsc::CRE;
+        // 分两条 4-byte 写（low 含 CRE/CMSE，high 含 CBA 高位）。
+        c.mmio_write_impl(&mut ctx, 0, 0x50, 4, v & 0xffff_ffff);
+        c.mmio_write_impl(&mut ctx, 0, 0x54, 4, v >> 32);
+        assert_eq!(
+            c.mmio_read_impl(0, 0x50, 8),
+            v,
+            "split dword CMBMSC 拼回 64 位"
+        );
+        assert_eq!(c.cmb.as_ref().unwrap().cba, cba, "CBA 高 32 位未截断");
+    }
+
+    // ---------------- 5) CRE-before-CMSE 时序校验（spec § 3.1.24） ----------------
+
+    #[test]
+    fn cmse_without_cre_is_rejected_and_sets_cbai() {
+        let mut c = mk_cmb();
+        // 时序违规：CMSE=1 而 CRE=0。
+        c.write_cmbmsc(cmbmsc::CMSE);
+        let cmb = c.cmb.as_ref().unwrap();
+        assert!(!cmb.cmse, "时序违规 → CMSE 不被启用");
+        assert!(!cmb.cre, "CRE 未请求仍 0");
+        assert!(cmb.cbai, "时序违规 → CBMSTS.CBAI 置位");
+        // CMBSTS 寄存器读反映 CBAI。
+        assert_ne!(
+            c.mmio_read_impl(0, 0x58, 4) as u32 & cmbsts::CBAI,
+            0,
+            "CMBSTS.CBAI 置位"
+        );
+    }
+
+    #[test]
+    fn legal_cre_then_cmse_clears_cbai() {
+        let mut c = mk_cmb();
+        // 先违规置 CBAI。
+        c.write_cmbmsc(cmbmsc::CMSE);
+        assert!(c.cmb.as_ref().unwrap().cbai);
+        // 再合法：CRE + CMSE 同写 → CBAI 清。
+        c.write_cmbmsc(cmbmsc::CRE | cmbmsc::CMSE);
+        let cmb = c.cmb.as_ref().unwrap();
+        assert!(cmb.cre && cmb.cmse, "合法时序 → CRE/CMSE 启用");
+        assert!(!cmb.cbai, "合法时序 → CBAI 清");
+        assert_eq!(c.mmio_read_impl(0, 0x58, 4), 0, "CMBSTS 回 0");
+    }
+
+    #[test]
+    fn cre_only_then_cmse_is_legal() {
+        let mut c = mk_cmb();
+        // 两步：先 CRE，后 CRE+CMSE（driver 典型序列）。
+        c.write_cmbmsc(cmbmsc::CRE);
+        assert!(c.cmb.as_ref().unwrap().cre && !c.cmb.as_ref().unwrap().cmse);
+        c.write_cmbmsc(cmbmsc::CRE | cmbmsc::CMSE);
+        let cmb = c.cmb.as_ref().unwrap();
+        assert!(cmb.cre && cmb.cmse && !cmb.cbai);
+    }
+
+    // ---------------- 6) reset 清 CMB enable 态 ----------------
+
+    #[test]
+    fn controller_reset_clears_cmb_enable_state() {
+        let mut c = mk_cmb();
+        let mut cap_t = CaptureTransport::with_start_token(0x100);
+        // 启用 CMB（CRE+CMSE+CBA）。
+        {
+            let mut ctx = DeviceCtx::new(&mut cap_t);
+            let v = (0x8000_0000u64 & cmbmsc::CBA_MASK) | cmbmsc::CMSE | cmbmsc::CRE;
+            c.mmio_write_impl(&mut ctx, 0, 0x50, 8, v);
+            // 触发一次违规置 CBAI 再恢复以确保 cbai 字段被 reset 真清（先记一个脏状态）。
+        }
+        c.cmb.as_mut().unwrap().cbai = true; // 模拟脏状态
+        // controller reset（CC.EN 1→0 走 disable）。
+        c.disable();
+        let cmb = c.cmb.as_ref().unwrap();
+        assert!(!cmb.cre, "reset 清 CRE");
+        assert!(!cmb.cmse, "reset 清 CMSE");
+        assert_eq!(cmb.cba, 0, "reset 清 CBA");
+        assert!(!cmb.cbai, "reset 清 CBAI");
+        // CMB 仍存在（CAP.CMBS 仍广告），只是 enable 态复位。
+        assert_ne!(
+            c.cap & cap::CMBS,
+            0,
+            "reset 后 CAP.CMBS 仍广告（CMB 仍存在）"
+        );
+        // CMBMSC 回读全 0（enable 态清）。
+        assert_eq!(c.mmio_read_impl(0, 0x50, 8), 0, "reset 后 CMBMSC 回 0");
+    }
+
+    #[test]
+    fn reset_via_pcie_reset_path_also_clears_cmb() {
+        let mut c = mk_cmb();
+        c.write_cmbmsc(cmbmsc::CRE | cmbmsc::CMSE);
+        assert!(c.cmb.as_ref().unwrap().cmse);
+        // PcieDevice::reset（FLR）走 disable。
+        c.reset(0);
+        assert!(!c.cmb.as_ref().unwrap().cmse, "FLR reset 清 CMSE");
+        // CSTS.RDY 也被清（确认走了完整 disable 路径）。
+        assert_eq!(c.csts & csts::RDY, 0);
     }
 }

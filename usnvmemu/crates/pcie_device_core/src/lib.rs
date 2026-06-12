@@ -24,6 +24,7 @@
 pub mod describe;
 mod device;
 mod noop_transport;
+mod shared_ram;
 mod transport_capture;
 
 pub use describe::BarKind;
@@ -34,5 +35,7 @@ pub use device::DeviceCtx;
 pub use device::PcieDevice;
 pub use device::Transport;
 pub use noop_transport::NoopTransport;
+pub use shared_ram::SharedRamRegion;
+pub use shared_ram::VecRamRegion;
 pub use transport_capture::CaptureTransport;
 pub use transport_capture::TransportEvent;

@@ -35,9 +35,11 @@ impl NvmeController {
             (0x30, 8) => self.acq,
             (0x30, 4) => self.acq & 0xffff_ffff,
             (0x34, 4) => self.acq >> 32,
-            // **Phase L3 + Q5** — CMB / BPINFO / PMR 寄存器
-            (0x38, _) => 0, // CMBLOC — Q6 (CMB) 仍 0
-            (0x3c, _) => 0, // CMBSZ — Q6 (CMB) 仍 0
+            // **Phase L3 + Q5 + CMB-P1a** — CMB / BPINFO / PMR 寄存器
+            // CMBLOC/CMBSZ 在 CMB 启用且 CMBMSC.CRE 置位后反映真值（spec § 3.1.24：
+            // CRE = Capabilities Registers Enabled）；否则返 0（无 CMB / 未 enable cap）。
+            (0x38, _) => self.cmbloc_value(),
+            (0x3c, _) => self.cmbsz_value(),
             // **Phase L3 + Q5 + 12轮 H-Q5** — BPINFO=0 不 advertise boot partition。
             // 之前 BPSZ=1 让 driver 看到 1 partition，但我们没 boot image
             // 服务 → driver 写 BPRSEL 后 poll BRS 永远 0 = hang。BPSZ=0
@@ -54,9 +56,14 @@ impl NvmeController {
             (0x48, 8) => self.bpmbl,         // BPMBL 64-bit
             (0x48, 4) => self.bpmbl & 0xFFFF_FFFF, // 低 32
             (0x4c, 4) => self.bpmbl >> 32,   // 高 32
-            (0xe00, _) => 0,                 // PMRCAP — Q6 (PMR) 仍 0
-            (0xe04, _) => 0,                 // PMRCTL
-            (0xe08, _) => 0,                 // PMRSTS
+            // **CMB-P1a** — CMBMSC（8-byte，size-aware 仿 ASQ/ACQ）+ CMBSTS（RO）。
+            (0x50, 8) => self.cmbmsc_value(),
+            (0x50, 4) => self.cmbmsc_value() & 0xffff_ffff,
+            (0x54, 4) => self.cmbmsc_value() >> 32,
+            (0x58, _) => self.cmbsts_value() as u64,
+            (0xe00, _) => 0, // PMRCAP — Q6 (PMR) 仍 0
+            (0xe04, _) => 0, // PMRCTL
+            (0xe08, _) => 0, // PMRSTS
             // doorbell 区 [0x1000, MSIX_TABLE) 读返回 0（write-only）。上界排除其后
             // 的 MSI-X table/PBA 区（见 parse_doorbell 的 LOW-1 注释）。
             (o, _) if (0x1000..MSIX_TABLE_BAR0_OFFSET).contains(&o) => 0,
@@ -172,6 +179,22 @@ impl NvmeController {
             0x4c => {
                 self.bpmbl = (self.bpmbl & 0xffff_ffff) | (value << 32);
             }
+            // **CMB-P1a** — CMBMSC 写（8-byte，size-aware 仿 ASQ/ACQ）：解析 CRE/CMSE/CBA
+            // 并按 spec § 3.1.24 时序校验启用 CMB。CMBSTS（0x58）是 RO，写忽略。
+            0x50 => {
+                let cur = self.cmbmsc_value();
+                let new = if size == 8 {
+                    value
+                } else {
+                    (cur & !0xffff_ffff) | (value & 0xffff_ffff)
+                };
+                self.write_cmbmsc(new);
+            }
+            0x54 => {
+                let cur = self.cmbmsc_value();
+                let new = (cur & 0xffff_ffff) | (value << 32);
+                self.write_cmbmsc(new);
+            }
             o if (0x1000..MSIX_TABLE_BAR0_OFFSET).contains(&o) => {
                 // doorbell 写**必须** 4 字节 access；其它尺寸视为 driver bug
                 // 直接忽略（不应该按 8/2/1 字节写 doorbell）。上界排除其后的 MSI-X
@@ -199,6 +222,112 @@ impl NvmeController {
         let inbox = std::mem::take(&mut self.sqe_inbox);
         for (sq_id, head, sqe) in inbox {
             self.dispatch_sqe(ctx, sq_id, head, sqe);
+        }
+    }
+
+    /// **CMB-P1a** — 合成 CMBLOC（offset 0x38, RO）。
+    ///
+    /// spec § 3.1.13/§ 3.1.24：CMBLOC/CMBSZ 仅在 CMBMSC.CRE 置位后反映真值；CRE 未置
+    /// （或无 CMB）返 0。BIR = CMB 所在 BAR，OFST=0（独立 BAR，CMB 落 BAR 起点）。
+    pub(super) fn cmbloc_value(&self) -> u64 {
+        use crate::regs::cmbloc;
+        match &self.cmb {
+            Some(cmb) if cmb.cre => {
+                ((cmb.bir as u64) << cmbloc::BIR_SHIFT) & cmbloc::BIR_MASK as u64
+                // OFST = 0（CMB 占整条独立 BAR），其余子字段教学版留 0。
+            }
+            _ => 0,
+        }
+    }
+
+    /// **CMB-P1a** — 合成 CMBSZ（offset 0x3C, RO）。
+    ///
+    /// 同 CMBLOC：CRE 未置返 0。SZU=0（4 KiB unit）、SZ = size / 4 KiB；数据类型位
+    /// 广告 SQS/CQS/LISTS/RDS/WDS（教学版 CMB 全能力，真数据路径 P1b/P2 落地）。
+    pub(super) fn cmbsz_value(&self) -> u64 {
+        use crate::regs::cmbsz;
+        match &self.cmb {
+            Some(cmb) if cmb.cre => {
+                const SZU: u32 = 0; // 4 KiB unit（与 enable_cmb 一致）
+                let unit = cmbsz::unit_bytes(SZU);
+                let sz = (cmb.size / unit) as u32;
+                let v = (SZU << cmbsz::SZU_SHIFT)
+                    | ((sz << cmbsz::SZ_SHIFT) & cmbsz::SZ_MASK)
+                    | cmbsz::SQS
+                    | cmbsz::CQS
+                    | cmbsz::LISTS
+                    | cmbsz::RDS
+                    | cmbsz::WDS;
+                v as u64
+            }
+            _ => 0,
+        }
+    }
+
+    /// **CMB-P1a** — 合成 CMBMSC（offset 0x50, RW, 64-bit）回读值。
+    ///
+    /// 回读 driver 编程的 CRE/CMSE/CBA（无 CMB 返 0）。
+    pub(super) fn cmbmsc_value(&self) -> u64 {
+        use crate::regs::cmbmsc;
+        match &self.cmb {
+            Some(cmb) => {
+                let mut v = cmb.cba & cmbmsc::CBA_MASK;
+                if cmb.cre {
+                    v |= cmbmsc::CRE;
+                }
+                if cmb.cmse {
+                    v |= cmbmsc::CMSE;
+                }
+                v
+            }
+            None => 0,
+        }
+    }
+
+    /// **CMB-P1a** — 合成 CMBSTS（offset 0x58, RO）。CBAI = CMSE 时序/地址非法标志。
+    pub(super) fn cmbsts_value(&self) -> u32 {
+        use crate::regs::cmbsts;
+        match &self.cmb {
+            Some(cmb) if cmb.cbai => cmbsts::CBAI,
+            _ => 0,
+        }
+    }
+
+    /// **CMB-P1a** — CMBMSC 写入状态机（spec § 3.1.24）。
+    ///
+    /// 解析 CRE/CMSE/CBA 并校验 **CRE 先于 CMSE 时序**（architect 复核 #5）：host 在
+    /// CRE 未置时置 CMSE 是非法组合 —— controller **不启用** CMB，置 CMBSTS.CBAI 让
+    /// driver 感知（spec § 3.1.25），并保持 CMSE=0（不进入可访问态）。合法时清 CBAI。
+    /// 无 CMB（None）时写忽略。
+    pub(super) fn write_cmbmsc(&mut self, new: u64) {
+        use crate::regs::cmbmsc;
+        let Some(cmb) = self.cmb.as_mut() else {
+            tracing::debug!("CMBMSC 写但 CMB 未启用（无 CMB 配置）→ 忽略");
+            return;
+        };
+        let new_cre = new & cmbmsc::CRE != 0;
+        let new_cmse = new & cmbmsc::CMSE != 0;
+        let new_cba = new & cmbmsc::CBA_MASK;
+        // P1b TODO（review LOW-2）：CMSE 已置位（CMB live）时改 CBA 会让数据路径映射漂移；
+        // P1b 接 `access_guest` 后应拒绝 live 改 CBA（或要求先清 CMSE）。P1a 无数据路径故无害。
+        cmb.cre = new_cre;
+        cmb.cba = new_cba;
+        if new_cmse && !new_cre {
+            // 时序违规：CMSE 不能在 CRE 之前置位 → 拒绝启用 + 置 CBAI。
+            cmb.cmse = false;
+            cmb.cbai = true;
+            tracing::warn!(
+                "CMBMSC: CMSE=1 而 CRE=0（时序违规，spec § 3.1.24）→ 不启用 CMB + CMBSTS.CBAI=1"
+            );
+        } else {
+            cmb.cmse = new_cmse;
+            cmb.cbai = false;
+            tracing::debug!(
+                cre = new_cre,
+                cmse = new_cmse,
+                cba = format_args!("{:#x}", new_cba),
+                "CMBMSC programmed"
+            );
         }
     }
 }
