@@ -186,3 +186,18 @@ device.rs 维持 committed C2-1（device_count 机制在 Option B 下休眠，re
 
 **采纳 Option B 为 Layer C 的设备-存在模型**：usnvmemu 是 transient 后端，非可热插拔设备；
 首 add（冷插/boot-absent→起）+ 透明 reconnect 覆盖主场景；永久移除留 `hide_device` graceful EJECT scaffolding。
+
+---
+
+## Option B 完善（2026-06-13）：多次快重启稳定 + 已试方案留档
+
+**多次快重启稳定性（真机）**：连续 2 次 kill+fast-restart（每次 ~4s）→ 盘全程 Healthy 稳定
+（drive D）、每次 IO markerMatch=True、**全程无 remove/re-add**。证 Option B 对反复快重启
+（usnvmemu crash+auto-restart 的主场景）幂等稳健——flapping 被 `process` 吸收（Lost→no-op，
+Live 设备已在→no-op）。
+
+**已试方案与去留**完整记录见 `docs/superpowers/plans/2026-06-12-layer-c-vpci-hotplug.md`
+顶部「已试方案与去留」表（C0 同-instance re-offer / C2-0 graceful EJECT / C2-1 device_count /
+C2-1-fix INVALIDATE_BUS / Option A 新 instance_id / Option B）——未采纳的留作未来参考，
+尤其 **Option A（换新 instance_id 强制重枚举）是未来长停顿自动恢复的首选 POC 目标**（承重假设
+"新 instance_id 重枚举" 未验证，按项目规矩先 POC）。

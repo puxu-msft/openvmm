@@ -9,6 +9,28 @@
 > memory `vfio-user-underhill-state`。下文 C2/C3 的 device_count/re-offer 设计**已作废**，仅留作
 > 调试历程记录。**
 
+## 已试方案与去留（未采纳的留作未来参考——"也许未来会用到"）
+
+承重平台约束（真机坐实，所有方案的前提）：**Windows pci.sys 只在 guest 自己重上电 bus FDO
+（`FDO_D0_EXIT`→`FDO_D0_ENTRY`）/ 首次开通道时才枚举 VPCI 子设备。VSP 侧无法在恒定通道上迫
+guest 重查 relations。** 据此评估每个方案：
+
+| 方案 | 机制 | 真机结果 | 去留 / 未来适用性 |
+|------|------|---------|------------------|
+| **C0 同-instance 通道 re-offer** | rescind VpciBus + 用**同** instance_id re-offer | ❌ 失败（finding-⑦）：guest 不重枚举，连 `pnputil /scan-devices` 也唤不回 | **永久弃**。同 instance_id → guest vmbus/PnP 状态未释放，当"已知/已移除"不重 PDO 化。 |
+| **C2-0 graceful EJECT** | 撤通道前发 `EJECT`(slot0) 给 guest query-remove 窗口 | ✅ 缓解⑥（脏卷不崩）；但 guest 不回 EJECT_COMPLETE（后端死无法 flush） | **保留为 scaffolding**（`hide_device`，`#[expect(dead_code)]`）。**未来 operator 显式永久移除**时用：先 EJECT 让 guest 有序 dismount 再撤。 |
+| **C2-1 device_count 0↔1 push** | 通道恒在，unsolicited 重发变长 `BUS_RELATIONS2`（device_count 0↔1） | ❌ re-add 失败：device_count=1 已送达但 guest 不出盘（remove 经 EJECT 可行） | **弃**（机制留在 device.rs 作 scaffolding，Option B 下休眠）。Windows 不响应 unsolicited relations push。 |
+| **C2-1-fix INVALIDATE_BUS** | re-add 时发标准 `INVALIDATE_BUS`（"relations 变了请重查"） | ❌ 失败：guest 不重查（≠ FDO 重上电）。已 revert | **弃**。Windows pci.sys 不响应 VSP 发的 INVALIDATE_BUS。 |
+| **Option A：换 NEW instance_id re-offer** | rescind 旧 bus + 用**全新** instance_id 重建+offer（guest 见全新总线→建**新 FDO**→`FDO_D0_ENTRY`→枚举） | ⚠️ **未验证**（C0 只验了同 instance_id；新 instance_id 是不同情形） | **未采纳，留作未来首选恢复路径**。理论应生效（新 FDO = guest 自己重上电的等价物）。代价：每次每周期漏一个 phantom 总线 devnode（Windows 会 GC）。**未来若要长停顿自动恢复，先 POC 此方案**（承重假设未验证，按项目规矩先 POC 再定）。 |
+| **Option B（已采纳）** | usnvmemu 停=transient 后端停顿，**不**移除设备；设备恒在，C-3 reconnect 透明恢复 | ✅ real-VM 通过：fast restart 盘无缝存活+IO；多次快重启稳定；long outage guest 有序移盘（无⑥崩） | **采纳**。HW-accurate（真硬件 controller reset 同理），无 phantom 债。**唯一缺口=长停顿不自动恢复**（guest 超时移盘后需 reboot/rescan，或未来上 Option A）。 |
+
+**未来增强路径（若需要）**：Option B + Option A 混合——快重启走 Option B 透明（主场景）；
+检测到长停顿（Lost 超 guest 容忍窗口 ~8s，需计时）→ reconnect 时走 Option A（rescind 旧 bus
+先清掉 guest 可能残留的盘 + 用新 instance_id 重 offer 强制重枚举）。**先 POC 验证 Option A 的
+"新 instance_id 重枚举" 承重假设**再定混合设计。代价 = 长停顿（罕见）时的 phantom 总线债。
+
+---
+
 > **For agentic workers:** 用 superpowers:subagent-driven-development 逐 task 执行。
 > 设计已经过 ecc:architect 评审（纠正了 2 个 CRITICAL 错误，见下），承重 POC（源码）+
 > 前置条件（ChipsetDevices/StateUnits 运行时留存）已核验。**C0 是真机 POC 门，必须先过。**
