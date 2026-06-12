@@ -386,9 +386,11 @@ impl FromStr for PcieRemoteCliConfig {
 }
 
 /// 单条 `OPENHCL_VFIO_USER_NVME` 配置（W6b）。
-/// 格式 `<guid>:<unix_path>`——主动连接到该 AF_UNIX 套接字上的 vfio-user server。
+/// 格式 `<guid>:<unix_path>[,bar0=<n>][,msix=<n>][,handshake_timeout_ms=<n>]`
+/// ——主动连接到该 AF_UNIX 套接字上的 vfio-user server。
 /// 与 pcie_remote 不同：用 socket 路径（String）而非 vsock_port（u32），
-/// 没有 takeover 路径，也没有 per-entry kv 选项（套接字路径无额外参数）。
+/// 没有 takeover 路径。可选 kv 选项允许 per-instance 覆盖 BAR0 大小 / MSI-X
+/// 向量数（缺省 None 时由 firmware/默认几何决定）。
 #[derive(Clone, Debug, MeshPayload, Inspect)]
 pub struct VfioUserNvmeCliConfig {
     /// 实例 GUID（也作为 vpci bus_instance_id 使用；必须 vmwp 已知）。
@@ -398,26 +400,55 @@ pub struct VfioUserNvmeCliConfig {
     pub unix_path: String,
     /// 握手超时（毫秒，默认 5000）。
     pub handshake_timeout_ms: u32,
+    /// 可选 BAR0 大小覆盖（字节）；None 表示用默认几何。
+    pub bar0_size: Option<u64>,
+    /// 可选 MSI-X 向量数覆盖；None 表示用默认几何。
+    pub msix_count: Option<u16>,
 }
 
 impl FromStr for VfioUserNvmeCliConfig {
     type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self, anyhow::Error> {
-        // 只在第一个 ':' 处切分：guid 在前，路径在后（路径可含其他字符，
-        // 但通常不含 ':'）。无 ':' 则报错。
-        let (guid_s, path_s) = s
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        // 先在第一个 ':' 处切分：guid 在前，其余（路径 + 可选 kv）在后。
+        let (guid_s, rest) = s
             .split_once(':')
-            .ok_or_else(|| anyhow::anyhow!("expected <guid>:<unix_path>"))?;
+            .context("expected <guid>:<unix_path>[,k=v]")?;
         let instance_id: guid::Guid = guid_s
             .parse()
-            .map_err(|e| anyhow::anyhow!("invalid guid {guid_s}: {e}"))?;
-        if path_s.is_empty() {
+            .with_context(|| format!("invalid guid {guid_s}"))?;
+        // 再在第一个 ',' 处切分：路径在前，kv 选项在后（路径本身不含 ','）。
+        let mut it = rest.splitn(2, ',');
+        let unix_path = it.next().unwrap_or("").to_string();
+        if unix_path.is_empty() {
             anyhow::bail!("empty unix_path");
+        }
+        let mut bar0_size = None;
+        let mut msix_count = None;
+        let mut handshake_timeout_ms = 5000u32;
+        if let Some(opts) = it.next() {
+            for kv in opts.split(',') {
+                let (k, v) = kv
+                    .split_once('=')
+                    .with_context(|| format!("expected k=v: {kv}"))?;
+                match k {
+                    "bar0" => bar0_size = Some(v.parse().with_context(|| format!("bad bar0 {v}"))?),
+                    "msix" => {
+                        msix_count = Some(v.parse().with_context(|| format!("bad msix {v}"))?)
+                    }
+                    "handshake_timeout_ms" => {
+                        handshake_timeout_ms =
+                            v.parse().with_context(|| format!("bad timeout {v}"))?
+                    }
+                    _ => anyhow::bail!("unknown key: {k}"),
+                }
+            }
         }
         Ok(Self {
             instance_id,
-            unix_path: path_s.to_string(),
-            handshake_timeout_ms: 5000,
+            unix_path,
+            handshake_timeout_ms,
+            bar0_size,
+            msix_count,
         })
     }
 }
@@ -880,5 +911,29 @@ mod pcie_remote_tests {
         let out = parse_pcie_remote_entries(raw, "TEST", None, None, 10).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].handshake_timeout_ms, 3000);
+    }
+}
+
+#[cfg(test)]
+mod vfio_user_nvme_tests {
+    use super::*;
+
+    /// W6b A1.2：解析 `<guid>:<unix_path>`，并支持可选的 per-instance 几何覆盖
+    /// （bar0 / msix），缺省时为 None（后续由 firmware/默认几何决定）。
+    #[test]
+    fn vfio_user_nvme_cfg_parses_path_and_optional_geometry() {
+        let c: VfioUserNvmeCliConfig = "00000000-0000-0000-0000-000000000001:/tmp/a.sock"
+            .parse()
+            .unwrap();
+        assert_eq!(c.unix_path, "/tmp/a.sock");
+        assert_eq!(c.bar0_size, None);
+        assert_eq!(c.msix_count, None);
+        let c2: VfioUserNvmeCliConfig =
+            "00000000-0000-0000-0000-000000000001:/tmp/a.sock,bar0=16384,msix=4"
+                .parse()
+                .unwrap();
+        assert_eq!(c2.unix_path, "/tmp/a.sock");
+        assert_eq!(c2.bar0_size, Some(16384));
+        assert_eq!(c2.msix_count, Some(4));
     }
 }

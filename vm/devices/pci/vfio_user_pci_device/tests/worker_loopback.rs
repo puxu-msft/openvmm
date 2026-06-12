@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! W6b Task 1.3 worker loopback 集成测：真 `vfio_user_transport::VfioUserSession` +
+//! W6b worker loopback 集成测：真 `vfio_user_transport::VfioUserSession` +
 //! `MockDev` server 线程 ⇄ [`vfio_user_pci_device::Worker`]（持全双工 split 通道）。
 //!
 //! 验证：
@@ -9,6 +9,11 @@
 //!   再 await 两个 `DeferredToken`，按 msg_id 路由拿回各自 seed 的 pattern；
 //! - **MMIO write→read 顺序**：fire-and-forget write 后紧跟 read 同 offset，值 round-trip，
 //!   证明 FIFO 顺序 + write 真落到 MockDev。
+//!
+//! **A2.1 后的 wiring**：worker 初始无 transport（`Connecting`），经
+//! [`ReconnectEvent::Connected`] 把 split 出的 (writer, reader) **一条消息**交给
+//! worker → worker 转 `Live` 才放行 MMIO。测试在驱动 MMIO 前先投递这条消息。
+//! 更丰富的重连场景（多次 Lost→revive）属 A2.4，另测。
 //!
 //! socketpair，Linux 直跑，无需 VTL。server 半段同步（独立线程），worker 段 async。
 
@@ -25,6 +30,7 @@ use std::thread;
 use vfio_user_device::VfioUserClient;
 use vfio_user_pci_device::DeviceRequest;
 use vfio_user_pci_device::DeviceState;
+use vfio_user_pci_device::ReconnectEvent;
 use vfio_user_pci_device::ReqKind;
 use vfio_user_pci_device::SharedState;
 use vfio_user_pci_device::Worker;
@@ -113,23 +119,30 @@ fn worker_full_duplex_reads_and_write_then_read() {
         client.region_write(0, 0, &pat0).await.expect("seed BAR0@0");
         client.region_write(0, 8, &pat1).await.expect("seed BAR0@8");
 
-        // 拆全双工读写半 → 建 Worker（空 interrupts / irq_tasks）。
+        // 拆全双工读写半 → 建 Worker（空 interrupts / irq_tasks）。worker 初始
+        // Connecting，先经 reconnect channel 投递 transport 才转 Live。
         let (writer, reader) = client.into_channel();
-        let state = SharedState::new(DeviceState::Live);
+        let state = SharedState::new(DeviceState::Connecting);
         let stats = std::sync::Arc::new(WorkerStats::default());
         let (tx, rx) = mesh::channel::<DeviceRequest>();
         let (shutdown_tx, shutdown_rx) = mesh::channel::<()>();
+        let (reconnect_tx, reconnect_rx) = mesh::channel::<ReconnectEvent>();
+        let (lost_tx, _lost_rx) = mesh::channel::<()>();
 
         let worker = Worker::new(
-            writer,
-            reader,
             state.clone(),
             rx,
             Vec::new(), // interrupts
             Vec::new(), // irq_tasks
             stats.clone(),
+            reconnect_rx,
+            lost_tx,
         );
         let worker_task = driver.spawn("w6b-worker", worker.run(shutdown_rx));
+
+        // 投递 transport（C-1：writer+reader 一条消息）→ worker 转 Live。
+        // select_biased! 中 reconnect 臂在 from_device 臂之前，故先于后续 MMIO 处理。
+        reconnect_tx.send(ReconnectEvent::Connected { writer, reader });
 
         // ── 全双工：连发两个 MmioRead（offset 0 / 8，size 8）不读任何 reply ──
         let (rd0, tok0) = defer_read();
@@ -217,21 +230,26 @@ fn worker_goes_lost_and_drains_on_server_close() {
         client.handshake().await.expect("handshake");
 
         let (writer, reader) = client.into_channel();
-        let state = SharedState::new(DeviceState::Live);
+        let state = SharedState::new(DeviceState::Connecting);
         let stats = std::sync::Arc::new(WorkerStats::default());
         let (tx, rx) = mesh::channel::<DeviceRequest>();
         let (_shutdown_tx, shutdown_rx) = mesh::channel::<()>();
+        let (reconnect_tx, reconnect_rx) = mesh::channel::<ReconnectEvent>();
+        let (lost_tx, _lost_rx) = mesh::channel::<()>();
 
         let worker = Worker::new(
-            writer,
-            reader,
             state.clone(),
             rx,
             Vec::new(),
             Vec::new(),
             stats.clone(),
+            reconnect_rx,
+            lost_tx,
         );
         let worker_task = driver.spawn("w6b-worker-lost", worker.run(shutdown_rx));
+
+        // 投递 transport → worker 转 Live（随后首个 read 触发 go_lost）。
+        reconnect_tx.send(ReconnectEvent::Connected { writer, reader });
 
         // 发一个 read：server 已关，worker 要么 send 失败要么 recv EOF → go_lost。
         let (rd, tok) = defer_read();

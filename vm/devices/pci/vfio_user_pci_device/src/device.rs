@@ -18,8 +18,14 @@
 //!     发给 firmware，reply 到达后 complete token。
 //!   - write → [`ReqKind::MmioWrite`] **fire-and-forget**，立即 `IoResult::Ok`
 //!     让 guest driver 继续；worker 异步发 REGION_WRITE。
-//! - Lost 状态：cfg_read 返回 `Err(InvalidRegister)`（让 vpci `compute_config_writes`
-//!   的 `now_or_never` 走 fill(!0) 路径）；MMIO 同样 Err；cfg_write 静默 Ok。
+//! - C-2「show-absent-until-Live」：backend（usnvmemu）真正 connect 成功
+//!   （state 进 `Live`）之前，对 guest 一律呈「设备不存在」。`Connecting` 与
+//!   `Lost` 在 cfg/MMIO 表面行为**完全一致**：cfg_read 返
+//!   `Err(InvalidRegister)`（让 vpci `compute_config_writes` 的 `now_or_never`
+//!   走 fill(!0) 路径，guest 读到全 1）；MMIO 同样 Err；cfg_write 静默 Ok。
+//!   只有 `Live` 才放行真实 cfg_space / MMIO 路径。理由见 `pci_cfg_read` 注释
+//!   的 291d8645 OS-hang 说明：若启动期就让 guest 看到合法身份，NVMe 驱动会
+//!   bind 到尚未联通的 controller，首个 MMIO 永远等不到应答 → OS 停响应。
 //!
 //! 相对模板删掉：`next_seq`（vfio-user 的 msg_id 由 worker 分配，不在 device 侧）、
 //! `side_effect_offsets`（无 cfg 转发）。
@@ -129,24 +135,38 @@ impl ChipsetDevice for VfioUserPciDevice {
 impl PciConfigSpace for VfioUserPciDevice {
     fn pci_cfg_read(&mut self, offset: u16, value: &mut u32) -> IoResult {
         match self.state.load() {
-            DeviceState::Lost => IoResult::Err(IoError::InvalidRegister),
+            // C-2 不变量「show-absent-until-Live」：在 backend（usnvmemu）真正
+            // connect 成功（state 进 Live）之前，对 guest 呈「设备不存在」。
+            // Connecting 必须与 Lost 表现完全一致 —— cfg read 返
+            // Err(InvalidRegister)，让 vpci `compute_config_writes` 的
+            // `now_or_never` 走 fill(!0) 路径（guest 读到全 1 = 设备消失）。
+            //
+            // 若 Connecting 落到真实 cfg_space.read_u32，guest 会看到合法
+            // vendor/device 而把 NVMe 驱动 bind 到一个尚未联通的 controller，
+            // 随后首个 MMIO（如写 CC.EN）永远等不到 firmware 应答 → IRP 卡死 →
+            // 整个 OS 停响应（291d8645 OS-hang 类故障）。故只有 Live 走真实 cfg。
+            DeviceState::Connecting | DeviceState::Lost => IoResult::Err(IoError::InvalidRegister),
             // vfio-user 模型：config 纯本地仿真，不转发 firmware。
-            DeviceState::Connecting | DeviceState::Live => self.cfg_space.read_u32(offset, value),
+            DeviceState::Live => self.cfg_space.read_u32(offset, value),
         }
     }
 
     fn pci_cfg_write(&mut self, offset: u16, value: u32) -> IoResult {
         match self.state.load() {
-            DeviceState::Lost => IoResult::Ok,
+            // 同 C-2：未 Live 之前静默丢弃写（Ok 但不落地），与 Lost 行为一致。
+            DeviceState::Connecting | DeviceState::Lost => IoResult::Ok,
             // 纯本地，不转发 firmware（删掉模板的 side-effect CfgAccess 转发）。
-            _ => self.cfg_space.write_u32(offset, value),
+            DeviceState::Live => self.cfg_space.write_u32(offset, value),
         }
     }
 }
 
 impl MmioIntercept for VfioUserPciDevice {
     fn mmio_read(&mut self, addr: u64, data: &mut [u8]) -> IoResult {
-        if matches!(self.state.load(), DeviceState::Lost) {
+        // C-2「show-absent-until-Live」：只有 Live 才让 MMIO 走真实路径。
+        // Connecting 与 Lost 一律 Err —— backend 未联通时绝不让 guest 驱动
+        // 通过 MMIO 触达半死 controller（见 pci_cfg_read 的 291d8645 说明）。
+        if !matches!(self.state.load(), DeviceState::Live) {
             return IoResult::Err(IoError::InvalidRegister);
         }
         match self.cfg_space.find_bar(addr) {
@@ -182,7 +202,8 @@ impl MmioIntercept for VfioUserPciDevice {
     }
 
     fn mmio_write(&mut self, addr: u64, data: &[u8]) -> IoResult {
-        if matches!(self.state.load(), DeviceState::Lost) {
+        // C-2「show-absent-until-Live」：同 mmio_read，只有 Live 放行。
+        if !matches!(self.state.load(), DeviceState::Live) {
             return IoResult::Err(IoError::InvalidRegister);
         }
         match self.cfg_space.find_bar(addr) {
@@ -273,6 +294,25 @@ mod tests {
         let mut dev = build_test_device(DeviceState::Lost);
         let mut v = 0;
         let r = <VfioUserPciDevice as PciConfigSpace>::pci_cfg_read(&mut dev, 0, &mut v);
+        assert!(matches!(r, IoResult::Err(IoError::InvalidRegister)));
+    }
+
+    #[test]
+    fn connecting_cfg_read_returns_err_like_lost() {
+        let mut dev = build_test_device(DeviceState::Connecting);
+        let mut v = 0u32;
+        let r = <VfioUserPciDevice as PciConfigSpace>::pci_cfg_read(&mut dev, 0, &mut v);
+        assert!(
+            matches!(r, IoResult::Err(IoError::InvalidRegister)),
+            "Connecting 必须对 guest 呈不存在（C-2），got {r:?}"
+        );
+    }
+
+    #[test]
+    fn connecting_mmio_read_returns_err() {
+        let mut dev = build_test_device(DeviceState::Connecting);
+        let mut buf = [0u8; 4];
+        let r = <VfioUserPciDevice as MmioIntercept>::mmio_read(&mut dev, 0x4000_0000, &mut buf);
         assert!(matches!(r, IoResult::Err(IoError::InvalidRegister)));
     }
 

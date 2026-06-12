@@ -45,6 +45,8 @@ pal_async.workspace = true
 # loopback worker 单测对接真 server 半：VfioUserSession + MockDev（pcie_device_core PcieDevice）。
 vfio_user_transport = { path = "../../../../usnvmemu/crates/vfio_user_transport" }
 pcie_device_core = { path = "../../../../usnvmemu/crates/pcie_device_core" }
+# A2.4 reconnect loopback：在文件系统路径上起真 AF_UNIX listener（可停/可重启），驱动 reconnect_loop 真 connect。
+tempfile.workspace = true
 
 [lints]
 workspace = true

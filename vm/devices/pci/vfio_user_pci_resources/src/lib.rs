@@ -17,6 +17,13 @@ pub struct VfioUserNvmeHandle {
     pub instance_id: guid::Guid,
     /// firmware vfio-user server 的 AF_UNIX socket 路径。
     pub unix_path: String,
+    /// 声明给 guest 的 BAR0 窗口字节大小（CLI override；`None` = 用 resolver 内置
+    /// 默认 `DEFAULT_BAR0_SIZE`）。identity 校验上界：firmware 实报 BAR0 超此值即
+    /// 拒绝（决策 b，防 guest 拿到半映射控制器）。
+    pub bar0_size: Option<u64>,
+    /// 声明给 guest 的 MSI-X 向量数（CLI override；`None` = 用 resolver 内置默认
+    /// `DEFAULT_MSIX_COUNT`）。identity 校验上界：firmware 实报 MSI-X 超此值即拒绝。
+    pub msix_count: Option<u16>,
 }
 
 impl ResourceId<PciDeviceHandleKind> for VfioUserNvmeHandle {

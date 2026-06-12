@@ -11,26 +11,30 @@
 
 pub mod absent;
 pub mod device;
+pub mod identity;
 pub mod irq;
-pub mod prepared;
+pub mod reconnect;
 pub mod resolver;
-pub mod spawn;
 pub mod state;
 pub mod worker;
 
 pub use absent::AbsentPcieDevice;
 pub use device::MSIX_BAR_INDEX;
 pub use device::VfioUserPciDevice;
+pub use identity::ActualGeometry;
+pub use identity::DeclaredGeometry;
+pub use identity::IdentityCheck;
+pub use identity::declared_hardware_ids;
+pub use identity::validate_identity;
 pub use irq::irq_wait_loop;
-pub use prepared::PreparedMap;
-pub use prepared::PreparedVfioUserDevice;
+pub use reconnect::ReconnectChannels;
+pub use reconnect::reconnect_loop;
 pub use resolver::VfioUserPciResolver;
 pub use resolver::WorkerTasks;
-pub use spawn::derive_hardware_ids_from_cfg;
-pub use spawn::spawn_vfio_user_connects;
 pub use state::DeviceState;
 pub use state::SharedState;
 pub use worker::DeviceRequest;
+pub use worker::ReconnectEvent;
 pub use worker::ReqKind;
 pub use worker::SharedWorkerStats;
 pub use worker::Worker;

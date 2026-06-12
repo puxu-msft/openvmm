@@ -9114,6 +9114,7 @@ dependencies = [
  "pci_core",
  "pci_resources",
  "pcie_device_core",
+ "tempfile",
  "thiserror 2.0.16",
  "tracelimit",
  "tracing",

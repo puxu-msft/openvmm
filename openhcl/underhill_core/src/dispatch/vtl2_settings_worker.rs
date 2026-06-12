@@ -1930,6 +1930,8 @@ impl InitialControllers {
                     resource: vfio_user_pci_resources::VfioUserNvmeHandle {
                         instance_id: cfg.instance_id,
                         unix_path: cfg.unix_path.clone(),
+                        bar0_size: cfg.bar0_size,
+                        msix_count: cfg.msix_count,
                     }
                     .into_resource(),
                 });
