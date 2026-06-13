@@ -28,18 +28,29 @@
   `PiLayout{Inline | Separate{mptr,meta,meta_pending}}`（mod.rs）；7 个 helper
   （`is_inline_pi`/`is_separate_pi`/`meta_done`/`meta_ready`/`set_separate_meta`/
   `take_separate_meta_for_scatter`/`clear_separate_meta_pending`）把 layout 派发收敛一处。
+- ✅ **P3① separate nlb=2** `31ea15300` — 分流判据 `nlb>2`→`prp::tier==List`，nlb=2 O>0（data
+  跨 3 页）路由进已证 N>2 PrpListOp；nlb=2 O=0 仍 Dual。修 O>0 旧路盲读跨页+漏第 3 页洞。
+- ✅ **P3② separate nlb=1** `3e28ee880` — bespoke separate 路径改 **per-host-segment**
+  （`dispatch_segs` 拼回-重切）：nlb=1 O=0 Single / O>0 Dual[(PRP1,4096−O),(PRP2,O)]；
+  `SepMetaWriteAccum.data_pages→seg_data`、PRP2 校验收敛 `validate_prp2`。修盲读跨页洞。
+- ✅ **P3③ inline nlb=1** `823f3fed4` — 分流判据 `nlb>=2`→`tier==List`：nlb=1 O≤4088 Dual
+  split 左移 (4096−O,8+O)、O>4088 升 List（PrpListOp inline，真做不拒）；去旧 M-2 强拒非页
+  对齐 PRP1；completion.rs inline finalize 硬编码 `==4096&&==8`→`拼回总长==block_bytes`。
+- ✅ **P3 收尾** `19bd047ea` — 消费层落地后移除 `dispatch_segs`/`DispatchSegs` 的
+  `#[allow(dead_code)]`；删 `SegLens`（零消费、与 `page_size` 冗余的残留 scaffolding）。
 
-**当前代码状态（P3 起点）：**
-- `prp.rs`：几何内核 + `dispatch_segs(prp1,prp2,total)->DispatchSegs{Single|Dual|List}` +
-  `SegLens`（段长迭代器）+ `prp2_role`/`validate_prp2`（io.rs）全部就绪、有单测。
-- `PrpListOp.pi: Option<PiFinalize>` 单字段 + helper 已就位；统一 `prp_pi_write_finalize`
-  按 `PiLayout` 分派（inline 原样存 / separate interleave 存），**reassemble-then-resplit
-  offset-aware**。P3 的新构造点直接填 `pi: Some(PiFinalize{layout})`、READ 走 List scatter。
-- **nlb≤2 PI 路径仍是旧 bespoke dual**（未改）：inline nlb=1 走 `InlineMetaWriteSeg`/
-  `InlineMetaWriteAccum`（io.rs ~2084-2176 WRITE、~977-1097 READ，硬编码 (4096,8)、
-  `M-2` 强拒非页对齐 PRP1）；separate nlb=1/2 走 `SepMetaWriteAccum`/`SepMetaReadAccum`
-  （io.rs ~2332-2391 WRITE、~1282-1403 READ，`data_prps=[prp1,prp2]` 整页、无 first_seg_len）。
-  **这就是 P3 要消灭/补全的对象。**
+**P3 三路径各经 ecc:rust-reviewer APPROVE（0 C/H/M）、差分 oracle 四件套 + revert-verify 实测、
+178 non-cmb tests 绿、clippy 无新增。至此 #4c-b 全 PI 路径（plain / separate nlb=1/2/N>2 /
+inline nlb=1/≥2）全 tier（Single/Dual/List）零 spec-legal 例外，PRP1 任意页内偏移 O∈[0,4095]
+均正确支持。**
+
+**完成状态：**
+- `prp.rs`：几何内核 + `prp2_role`/`validate_prp2`（io.rs）+ `dispatch_segs`/`DispatchSegs`
+  全部就绪并被生产消费（无 `#[allow(dead_code)]`）；`SegLens` 已删（未被消费）。
+- 所有 PI dispatch 入口统一 `validate_prp2(prp2, prp1_offset(prp1), total)`；bespoke
+  separate（nlb≤2 非 List）与 inline（nlb=1 非 List）均 per-host-segment，List 档统一进
+  offset-aware `PrpListOp`（separate / inline layout）。dual accum 退役（separate）/ 段长
+  随 O（inline）。
 
 ## 共享树多会话纪律（本任务实测，交接必读）
 - 本 crate 有并行 CMB 会话（silver-lynx 等）同改 io.rs/mod.rs/completion.rs。用 neighbors
@@ -86,7 +97,7 @@ READ 侧 `prp_pi_read_scatter`：盘上 verify-all→按 SegLens 切 data_pages�
   **P2-a ✅ `6f0119efe`**（finalize 合一）／**P2-b ✅ `c2c55865a`**（单 pi 字段 + 7 helper）。
   详见上「执行进度」。
 
-- **P3（B 核心，execution-ready，下一步做）：消灭 nlb=1/2 PI 路径 4096/8 硬编码 +
+- **P3（B 核心，✅ 已完成 — 见上「执行进度」P3①②③+收尾 commit）：消灭 nlb=1/2 PI 路径 4096/8 硬编码 +
   补全 Dual→List，全路径全 tier 零 spec-legal 例外。** 逐路径（每条 READ+WRITE 对称）：
 
   - **separate nlb=2（最先做，最省、复用已证机件）**：当前 `nlb==2` 走 dual-PRP

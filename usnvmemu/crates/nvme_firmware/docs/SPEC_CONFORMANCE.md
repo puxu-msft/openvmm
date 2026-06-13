@@ -60,8 +60,8 @@
 
 | Opcode | 状态 | 缺什么 / 备注 | spec | 锚点 |
 |--------|------|--------------|------|------|
-| READ (0x02) | ✅ [F] | plain + PI(PRACT=1 inline) + **separate PRACT=0 单 LBA**(B6b-3)；多 LBA separate ⏸(B6b-4) | §3.x | io.rs READ |
-| WRITE (0x01) | ✅ [F] | 同 READ + **separate PRACT=0 单 LBA**(B6b-2，verify-before-store) | §3.x | io.rs WRITE |
+| READ (0x02) | ✅ [F] | plain + PI(PRACT=1 inline) + **separate/inline PRACT=0 全 nlb**(B6b-3/4 + B6c/3) + **#4c PRP1 页内偏移全 tier** | §3.x | io.rs READ |
+| WRITE (0x01) | ✅ [F] | 同 READ + **separate/inline PRACT=0 全 nlb**(verify-before-store) + **#4c PRP1 页内偏移全 tier** | §3.x | io.rs WRITE |
 | COMPARE (0x05) | ✅ | plain NS only（PI/meta NS→INVALID_FIELD）+ fused C&W 原子 | §3.x | io.rs COMPARE |
 | FLUSH (0x00) | ✅ | flush 全 NS volatile | §3.x | io.rs FLUSH |
 | WRITE_ZEROES (0x08) | ✅ | 范围写零（无 host 数据传输）| §3.x | io.rs WRITE_ZEROES |
@@ -83,8 +83,8 @@
 | 特性 | 状态 | 缺什么 / 激活条件 | 锚点 |
 |------|------|------------------|------|
 | **PI 内联(extended LBA, MSET=1) PRACT=1** | ✅ | controller gen/strip，data-only wire，interleave 存盘 | io.rs PI 路径 + completion.rs NvmWritePi* |
-| **PI separate(MSET=0) PRACT=0** | ◐ [F] | host 经 MPTR 供 PI + verify；**单 LBA WRITE+READ 闭环**(B6b-2/3)；**多 LBA ⏸=B6b-4** | completion.rs SepMetaWrite/ReadAccum |
-| PI inline PRACT=0（host inline tuple） | ⏸ [F] | 未实现（仍 INVALID_PROTECTION_INFO）；另一条 host-PI 路径，待做 | io.rs `!pract && is_pi_path && meta_inline` |
+| **PI separate(MSET=0) PRACT=0** | ✅ [F] | host 经 MPTR 供 PI tuple + verify-before-store；**全 nlb**（单 LBA B6b-2/3、多 LBA N>2 B6b-4 PRP-list）；**#4c PRP1 任意页内偏移 O∈[0,4095]**（nlb=1 Single/Dual、nlb=2 Dual/List、N>2 List；per-host-segment 拼回→按 data_bytes 重切，全 tier 零 spec-legal 例外，#4c-b P3②/①）| completion.rs SepMeta*Accum + sep_meta_write_finalize + io.rs |
+| **PI inline(MSET=1) PRACT=0**（host extended-block） | ✅ [F] | host 经 PRP 供完整 4104 extended block + verify-then-store；**全 nlb**（nlb=1 dual-PRP B6c、nlb≥2 PRP-list B6c-3）；**#4c PRP1 任意页内偏移**（nlb=1 O≤4088 Dual split 左移 (4096−O,8+O) / O>4088 升 List、nlb≥2 List，全 tier 零例外，#4c-b P3③/#4c-a）| io.rs inline 路径 + completion.rs inline_meta_write_finalize / PrpListOp inline |
 | PRCHK 逐项门控（cdw12 28:26） | ⏸ [F] | 未解析→一律 verify(over-strict，安全方向)；真做时按 bit | completion.rs verify 注释 |
 | **PRP** 单/双/单-list | ✅ | ≤513 页(~2 MiB) | io.rs + mod.rs PrpListOp |
 | **PRP-list chaining(>2 MiB) device→host** | ✅ [F] | 机制就绪(C1②)；**生产路径激活待 MDTS 抬高 / report cap 放开**(forward scaffolding §30) | completion.rs NvmReadPrpListFetch |
@@ -108,9 +108,9 @@
 
 | 项 | 类 | 激活条件 / 理由 | 归属 |
 |----|----|---------------|------|
-| B6b-4 多 LBA separate metadata | ⏸ | 下一步；设计见 `plans/2026-06-11-b6b4-and-resume-plan.md` | [F] |
+| B6b-4 多 LBA separate metadata | ✅ | 已落地（`8d87e7812` + #4c-a/#4c-b PRP1 偏移）；见上 "PI separate" 行 | [F] |
 | PRP-list chaining 真激活 | ⏸ | 抬 MDTS 让 IO Read >2 MiB（注意 nvme-of transport nlb cap 独立）| [F] |
-| inline NS PRACT=0 / PRCHK 门控 | ⏸ | host-PI 另一路径 / 按 bit 解析 | [F] |
+| inline NS PRACT=0 / PRCHK 门控 | ✅ | 已落地（B6c/B6c-3 + #4c-b P3③ PRP1 偏移）；见上 "PI inline" 行；PRCHK 门控已接（cdw12 PRINFO 逐项）| [F] |
 | CMB-SGL SC 一致（条件化）| ✅ | `sgl.rs` 共享 `subtype_to_sc`+`resolve_sgl_address`，3 路径统一：CMB off→0x12 / 启用越界→0x16 / 启用合法→放行 rebase（CMB-P2/P5）| [Q] |
 | NS-not-ready (0x82) | ✅ | item-1：per-NS `not_ready` + `--not-ready-nsid` 触发 + IO/fused 门 + Format-readiness + NSTAT.NRDY 跟随（`488ffaa8`）| [Q] |
 | AWUN (0x14) | ✅ | item-2：fused C&W >1page(超原子能力)→ATOMIC_WRITE_UNIT_EXCEEDED；普通 Write>AWUN 不 reject（spec：仅不保证原子）（`5b8dafa1`）| [Q] |
