@@ -272,14 +272,24 @@ W6a（单 commit `571ad805`）：
 - **VTL2 判活务必 `ps` 实证**：`pgrep -x <comm>`（busybox 怪癖）与 `pgrep -f <含自身的 pattern>`（匹配到自己）两种误报都踩过。
 - 归档：`experiments/2026-06-12-w6b-reconnect-real-vm/RESULT.md`（finding-③④⑤）。
 
-**W6b 之后的方向**（非 W6c）：Layer C 真 guest hot-add/remove（需净新增可控 VpciBus plumbing，见 §3.3 审计修正②）+ usnvmemu 独立托管服务（VTL2 init/initrd 或 underhill supervisor 启动，替代 operator 手动 push）；以及 §2.1 所列各接入的其它落地（按价值挑，无固定主战场）。
+**W6b 之后的方向**（非 W6c）：① Layer C 真 guest hot-add/remove **已收口**（真机证 Windows 平台硬限 → 采 Option B「transient 停顿 + C-3 透明重连」，见 `experiments/2026-06-12-layer-c-c0-real-vm/RESULT.md` + memory `vfio-user-underhill-state`）；② usnvmemu 独立托管服务 **已落地**（§3.6：init env-gated autostart，零-operator 出盘真机 PASS）；以及 §2.1 所列各接入的其它落地（按价值挑，无固定主战场）。
 
 ### 3.5 IGVM 构建笔记（W6b/c 真机必备）
 
 - **IGVM 已构建可用**（2026-06-12，`cargo xflowey build-igvm x64` 成功，产物 `flowey-out/artifacts/build-igvm/debug/x64/openhcl-x64.bin`）；配 vfio device 须加 `--override-openvmm-hcl-feature vpci`（见 finding①）。
 - **集成在真 musl VTL2 target 干净编译**（比 host cargo check 严）。
 - **带注解的坑**：WSL 重启打断的构建会留**损坏的 incremental cache** 致 rustc ICE（`nvme_driver` lint_mod / try_mark_green dep node，非代码 bug）；修法 `rm -rf target/openvmm_hcl/x86_64-unknown-linux-musl/debug/incremental` 后重跑即过。
-- **带注解的中间结论（后被 reconnect/operator 模型取代）**：早期判断 guest 枚举要 firmware 先于 underhill connect spawner(init 早期 ~0.7-3.9s) listening，且外挂两路实测均不行（首 boot 时 VTL2 diag 未起无法注入 / ohcldiag-dev restart 重置 VTL2 /tmp 致 socket 消失），故当时认为「正确做法是 firmware 由 VTL2 init(initrd) 或 underhill supervisor 启动」。**实际 W6b 用 §3.3 的 operator-managed 生命周期 + 持久 reconnect 模型解决了枚举**（boot 后 operator setsid 推 usnvmemu → device 从 Connecting revive 到 Live → guest 枚举正确，见 finding-③ PROVEN），**不需要** supervisor/initrd。supervisor/initrd 自启动留作未来「usnvmemu 独立托管服务」方向（§3.4 末）。
+- **带注解的中间结论（后被 reconnect/operator 模型取代）**：早期判断 guest 枚举要 firmware 先于 underhill connect spawner(init 早期 ~0.7-3.9s) listening，且外挂两路实测均不行（首 boot 时 VTL2 diag 未起无法注入 / ohcldiag-dev restart 重置 VTL2 /tmp 致 socket 消失），故当时认为「正确做法是 firmware 由 VTL2 init(initrd) 或 underhill supervisor 启动」。**实际 W6b 用 §3.3 的 operator-managed 生命周期 + 持久 reconnect 模型解决了枚举**（boot 后 operator setsid 推 usnvmemu → device 从 Connecting revive 到 Live → guest 枚举正确，见 finding-③ PROVEN），**不需要** supervisor/initrd。supervisor/initrd 自启动作为「usnvmemu 独立托管服务」方向**已于 §3.6 落地**（init env-gated autostart，零-operator 出盘真机 PASS）。
+
+### 3.6 usnvmemu VTL2 自启动托管服务（W6 收尾）— ✅ 零-operator 出盘真机 PASS（commit `738ab808d`）
+
+让 vfio-user NVMe 设备在 OpenHCL boot 自动出现，替代 operator 手动 `ohcldiag-dev push + setsid` 起 usnvmemu。三层 env-gated（未设零回归）：① usnvmemu(static musl) 烤进 IGVM initrd `/bin/usnvmemu`（新 `openhcl/usnvmemu_fs.config` + `cargo xflowey build-igvm --custom-extra-rootfs`，**零 flowey 改动**）；② `underhill_init`(PID1) env-gated 在 spawn underhill 前 spawn usnvmemu；③ underhill_core 现有 device + 持久 reconnect（不改）。
+
+- **配置**：`OPENHCL_VFIO_USER_NVME_AUTOSTART=<size_mb>:<backing>`（colon、**空格-free** 以过 kernel cmdline→init env 不被截断；sock 从设备 env `OPENHCL_VFIO_USER_NVME` 派生**不重复**）。init 建 backing file（usnvmemu `NvmeController::open` 无 `.create`，要文件已在）。
+- **PID1 安全（architect + rust-reviewer 评审纳入）**：`pre_exec` 内 `RLIMIT_CORE=0`（usnvmemu segfault **不触发** `core_pattern=|/bin/underhill-crash`——其无 PID 过滤会向 host 流 core=**假 VTL2 崩报**；令异常退出**静默退化 boot-absent**）+ `setsid` + `dup2(2,1)`（usnvmemu `tracing` 走 stdout，dup→stderr=ttyprintk→kmsg，否则继承 init `/dev/null` 静默丢日志）；CVM-gate（隔离 VM 不 autostart）；错误**绝不**逃出 `do_main`（逃出→`main` `exit(1)`→PID1 死→kernel panic）→ `if let Err` 吞掉。**不加 crash-restart**（VTL2「非预期进程死即 fatal」哲学；graceful 重启留 operator/reconnect；C-1 后未来若做仅 `WIFEXITED(0)`/`SIGTERM` 重启）。
+- **真机 PASS（承重假设②）**：boot 两 env（皆空格-free 过 cmdline）、**零手动推/起** → init 自启 `/bin/usnvmemu`(pid 35，args 由 env 构造)+建 256MiB backing → device shim 连上 → guest 自动出盘「OpenHCL Userspace NVMe v2.0」256MB + 4MiB IO markerMatch（oracle-1）+ oracle-2 raw backing @22577152。6 单测 + clippy/fmt 净。
+- 设计/承重假设/评审 archive：`docs/superpowers/plans/2026-06-13-w6-usnvmemu-vtl2-autostart.md`。
+- **未来（非本期）**：supervised restart（区分 graceful-exit vs crash，对齐 fatal-death 哲学）/ persistent backing（tmpfs backing 重启即失）/ build-igvm 一等 `--with-vfio-user-nvme` flag（仿 `--with-perf-tools`）/ 多设备。
 
 ---
 
