@@ -78,8 +78,10 @@ fn make_controller_with_cmb() -> NvmeController {
 fn cmb_bar_region_info_from_real_controller() {
     let (server, mut client) = UnixStream::pair().unwrap();
     let mut ctrl = make_controller_with_cmb();
-    // **NvmeController 含 `Box<dyn SharedRamRegion>` 非 Send** → controller 留在主线程
-    // pump，client（只持 UnixStream，Send）放到 spawn 线程。
+    // controller 在主线程同步 pump（本测试的组织方式）；client（持 `UnixStream`）放 spawn
+    // 线程当对端。注：`NvmeController` 现**已** `Send`（`pcie_device_core` 的
+    // `SharedRamRegion: Send + Sync` 修复后，2026-06-13），故此分工是**测试结构选择、非 Send
+    // 约束**——controller 也可移进 spawn 线程，这里按主线程 pump 只为读写时序直观。
     let h = thread::spawn(move || {
         let req = RegionInfoPayload {
             argsz: core::mem::size_of::<RegionInfoPayload>() as u32,

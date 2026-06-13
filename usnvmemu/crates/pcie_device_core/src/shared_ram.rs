@@ -23,7 +23,22 @@
 /// [`as_bytes_mut`](SharedRamRegion::as_bytes_mut) 返回的切片长度恒等于
 /// [`len`](SharedRamRegion::len)，且在 region 生命周期内地址稳定（map 模式依赖
 /// 这一点：client 的 mmap 与 firmware 的本地访问指向同一物理页）。
-pub trait SharedRamRegion {
+///
+/// **`Send + Sync` 是承重 supertrait（勿删）**，两个 bound **各有独立根据**：
+/// - **`Send`**：CMB backing 经 `Box<dyn SharedRamRegion>` 进 firmware 的 `CmbState`
+///   → `NvmeController`。NVMe-oF TCP target 的 async session 把 controller 包进
+///   `Arc<Mutex<…>>` 后 `tokio::spawn` 跨线程——**这条链只要求 `Send`**。无 bound 时
+///   trait object 默认非 `Send` → `CmbState` / `NvmeController: Send` 链断 →
+///   `nvme_of_tcp_target` 的 async 测试编译失败（2026-06-13 由新建的 usnvmemu CI gate
+///   暴露的真 HEAD 回归）。
+/// - **`Sync`**：是共享内存抽象的**固有契约**，**非 spawn 所需**（故勿因"spawn 只要
+///   `Send`"就以为 `Sync` 多余而删它）：backing 可被 `&dyn SharedRamRegion` 跨线程**只读
+///   借用**（如未来 `Arc<dyn …>` 多线程读 backing），map 模式下 backing 更是字面的共享
+///   物理页。`Sync` 把"可安全跨线程共享 `&`"这一本质属性写进类型。
+///
+/// 两个实现者 [`VecRamRegion`]（`Vec<u8>`）与 `MemfdRamRegion`（`OwnedFd` +
+/// `memmap2::MmapMut`）本就 `Send + Sync`，零额外约束。
+pub trait SharedRamRegion: Send + Sync {
     /// 只读访问整段 backing。切片长度 == [`len`](Self::len)。
     fn as_bytes(&self) -> &[u8];
 
