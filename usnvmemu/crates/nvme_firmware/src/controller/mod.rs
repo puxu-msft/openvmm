@@ -6153,30 +6153,39 @@ mod cmb_datapath_tests {
         assert!(c.cmb_completions.is_empty(), "drain 后队列空");
     }
 
-    /// **CMB-P2 (reviewer M-1) — 越界 CMB-relative offset 的实测行为（lenient）**。
-    /// offset ≥ CMB size → rebase 成 `cba+offset ≥ win_end` → `cmb_hit` 判 Miss →
-    /// **走 transport DMA**（对真实 guest GPA），**非** straddle/0x16 拒。此测试钉死
-    /// 当前 lenient 行为（非内存安全问题：guest 自有 RAM）。**P5 TODO**：SGLS advertise
-    /// 后应改严格返 SGL_OFFSET_INVALID(0x16)，届时本测试改为断言 0x16。
+    /// **CMB-P5（越界严格化）** — CMB-relative offset ≥ CMB size（起点出窗口）→
+    /// `resolve_sgl_address` 返 `Err(SGL_OFFSET_INVALID)` (0x16)，`dispatch_io` 同步返
+    /// error CQE。**取代** P2 时的 lenient 行为（越界 rebase 出窗 → cmb_hit Miss → 走
+    /// transport DMA）。独立 oracle = firmware 同步 CQE status == 0x16 + 全程无 transport
+    /// outbound（既不落 CMB、也不发 DMA）。
     #[test]
-    fn cmb_relative_offset_out_of_window_falls_to_dma_lenient() {
+    fn cmb_relative_offset_out_of_window_rejected_with_offset_invalid() {
         let mut c = mk_cmb_live();
         c.csts |= csts::RDY;
         insert_cmb_cq(&mut c, 1, 0x10_0000);
-        // offset 越过 CMB 窗口（≥ size）→ rebase 出窗口。
+        // offset 越过 CMB 窗口（≥ size）→ 严格拒。
         let prp1 = CMB_SIZE + 0x1000;
         let prp2 = (0x01u64 << 56) | SECTOR_SIZE; // Data Block + sub_type=1
         let mut cap = CaptureTransport::with_start_token(0x100);
-        {
+        let cqe = {
             let mut ctx = DeviceCtx::new(&mut cap);
             let sqe = cmb_io_sqe(0x02, 0x55, 1, 0, 1, 1, prp1, prp2);
-            let _ = c.dispatch_io(&mut ctx, 1, sqe, 0x55, 0, 1);
+            let r = c.dispatch_io(&mut ctx, 1, sqe, 0x55, 0, 1);
             c.drain_cmb_completions(&mut ctx);
-        }
-        // 越界 CMB-relative → Miss → transport DMA（lenient），而非落 CMB backing。
+            r
+        };
+        // 越界 → resolve_data_pointers 返 Err(0x16) → dispatch_io 同步返 error CQE。
+        let cqe = cqe.expect("越界 CMB-relative → 同步拒，返 CQE");
+        let status = (((cqe.dw3 >> 17) & 0xff) | (((cqe.dw3 >> 25) & 0x7) << 8)) as u16;
+        assert_eq!(
+            status,
+            crate::cmd::sc::SGL_OFFSET_INVALID,
+            "越界 CMB-relative offset → SGL Offset Invalid (0x16)，不再 lenient 走 DMA"
+        );
+        // 严格拒：既不落 CMB backing，也不发 transport DMA。
         assert!(
-            !cap.events().is_empty(),
-            "越界 CMB-relative offset 当前走 transport DMA（lenient，P5 改严格 0x16）"
+            cap.events().is_empty(),
+            "越界 CMB-relative 被早拒 → 无 transport outbound（不再 lenient DMA）"
         );
     }
 

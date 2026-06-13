@@ -5902,6 +5902,55 @@ fn identify_controller_sgls_matches_impl() {
     );
 }
 
+/// **CMB-P5（SGLS SAOS 条件 advertise）** — SGLS bit 20 = "SGL Address Field Specifies
+/// an Offset"（SAOS，CMB-relative 寻址支持；Linux 内核 `NVME_CTRL_SGLS_SAOS`= `1<<20`
+/// 作独立 oracle）。advertise⟺implement 纪律：该位**仅在 CMB 启用时**置——CMB off 时
+/// driver 不应被告知支持 CMB-relative SGL（功能就绪但无 CMB 可寻址）。
+/// - `build_v2_bytes`（默认 builder，CMB 未知/未启用）→ bit20 = 0。
+/// - `build_v2_bytes_with_cmb(.., cmb_offset_sgl=false)` → bit20 = 0。
+/// - `build_v2_bytes_with_cmb(.., cmb_offset_sgl=true)` → bit20 = 1。
+///
+/// 其余 SGLS 位（bits1:0 / bit16）不受 CMB 影响。
+#[test]
+fn identify_controller_sgls_saos_conditional_on_cmb() {
+    const SAOS: u32 = 1 << 20; // NVME_CTRL_SGLS_SAOS
+
+    // 默认 builder：CMB 未启用 → 不 advertise SAOS。
+    let off = IdentifyController::build_v2_bytes(0x1414, 0xc0de, 1);
+    let sgls_off = u32::from_le_bytes(off[536..540].try_into().unwrap());
+    assert_eq!(
+        sgls_off & SAOS,
+        0,
+        "CMB off（默认 builder）→ SGLS bit20 不置"
+    );
+
+    // 显式 cmb_offset_sgl=false → 同样不置。
+    let no_cmb = IdentifyController::build_v2_bytes_with_cmb(0x1414, 0xc0de, 1, 0x01, 0, false);
+    let sgls_no = u32::from_le_bytes(no_cmb[536..540].try_into().unwrap());
+    assert_eq!(sgls_no & SAOS, 0, "cmb_offset_sgl=false → SGLS bit20 不置");
+
+    // cmb_offset_sgl=true → 置 SAOS，其余位不变。
+    let with_cmb = IdentifyController::build_v2_bytes_with_cmb(0x1414, 0xc0de, 1, 0x01, 0, true);
+    let sgls_cmb = u32::from_le_bytes(with_cmb[536..540].try_into().unwrap());
+    assert_eq!(sgls_cmb & SAOS, SAOS, "CMB 启用 → SGLS bit20 (SAOS) 置位");
+    assert_eq!(
+        sgls_cmb & 0x0003,
+        0x0001,
+        "SAOS 置位不影响 bits1:0（基础 SGL 支持）"
+    );
+    assert_eq!(
+        sgls_cmb & (1 << 16),
+        1 << 16,
+        "SAOS 置位不影响 bit16（Bit Bucket）"
+    );
+    // SAOS 是 bit20 与 sgls_off 的唯一差异。
+    assert_eq!(
+        sgls_cmb,
+        sgls_off | SAOS,
+        "CMB 启用版 SGLS == 默认版 | SAOS（仅 bit20 一处差异）"
+    );
+}
+
 /// **R2d-followup** — **全** `sc::` 状态码锚定到仓库内 canonical
 /// `nvme_spec::Status`（vm/devices/storage/nvme_spec）。常量现是完整 16-bit
 /// status（SC + SCT<<8），故 `sc::X == Status::Y.0` 精确逐位比对——任何手填错

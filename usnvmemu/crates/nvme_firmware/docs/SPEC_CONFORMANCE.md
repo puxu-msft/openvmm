@@ -89,7 +89,8 @@
 | **PRP** 单/双/单-list | ✅ | ≤513 页(~2 MiB) | io.rs + mod.rs PrpListOp |
 | **PRP-list chaining(>2 MiB) device→host** | ✅ [F] | 机制就绪(C1②)；**生产路径激活待 MDTS 抬高 / report cap 放开**(forward scaffolding §30) | completion.rs NvmReadPrpListFetch |
 | PRP-list chaining host→device(write) | ⏸ [F] | 不可达(MDTS=128KiB 锁死)，按 §30 不投机实现 | — |
-| **SGL** (PSDT=10) | ✅ [Q] | segment chain + Bit Bucket（R2d）；**sub_type 仅 Address**◐（CMB sub_type=1→`SGL_INVALID_USE_OF_CMB`(0x12)，**3 路径经共享 `subtype_to_sc` 一致**，item-0，非支持 CMB）；SGL×PI ✗ | src/sgl.rs + io.rs SGL 路径 |
+| **SGL** (PSDT=10) | ✅ [Q] | segment chain + Bit Bucket（R2d）；**CMB-relative sub_type=1（Offset）**：CMB 启用时**放行 + rebase**（`cba+offset`，CMB-P2/P5）、越界 offset≥size→`SGL_OFFSET_INVALID`(0x16)（P5 严格）、CMB off 时→`SGL_INVALID_USE_OF_CMB`(0x12)；**3 路径经共享 `subtype_to_sc`+`resolve_sgl_address` 一致**；SGL×PI ✗ | src/sgl.rs + io.rs SGL 路径 |
+| **CMB**（Controller Memory Buffer，spec § 8.x）| ✅ | **双模 + 配置可选**（`--cmb-mode off\|trap\|map`）：CMBLOC/CMBSZ/CMBMSC/CMBSTS 寄存器 + CMBMSC 时序状态机（CRE 先于 CMSE）；**trap**=REGION_RW 转发 backing（任意 transport）/ **map**=memfd backing + SCM_RIGHTS fd-pass + client mmap 零拷贝（仅 vfio-user，OpenHCL 无 mapper 降级 trap，TCP 不适用）；CMB 内 SQ/CQ/PRP/SGL-data；SGLS bit20 SAOS 条件 advertise。两模均有 e2e | regs.rs+controller/{mmio,cmb}.rs + vfio_user_transport/{session,memfd_region}.rs + vfio_user_pci_device + main.rs |
 | **MDTS** 强制 | ✅ [F] | 全数据命令；计入 inline metadata(C1①)；值=5(128 KiB) | src/regs.rs MDTS_MAX_BYTES + io.rs |
 | **Fused** Compare&Write | ✅ | 原子；**>1page(超原子能力)→ATOMIC_WRITE_UNIT_EXCEEDED(0x14)**（item-2[Q]，共享 `fused_cw_reject_sc`，本地+fabric 一致）| io.rs/completion.rs fused + mod.rs fused_cw_reject_sc |
 | **NS-not-ready 门** (0x82) | ✅ [Q] | not_ready NS 的 IO + fused C&W→NAMESPACE_NOT_READY；`--not-ready-nsid` 触发、Format 转 ready、Identify CNS 0x08 NSTAT.NRDY 跟随（item-1）| io.rs/mod.rs not_ready 门 + admin.rs NSTAT |
@@ -110,7 +111,7 @@
 | B6b-4 多 LBA separate metadata | ⏸ | 下一步；设计见 `plans/2026-06-11-b6b4-and-resume-plan.md` | [F] |
 | PRP-list chaining 真激活 | ⏸ | 抬 MDTS 让 IO Read >2 MiB（注意 nvme-of transport nlb cap 独立）| [F] |
 | inline NS PRACT=0 / PRCHK 门控 | ⏸ | host-PI 另一路径 / 按 bit 解析 | [F] |
-| CMB-SGL SC 一致 (0x12) | ✅ | item-0：`sgl.rs` 共享 `subtype_to_sc`，3 路径统一 emit（`fe30b715`）| [Q] |
+| CMB-SGL SC 一致（条件化）| ✅ | `sgl.rs` 共享 `subtype_to_sc`+`resolve_sgl_address`，3 路径统一：CMB off→0x12 / 启用越界→0x16 / 启用合法→放行 rebase（CMB-P2/P5）| [Q] |
 | NS-not-ready (0x82) | ✅ | item-1：per-NS `not_ready` + `--not-ready-nsid` 触发 + IO/fused 门 + Format-readiness + NSTAT.NRDY 跟随（`488ffaa8`）| [Q] |
 | AWUN (0x14) | ✅ | item-2：fused C&W >1page(超原子能力)→ATOMIC_WRITE_UNIT_EXCEEDED；普通 Write>AWUN 不 reject（spec：仅不保证原子）（`5b8dafa1`）| [Q] |
 | boot-partition (0x11e) | ✅ | item-3：`--boot-partition-file` 装只读出厂镜像→广告 BPSZ>0 + 服务 Boot Partition Read（BPRSEL→DMA→BMBL，BRS 状态机）+ FW Commit BPID→BOOT_PARTITION_WRITE_PROHIBITED（write-protected）| [Q] |

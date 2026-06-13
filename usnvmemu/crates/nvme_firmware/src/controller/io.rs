@@ -372,10 +372,11 @@ pub(crate) fn resolve_data_pointers(
                         );
                         return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID);
                     }
-                    // **CMB-P2** — CMB-relative（sub_type=1）的 address 是 CMB 内偏移，
-                    // rebase 成实际 GPA `cba+offset` 当 prp1；sub_type=0 原样。
+                    // **CMB-P2 / P5** — CMB-relative（sub_type=1）的 address 是 CMB 内偏移，
+                    // rebase 成实际 GPA `cba+offset` 当 prp1；sub_type=0 原样。offset ≥ CMB
+                    // size（越界）→ `resolve_sgl_address` 返 `Err(SGL_OFFSET_INVALID)`，经 `?` 透传。
                     Ok(DataPointer::Prp {
-                        prp1: crate::sgl::resolve_sgl_address(desc.sub_type, desc.address, cmb),
+                        prp1: crate::sgl::resolve_sgl_address(desc.sub_type, desc.address, cmb)?,
                         prp2: 0,
                     })
                 }
@@ -456,12 +457,13 @@ pub(crate) fn validate_segment_pointer(
 /// Last Segment，sub_type∈{0 Address, 1 CMB-relative}）。返 `(segment_addr, segment_len, is_last)`。
 /// 校验逻辑见 `validate_segment_pointer`。
 ///
-/// **CMB-P2**：CMB-relative（sub_type=1）的 segment_addr 经 `sgl::resolve_sgl_address`
-/// rebase 成 `cba+offset`（SGL 列表本身驻留 CMB 时）。
+/// **CMB-P2 / P5**：CMB-relative（sub_type=1）的 segment_addr 经 `sgl::resolve_sgl_address`
+/// rebase 成 `cba+offset`（SGL 列表本身驻留 CMB 时）；offset ≥ CMB size（越界）→
+/// `Err(SGL_OFFSET_INVALID)` 经 `?` 透传。
 fn parse_sgl1_segment(bytes: &[u8; 16], cmb: Option<(u64, u64)>) -> Result<(u64, u32, bool), u16> {
     let desc = crate::sgl::SglDescriptor::parse(bytes).ok_or(sc::SGL_DESCRIPTOR_TYPE_INVALID)?;
     let (len, is_last) = validate_segment_pointer(&desc, cmb)?;
-    let addr = crate::sgl::resolve_sgl_address(desc.sub_type, desc.address, cmb);
+    let addr = crate::sgl::resolve_sgl_address(desc.sub_type, desc.address, cmb)?;
     Ok((addr, len, is_last))
 }
 

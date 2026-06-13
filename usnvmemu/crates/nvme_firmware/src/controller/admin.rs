@@ -163,12 +163,20 @@ impl NvmeController {
                         // **2026-06-09** — MAXCMD 跟随队列深度：= MQES+1（entry
                         // 数），clamp 到 u16 上限，避免 host 把深度 clamp 到旧硬编 64。
                         let mqes_plus_1 = ((self.cap & 0xffff) + 1).min(u16::MAX as u64) as u16;
-                        IdentifyController::build_v2_bytes_with_cntrltype(
+                        // **CMB-P5** — SGLS SAOS（bit20，CMB-relative SGL 支持）条件
+                        // advertise：CMB **一经 advertise**（`enable_cmb*` 调过，`self.cmb`
+                        // Some）即置——不门控于 CMSE。理由：driver 先读 Identify 看 SAOS +
+                        // CMBLOC/CMBSZ，**之后**才编程 CMBMSC.CMSE；若 SAOS 门控 CMSE 则
+                        // driver 在置 CMSE 前永远看不到 SAOS（鸡生蛋）。与 `is_cmb_bar`
+                        // "BAR 暴露不要求 CMSE" 同纪律。CMB off（`self.cmb` None）→ 不 advertise。
+                        let cmb_offset_sgl = self.cmb.is_some();
+                        IdentifyController::build_v2_bytes_with_cmb(
                             self.vid,
                             self.ssvid,
                             nn,
                             cntrltype,
                             mqes_plus_1,
+                            cmb_offset_sgl,
                         )
                     }
                     0x02 => {

@@ -1,7 +1,7 @@
 # NVMe CMB 双模设计 —— trap-based + map-based 并存,配置可选
 
 **日期**：2026-06-12
-**状态**：设计（待 architect review → 分阶段实现）
+**状态**：✅ 已实现（P1a–P5 全部落地，7+1 commit，每相独立 review；两模均有 e2e。真 QEMU/Hyper-V guest-boot 驱动 CMB 属真机验证、尚未跑）
 **归属**：`nvme_firmware`（主）+ `vfio_user_transport` / `vfio_user_wire` / `pcie_device_core`（协议）+ `vfio_user_pci_device`（OpenHCL client，仅 map 模式）
 **前置可行性**：见 `usnvmemu/experiments/2026-06-12-vtl-memory-direction-feasibility/`（VSM 单向墙 + transport 不对称的三重证据）。
 

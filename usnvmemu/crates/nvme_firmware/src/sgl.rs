@@ -50,15 +50,15 @@
 //! 三条 SGL 路径（inline / segment 指针 / segment 页 Data Block）共用 [`subtype_to_sc`]
 //! 的 `cmb_enabled` 入参 + [`resolve_sgl_address`] 的 rebase 规则，判据自动一致。
 //!
-//! **SGLS 位（Identify Controller offset 536）裁定**：NVMe Base 2.0 § 5.1.13.2 的 SGLS
-//! 字段有一个 "SGL Address Field Specifies an Offset"（CMB-relative）支持位。本次 P2
-//! **不动** `cmd.rs` 的 `id.sgls`（保持 `0x0001_0001`），理由：① 该 advertise 须**条件化**
-//! 于运行时 CMB 是否启用（`--cmb-mode off` 默认下不能宣告 offset 支持，否则违反本仓库
-//! advertise⟺implement 纪律）——需把 CMB 状态穿进 `IdentifyController` builder，是 cmd.rs
-//! 的非局部改动；② 该 builder 所在 cmd.rs 正由并行会话修改（共享树纪律：不碰他人正改的
-//! 文件）；③ CMB-relative SGL 的**功能正确性不依赖该位**——driver 依 CMBLOC/CMBSZ 存在性
-//! 决定是否用 CMB-relative，本 controller 经 classifier 正确放行/拒绝。待 CMB CLI（P5）
-//! 落地、Identify 改动窗口安全时，再条件化置位。
+//! **SGLS 位（Identify Controller offset 536）裁定（P5 已落地）**：NVMe Base 2.0
+//! § 5.1.13.2 的 SGLS 字段 **bit 20 = "SGL Address Field Specifies an Offset"（SAOS，
+//! CMB-relative 支持；Linux 内核 `NVME_CTRL_SGLS_SAOS` = `1<<20` 作独立 oracle）**。
+//! **CMB-P5** 已把它**条件化** advertise：`cmd.rs::build_v2_bytes_with_cmb` 在 CMB 启用
+//! （`controller/admin.rs` 传 `self.cmb.is_some()`）时置 bit20，CMB off 时不置——满足本仓库
+//! advertise⟺implement 纪律。注意门控用 `cmb.is_some()`（CMB 已 advertise）而非 CMSE：
+//! driver 先读 Identify 看 SAOS + CMBLOC/CMBSZ，**之后**才编程 CMBMSC.CMSE（鸡生蛋，见
+//! admin.rs 注释）。CMB-relative SGL 的**功能正确性**仍由本文件 classifier（`subtype_to_sc`）
+//! 兜底，不依赖该 advertise 位。
 
 /// SGL Descriptor Type (high nibble of byte 15)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,34 +151,52 @@ pub(crate) fn subtype_to_sc(sub_type: u8, cmb_enabled: bool) -> Option<u16> {
     }
 }
 
-/// **CMB-P2** — 把一个 SGL descriptor 的 address 字段按 sub_type 解析成实际
+/// **CMB-P2 / P5** — 把一个 SGL descriptor 的 address 字段按 sub_type 解析成实际
 /// guest 物理地址（GPA），供 `guest_read`/`guest_write` 使用。三条 SGL 路径
 /// （inline / segment 指针 / segment 页内 Data Block）**共用本一处** rebase 规则，
 /// 与 [`subtype_to_sc`] 同样集中，避免某路径忘了 rebase 而把 CMB 偏移误当 GPA。
 ///
+/// 返 `Result<u64, u16>`：`Ok(gpa)` 是可喂 `guest_*` 的实际 GPA；`Err(sc)` 是精确
+/// NVMe Status Code，caller 经 `?` 透传给 CQE（三路径已全返 `Result<_, u16>`）。
+///
 /// 规则（spec § 4.4 SGL Offset sub-type）：
-/// - sub_type=0（Address）→ 原样返回（address 本就是 GPA）。
+/// - sub_type=0（Address）→ 原样返回 `Ok(address)`（address 本就是 GPA，不受 CMB 约束）。
 /// - sub_type=1（Offset/CMB-relative）→ `cba + offset`（CMB 在 guest 地址空间的实际
 ///   位置 = CMBMSC.CBA + descriptor 内偏移）。
-///   * `cmb` 为 `Some((cba, _size))` 时正常 rebase（`cba + offset`）。**越界行为（reviewer
-///     M-1 实测，非"判 straddle"）**：① offset ≥ size（起点已出窗口）→ `cba+offset ≥ win_end`
-///     且 `≥ cba` → `cmb_hit` 判 **Miss → 走 DMA**（对一个真实 guest GPA 发 DMA，lenient；
-///     非内存安全问题——是 guest 自有 RAM，且巨偏移 saturating 后溢出仍 Miss→transport 拒）；
-///     ② offset < size 但 offset+len 越尾 → `cmb_hit` 判 **Straddle → ok=false**。
-///     **P5 TODO**：CMB-relative offset ≥ size 严格应返 `SGL_OFFSET_INVALID`(0x16) 而非 DMA；
-///     待 P5 SGLS advertise 后 CMB-relative 才被 driver 触发，届时把本函数改 `Result` 严格拒。
+///   * `cmb` 为 `Some((cba, size))`：
+///     - **`offset < size`**（落在 CMB 窗口 `[0, size)` 内）→ `Ok(cba + offset)`。
+///     - **`offset ≥ size`**（起点已出窗口）→ `Err(SGL_OFFSET_INVALID)` (0x16)。
+///       **CMB-P5 严格化**：取代旧行为（rebase 成 `cba+offset` 出窗 → `cmb_hit` Miss →
+///       lenient 走 DMA）。spec § 4.4 要求 SGL Offset 落在 CMB 内，越界即非法字段，应以
+///       generic status 0x16 拒，而非把 CMB-relative 访问悄悄当真实 GPA 发 DMA。
+///       （注：`offset < size` 但 `offset + len` 越尾的 straddle，由 `cmb_hit` 在 dispatch
+///       期判 `ok=false`——本函数只见 address 不见 len，故越尾 straddle 不在此拦。）
 ///   * `cmb` 为 `None`（CMB 未启用）时**不该到达**（`subtype_to_sc` 已先拒 sub_type=1），
-///     防御性地原样返回偏移（后续 `cmb_hit` Miss → 走 DMA，行为可预测、不 panic）。
+///     防御性地原样返回 `Ok(offset)`（后续 `cmb_hit` Miss → 走 DMA，行为可预测、不 panic）。
 ///
 /// **注意**：本函数只处理 sub_type∈{0,1}；sub_type≥2 由 `subtype_to_sc` 在更早处拒，
 /// 不会带着非法 sub_type 走到这里。
-pub(crate) fn resolve_sgl_address(sub_type: u8, address: u64, cmb: Option<(u64, u64)>) -> u64 {
+pub(crate) fn resolve_sgl_address(
+    sub_type: u8,
+    address: u64,
+    cmb: Option<(u64, u64)>,
+) -> Result<u64, u16> {
+    use crate::cmd::sc;
     match (sub_type, cmb) {
-        // CMB-relative：偏移 + CMB 基址 → 实际 GPA。saturating_add 防恶意巨偏移溢出
-        // panic（溢出后必落出窗口 → cmb_hit Miss/Straddle，行为可预测）。
-        (1, Some((cba, _size))) => cba.saturating_add(address),
-        // Address（sub_type=0）或防御性 fallback：原样。
-        _ => address,
+        // CMB-relative：偏移必须落在 CMB 窗口 [0, size) 内。
+        (1, Some((cba, size))) => {
+            if address >= size {
+                // 起点已出窗口 → SGL Offset Invalid（CMB-P5 严格化，取代旧 lenient DMA）。
+                Err(sc::SGL_OFFSET_INVALID)
+            } else {
+                // offset < size：rebase 成实际 GPA。`address < size` 且 size 为有界
+                // CMBSZ，`cba` 为 4 KiB 对齐 CBA → `cba + address` 不溢出（cmb_hit
+                // 的 win_end checked_add 已是窗口上界守卫的真相源）。
+                Ok(cba + address)
+            }
+        }
+        // Address（sub_type=0）或防御性 fallback（None）：原样。
+        _ => Ok(address),
     }
 }
 
@@ -224,9 +242,10 @@ pub(crate) fn parse_sgl_list(
         if let Some(err_sc) = subtype_to_sc(desc.sub_type, cmb.is_some()) {
             return Err(err_sc);
         }
-        // **CMB-P2** — 放行的 CMB-relative descriptor：就地把偏移 rebase 成实际 GPA，
+        // **CMB-P2 / P5** — 放行的 CMB-relative descriptor：就地把偏移 rebase 成实际 GPA，
         // 使下游 fragment walk 拿到的 address 直接可喂 `guest_*`（命中 CMB backing）。
-        desc.address = resolve_sgl_address(desc.sub_type, desc.address, cmb);
+        // offset ≥ CMB size（越界）→ `resolve_sgl_address` 返 `Err(0x16)`，经 `?` 透传。
+        desc.address = resolve_sgl_address(desc.sub_type, desc.address, cmb)?;
         out.push(desc);
     }
     Ok(out)
@@ -448,6 +467,7 @@ mod tests {
     /// 状态影响。`resolve_sgl_address` 把放行的 CMB-relative 偏移 rebase 成 `cba+offset`。
     #[test]
     fn cmb_relative_subtype_allowed_and_rebased_when_cmb_enabled() {
+        use crate::cmd::sc;
         // 放行：CMB 启用 → sub_type=1 合法。
         assert_eq!(subtype_to_sc(1, true), None, "CMB 启用 → sub_type=1 放行");
         // sub_type=0 (Address) 与 CMB 无关，恒放行。
@@ -459,15 +479,48 @@ mod tests {
         let cmb = Some((cba, 2 * 1024 * 1024u64));
         assert_eq!(
             resolve_sgl_address(1, 0x1000, cmb),
-            cba + 0x1000,
+            Ok(cba + 0x1000),
             "CMB-relative 偏移 rebase 成 cba+offset"
         );
         // sub_type=0：address 本就是 GPA，原样（即使传了 cmb 窗口）。
-        assert_eq!(resolve_sgl_address(0, 0xDEAD_0000, cmb), 0xDEAD_0000);
+        assert_eq!(resolve_sgl_address(0, 0xDEAD_0000, cmb), Ok(0xDEAD_0000));
         // CMB 未启用（None）：防御性原样返回偏移（subtype_to_sc 已先拒，不该到达）。
-        assert_eq!(resolve_sgl_address(1, 0x1000, None), 0x1000);
-        // 恶意巨偏移：saturating_add 不 panic（溢出后落出窗口 → cmb_hit 兜底）。
-        assert_eq!(resolve_sgl_address(1, u64::MAX, cmb), u64::MAX);
+        assert_eq!(resolve_sgl_address(1, 0x1000, None), Ok(0x1000));
+    }
+
+    /// **CMB-P5（越界严格化）** — CMB-relative（sub_type=1）的 offset ≥ CMB size
+    /// （起点已出窗口）必须返 `Err(SGL_OFFSET_INVALID)` (0x16)，**不再** rebase 成
+    /// `cba+offset`（旧 lenient 行为：rebase 出窗 → cmb_hit Miss → 走 DMA）。
+    /// 边界值 offset == size 也越界（窗口是半开区间 `[cba, cba+size)`）。
+    #[test]
+    fn resolve_sgl_address_rejects_offset_out_of_cmb_window() {
+        use crate::cmd::sc;
+        let cba = 0x8000_0000u64;
+        let size = 2 * 1024 * 1024u64;
+        let cmb = Some((cba, size));
+        // offset < size：合法，rebase。
+        assert_eq!(resolve_sgl_address(1, size - 1, cmb), Ok(cba + size - 1));
+        // offset == size：越界（半开区间）→ 0x16。
+        assert_eq!(
+            resolve_sgl_address(1, size, cmb),
+            Err(sc::SGL_OFFSET_INVALID),
+            "offset == size 已出窗口 → SGL_OFFSET_INVALID"
+        );
+        // offset > size：越界 → 0x16。
+        assert_eq!(
+            resolve_sgl_address(1, size + 0x1000, cmb),
+            Err(sc::SGL_OFFSET_INVALID),
+        );
+        // 恶意巨偏移：越界 → 0x16（不 panic、不 saturating rebase）。
+        assert_eq!(
+            resolve_sgl_address(1, u64::MAX, cmb),
+            Err(sc::SGL_OFFSET_INVALID),
+        );
+        // sub_type=0 不受 CMB 窗口约束（address 是 GPA），即使 ≥ size 也原样放行。
+        assert_eq!(
+            resolve_sgl_address(0, cba + size + 1, cmb),
+            Ok(cba + size + 1)
+        );
     }
 
     /// **CMB-SGL spec-completeness（unit anchor）** — 本 controller 无 CMB

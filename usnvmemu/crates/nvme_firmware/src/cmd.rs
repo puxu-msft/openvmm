@@ -277,6 +277,12 @@ pub mod sc {
     pub const DATA_SGL_LENGTH_INVALID: u16 = 0x000f;
     pub const SGL_DESCRIPTOR_TYPE_INVALID: u16 = 0x0011;
     pub const SGL_INVALID_USE_OF_CMB: u16 = 0x0012;
+    /// SGL Offset Invalid（Generic 0x16）—— CMB-relative SGL（sub_type=1 Offset）的
+    /// 偏移字段超出 CMB 窗口（offset ≥ CMBSZ）。spec § 4.4 SGL Offset sub-type 要求
+    /// 偏移落在 CMB 内；越界时 controller 返此码（**CMB-P5**：取代此前"越界 rebase 出
+    /// 窗口 → cmb_hit Miss → lenient 走 DMA"的旧行为）。值锚定 canonical
+    /// `nvme_spec::Status::SGL_OFFSET_INVALID`（见 `sc_queue_anchor`）。
+    pub const SGL_OFFSET_INVALID: u16 = 0x0016;
     pub const SGL_DATA_BLOCK_GRANULARITY_INVALID: u16 = 0x001e;
 
     // ── Command Specific Status (SCT=1)，值 == nvme_spec::Status（含 0x1xx）──
@@ -556,12 +562,31 @@ impl IdentifyController {
     ///
     /// 替代 V7c-fix 在 `controller/admin.rs` 用 byte 111 post-hoc patch 的
     /// 临时方案；wire data 全由 type 构造，更清洁。
+    ///
+    /// **CMB-P5**：本函数是 [`build_v2_bytes_with_cmb`] 的 thin wrapper，固定
+    /// `cmb_offset_sgl=false`（不 advertise SGLS SAOS）。需条件 advertise CMB-relative
+    /// SGL 的生产路径（CMB 启用时）应直接调 [`build_v2_bytes_with_cmb`]。
     pub fn build_v2_bytes_with_cntrltype(
         vid: u16,
         ssvid: u16,
         nn: u32,
         cntrltype: u8,
         max_outstanding: u16,
+    ) -> Vec<u8> {
+        Self::build_v2_bytes_with_cmb(vid, ssvid, nn, cntrltype, max_outstanding, false)
+    }
+
+    /// **CMB-P5** — builder 化的 Identify Controller，额外 `cmb_offset_sgl` 控制是否
+    /// advertise SGLS bit 20（SAOS，"SGL Address Field Specifies an Offset" = CMB-relative
+    /// 寻址支持）。advertise⟺implement 纪律：CMB 启用（CLI `--cmb-mode trap|map`）时 caller
+    /// 传 `true`，否则 `false`（默认 builder / [`build_v2_bytes_with_cntrltype`] 即此）。
+    pub fn build_v2_bytes_with_cmb(
+        vid: u16,
+        ssvid: u16,
+        nn: u32,
+        cntrltype: u8,
+        max_outstanding: u16,
+        cmb_offset_sgl: bool,
     ) -> Vec<u8> {
         let mut id = SpecIdentifyController::new_zeroed();
         id.vid = vid;
@@ -689,6 +714,14 @@ impl IdentifyController {
         // bit17（byte-alignment 等额外位）仍不置：未实现对应语义。
         // 注：Segment chain 属基础 SGL 支持（bits 1:0），无独立 SGLS bit。
         id.sgls = 0x0001_0001;
+        // **CMB-P5** — SGLS bit 20 = "SGL Address Field Specifies an Offset"（SAOS，
+        // CMB-relative 寻址支持；spec NVMe Base 2.0 § 5.1.13.2 / Linux 内核
+        // `NVME_CTRL_SGLS_SAOS` = `1<<20`）。**条件化** advertise⟺implement：仅在 CMB
+        // 启用（`cmb_offset_sgl=true`）时置位——CMB off 时 driver 不应被告知支持
+        // CMB-relative SGL（offset 无 CMB 可寻址，置位会诱使 driver 发我们会拒的命令）。
+        if cmb_offset_sgl {
+            id.sgls |= 1 << 20;
+        }
         // **Phase S3** — Atomic Write Unit (NVMe spec § 5.15.2.2 + § 4.10)。
         // AWUN/AWUPF/ACWU 都是 0-based：值 N → N+1 LBAs。
         //   awun  = 全 NS power-loss safe atomic write 上限
@@ -1134,6 +1167,19 @@ mod sc_queue_anchor {
             sc::PRP_OFFSET_INVALID >> 8,
             0,
             "PRP_OFFSET_INVALID 须 Generic (SCT=0)"
+        );
+        // **CMB-P5** SGL_OFFSET_INVALID（Generic 0x16）锚定 canonical nvme_spec——
+        // CMB-relative SGL 偏移越界返此码（严格化，取代旧 lenient DMA 回退）。
+        assert_eq!(sc::SGL_OFFSET_INVALID, Status::SGL_OFFSET_INVALID.0);
+        assert_eq!(
+            sc::SGL_OFFSET_INVALID >> 8,
+            0,
+            "SGL_OFFSET_INVALID 须 Generic (SCT=0)"
+        );
+        assert_eq!(
+            sc::SGL_OFFSET_INVALID & 0xff,
+            0x16,
+            "SGL Offset Invalid SC byte = 0x16 (spec § 4.4 SGL Offset sub-type)"
         );
         assert_eq!(
             sc::INVALID_QUEUE_IDENTIFIER,
