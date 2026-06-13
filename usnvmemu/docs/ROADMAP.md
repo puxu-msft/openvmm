@@ -117,24 +117,37 @@ setup/queue 创建,**不只 IO payload**——§28 bug 多藏 control 边角),�
 最强档**。**横切子条款**:自写 harness 的 guest-memory 须能生成 **≥4 GiB/高地址**(§26),否则
 结构性排除"64-bit 高半截断"整类 bug(此为对所有 transport 的承重款,根因在 firmware-core)。
 
-**覆盖矩阵(判别轴=可否每-commit 无人值守 standing;"—"=不适用,"⛔"=据律欠缺待补)**：
+**覆盖矩阵**(判别轴=可否每-commit 无人值守 standing;**独立性标注**:【回归】=自写两端、防己方
+drift、**非**独立 oracle(§20 反模式);【独立-ish】=手搓二次解码、不同代码路径;算法类如 CHAP
+crypto/TLS-PSK 的**真**独立只能靠档2 frozen vector/档3 真机。"⛔"=据律欠缺待补)：
 
-| 层 / 接入 | 档1 standing gate(已有) | 档1 应升 gate(一次性→standing) | 档2 frozen-vector | 档3 cadence live(不计 gate,须配档2 代理) |
+| 层 / 接入 | 档1 standing gate 现状【独立性】 | 档1 待补独立-ish gate | 档2 frozen-vector | 档3 cadence live(不计 gate) |
 |---|---|---|---|---|
-| **firmware-core**(全 transport 共享) | interleaving 单测(§29) / mmio qword size-aware(§26) / prp 单测 | — | — | —(其盲区由各 transport 档3 真机覆盖) |
-| OpenHCL pcie_remote | 跨进程 TCP e2e | — | ⛔ 欠(L3 真 guest 的冻结代理) | L3 真 Hyper-V guest(§26 >4 GiB,**尚未自动化**) |
-| vfio-user | realize e2e | **libvfio-user differential**(需 libjson-c)/ 真 QEMU realize e2e(3b 重,cadence) | ⛔ 欠(真 guest-boot 的冻结代理) | 真 guest-boot **已有** `run_qemu_vfio_guest.py`(§28 4-bug,不计 gate) |
-| NVMe-oF TCP | Python wire-conformance(已存在) | **纯-4K / CHAP wire 升 gate** | tls-psk kernel vector(待 dump) | dhchap-4 真 `nvme connect`(尚缺) |
+| **firmware-core**(全 transport 共享) | interleaving(§29)/ mmio qword(§26)/ prp 单测【回归】 | — | — | —(盲区借各 transport 档3) |
+| OpenHCL pcie_remote | `openhcl_pcie_remote_e2e`(手搓 wire driver)【独立-ish ✅】 | — | ⛔ 欠 L3 代理 | L3 真 Hyper-V guest(§26 >4 GiB,未自动化) |
+| vfio-user | `loopback_*`(生产 `VfioUserClient`⇄`Session`)【**非独立**=§20 反模式】 | ⛔ **手搓 Rust vfio wire e2e**(下一步做) | ⛔ 欠真 guest 代理 | `run_qemu_vfio_guest.py`(§28 4-bug,已有未 gate) |
+| NVMe-oF TCP | Rust wire e2e(`vt_dhchap4` 等)【framing 手搓 indep / crypto 用生产 `compute_response` 自洽】 | (crypto 真独立靠档2/3) | tls-psk kernel vector(待 dump) | dhchap-4 真 `nvme connect` |
 
-**立即可做(本元项最廉价兑现,无 root)**：①把 vfio `interop_py` 的 libvfio-user differential
-从一次性手跑做成 CI job(依赖 `libjson-c-dev`,有 C 依赖但无需 root);②把 Python CHAP wire +
-纯-4K wire conformance 入 CI standing gate。这些档-1 oracle 早已存在,只缺 gate 化。
+**诚实结论**(纠上版 over-claim:把"已 gate"误当"独立已满足")：三 transport 里**只有 OpenHCL** 有
+手搓独立-ish standing gate;**vfio 是最硬缺口**——其 standing gate 全是生产-client-两端的 loopback
+(正是律要打击的 §20 反模式),连手搓独立 gate 都没有。真第三方(libvfio-user / 真 QEMU / 真 kernel /
+真 nvme-cli)对**所有** transport 仍未 standing,只在档2/档3 收口。故结构律此刻对 vfio **未满足**。
 
-**据律自动暴露的缺口(⛔)**：vfio 已有档-3 live(`run_qemu_vfio_guest.py`)却**欠档-2 frozen
-代理**;OpenHCL L3 真 guest 同样欠代理——按"凡有档3 必配档2"律,这两格须补冻结代理,非"不适用"。
+**下一步(经 architect 对抗审定案,弃"包 python"路径)**：给 vfio 补一个**手搓 Rust 跨进程 wire e2e
+`#[test]`**(照 `openhcl_pcie_remote_e2e.rs` 样板:`CARGO_BIN_EXE` spawn 真 bin + 唯一 unix socket +
+独立于生产 `VfioUserClient` 的手搓 wire),骑现有 workspace nextest 门(预算已由 OpenHCL 同型测试验证
+fit 10s ci profile)、**不碰 flowey/python**。理由:包 python 在 hermetic(CI 无 python3/uv)、ci 超时
+预算(解释器+嵌套 build 冷启动)、独立性(同份 python 与 Rust 端共享 spec=半自洽)三轴同时更差。
+
+**Tier B(opt-in,非 standing)**：libvfio-user differential(真第三方 C,但需 apt+GitHub clone+meson →
+非 hermetic)走 `#[ignore]` + pinned 专用 job;Python wire harness 留作 cadence/差分 oracle,不入 always-on gate。
+
+**据律自暴缺口(⛔)**：vfio 已有档-3 live(`run_qemu_vfio_guest.py`)欠档-2 frozen 代理;OpenHCL L3
+真 guest 同样欠代理——按"凡有档3 必配档2"律,这两格须补冻结代理,非"不适用"。
 
 **新 transport checklist(并入 [HOW_TO_ADD_TRANSPORT](HOW_TO_ADD_TRANSPORT.md))**：列三档各自
-oracle → 档1 必 gate → 凡有档3 路径必配档2 frozen 代理 → 自写 harness 满足 ≥4 GiB 子条款。
+oracle → 档1 必有≥1 独立-ish standing gate(非自家两端 loopback)→ 凡有档3 路径必配档2 frozen 代理
+→ 自写 harness 满足 ≥4 GiB 子条款。
 
 **下方三执行实例**(保留各自 runbook/blocker 执行细节,状态归本元项统辖)：
 
