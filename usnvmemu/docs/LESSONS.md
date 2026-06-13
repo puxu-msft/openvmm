@@ -854,3 +854,37 @@ PASS）；② golden 必带 provenance（kernel/QEMU 版本 + marker）+ **机�
 `vfio_user_guest_replay_e2e.rs`；POC 3× 0-mismatch；rust-reviewer 2 层独立 revert-verify（revision
 字节 / BAR size 皆 catch）。**连带发现**：建这个 gate 的前置 usnvmemu CI（[[usnvmemu-no-ci-gate-workspace-excluded]]）
 首跑就会抓到 CMB 工作引入的 `NvmeController: !Send` HEAD 回归——standing gate 的价值即时兑现。
+
+## 32. 物理页边界 ≠ 逻辑单元边界：拼回-重切 + 正交切轴不混淆 + tier 当唯一裁判 (HIGH)
+
+**症状**：PI 数据路径（separate-meta / inline-meta）原按"每 LBA / 每段**固定**大小"切 host DMA
+（separate 每段 4096；inline dual-PRP 硬编码 (4096,8)）。PRP1 可带**任意页内偏移 O**（spec NVMe
+Base §4.1.1：**仅 PRP1** 可带页内偏移，PRP2/list-entry 须页对齐），使一个**逻辑单元**（separate 的
+一个 LBA data / inline 的一个 4104 extended block）跨 host 页边界。固定切分在 O>0 **silent 错位**——
+从 `PRP1@offset` 盲读整 4096 字节跨进下一页、且漏掉本该落 PRP2 的尾段 = 真**数据完整性洞**（非 panic，
+happy-path O=0 看不见）。
+
+**修复范式 = 拼回-重切（reassemble-then-resplit）**：host DMA 按**物理页段**收/发（`prp::dispatch_segs`：
+首段 `page−O`、中段整页、末段 partial）→ 拼回连续逻辑流 → 按**逻辑单元大小**（`data_bytes` / `block_bytes`）
+重切 → 逐单元 verify/store。**物理段数 ≠ 逻辑单元数**（O>0 时一个逻辑单元跨多段；List 档一段含多单元）。
+统一了 dual / list 两条曾经 bespoke 的路径。
+
+**正交切轴陷阱（inline extended-LBA 特有，最隐蔽）**：inline block 有**两条独立切轴**——
+① "页划分" `(4096−O, 8+O)`（决定 host DMA 段长 / PRP1·PRP2 落点）；② "data/tuple 划分" `(4096, 8)`
+（决定 PI 校验在哪切 guard）。**finalize 必须在拼回后的完整 4104 block 上切 data/tuple，绝不在 host
+段上切**，否则 guard 算错 → PI mismatch。两轴在 O=0 **巧合对齐**（`4096−0 == 4096`），正是 latent bug
+的藏身处——O=0 测试全绿、O>0 才暴露。
+
+**tier 当唯一裁判，别耦合 nlb**：分流判据写 `nlb>2` / `nlb>=2` 是脆弱耦合（漏掉"nlb 小但偏移把传输顶进
+更高档"）。改用 `prp::tier(O, total)` 单点裁定 Single/Dual/List：separate nlb=2 O>0 → 3 页 → List；
+inline nlb=1 O>4088 → 3 页 → List。这些都是 **spec-legal corner，真做不拒**（known-answer 单测直构造
+验 List 机件接管，不靠真 driver 触发；不拿"真 driver 不构造"砍，见 [[meaningful-complete-not-minimal]]）。
+
+**验证（差分 oracle 四件套，§23 的具体化）**：① backing/`PiTuple::compute` 期望；② **显式断每条
+DmaRead/DmaWrite 的 `(gpa,len)`**——`CaptureTransport` 不截断喂入，光断 backing/重组字节**抓不到**"固定
+4096 盲读"盲点，必须断段长；③ **断走哪个 tier 分支**（Dual vs List，op 变体 + 累积器 map 双证）；
+④ revert-verify 两向（把切分退回硬编码 → O>0 段长/段数断言转红）。临界必测 O=0/100/4088/4090/4095。
+
+**来源**：#4c-b P3（2026-06-14，commits `31ea153`/`3e28ee8`/`823f3fe`/`19bd047`，各 ecc:rust-reviewer
+APPROVE 0 C/H/M）。全 PI 路径全 tier PRP1 偏移零 spec-legal 例外，见 MILESTONES §1.8 + plan
+`2026-06-13-4cb-unified-prp-segment-abstraction.md`。

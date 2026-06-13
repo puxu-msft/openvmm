@@ -59,7 +59,7 @@
 - **D** persistent features(Save) + CSTS.CFS on flush 失败（`434d70b8`）
 - **B6b** separate-metadata buffer（PRACT=0 host-PI via MPTR）**单 LBA WRITE+READ 闭环**：B6b-1 Format接受MSET=0(`1950f033`) / B6b-2 WRITE(`90536c52`) / B6b-3 READ(`04c76b22`）
 
-**绿基线** `04c76b22` = 149 lib test。**续作点 = B6b-4 多 LBA**，完整设计 + 起手提示词 + 纪律在 `usnvmemu/crates/nvme_firmware/docs/plans/2026-06-11-b6b4-and-resume-plan.md`（`fc7fd652`）——回项目先读它。剩余功能缺口（Reservation Report EDS=1+ptpls / Security/Virt 真实现 / SGL 更多 sub_type / Write Uncorrectable）见 plan §3 + `docs/TEST_COVERAGE_PROGRESS.md`。
+**绿基线** `04c76b22` = 149 lib test。**B6b-4 多 LBA separate 已完成**（`8d87e7812`），并经 #4c-a/#4c-b 全 PI 路径全 tier PRP1 偏移补全（见 §1.8）。剩余功能缺口（Reservation Report EDS=1+ptpls / Security/Virt 真实现 / SGL 更多 sub_type / Write Uncorrectable）见 `plans/2026-06-11-b6b4-and-resume-plan.md` §3 + `docs/TEST_COVERAGE_PROGRESS.md`。
 
 ### 1.4 firmware spec 缺口补全 + scaffolding-SC 全收
 
@@ -112,6 +112,16 @@
 **hoisted 设计（2 轮 reviewer 后定型）**：controller 新增**无状态**原子入口 `nvme_fused_cas(...)`：单 `&mut self` 内（无 await/锁释放）read backing→比→相等才写→双 CQE。session 独占 fuse 状态：FIRST 暂存不响应；SECOND 先经 R2T 把两 host buffer 各按 cccid 取齐 → 单锁调 nvme_fused_cas → 双 CapsuleResp。
 
 **带注解的错误（为什么 hoisted 而非首版 capture-based）**：首版给 Compare/Write 数据设不同 PRP sentinel 靠 gpa 反推 CID + 双状态，被 reviewer BLOCK：HIGH-1 两 FIRST 双状态失步→错 buffer 比→silent corruption；HIGH-2 锁中途释放非原子；HIGH-3 多 conn 共享 controller pending_fused 串对。hoisted 一举消三 HIGH 且更短。详 LESSONS §24。
+
+### 1.8 #4 PRP1 非页对齐布局 —— 全 PI 路径全 tier 偏移支持（#4 → #4c-a → #4c-b）
+
+`nvme_firmware` controller 支持 PRP1 任意页内偏移 O（spec NVMe Base §4.1.1：仅 PRP1 可带页内偏移，PRP2/list-entry 须页对齐；传输 >2 页时 PRP2 是 PRP-list 指针）。分三波：
+
+- **#4（part1）+ #4b/#4f**：plain 数据路径 PRP1 非页对齐 + 中心化 `prp` helper（`202e78fc` / `563b723c`）；`prp.rs` 几何内核 `prp1_offset / first_seg_len / total_pages / page_size / tier`，O=0≡legacy 守 `offset_zero_matches_legacy`。
+- **#4c-a**：inline nlb≥2（`c48b3f09`）+ separate N>2（`f14ba3c97`）PI 路径偏移——PrpListOp + reassemble-then-resplit，恒 List 档。
+- **#4c-b（统一段抽象，2026-06-13/14，全 ecc:rust-reviewer APPROVE 0 C/H/M）**：P0 段抽象地基（`prp2_role`/`validate_prp2`/`dispatch_segs`，`54f18713d`）→ P1 plain 接入 `validate_prp2`（`6a18831`）→ P2 PI finalize 收敛单 `pi` 字段（`6f0119ef`/`c2c5585`）→ **P3 消灭 nlb≤2 bespoke dual 的 4096/8 硬编码**：P3① separate nlb=2 tier 分流（`31ea153`）/ P3② separate nlb=1 per-host-segment 拼回-重切（`3e28ee8`）/ P3③ inline nlb=1 Dual split 左移 (4096−O,8+O) + O>4088 升 List（`823f3fe`）→ 收尾清 P0 scaffolding（`19bd047`）。
+
+**成果**：全 PI 路径（plain / separate nlb=1/2/N>2 / inline nlb=1/≥2）全 tier（Single/Dual/List）PRP1 偏移 O∈[0,4095] 零 spec-legal 例外。P3 各修真实**数据完整性洞**（旧 bespoke O>0 盲读跨页 + 漏段），非纯重构。**关键技术点**：物理页边界 ≠ 逻辑单元边界 → 拼回连续流再按逻辑大小重切；inline 的"页划分 (4096−O,8+O)"与"data/tuple 划分 (4096,8)"是**两条正交切轴**，finalize 在拼回后的完整 block 上切 data/tuple，绝不混淆。差分 oracle 四件套（含显式断每条 DmaRead/Write 段长 + 断 tier 分支 + revert-verify 两向）。设计/进度见 `crates/nvme_firmware/docs/plans/2026-06-13-4cb-unified-prp-segment-abstraction.md`，状态见 `SPEC_CONFORMANCE.md` PI 行。
 
 ---
 
