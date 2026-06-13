@@ -615,4 +615,51 @@ mod cmb_cli_tests {
             assert!(validate_cmb_bir(bir).is_err(), "BIR {bir} 暂不支持 → Err");
         }
     }
+
+    /// **CMB-P5（run-path glue 覆盖）** — 直测 `apply_cmb_*` 接线（negotiate 结果 →
+    /// 真 `enable_cmb*` 调用）。此前 negotiate / enable_cmb / MemfdRamRegion 各自有测，
+    /// 但连接它们的 glue（run_vfio_user/run_main 实际调的那段）无直测——正是被中断的
+    /// subagent 最易漏测处。oracle 用公共 `PcieDevice::cmb_region_fd`（map→Some memfd /
+    /// trap·off→None）+ 防御性 Err 守门。
+    #[cfg(feature = "vfio-user")]
+    #[test]
+    fn apply_cmb_glue_wires_memfd_for_map_and_guards_misdispatch() {
+        use pcie_device_core::PcieDevice as _;
+        // open 要求 ≥1 backing 文件。
+        let path = std::env::temp_dir().join(format!("nvme_cmb_glue_{}.img", std::process::id()));
+        std::fs::write(&path, vec![0u8; 64 * 1024]).expect("write temp backing");
+        let p = path.to_string_lossy().to_string();
+        let files = std::slice::from_ref(&p);
+        let (sz, bir) = (2 * 1024 * 1024u64, 2u8);
+
+        // map（vfio-user）→ glue 造 MemfdRamRegion 注入 → cmb_region_fd 暴露 memfd。
+        let mut c = NvmeController::open(files, 0x1414, 0, &[]).unwrap();
+        apply_cmb_vfio_user(&mut c, CmbMode::Map, sz, bir).expect("map glue ok");
+        assert!(
+            c.cmb_region_fd(bir as u32).is_some(),
+            "map glue 应注入 memfd backing（可经 SCM_RIGHTS 暴露 fd）"
+        );
+
+        // trap → Vec backing → 无可暴露 fd（map e2e 与 trap 的本质差别就在这）。
+        let mut c2 = NvmeController::open(files, 0x1414, 0, &[]).unwrap();
+        apply_cmb_vfio_user(&mut c2, CmbMode::Trap, sz, bir).expect("trap glue ok");
+        assert!(
+            c2.cmb_region_fd(bir as u32).is_none(),
+            "trap glue 用 Vec backing，无 fd"
+        );
+
+        // off → 不启用。
+        let mut c3 = NvmeController::open(files, 0x1414, 0, &[]).unwrap();
+        apply_cmb_vfio_user(&mut c3, CmbMode::Off, sz, bir).expect("off glue ok");
+        assert!(c3.cmb_region_fd(bir as u32).is_none(), "off 不启用 CMB");
+
+        // 防御守门：apply_cmb_trap_or_off 收到 map（应已被 negotiate 降级）→ Err。
+        let mut c4 = NvmeController::open(files, 0x1414, 0, &[]).unwrap();
+        assert!(
+            apply_cmb_trap_or_off(&mut c4, CmbMode::Map, sz, bir).is_err(),
+            "apply_cmb_trap_or_off 收到 map 应 Err（CLI dispatch bug 守门）"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
