@@ -180,3 +180,18 @@ architect 对抗复核结论:主架构("同一 backing 两模暴露")**成立**,
   - **P3b**(中承重,跨 crate):OpenHCL `vfio_user_pci_device` 暴露第二 BAR + worker 转发(当前无第二 BAR 先例)。
 - **fd-pass spike 前移**:P4 的"带 fd 的 GET_REGION_INFO reply"(`session.rs` 现 `reply()` 不带 fd,需扩展)是 map 模式唯一真承重点,应作 **P4 准入 spike**(可与 P1 并行的 Linux 原生最小验证),不放 P4 内部靠后。
 - P1 验收加第 2 条的"本地队列 + 栈外 drain + 非重入"。
+
+## 11. 验证缺口与后续条件（记录不丢弃）
+
+CMB 验证金字塔自下而上 4 层；前两层**已做**,后两层是**已知缺口**(非遗漏,本就超单测/in-process 范畴),在此显式记录 + 标注"何时值得补":
+
+| 层 | 状态 | 覆盖什么 | 何时补才有意义 |
+|---|---|---|---|
+| **L1 单元/行为**(234 测试) | ✅ 已做 | 寄存器/dispatch/非重入/SGL/strict-0x16/SGLS/negotiate/BAR 访问/`apply_cmb_*` glue | —— |
+| **L2 in-process e2e**(trap + map) | ✅ 已做 | 真 controller+session/socketpair:trap REGION_RW 往返 + map memfd 零拷贝(断言无 REGION_RW) | —— |
+| **L3 binary-startup smoke**(起真 server + 连 client 跑通 main run 路径) | ❌ 缺口 | `run_vfio_user`/`run_main` 的**启动胶水**:negotiate→apply→serve 的时序、feature-gate、真 socket 起服务。构成它的零件全测了,但"二进制真起来并服务 CMB"这层没自动化 | **main.rs 启动路径重构后** / **CI 要 gate"二进制能起 CMB"** / 怀疑启动时序回归时。当前边际价值低(零件已测 + glue 已单测),是回归守护性质 |
+| **L4 真机 guest-boot**(真 NVMe 驱动驱动 CMB) | ❌ 缺口 | 真 Linux `nvme.ko`/Windows `nvme.sys` 在真 QEMU/Hyper-V 上:driver 真读 Identify SAOS+CMBLOC/CMBSZ→编程 CMBMSC.CMSE→把 SQ/CQ/data 放进 CMB BAR;map 模式真 QEMU mmap 零拷贝;OpenHCL trap CMB 真 guest 可达 | **要 ship/真用 CMB 时**(这是"功能对真驱动成立"的终极证明);catch 真驱动 quirk(真编程序列、真 BAR 映射、真零拷贝);需真机 + 一个会用 CMB 的 guest。**高价值-当-ship,但要真机** |
+
+另:**P6**(map-on-OpenHCL 的 `create_ram_gpa_range` 别名推测路径,§5/§8)是独立 track 的真机 POC,与 L4 不同——L4 是"已实现的 trap/map 在真机跑通",P6 是"验证一条尚未实现的 OpenHCL 零拷贝推测路径是否可行"。
+
+**结论**:CMB 在 L1+L2 完整;L3/L4 是有意识保留的上层验证,补全条件如上。不补不代表特性不完整(行为正确性已 L1+L2 证),只代表"真二进制起服务"与"真驱动真机"两层未自动化。
