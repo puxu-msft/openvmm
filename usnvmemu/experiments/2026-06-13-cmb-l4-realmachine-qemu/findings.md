@@ -61,3 +61,34 @@ guest dmesg 新增：`nvme 0000:00:03.0: added peer-to-peer DMA memory 0xfe00000
 ### fork-QEMU 裁定（修订后，与审计一致）
 - **当前不该先 fork**——但理由从"洞在内核"修正为"洞虽指回 QEMU vfio-user 的 BAR-DMA 暴露,但根因未坐实,且具体动作不是改已通过的 BAR 寄存器暴露,而是深水区的 vfio-user dma-buf/IOMMU-mappable 路径,确定性低成本高"。
 - **决策前置实验**:先 QEMU-emulated-nvme 对照 + 内核侧观测,坐实洞在 vfio-user 还是 QEMU 模拟通病,再谈 fork。
+
+## S6 对照实验：QEMU emulated nvme —— **决定性结果（fork 裁定反转）**
+
+harness：`qemu_interop/run_qemu_nvme_cmb_control.py`（QEMU 自带 `-device nvme,cmb_size_mb=2`，同 guest，`-trace pci_nvme_create_sq`）。
+
+### 结果：QEMU emulated nvme 的 **IO SQ 落在 CMB**
+QEMU trace（真 oracle = `create_sq` 的 addr，**非** `pci_nvme_map_addr_cmb`——后者是 DMA-data 路径、SQ-fetch 不走它，我**一度误用**，读 trace 后纠正）：
+```
+pci_nvme_create_sq addr=0x1ffd8000 sqid=1 qsize=255   ← admin SQ, host RAM
+pci_nvme_create_sq addr=0xfe000000 sqid=1 qsize=1023  ← IO SQ 在 CMB!
+pci_nvme_create_sq addr=0xfe010000 sqid=2 qsize=1023  ← IO SQ 在 CMB!
+```
+（p2p 注册区 `0xfe000000-0xfe1fffff`；IO SQ addr=0xfe000000 正落其中。）
+
+### 对照
+| 设备侧 | IO SQ 落点 | SQ-in-CMB |
+|---|---|---|
+| **QEMU emulated nvme**（native BAR）| `0xfe000000`（CMB）| ✅ |
+| **我们的 vfio-user firmware** | `0x1ffdb000`（host RAM）| ❌ |
+
+**同一 guest、同一 kernel、同一 CMB 2MiB**——唯一变量是**设备暴露路径**。
+
+### 裁定（反转 S5 的"先别 fork"）
+- **guest + kernel 完全有能力把 SQ 放进 CMB**（emulated nvme 实证），**不是**环境/内核限制。
+- **洞专属 vfio-user 路径**：QEMU vfio-user client 把设备 BAR 暴露为"可作 DMA 目标/dma-buf"这步失败（`failed to create dma-buf` on CMB BAR），导致 Linux `pci_p2pmem_virt_to_bus` 拿不到 bus 地址 → SQ 回退 host RAM。
+- → **fork/改 QEMU vfio-user 的 BAR-as-DMA-target / dma-buf 暴露路径,是让 SQ-in-CMB 在我们这条 transport 上成立的对路杠杆。** （回答了最初"qemu 官方 vfio-user 不支持,能否 fork and improve"——是,且对照已证 guest/kernel 不是瓶颈。）
+- **范围**:这是 QEMU vfio-user **client** 的洞(也可能含我们 firmware 的 region_info 缺某属性让 client 据以建 dma-buf——两侧都属"vfio-user 路径",需进一步定位是 client-only 还是 server-hint)。
+
+### 下一步（若投入）
+1. 定位是 QEMU vfio-user client 单方面缺 dma-buf 支持，还是我们 region_info 缺让 client 建 dma-buf 的 hint/flag（读 QEMU `hw/vfio-user/` + libvfio-user dma-buf 协议）。
+2. 据定位 fork QEMU vfio-user（或补 firmware region_info）打通 BAR-as-DMA-target。
