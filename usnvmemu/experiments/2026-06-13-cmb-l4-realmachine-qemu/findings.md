@@ -83,12 +83,14 @@ pci_nvme_create_sq addr=0xfe010000 sqid=2 qsize=1023  ← IO SQ 在 CMB!
 
 **同一 guest、同一 kernel、同一 CMB 2MiB**——唯一变量是**设备暴露路径**。
 
-### 裁定（反转 S5 的"先别 fork"）
-- **guest + kernel 完全有能力把 SQ 放进 CMB**（emulated nvme 实证），**不是**环境/内核限制。
-- **洞专属 vfio-user 路径**：QEMU vfio-user client 把设备 BAR 暴露为"可作 DMA 目标/dma-buf"这步失败（`failed to create dma-buf` on CMB BAR），导致 Linux `pci_p2pmem_virt_to_bus` 拿不到 bus 地址 → SQ 回退 host RAM。
-- → **fork/改 QEMU vfio-user 的 BAR-as-DMA-target / dma-buf 暴露路径,是让 SQ-in-CMB 在我们这条 transport 上成立的对路杠杆。** （回答了最初"qemu 官方 vfio-user 不支持,能否 fork and improve"——是,且对照已证 guest/kernel 不是瓶颈。）
-- **范围**:这是 QEMU vfio-user **client** 的洞(也可能含我们 firmware 的 region_info 缺某属性让 client 据以建 dma-buf——两侧都属"vfio-user 路径",需进一步定位是 client-only 还是 server-hint)。
+### 裁定（反转 S5 的"先别 fork"——但 fork **对象**仍未定，见独立审计）
+- **① guest + kernel 完全有能力把 SQ 放进 CMB** = ✅ **真机坐实**。emulated nvme 的 IO SQ addr=0xfe000000 落 CMB 区；QEMU 取 SQE 走 `nvme_addr_read`→`nvme_addr_is_cmb` 命中→`memcpy(n->cmb.buf)`（device CMB backing），绕开 DMA。即"addr 在 CMB 区"经 QEMU 语义等价于"SQE 真从 CMB backing 取"。**非**环境/内核限制。
+- **② 瓶颈在 vfio-user 的 BAR-as-DMA-target 暴露链** = ✅ **成立**。同 guest 同 kernel，native-BAR 路径成功、vfio-user-BAR 路径失败（QEMU `failed to create dma-buf` / `vfio_container_dma_unmap = -22 EINVAL`）；+ map 模式（真 memfd 共享 BAR）也失败 ⟹ 排除"trap 假 BAR 无 struct page"。三条锁定瓶颈在这条链。
+- **③ fork 对象未定**（审计纠正我**过早收敛**）：EINVAL 既可能是 **QEMU vfio-user client 不支持** BAR-dma-buf，也可能是**我们 firmware 的 region_info 缺 flag/hint**（如未标 dma-buf-able capability）让 client 据以建 dma-buf——**现有证据无法区分**。这区别决定该 **fork QEMU** 还是**改 firmware（几行 region_info，远省）**。故**不能把 fork 钉死在 QEMU**，更不能说"应先 fork QEMU"。
+- → **正确下一动作 = 低成本定位实验（S7），不是 fork**。"动 vfio-user 这条链是对的方向"成立；"必须 fork QEMU"**未被证据指定**。
+- ⚠️ 残留风险：EINVAL 来自 `vfio_container_dma_unmap`（IOMMU 容器层，非纯 dma-buf 创建）暗示要改的可能不止一层；fork 若真要做，深度可能超预期。
 
-### 下一步（若投入）
-1. 定位是 QEMU vfio-user client 单方面缺 dma-buf 支持，还是我们 region_info 缺让 client 建 dma-buf 的 hint/flag（读 QEMU `hw/vfio-user/` + libvfio-user dma-buf 协议）。
-2. 据定位 fork QEMU vfio-user（或补 firmware region_info）打通 BAR-as-DMA-target。
+### 下一步（定位实验 S7，决定 fork 对象 / 是否需 fork）
+1. **guest 侧**：`nvme` dyndbg/ftrace 抓 `nvme_alloc_sq_cmds` —— 是 `pci_alloc_p2pmem` 返 NULL，还是 `pci_p2pmem_virt_to_bus` 返 0？定位失败在内核哪一步。
+2. **协议侧**：读 QEMU `hw/vfio-user/` + libvfio-user dma-buf 协议，确认 `-22 EINVAL` 来自 **client 不支持** 还是 **server region_info 缺 flag**。
+3. 据 1+2 定 fork 对象：若 server-hint 缺 → 补 firmware region_info（无需 fork QEMU）；若 client 缺支持 → fork QEMU vfio-user。
