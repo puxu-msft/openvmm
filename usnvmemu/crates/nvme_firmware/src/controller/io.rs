@@ -981,8 +981,7 @@ impl NvmeController {
                                     pages_done: 0,
                                     data_pages,
                                     list_pages_fetched: 0,
-                                    sep_meta: None,
-                                    inline_pi: None, // READ scatter 走 plain，无需标记
+                                    pi: None,
                                 },
                             );
                             let tok = self.guest_read(ctx, prp2, NVME_PAGE_SIZE as u32);
@@ -1275,17 +1274,18 @@ impl NvmeController {
                                 pages_done: 0,
                                 data_pages: prp_data_pages,
                                 list_pages_fetched: 0,
-                                sep_meta: Some(crate::controller::SepMetaPrp {
-                                    mptr,
+                                pi: Some(crate::controller::PiFinalize {
                                     pi_type,
                                     pi_first,
                                     data_bytes: data_bytes as u32,
                                     block_bytes: block_bytes as u32,
                                     prchk,
-                                    meta: Some(tuple_concat),
-                                    meta_pending: false, // scatter step 触发时 set true
+                                    layout: crate::controller::PiLayout::Separate {
+                                        mptr,
+                                        meta: Some(tuple_concat),
+                                        meta_pending: false, // scatter step 触发时 set true
+                                    },
                                 }),
-                                inline_pi: None,
                             },
                         );
                         // fetch PRP list 页（NvmReadPrpListFetch arm 会 walk + scatter）。
@@ -1848,8 +1848,7 @@ impl NvmeController {
                                 pages_done: 0,
                                 data_pages,
                                 list_pages_fetched: 0,
-                                sep_meta: None,
-                                inline_pi: None,
+                                pi: None,
                             },
                         );
                         let tok = self.guest_read(ctx, prp2, NVME_PAGE_SIZE as u32);
@@ -2049,13 +2048,13 @@ impl NvmeController {
                                     pages_done: 0,
                                     data_pages,
                                     list_pages_fetched: 0,
-                                    sep_meta: None,
-                                    inline_pi: Some(crate::controller::InlinePiPrp {
+                                    pi: Some(crate::controller::PiFinalize {
                                         pi_type,
                                         pi_first,
                                         data_bytes: data_bytes as u32,
                                         block_bytes: block_bytes as u32,
                                         prchk,
+                                        layout: crate::controller::PiLayout::Inline,
                                     }),
                                 },
                             );
@@ -2282,17 +2281,18 @@ impl NvmeController {
                                 pages_done: 0,
                                 data_pages,
                                 list_pages_fetched: 0,
-                                sep_meta: Some(crate::controller::SepMetaPrp {
-                                    mptr,
+                                pi: Some(crate::controller::PiFinalize {
                                     pi_type,
                                     pi_first,
                                     data_bytes: data_bytes as u32,
                                     block_bytes: block_bytes as u32,
                                     prchk,
-                                    meta: None,
-                                    meta_pending: false,
+                                    layout: crate::controller::PiLayout::Separate {
+                                        mptr,
+                                        meta: None,
+                                        meta_pending: false,
+                                    },
                                 }),
-                                inline_pi: None,
                             },
                         );
                         // fetch PRP list 页本身
@@ -2728,8 +2728,7 @@ impl NvmeController {
                                 pages_done: 0,
                                 data_pages,
                                 list_pages_fetched: 0,
-                                sep_meta: None,
-                                inline_pi: None,
+                                pi: None,
                             },
                         );
                         // 先 fetch PRP list 页本身

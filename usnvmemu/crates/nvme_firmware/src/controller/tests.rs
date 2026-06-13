@@ -3757,8 +3757,7 @@ fn c1_chain_depth_cap_rejects_malformed_chain() {
             pages_done: 0,
             data_pages: vec![None; 8200],
             list_pages_fetched: 0,
-            sep_meta: None,
-            inline_pi: None,
+            pi: None,
         },
     );
     let pre_events = cap.events().len();

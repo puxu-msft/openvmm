@@ -504,7 +504,7 @@ pub(super) enum PendingOp {
         op_id: u64,
     },
     /// **B6b-4-N>2 WRITE** — separate-meta PRP-list-data WRITE 的 MPTR PI tuple DMA-read 完成。
-    /// 填 `PrpListOp.sep_meta.meta`；与 data 全到齐双门控触发 verify-all-then-interleave-store-all。
+    /// 填 `PiLayout::Separate.meta`；与 data 全到齐双门控触发 verify-all-then-interleave-store-all。
     NvmWritePrpListSepMeta {
         op_id: u64,
     },
@@ -689,56 +689,101 @@ pub(super) struct PrpListOp {
     /// （仅 Write）每页 data buffer，filled by sub-DMA-read 完成。
     /// 索引 0 = PRP1 数据；1..N = PRP list[0..N-1] 数据。
     pub(super) data_pages: Vec<Option<Vec<u8>>>,
-    /// **B6b-4-N>2（separate metadata PRACT=0，PRP-list data）** —
-    /// 可选 separate-meta 描述符。`None` = 普通 plain/admin PRP-list 路径（与改造前
-    /// 行为**比特一致**，所有现有 caller 不受影响）；`Some` = 本命令是 PI separate-meta
-    /// N>2 路径，data 走 PRP-list（N 页 = N 个 LBA 的纯 data，因 data_bytes=4096=
-    /// NVME_PAGE_SIZE），N×8 PI tuple 经 MPTR 单条 DMA。WRITE finalize 须等 data 全到齐
-    /// **且** meta 到齐才触发，并做 verify-all-then-store-all。READ 在 scatter 前同步
-    /// verify-all stored PI（dispatch 时 backing 已读、stored tuple concat 已算）。
-    pub(super) sep_meta: Option<SepMetaPrp>,
-    /// **B6c-3（inline metadata PRACT=0，nlb≥2，PRP-list data）** —
-    /// 可选 inline-PI 描述符。`None` = 非 inline-PI 路径（plain/admin/separate，行为不变）；
-    /// `Some` = 本命令是 inline (extended-LBA) PI WRITE，host 经 PRP-list 提供完整
-    /// `nlb × block_bytes` 连续 extended-block 流（按 4096 页分段传输，与 PI 的 block_bytes
-    /// 分块**两种分组**）。WRITE finalize 在 data 全到齐后：拼回连续流 → 按 block_bytes 切 nlb
-    /// 块 → 逐块 verify host PI（PRCHK）→ 任一失败不落盘（原子）→ 全通过才把连续流原样写
-    /// backing（backing 布局 == extended-block 流）。READ 方向**不用**本标记：dispatch 同步
-    /// 读 backing + verify 后，把连续流当普通字节流走 plain PRP-list scatter。
-    pub(super) inline_pi: Option<InlinePiPrp>,
+    /// **#4c-b** — 可选 PI finalize 描述符。`None` = 普通 plain/admin PRP-list 路径（与
+    /// 改造前行为**比特一致**）；`Some` = 本命令是 PI PRP-list 路径（inline 或 separate），
+    /// finalize/scatter 据 `PiFinalize.layout` 分派。取代原 `{sep_meta, inline_pi}` 两个
+    /// 互斥 Option（"两者皆 Some" 这一非法态不再可表达），并消除两描述符共享的 PI 几何
+    /// 字段重复。详见 `PiFinalize`/`PiLayout`。
+    pub(super) pi: Option<PiFinalize>,
 }
 
-/// **B6c-3** — `PrpListOp` 的 inline-PI（extended-LBA）WRITE 扩展描述符。
-/// 与 `SepMetaPrp` 不同：inline PI 在 data 流内部（无 MPTR），故无 mptr/meta 字段。
-pub(super) struct InlinePiPrp {
-    pub(super) pi_type: u8,
-    pub(super) pi_first: bool,
-    pub(super) data_bytes: u32,
-    pub(super) block_bytes: u32,
-    pub(super) prchk: crate::pi::PrChk,
-}
-
-/// **B6b-4-N>2** — `PrpListOp` 的 separate-meta 扩展描述符。WRITE 与 READ 用同一结构
-/// 但 `meta` 字段语义不同：
-/// - WRITE：dispatch 时 `meta = None`，MPTR DMA-read 到达后填；finalize 在
-///   `pages_done == total_pages && meta.is_some()` 时触发，做 verify-all → interleave-store-all。
-/// - READ：dispatch 时已从 backing 读 N 个 interleaved block + 同步 verify-all + 算好
-///   `meta` 为 N×8 tuple concat；scatter 时把 `meta` 写到 `mptr`（额外一条 DMA-write
-///   计入 `total_pages` 之外的"meta 子任务"，由 `meta_pending` 标记）。
-pub(super) struct SepMetaPrp {
-    /// PI tuple buffer 的 host GPA（MPTR）。
-    pub(super) mptr: u64,
-    /// PI tuple 形态相关。
+/// **#4c-b** — PRP-list PI 路径（WRITE/READ）的统一 finalize 描述符。inline 与 separate
+/// 共享 PI 几何（pi_type/pi_first/data_bytes/block_bytes/prchk），差异仅在 metadata 形态
+/// `layout`。取代原 `InlinePiPrp` + `SepMetaPrp` 两个独立描述符。
+pub(super) struct PiFinalize {
     pub(super) pi_type: u8,
     pub(super) pi_first: bool,
     pub(super) data_bytes: u32,  // 4096
     pub(super) block_bytes: u32, // 4104
     /// PRCHK 逐项校验门控（dispatch 时从 cdw12 PRINFO 解析）。
     pub(super) prchk: crate::pi::PrChk,
-    /// N×8 字节 PI tuple buffer。WRITE：MPTR DMA-read 填；READ：dispatch 时算好。
-    pub(super) meta: Option<Vec<u8>>,
-    /// READ 路径：meta DMA-write 是否仍 pending（true 表示还没完成）。WRITE 路径忽略。
-    pub(super) meta_pending: bool,
+    pub(super) layout: PiLayout,
+}
+
+/// PI metadata 形态——`PiFinalize` 的差异轴。
+pub(super) enum PiLayout {
+    /// **inline**（extended-LBA，B6c-3）：tuple 在 data 流内（block_bytes/块），无 MPTR。
+    /// host 经 PRP-list 提供 `nlb × block_bytes` 连续 extended-block 流；WRITE finalize 拼回
+    /// 连续流→逐块 verify→**原样**写 backing（== backing 布局）。READ 不用本枚举（dispatch
+    /// 同步读 backing + verify 后把连续流当普通字节流走 plain scatter）。
+    Inline,
+    /// **separate**（B6b-4-N>2）：tuple 经 MPTR；data 流是纯 data（data_bytes/块）。
+    /// - WRITE：dispatch 时 `meta = None`，MPTR DMA-read 到达后填；finalize 在 data 全到齐
+    ///   **且** `meta.is_some()` 时 verify-all→interleave-store-all。
+    /// - READ：dispatch 时算好 `meta`（N×8 tuple concat）；scatter 时写到 `mptr`（额外一条
+    ///   DMA-write，由 `meta_pending` 标记门控）。
+    Separate {
+        mptr: u64,
+        meta: Option<Vec<u8>>,
+        meta_pending: bool,
+    },
+}
+
+impl PrpListOp {
+    /// 是否 inline PI 路径。
+    pub(super) fn is_inline_pi(&self) -> bool {
+        matches!(self.pi.as_ref().map(|p| &p.layout), Some(PiLayout::Inline))
+    }
+    /// 是否 separate-meta PI 路径。
+    pub(super) fn is_separate_pi(&self) -> bool {
+        matches!(
+            self.pi.as_ref().map(|p| &p.layout),
+            Some(PiLayout::Separate { .. })
+        )
+    }
+    /// separate-meta 的 MPTR 子任务是否已完成（非 separate → true，不门控）。
+    pub(super) fn meta_done(&self) -> bool {
+        match self.pi.as_ref().map(|p| &p.layout) {
+            Some(PiLayout::Separate { meta_pending, .. }) => !meta_pending,
+            _ => true,
+        }
+    }
+    /// separate-meta 的 meta buffer 是否已到（WRITE finalize 第二门控）。
+    pub(super) fn meta_ready(&self) -> bool {
+        matches!(
+            self.pi.as_ref().map(|p| &p.layout),
+            Some(PiLayout::Separate { meta: Some(_), .. })
+        )
+    }
+    /// WRITE：MPTR DMA-read 到达，填入 separate 的 meta（非 separate 则 no-op）。
+    pub(super) fn set_separate_meta(&mut self, data: Vec<u8>) {
+        if let Some(PiLayout::Separate { meta, .. }) = self.pi.as_mut().map(|p| &mut p.layout) {
+            *meta = Some(data);
+        }
+    }
+    /// READ scatter：取出 separate 的 meta 待写 MPTR，并置 `meta_pending=true`。
+    /// 返回 `(mptr, meta)`；非 separate → `None`。
+    pub(super) fn take_separate_meta_for_scatter(&mut self) -> Option<(u64, Vec<u8>)> {
+        if let Some(PiLayout::Separate {
+            mptr,
+            meta,
+            meta_pending,
+        }) = self.pi.as_mut().map(|p| &mut p.layout)
+        {
+            *meta_pending = true;
+            Some((*mptr, meta.take().unwrap_or_default()))
+        } else {
+            None
+        }
+    }
+    /// READ：MPTR DMA-write 完成，清 `meta_pending`（非 separate 则 no-op）。
+    pub(super) fn clear_separate_meta_pending(&mut self) {
+        if let Some(PiLayout::Separate { meta_pending, .. }) =
+            self.pi.as_mut().map(|p| &mut p.layout)
+        {
+            *meta_pending = false;
+        }
+    }
 }
 
 /// **Phase R2b** — SGL segment chain fetch 段数上限（防恶意 driver 构造
@@ -3884,8 +3929,7 @@ impl NvmeController {
                     pages_done: 0,
                     data_pages,
                     list_pages_fetched: 0,
-                    sep_meta: None,
-                    inline_pi: None,
+                    pi: None,
                 },
             );
             // DMA-read PRP list 页（在 prp2）；到达后 NvmReadPrpListFetch 解析 + per-page 写。
