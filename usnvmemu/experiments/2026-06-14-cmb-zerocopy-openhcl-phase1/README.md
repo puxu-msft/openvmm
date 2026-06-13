@@ -41,14 +41,19 @@ iter-2（真 MMIO-hole GPA + i440bx 风格 + early/late 双时序，5×2=10 探�
   成功 pattern，i440bx 也无漏掉的前置步骤，差别纯在地址落点（它在声明低 1MB RAM 内 / 我在 MMIO 空洞或异址）。
 - **推翻 feasibility 实验的未验证推断**：原档称 create_ram_gpa_range "生产已证（i440bx 依赖）"——实为**从未真机测过**
   （i440bx 是 Gen1/PCAT，本 VM 是 Gen2 从不走它）。本 POC 是**首次真机调用**，结果 FAILED。"生产代码依赖" ≠ "本配置可用"。
-- **唯一未测变体（标"未证伪/概念存疑"，不并进已证伪）**：gpa_start = 真实存在的设备 BAR 的 GPA（host 已知的 declared MMIO 窗口），而非任意空洞。
-  i440bx 的成功 gpa_start 是 chipset 声明的 PAM-ROM 区（**在声明低 1MB RAM 内**）；host 可能只 remap 它声明过的区。本 VM `inspect` 显 `missing-pci`
-  （vfio-user 设备未上线），未能取真 BAR 测。**这是 A 的最后一线生机，但概念上 host 不拥有 vfio-user BAR 的 decode。**
+- **device-BAR 变体已测 + FAILED（口子已关，2026-06-14 iter-3）**：`inspect` 取到真 VPCI 设备
+  （`vfio_user_nvme:device-1111...`）的 MMIO 窗口 = **`0x127400000-0x128000000`**（device BAR 真落点；
+  前两轮的 0xf9000000/0x200000000 都不在此窗口 → device-BAR 当时实际未测）。iter-3 探针打这个**真窗口**：
+  `0x127400000`/`0x127500000` ← 低 RAM / RAM-顶，default / rom_mb / 64KB、early+late 两时序——**全 FAILED**。
+  → **device-BAR 变体不再是未测口子**：host 对"往真 VPCI 设备 MMIO 窗口（VTL2-intercept）填 RAM"同样拒。
+  印证架构推断（vfio-user BAR 是 VTL2-emulated，host 不会把它转成 host-backed RAM）。
+- **故承重假设 A 现无条件证伪（本 Gen2 host）**：任意空洞 / RAM identity / i440bx 式 / **真 VPCI 设备 BAR 窗口**——
+  20+ 配置（含两时序）一律 FAILED。零拷贝 CMB-on-OpenHCL 被 host primitive 彻底挡住。
 
 ## 对缺口①②的影响
-- **缺口②（承重）实测受阻**：§5 零拷贝路径卡在 host primitive（create_ram_gpa_range FAILED），非"只缺 wiring"。
-- **缺口①（GET-backed 别名组件）moot**：primitive 不工作，建组件无意义——除非"真 BAR gpa_start"变体翻盘。
-- **净**：OpenHCL 上**可用的 CMB 仍是 trap 模式**（拷贝式，QEMU L4 已 PASS）；**零拷贝 CMB-on-OpenHCL 在本 Gen2 host 实测被 create_ram_gpa_range 的 FAILED 挡住**。
+- **缺口②（承重）实测彻底受阻**：§5 零拷贝路径卡在 host primitive（create_ram_gpa_range 对任意 GPA、含真设备 BAR 窗口全 FAILED），非"只缺 wiring"。
+- **缺口①（GET-backed 别名组件）moot**：primitive 不工作（device-BAR 变体已测亦 FAILED，无翻盘口子），建组件无意义。
+- **净**：OpenHCL 上**可用的 CMB 仍是 trap 模式**（拷贝式，QEMU L4 已 PASS）；**零拷贝 CMB-on-OpenHCL 在本 Gen2 host 实测被 create_ram_gpa_range 的 FAILED 彻底挡住**。
 
 ## 复跑
 probe 在 worker.rs（未 commit）。`cargo xflowey build-igvm x64 --override-openvmm-hcl-feature vpci` →
