@@ -24,6 +24,13 @@
 //! **当前 `#[ignore]`**：silver-heron 的 `completion.rs:2474` 硬化修**未落地前**本 test 会
 //! panic（debug_assert）。修落地后 **un-ignore** 即成 standing 回归守卫。
 
+//! **un-ignore（2026-06-14）**：silver-heron 的 `completion.rs` truncated-read 硬化已落地
+//! （commit `ea6cad268`：`NvmReadPrpListFetch` 短 list 页欠填 → 先于 scatter 精确
+//! `DATA_TRANSFER_ERROR`，不再 debug_assert panic / 静默短 scatter）。本 test 转为
+//! standing 回归守卫：契约允许的 ok=true 短 list 页 → no-panic + 链优雅 drain。
+//! 精确 SC 级断言归 silver-heron in-crate（`prp_list_short_read_fails_clean_not_panic_or_underfill`）；
+//! 本 test 守**外部 robustness 边界**（no-panic + drain）。
+
 use nvme_firmware::NvmeController;
 use nvme_firmware::cmd::Sqe;
 use pcie_device_core::{CaptureTransport, DeviceCtx, PcieDevice, TransportEvent};
@@ -55,7 +62,6 @@ fn open_tmp_ctrl() -> (NvmeController, TmpImg) {
 ///   - pre-fix：`acc.extend(take(2))` 实得 1 → `acc.len()=1 < needed=2` → `completion.rs:2474`
 ///     debug_assert(`1+1 != 3`) panic。
 ///   - post-fix（silver-heron）：underfill → `DATA_TRANSFER_ERROR` CQE，链优雅收尾、不 panic。
-#[ignore = "blocked on completion.rs:2474 truncated-read hardening (silver-heron); un-ignore after fix lands"]
 #[test]
 fn prp_list_truncated_read_completes_without_panic() {
     let (mut c, _img) = open_tmp_ctrl();
