@@ -143,21 +143,24 @@ pub mod cap {
 /// 低位的 SQS/CQS/LISTS/RDS/WDS 声明"CMB 可承载哪些数据类型"。**字段次序严格按
 /// spec 字节布局**（项目纪律 spec-aligned-field-order）。
 pub mod cmbsz {
-    /// bits 3:0 = SZU (Size Units)：0=4 KiB, 1=64 KiB, 2=1 MiB, 3=16 MiB, 4=256 MiB …
-    /// （每 +1 乘 16）。
-    pub const SZU_SHIFT: u32 = 0;
+    // NVMe Base Spec § 3.1.14 (CMBSZ, offset 0x3C) 字节布局 —— 字段绝对位置必须
+    // 与 spec 一致，否则真 host 驱动按 spec 解码会读错能力位（教训：曾把数据类型位
+    // 整体上移 4 位、SZU 错放 3:0，真 Linux nvme 据 SQS=0 拒绝把 SQ 放进 CMB；
+    // in-process 测试因两端共用错误常量而自洽通过、未暴露——见 self-consistent trap）。
+    /// bit 0 = SQS (Submission Queue Support)：CMB 可放 SQ。
+    pub const SQS: u32 = 1 << 0;
+    /// bit 1 = CQS (Completion Queue Support)：CMB 可放 CQ。
+    pub const CQS: u32 = 1 << 1;
+    /// bit 2 = LISTS (PRP/SGL List Support)：CMB 可放 PRP list / SGL segment。
+    pub const LISTS: u32 = 1 << 2;
+    /// bit 3 = RDS (Read Data Support)：CMB 可作 read 数据源。
+    pub const RDS: u32 = 1 << 3;
+    /// bit 4 = WDS (Write Data Support)：CMB 可作 write 数据宿。
+    pub const WDS: u32 = 1 << 4;
+    // bits 7:5 reserved。
+    /// bits 11:8 = SZU (Size Units)：0=4 KiB, 1=64 KiB, 2=1 MiB, 3=16 MiB …（每 +1 乘 16）。
+    pub const SZU_SHIFT: u32 = 8;
     pub const SZU_MASK: u32 = 0xf << SZU_SHIFT;
-    /// bit 4 = SQS (Submission Queue Support)：CMB 可放 SQ。
-    pub const SQS: u32 = 1 << 4;
-    /// bit 5 = CQS (Completion Queue Support)：CMB 可放 CQ。
-    pub const CQS: u32 = 1 << 5;
-    /// bit 6 = LISTS (PRP/SGL List Support)：CMB 可放 PRP list / SGL segment。
-    pub const LISTS: u32 = 1 << 6;
-    /// bit 7 = RDS (Read Data Support)：CMB 可作 read 数据源。
-    pub const RDS: u32 = 1 << 7;
-    /// bit 8 = WDS (Write Data Support)：CMB 可作 write 数据宿。
-    pub const WDS: u32 = 1 << 8;
-    // bits 11:9 reserved。
     /// bits 31:12 = SZ (Size)：CMB 大小（以 SZU 编码的 size unit 为单位）。
     pub const SZ_SHIFT: u32 = 12;
     pub const SZ_MASK: u32 = 0xf_ffff << SZ_SHIFT;
@@ -309,17 +312,19 @@ mod cmb_reg_tests {
         assert_eq!(cap::CMBS, 1u64 << 57);
     }
 
-    /// CMBSZ 编码：SZU 在 bits 3:0、SZ 在 bits 31:12，数据类型位各就各位（spec § 3.1.14）。
+    /// CMBSZ 编码：数据类型位 SQS/CQS/LISTS/RDS/WDS 在 bits 4:0、SZU 在 bits 11:8、
+    /// SZ 在 bits 31:12（NVMe Base Spec § 3.1.14）。绝对位置锚定，防字段次序漂移。
     #[test]
     fn cmbsz_field_offsets_match_spec() {
         use cmbsz::*;
-        // 位绝对位置（防字段次序漂移 / 与 spec 字节布局对齐）。
-        assert_eq!(SZU_MASK, 0xf);
-        assert_eq!(SQS, 1 << 4);
-        assert_eq!(CQS, 1 << 5);
-        assert_eq!(LISTS, 1 << 6);
-        assert_eq!(RDS, 1 << 7);
-        assert_eq!(WDS, 1 << 8);
+        // 位绝对位置（与 spec 字节布局对齐；同步交叉核对 Linux nvme.h / QEMU hw/nvme）。
+        assert_eq!(SQS, 1 << 0);
+        assert_eq!(CQS, 1 << 1);
+        assert_eq!(LISTS, 1 << 2);
+        assert_eq!(RDS, 1 << 3);
+        assert_eq!(WDS, 1 << 4);
+        assert_eq!(SZU_SHIFT, 8);
+        assert_eq!(SZU_MASK, 0xf << 8);
         assert_eq!(SZ_SHIFT, 12);
         assert_eq!(SZ_MASK, 0xf_ffff << 12);
         // 组装一个典型 CMBSZ：SZU=0（4 KiB unit）+ SZ=512（→ 2 MiB）+ RDS+WDS+SQS+CQS+LISTS。
@@ -328,8 +333,11 @@ mod cmb_reg_tests {
         let v = (szu << SZU_SHIFT) | (sz << SZ_SHIFT) | RDS | WDS | SQS | CQS | LISTS;
         assert_eq!((v & SZU_MASK) >> SZU_SHIFT, 0);
         assert_eq!((v & SZ_MASK) >> SZ_SHIFT, 512);
+        assert_ne!(v & SQS, 0, "SQS 必须置位（真驱动据此决定 cmb_use_sqes）");
         assert_ne!(v & RDS, 0);
         assert_ne!(v & WDS, 0);
+        // 整字回归锚：spec 布局下 2 MiB 全能力 CMB == 0x0020_001f（曾误为 0x0020_01f0）。
+        assert_eq!(v, 0x0020_001f);
     }
 
     /// SZU 编码 → size unit 字节数（4 KiB × 16^szu）。

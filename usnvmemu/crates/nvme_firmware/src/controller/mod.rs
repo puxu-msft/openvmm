@@ -4267,6 +4267,16 @@ impl PcieDevice for NvmeController {
     fn reset(&mut self, kind: u32) {
         tracing::info!(kind, "NVMe: PCIe reset");
         self.disable();
+        // **CMB lifecycle** — PCIe/FLR 是 Controller Level Reset（区别于 CC.EN 1→0 的
+        // Controller Reset，后者保留 CMBMSC、见 `disable`）：清 CMBMSC enable 态
+        // （CRE/CMSE/CBA/CBAI），CMB 须 driver 重新经 CMBMSC 编程才再可用。CAP.CMBS
+        // 仍广告（CMB 仍存在，只 enable 态复位）。
+        if let Some(cmb) = self.cmb.as_mut() {
+            cmb.cre = false;
+            cmb.cmse = false;
+            cmb.cba = 0;
+            cmb.cbai = false;
+        }
     }
 
     fn tick(&mut self, ctx: &mut DeviceCtx<'_>) {
@@ -5606,10 +5616,10 @@ mod cmb_tests {
         assert!(cmb.cre && cmb.cmse && !cmb.cbai);
     }
 
-    // ---------------- 6) reset 清 CMB enable 态 ----------------
+    // ---------------- 6) Controller Reset 保留 CMB；FLR 才清 ----------------
 
     #[test]
-    fn controller_reset_clears_cmb_enable_state() {
+    fn controller_reset_preserves_cmb_enable_state() {
         let mut c = mk_cmb();
         let mut cap_t = CaptureTransport::with_start_token(0x100);
         // 启用 CMB（CRE+CMSE+CBA）。
@@ -5617,24 +5627,24 @@ mod cmb_tests {
             let mut ctx = DeviceCtx::new(&mut cap_t);
             let v = (0x8000_0000u64 & cmbmsc::CBA_MASK) | cmbmsc::CMSE | cmbmsc::CRE;
             c.mmio_write_impl(&mut ctx, 0, 0x50, 8, v);
-            // 触发一次违规置 CBAI 再恢复以确保 cbai 字段被 reset 真清（先记一个脏状态）。
         }
-        c.cmb.as_mut().unwrap().cbai = true; // 模拟脏状态
-        // controller reset（CC.EN 1→0 走 disable）。
+        // **真机 interop 回归**：Controller Reset（CC.EN 1→0 走 disable）必须**保留**
+        // CMBMSC（CRE/CMSE/CBA）。真 Linux `nvme_map_cmb` 只编程一次、init 的 CC.EN 周期后
+        // 不重编程，依赖跨 Controller Reset 持久；QEMU `nvme_ctrl_reset` 同样不动 cmbmsc。
+        // 原断言"reset 清 CMBMSC"是 self-consistent trap，真驱动据 cmse=false 把 SQ-in-CMB
+        // fetch 当非-CMB 走 DMA → "DMA_READ … not in any DMA region" → controller 起不来。
         c.disable();
         let cmb = c.cmb.as_ref().unwrap();
-        assert!(!cmb.cre, "reset 清 CRE");
-        assert!(!cmb.cmse, "reset 清 CMSE");
-        assert_eq!(cmb.cba, 0, "reset 清 CBA");
-        assert!(!cmb.cbai, "reset 清 CBAI");
-        // CMB 仍存在（CAP.CMBS 仍广告），只是 enable 态复位。
+        assert!(cmb.cre, "Controller Reset 保留 CRE");
+        assert!(cmb.cmse, "Controller Reset 保留 CMSE");
+        assert_eq!(cmb.cba, 0x8000_0000, "Controller Reset 保留 CBA");
+        // CMB 仍存在 + enable 态仍 live → CMBMSC 回读保留 CMSE。
+        assert_ne!(c.cap & cap::CMBS, 0, "CAP.CMBS 仍广告");
         assert_ne!(
-            c.cap & cap::CMBS,
+            c.mmio_read_impl(0, 0x50, 8) & cmbmsc::CMSE,
             0,
-            "reset 后 CAP.CMBS 仍广告（CMB 仍存在）"
+            "Controller Reset 后 CMBMSC 回读仍含 CMSE"
         );
-        // CMBMSC 回读全 0（enable 态清）。
-        assert_eq!(c.mmio_read_impl(0, 0x50, 8), 0, "reset 后 CMBMSC 回 0");
     }
 
     #[test]

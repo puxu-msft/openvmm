@@ -229,16 +229,15 @@ impl NvmeController {
         // M1: interrupt coalescing 重置默认（无 coalesce）
         self.irq_aggr_time = 0;
         self.irq_aggr_threshold = 0;
-        // **CMB-P1a（spec § 3.1.24 + architect 复核 #4）** — controller reset（CC.EN
-        // 1→0）清 CMBMSC 的 enable 态（CRE/CMSE）+ CBA + CBAI：CMB 须 driver 重新经
-        // CMBMSC 编程才再可用。CMB **backing 不 take**（CMB 内容在 reset 后 spec 规定
-        // "未定义"，可不清；且 CAP.CMBS 仍广告，CMB 仍存在，只是 enable 态复位）。
-        if let Some(cmb) = self.cmb.as_mut() {
-            cmb.cre = false;
-            cmb.cmse = false;
-            cmb.cba = 0;
-            cmb.cbai = false;
-        }
+        // **CMB lifecycle 纠正（真 Linux nvme + QEMU interop oracle 推翻原 architect 复核 #4）** —
+        // Controller Reset（CC.EN 1→0）**保留** CMBMSC 的 CRE/CMSE/CBA/CBAI，不清。
+        // 真 Linux `nvme_map_cmb` 仅编程 CMBMSC 一次（`if (dev->cmb_size) return` 守卫），
+        // init 期间的 CC.EN 周期后**不**重编程，依赖其跨 Controller Reset 持久；QEMU
+        // `nvme_ctrl_reset(NVME_RESET_CONTROLLER)` 同样不动 cmbmsc（interop 参考实现）。
+        // 原"reset 清 CMBMSC"是 **self-consistent trap**：in-process 测试 + 误读 spec 两端
+        // 自洽通过，但真驱动据 cmse=false 把 SQ-in-CMB 的 SQE-fetch 当非-CMB 走 DMA → fail。
+        // CMB enable 态**只**由 driver 的 CMBMSC 写改，或 Controller Level Reset（FLR/PCIe，
+        // 见 `reset`）清。CMB backing 内容亦不动（spec 规定 reset 后"未定义"，可不清）。
         self.state = CtrlState::Disabled;
         // spec § 3.1.4.2：Controller Reset（CC.EN→0）清 CSTS.RDY **与 CSTS.CFS**。
         // 清 CFS 是 I2 门控（completion.rs `on_dma_complete_impl` 入口）的**成立前提**：
