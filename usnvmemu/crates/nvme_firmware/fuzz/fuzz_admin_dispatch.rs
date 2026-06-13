@@ -48,9 +48,13 @@ use xtask_fuzz::fuzz_target;
 const NVME_PAGE_SIZE: u64 = 4096;
 const ENTRIES_PER_PAGE: usize = (NVME_PAGE_SIZE / 8) as usize; // 512
 
-/// 安全上限：远超任何合法 admin DMA 链深度（Get Log Page chain ≤ MAX_PRP_LIST_PAGES=16），
-/// 用来 catch「守卫失效 → 无限 fetch」。真挂死则 libfuzzer 超时（也算 fail）。
-const ITER_SAFETY_CAP: u32 = 4096;
+/// 安全上限：catch「守卫失效 → 无限 fetch」。**admin 专属取大**：与 IO target（fuzz_sgl_chain
+/// / fuzz_prp_list_chain，受 MDTS=128 KiB 天然限 ≤ ~32 data 页）不同，admin **Get Log Page**
+/// 的 PRP-list 链**不受 MDTS 限**，合法最坏 = `MAX_PRP_LIST_PAGES(16) × ~511 data 页 ≈ 8176`
+/// 个 data-page DMA（coverage-guided 实测一条大 NUMD Get Log Page 跑出 total_dmas=4137、表全
+/// drain 无泄漏——证 controller 正确有界，是本 cap 取 4096 太低误报）。故取 20000（远超 8176
+/// 合法最坏、仍能 catch 真无限 fetch）。真挂死则 libfuzzer 超时（也算 fail）。
+const ITER_SAFETY_CAP: u32 = 20000;
 
 /// 输入 Vec 限幅（W-2）。
 const MAX_FED_PAGES: usize = 64;
