@@ -15,10 +15,17 @@ trait Transport，3 个接入（OpenHCL vsock / vfio-user / NVMe-oF TCP），各
 ## 硬约束（指令，非背景建议）
 
 1. **语言**：新增/修改的注释、文档、PR、对话用**中文**；原 upstream 英文内容保持不动。
-2. **fork + 多会话共享工作树**：可能有别的 Claude 会话并行改同一树。提交只用
-   `git commit -- <pathspec>` 限定自己的文件（`-m` 等 option 放 `--` **前**；新建文件 pathspec
-   不会自动 stage，需先**精确** `git add <新文件>`）；**绝不 `git add -A` / `git add .`**；
-   不碰别的会话正在改的文件（如 `usnvmemu/docs/DECISIONS.md`）；提交前 `git status` 看清 index。
+2. **fork + 多会话共享工作树**：可能有别的 Claude 会话并行改同一树。
+   - **可以改别的会话也在改的文件**（必要时就改）；约束不在"碰不碰"，而在"提交时
+     **line-range / hunk 级隔离**"——只把自己的改动塞进 commit，**绝不裹挟别人的 hunk**。
+   - 隔离技法（`git add -p` 交互式在本环境不可用，改用 `git apply --cached`）：
+     `git diff -- <file>` 看全部 hunk → 截出只含自己 hunk 的 patch → `git apply --cached <my.patch>`
+     塞进 index → **裸 `git commit`**（读 index，不带 pathspec）。整文件精确替换则用
+     `git hash-object` + `git update-index` 塞内容再裸 commit。
+   - **陷阱**：`git commit -- <pathspec>` 提交的是**工作树版**（含别人的 hunk），**不是** index 版
+     ——精确 staging 后**不要**带 pathspec commit。见 memory `shared-worktree-fmt-hazard-index-commit`。
+   - **绝不 `git add -A` / `git add .`**；新建文件需先**精确** `git add <新文件>`；
+     `-m` 等 option 放 `--` 前；提交前 `git status` 确认 index 只含自己的东西。
 3. **构建/运行按目标而定**：OpenHCL 走 WSL 交叉编译（`cargo xflowey build-igvm x64`），产物在
    Windows Hyper-V 跑（无原生 Windows 构建）；toolchain 已钉 **1.95**（命令不加 `+1.95`）。
    vfio-user / NVMe-oF TCP 是 Linux 原生可测。
