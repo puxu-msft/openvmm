@@ -51,13 +51,15 @@ GET `create_ram_gpa_range(slot, gpa_start, gpa_count, gpa_offset, flags)` 的语
 ## 承重假设清单（架构复核后更新）
 | # | 假设 | 状态 | 何时验 |
 |---|---|---|---|
-| **A** | host 接受 BAR-hole gpa_start + 异址 gpa_offset 别名 | ❌ **未证，无源码托底（GED stub FAILED）** | Phase 1 探针 C（**最可能翻车**）|
-| **B** | gpa_allocator 切的 VTL0 RAM 在 mshv_vtl_low 注册段内 | ⚠️ 主 RAM 段实测在，allocator 切的具体段待确认 | Phase 1 顺带 |
+| **A** | host 接受 BAR-hole gpa_start + 异址 gpa_offset 别名 | ❌ **真机证伪（2026-06-14 Phase 1）**：custom underhill 探针在真 Gen2 pcie-remote-exp 上调 `create_ram_gpa_range`，对真 MMIO-hole/RAM/identity/rom_mb/i440bx-式 offset/两页大小/early+late 两时序 **一律 FAILED=5**（host 真在评估——iter-1 别的 GPA 返 INVALID_GPA——但操作本身失败）。详见 `experiments/2026-06-14-cmb-zerocopy-openhcl-phase1/`。唯一未测变体=真 declared 设备 BAR 的 gpa_start（需 firmware 上线取真 BAR；概念上 host 不拥有 vfio-user BAR decode，存活率低）| **Phase 1 已跑（证伪）** |
+| **B** | gpa_allocator 切的 VTL0 RAM 在 mshv_vtl_low 注册段内 | ⚠️ moot（A 已伪，未到此步）| — |
 | **C** | firmware 经 mshv_vtl_low 可**写** guest RAM | ✅ **已证**（poc3/vtl2-deploy PROT_WRITE + 生产 dma.rs Rw）| Phase 0 完成 |
 | **D** | 缺口①走直接别名（非 MemoryMapper）| ✅ **已定**（G1 trait 不同构）| Phase 0 完成 |
-| **E** | slot 资源不与 underhill 其它 GET-range 用户冲突 | ⚠️ 待 grep | Phase 2 |
-| **F** | async create_ram_gpa_range 的 block_on 不在 GET 线程死锁 | ⚠️ 待验 | Phase 2 |
-| **G** | 写序/缓存一致性（guest 写 SQE→firmware 立即按序见）| ⚠️ 待验 | Phase 1 oracle②/③ 顺带 |
+| **E/F/G** | slot 资源 / block_on 并发 / 写序一致性 | ⚠️ moot（缺口① 因 A 伪而暂停）| — |
+
+## Phase 1 真机结论（2026-06-14，决定性）
+**承重假设 A 真机证伪** → §5 零拷贝 CMB-on-OpenHCL 路径**卡在 host primitive**（`create_ram_gpa_range` 对任意 GPA FAILED），**非"只缺 wiring"**。缺口① 组件 moot（primitive 不工作建组件无意义）。**修正 feasibility 实验**："create_ram_gpa_range 生产已证"是从未真机测过的推断（i440bx 是 Gen1，本 VM Gen2 从不走它）；本 POC 首次真机调用即 FAILED。
+**净**：OpenHCL 上**可用的 CMB = trap 模式**（拷贝式，L4 已 PASS）；**零拷贝 CMB-on-OpenHCL 在真 Gen2 Hyper-V 被 create_ram_gpa_range 的 FAILED 挡住**。唯一剩余生机=真 declared 设备-BAR gpa_start 变体（重设置 + 概念上低存活率，待用户定夺是否投）。
 
 ## 非目标 / 边界
 - 不碰 VTL2 私有内存暴露（已证死路）。

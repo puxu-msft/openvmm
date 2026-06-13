@@ -92,6 +92,14 @@ host-backed、RAM-backed 的区**，guest 零拷贝直访。
   `handle_create_ram_gpa_range` **硬编码返回 FAILED**（`vm/devices/get/guest_emulation_device/src/lib.rs`
   的 handler 体）；**真 Hyper-V** 的 GET 对端实现 `IVmGuestMemoryAccess`（故 client/protocol/i440bx
   生产用例都在）。即真机支持、OpenVMM 测试桩未实现。
+  > **🔴 2026-06-14 真机纠正（Phase 1 POC 推翻本段推断）**：上面"真机支持"是从"i440bx 生产用例都在"
+  > 反推的，**从未真机测过**。Phase 1 custom underhill 探针在真 Gen2 pcie-remote-exp 上首次实调
+  > `create_ram_gpa_range`，对真 MMIO-hole / RAM / identity / rom_mb / i440bx-式 offset / early+late
+  > 两时序 **一律 FAILED=5**（host 真在评估：iter-1 别的 GPA 返 INVALID_GPA，故非 blanket reject）。
+  > i440bx 是 **Gen1/PCAT**，本 VM 是 **Gen2 从不走它**，所以"生产依赖"不蕴含"本配置可用"。
+  > **唯一未测变体=真 declared 设备 BAR 的 gpa_start**（host 可能只 remap 它声明过的区；需 firmware
+  > 上线取真 BAR）。详见 `experiments/2026-06-14-cmb-zerocopy-openhcl-phase1/`。
+  > **结论修正**：零拷贝共享区在真 Gen2 host 被 `create_ram_gpa_range` 的 FAILED 挡住，不是"原语齐备"。
 
 ### 真机确认（活 VM `pcie-remote-exp`，2026-06-12，ohcldiag-dev inspect）
 
