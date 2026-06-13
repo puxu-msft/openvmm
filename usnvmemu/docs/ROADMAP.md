@@ -147,7 +147,7 @@ crypto/TLS-PSK 的**真**独立只能靠档2 frozen vector/档3 真机。"⛔"=�
 |---|---|---|---|---|
 | **firmware-core**(全 transport 共享) | interleaving(§29)/ mmio qword(§26)/ prp 单测【回归】 | — | — | —(盲区借各 transport 档3) |
 | OpenHCL pcie_remote | `openhcl_pcie_remote_e2e`(手搓 wire driver)【独立-ish ✅】 | — | ⛔ 欠 L3 代理 | L3 真 Hyper-V guest(§26 >4 GiB,未自动化) |
-| vfio-user | `loopback_*`(生产 `VfioUserClient`⇄`Session`)【**非独立**=§20 反模式】 | ✅ **已写** `vfio_user_wire_e2e`(手搓 client,§28 4-bug,revert-verified,commit 8284c45d4) | ⛔ 欠真 guest 代理 | `run_qemu_vfio_guest.py`(§28 4-bug,已有未 gate) |
+| vfio-user | `loopback_*`(生产 `VfioUserClient`⇄`Session`)【**非独立**=§20 反模式】 | ✅ **已写** `vfio_user_wire_e2e`(手搓 client,§28 4-bug,revert-verified,commit 8284c45d4) | ✅ **已写** `vfio_user_guest_replay_e2e`(真 kernel 前缀 frozen-vector,commit 1695bbce3) | `run_qemu_vfio_guest.py`(§28 4-bug,已有未 gate;+ `_capture.py` 抓真 transcript) |
 | NVMe-oF TCP | Rust wire e2e(`vt_dhchap4` 等)【framing 手搓 indep / crypto 用生产 `compute_response` 自洽】 | (crypto 真独立靠档2/3) | tls-psk kernel vector(待 dump) | dhchap-4 真 `nvme connect` |
 
 > **⚠ 承重发现(2026-06-13,执行 POC 时坐实,纠正本元项一个根本错误假设)**：**usnvmemu 全 9 crate
@@ -175,8 +175,10 @@ standing ✅,故对每条 transport 此刻都**未满足**(vfio 独立性刚补�
 2. (已做)vfio 手搓独立 oracle `vfio_user_wire_e2e`(commit 8284c45d4)——独立性补齐,等步骤 1 转 standing。
 3. (opt-in)libvfio-user differential → Tier B `#[ignore]` + pinned job;Python wire harness 留 cadence。
 
-**据律自暴缺口(⛔)**：vfio 已有档-3 live(`run_qemu_vfio_guest.py`)欠档-2 frozen 代理;OpenHCL L3
-真 guest 同样欠代理——按"凡有档3 必配档2"律,这两格须补冻结代理,非"不适用"。
+**据律自暴缺口(⛔)**：~~vfio 已有档-3 live 欠档-2~~ **✅ 已补**(`vfio_user_guest_replay_e2e`,真 kernel
+前缀 frozen-vector,commit 1695bbce3:抓包 `_capture.py` → 机械抽取 `extract_wire_prefix.py` → replay
+golden,revert-verified 2 轮)。**仅剩 OpenHCL L3 真 guest 欠档-2 frozen 代理**——按"凡有档3 必配档2"
+律须补;但 OpenHCL L3 真 guest harness 本身尚未自动化(须 Windows/Hyper-V),其档-2 待 L3 可跑后抓。
 
 **新 transport checklist(并入 [HOW_TO_ADD_TRANSPORT](HOW_TO_ADD_TRANSPORT.md))**：列三档各自
 oracle → 档1 必有≥1 独立-ish standing gate(非自家两端 loopback)→ 凡有档3 路径必配档2 frozen 代理
