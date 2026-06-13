@@ -91,6 +91,35 @@ pci_nvme_create_sq addr=0xfe010000 sqid=2 qsize=1023  ← IO SQ 在 CMB!
 - ⚠️ 残留风险：EINVAL 来自 `vfio_container_dma_unmap`（IOMMU 容器层，非纯 dma-buf 创建）暗示要改的可能不止一层；fork 若真要做，深度可能超预期。
 
 ### 下一步（定位实验 S7，决定 fork 对象 / 是否需 fork）
-1. **guest 侧**：`nvme` dyndbg/ftrace 抓 `nvme_alloc_sq_cmds` —— 是 `pci_alloc_p2pmem` 返 NULL，还是 `pci_p2pmem_virt_to_bus` 返 0？定位失败在内核哪一步。
-2. **协议侧**：读 QEMU `hw/vfio-user/` + libvfio-user dma-buf 协议，确认 `-22 EINVAL` 来自 **client 不支持** 还是 **server region_info 缺 flag**。
-3. 据 1+2 定 fork 对象：若 server-hint 缺 → 补 firmware region_info（无需 fork QEMU）；若 client 缺支持 → fork QEMU vfio-user。
+见下方 ## S7 章节——已做协议侧源码溯源（决定性）。
+
+## S7 定位实验：QEMU vfio-user dma-buf 源码溯源 —— **决定性，且推翻"region_info flag"廉价解**
+
+### 协议侧（源码坐实，QEMU 11.0.1 + 用户 fork 11.0.50 双版核对）
+`-22 EINVAL` 的精确来源 = **QEMU client 自身短路，根本没发 vfio-user 消息也没到 host kernel**：
+1. `hw/vfio/region.c:288 vfio_region_create_dma_buf` 在 **BAR mmap 时**（设备 setup，非 guest 建 IOMMU 映射时）对每个 BAR 尝试建 dma-buf，使该 BAR 的 RAMBlock 带 fd → 可作 DMA target。失败只 `error_report` 不中断 BAR 映射（故 BAR 仍可访问、p2pdma 仍注册，但无 dma-buf）。
+2. 它发 `VFIO_DEVICE_FEATURE_GET | VFIO_DEVICE_FEATURE_DMA_BUF` 走 `vfio_device_get_feature`→`io_ops->device_feature`。**brew 11.0.1 的 `vfio_user_device_io_ops_sock` 无 `.device_feature` 成员** → NULL 钩子 → 当场 `return -EINVAL`。后续 `vfio_container_dma_unmap = -22` 是该 BAR 退化为无-fd 映射的连锁后果。
+
+### ❌ 推翻审计的"廉价解 A"（region_info 多发个 flag）
+dma-buf 路径**不读任何 region capability**（`vfio_region_create_dma_buf` 只用标准 MMAP+sparse-mmap 的 `nr_mmaps`/offset/size）。能力协商走 **device-feature 通道（cmd 16）**，不是 region cap。→ **server 在 region_info 多发 flag 不可能解**。审计的 (A) 证伪。
+
+### 三层缺口（每层源码锚定）
+| 层 | 现状 | 缺口 |
+|---|---|---|
+| host kernel VFIO | `VFIO_DEVICE_FEATURE_DMA_BUF` 已进 mainline（`drivers/vfio/pci/vfio_pci_dmabuf.c`）| ✅ 有能力 |
+| QEMU client | `region.c` 会尝试建 dma-buf（commit 8cfaf22668，11.0.1 已有）；device_feature 转发 = commit **e2358af583**（master，11.0.1 **无**）| ❌ 11.0.1 缺转发 |
+| server（我们 firmware）| 自有 vfio-user server（非 libvfio-user），未实现 `VFIO_USER_DEVICE_FEATURE` 的 DMA_BUF GET | ❌ 缺实现 |
+
+### 用户 fork `/home/xp/src/qemu-fork`（11.0.50，master-based，HEAD=vfio-user-win devdoc）的确切状态
+- ✅ **已含 device_feature 转发**：`hw/vfio-user/device.c:78 vfio_user_device_io_device_feature` + `:476 .device_feature=…` 已挂进 `vfio_user_device_io_ops_sock`（泛化转发任意 feature，含 DMA_BUF）。即 e2358af583 已在此 fork。client 短路缺口**已闭合**。
+- ❌ **但 dma-buf 仍被门控跳过**：`region.c:297` 的门 `if (!(io_ops->capabilities & VFIO_IO_CAP_DMA_BUF)) return;`，而 `vfio_user_device_io_ops_sock` **未设** `.capabilities = VFIO_IO_CAP_DMA_BUF`（默认 0）→ 对 vfio-user 设备**直接跳过 dma-buf 创建**（故 fork 下连 -22 都不会有，但也永远不建 dma-buf）。
+
+### 净裁定（S7，源码级，反转并细化 S6 的"对象未定"）
+让"vfio-user BAR 作 SQ-in-CMB 的 DMA target"成立，需 **(B client) + (C server) 叠加，排除 (A region-flag)**，具体到用户 fork 是**有界三步**（非从零 fork）：
+1. **QEMU fork**：`vfio_user_device_io_ops_sock.capabilities |= VFIO_IO_CAP_DMA_BUF`（~1 行，过 region.c:297 门）。
+2. **firmware server**：实现 `VFIO_USER_DEVICE_FEATURE` GET + DMA_BUF —— 把指定 BAR region 导出为 host vfio-pci 可当 dma-buf 的 fd（map 模式已有 memfd backing，正好可作 fd 来源）。
+3. **真机验残留 (D)**：host `vfio_pci_dmabuf.c::validate_dmabuf_input` 是否肯为"无真实 PCI BAR 资源背书"的软件 vfio-user 设备导出 dma-buf —— 这是唯一**未坐实的承重假设**，须先 POC 再大改。
+- **fork 方向 = 用 `/home/xp/src/qemu-fork`（已闭合 client 短路），加 1 行 capability，不从零开始。** 但 (D) 不验证就实现 server 侧 = 押未验证承重假设，违项目"先 POC"原则。
+
+### S7 part-1（guest 侧 ftrace `pci_alloc_p2pmem` vs `virt_to_bus`）
+进行中（子 agent）——定位 guest 回退在哪个内核函数，与 host-side dma-buf 缺口对账（reconcile 是 guest 自身 pool 问题，还是 host dma-buf 缺失的下游 guest-visible 后果）。
