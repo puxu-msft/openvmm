@@ -152,7 +152,8 @@ impl NvmeController {
     /// （cascade 失控）即停止 drain 并置 CSTS.CFS，与 `MAX_SHADOW_POLL_ITERS` 同纪律
     /// （有限终止优先于隐性僵死）。正常 IO 远不会接近此值（一次 doorbell 派生的 CMB
     /// 访问链是有界的）。
-    const MAX_CMB_DRAIN_ITERS: u32 = 1 << 20;
+    // pub(super)：让 `controller::tests` 的 firing 测试引用真常量(锚定纪律,不复制值)。
+    pub(super) const MAX_CMB_DRAIN_ITERS: u32 = 1 << 20;
 
     /// **CMB-P1b** — 分配一个 CMB 合成 token（带 [`Self::CMB_TOKEN_TAG`]）。
     fn alloc_cmb_token(&mut self) -> u64 {

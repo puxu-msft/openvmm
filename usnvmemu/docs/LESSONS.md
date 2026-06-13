@@ -771,9 +771,14 @@ shadow buffer 拿真 SQ tail/CQ head + 写回 event_idx。因 `Transport::dma_re
    误伤真负载、挡 ring 距离脆弱且 dead、挡自续深度才既不误伤又能终止。cap 写完要证它**真能
    触发**（dead cap = 装了个永不响的保险）。
 3. **synchronous-drain transport 上设备自发的 DMA 会自馈 drain 循环**：任何"完成里再发请求"的
-   逻辑都可能把 host 线程卡死在一次 pump 内。要么有限深度 cap 兜底（本次），要么 drain 循环本身
-   设每-pump 让步（future hardening；该提示注在 mod.rs 的 `MAX_SHADOW_POLL_ITERS` 文档，指向
-   `session.rs` 的 drain 循环）。
+   逻辑都可能把 host 线程卡死在一次 pump 内。**封顶必须放 device 侧**（per-链自续深度 cap，量 =
+   "自续深度"而非"advance/ring 距离"，见上 cap 三选）：device core 是 runtime-agnostic 的，一处
+   正确则三条 transport 全受益。transport 的 `session.rs` drain 循环**不该**加迭代上限——其合法
+   worst-case = 链数 × per-链 cap，扁平常量要么误伤真负载（=重演"挡 advance"）要么是 dead cap，
+   且 transport 拿不到"哪条链在自馈"的语义。当前每条递归 DMA-in-completion 路径（SGL / PRP-list /
+   shadow-poll / CMB-drain）均已各自封顶且各有 firing 测试；**完整不变式台账（每路径→终止机制→
+   firing 测试 + I1/I2/I3 承重不变式 + PR 回归闸 + ChainDepth 收敛下一步）见
+   `crates/nvme_firmware/docs/DMA_COMPLETION_INVARIANTS.md`**。
 
 **来源**: DBBUF 真实现 commit `f35e5a71`；4 轮 rust-reviewer 逐层抓 HIGH-1(dropped-ring) →
 HIGH-2 wrap-saturation → point-3 vfio 自馈死锁（每轮修完下一轮挖更深，全在 vfio 同步 harness

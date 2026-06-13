@@ -3819,6 +3819,58 @@ fn c1_chain_depth_cap_rejects_malformed_chain() {
     );
 }
 
+/// **§29 dead-cap 债清偿 — `MAX_CMB_DRAIN_ITERS` firing 证明**(台账
+/// `docs/DMA_COMPLETION_INVARIANTS.md` CMB 行)。
+///
+/// `drain_cmb_completions`(cmb.rs)是"completion 里再发 CMB 访问 → 自馈 cascade"这条
+/// host-存活性 DoS 路径的循环级封顶。§29 纪律:cap 写完必须证它**真能 fire**(dead cap =
+/// 装了个永不响的保险)。SGL / PRP-list / shadow-poll 三个 cap 都有 firing 测试,唯独
+/// `MAX_CMB_DRAIN_ITERS` 此前**零测试引用** —— 本测试补齐。
+///
+/// 手法(同 `c1_chain_depth_cap_rejects_malformed_chain`:直接把队列预填到撞 cap)。drain
+/// 循环的 `iters` 按 **pop 计数**(非 cascade 进展),故预填 `MAX_CMB_DRAIN_ITERS` 条合成
+/// 完成即可驱动到上限。每条用 unknown token(fresh controller 全空表 → `on_dma_complete_impl`
+/// 走 unknown-token debug 早退、纯 no-op 无状态增长),不依赖真 cascade 即可证"循环在 cap 处
+/// 硬终止 + 置 CSTS.CFS + 收链(clear)"——这正是 cap 守的属性。
+///
+/// 独立 oracle:drain 返回后 `csts & CFS != 0`(fatal 置位)+ `cmb_completions` 已清空。
+/// revert-verify(手动):把**预填条数**改成 `MAX_CMB_DRAIN_ITERS - 1`(或把 cap 抬过预填数)
+/// → `iters` 永不达上限、有限队列自然 drain 干净 → CFS **不**置位 → 本测试 CFS 断言转红。
+/// (注:**不能**用 cap=`u32::MAX` 做 revert——预填数 `n` 绑定同一常量,会预填 ~4.3B 条 OOM;
+/// 此处 cap 与预填解耦的等价判别是调预填数。)证明 CFS 确由 cap 把守、而非旁路置位。
+#[test]
+fn cmb_drain_iters_cap_fires_and_sets_cfs() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx};
+    let mut c = make_ctrl_with_tmp("cmb_drain_cap");
+    // 预填到撞 cap 的最小条数(第 MAX 次 pop 时 `iters>=MAX` → fire,先于 dispatch)。
+    let n = NvmeController::MAX_CMB_DRAIN_ITERS;
+    for i in 0..n {
+        c.cmb_completions
+            .push_back(crate::controller::CmbCompletion {
+                // 高位 token,fresh controller 各 pending 表皆空 → 必为 unknown(no-op 早退)。
+                token: (1u64 << 63) | i as u64,
+                ok: true,
+                data: None,
+            });
+    }
+    let mut cap = CaptureTransport::with_start_token(0x100);
+    {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        c.drain_cmb_completions(&mut ctx);
+    }
+    // oracle 1:撞顶置 CSTS.CFS(否则 = dead cap)。
+    assert_ne!(
+        c.csts & crate::regs::csts::CFS,
+        0,
+        "MAX_CMB_DRAIN_ITERS 撞顶应置 CSTS.CFS"
+    );
+    // oracle 2:cap 分支 clear 了队列(收链,不留残余 cascade)。
+    assert!(
+        c.cmb_completions.is_empty(),
+        "cap 撞顶应清空 cmb_completions"
+    );
+}
+
 /// **L-2：PRP-list 多-sibling DMA-fail 清理（spec § 4.6.1 "one CQE per command"）差分
 /// oracle** —— 一条 PRP-list 命令派生多条共享 op_id 的 sibling 子-DMA（list-fetch +
 /// 每数据页 DMA）。当 scatter 已发出**多条** data sibling、其中一条 DMA 失败时，
