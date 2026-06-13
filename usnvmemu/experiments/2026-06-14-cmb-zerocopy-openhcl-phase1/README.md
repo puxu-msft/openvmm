@@ -29,14 +29,20 @@ iter-2（真 MMIO-hole GPA + i440bx 风格 + early/late 双时序，5×2=10 探�
 | 0xf9100000 | 0x10000000 | 64KB | FAILED | FAILED |
 | 0x10000000 | 0x10000000(identity) | default | FAILED | FAILED |
 
-## 裁定
-- **承重假设 A（对 arbitrary hole/RAM、本 Gen2 host 配置）= 证伪**。host `CreateRamGpaRange` 对真 MMIO 空洞、
+## 裁定（独立 reviewer 复核后收紧措辞）
+- **承重假设 A 的"任意-空洞/RAM 别名"路径 = 本 Gen2 host 实测证伪**。host `CreateRamGpaRange` 对真 MMIO 空洞、
   RAM、identity、rom_mb 标志、i440bx 风格 gpa_offset、两种页大小、early+late 两时序——**一律 FAILED=5**。
   不是 INVALID_GPA/SLOT_OUT_OF_BOUNDS（host 接受了 GPA 和 slot），是操作本身失败。
+- **🔑 排除假阴性（reviewer 强化）**：OpenVMM 树里 `CreateRamGpaRange` 的**唯一 responder = GED stub**
+  （`guest_emulation_device/src/lib.rs:1031-1040`，硬编码返 FAILED、**连 INVALID_GPA 都返不出**）。而 iter-1
+  观测到 **INVALID_GPA** 差异化错码 → **确证打到的是真 Hyper-V host 的 `IVmGuestMemoryAccess`、非 stub、非 API 误用**。
+- **API 用法已核无误（reviewer）**：`gpa_count` 字节（同 i440bx `MemoryRange::len()`）、slot 错会返 SLOT_OOB、
+  flag 错会返 INVALID_FLAG——都没收到，故 FAILED 非参数误用。全仓除 i440bx 外无第二个 create_ram_gpa_range
+  成功 pattern，i440bx 也无漏掉的前置步骤，差别纯在地址落点（它在声明低 1MB RAM 内 / 我在 MMIO 空洞或异址）。
 - **推翻 feasibility 实验的未验证推断**：原档称 create_ram_gpa_range "生产已证（i440bx 依赖）"——实为**从未真机测过**
   （i440bx 是 Gen1/PCAT，本 VM 是 Gen2 从不走它）。本 POC 是**首次真机调用**，结果 FAILED。"生产代码依赖" ≠ "本配置可用"。
-- **唯一未测变体**：gpa_start = 真实存在的设备 BAR 的 GPA（host 已知的 declared MMIO 窗口），而非任意空洞。
-  i440bx 的成功 gpa_start 是 chipset 声明的 PAM-ROM 区；host 可能只 remap 它声明过的区。本 VM `inspect` 显 `missing-pci`
+- **唯一未测变体（标"未证伪/概念存疑"，不并进已证伪）**：gpa_start = 真实存在的设备 BAR 的 GPA（host 已知的 declared MMIO 窗口），而非任意空洞。
+  i440bx 的成功 gpa_start 是 chipset 声明的 PAM-ROM 区（**在声明低 1MB RAM 内**）；host 可能只 remap 它声明过的区。本 VM `inspect` 显 `missing-pci`
   （vfio-user 设备未上线），未能取真 BAR 测。**这是 A 的最后一线生机，但概念上 host 不拥有 vfio-user BAR 的 decode。**
 
 ## 对缺口①②的影响

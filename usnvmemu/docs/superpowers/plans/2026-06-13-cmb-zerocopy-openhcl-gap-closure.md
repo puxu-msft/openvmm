@@ -57,9 +57,10 @@ GET `create_ram_gpa_range(slot, gpa_start, gpa_count, gpa_offset, flags)` 的语
 | **D** | 缺口①走直接别名（非 MemoryMapper）| ✅ **已定**（G1 trait 不同构）| Phase 0 完成 |
 | **E/F/G** | slot 资源 / block_on 并发 / 写序一致性 | ⚠️ moot（缺口① 因 A 伪而暂停）| — |
 
-## Phase 1 真机结论（2026-06-14，决定性）
-**承重假设 A 真机证伪** → §5 零拷贝 CMB-on-OpenHCL 路径**卡在 host primitive**（`create_ram_gpa_range` 对任意 GPA FAILED），**非"只缺 wiring"**。缺口① 组件 moot（primitive 不工作建组件无意义）。**修正 feasibility 实验**："create_ram_gpa_range 生产已证"是从未真机测过的推断（i440bx 是 Gen1，本 VM Gen2 从不走它）；本 POC 首次真机调用即 FAILED。
-**净**：OpenHCL 上**可用的 CMB = trap 模式**（拷贝式，L4 已 PASS）；**零拷贝 CMB-on-OpenHCL 在真 Gen2 Hyper-V 被 create_ram_gpa_range 的 FAILED 挡住**。唯一剩余生机=真 declared 设备-BAR gpa_start 变体（重设置 + 概念上低存活率，待用户定夺是否投）。
+## Phase 1 真机结论（2026-06-14，独立 reviewer 复核共识）
+**承重假设 A 的"任意-空洞/RAM 别名"路径真机证伪**（10 配置×2 时序全 FAILED=5；reviewer 经 GED-stub 排除——iter-1 的 INVALID_GPA 是 stub 返不出的码，确证打到真 host 非 stub、非 API 误用）→ §5 零拷贝 CMB-on-OpenHCL 路径**卡在 host primitive**，**非"只缺 wiring"**。缺口① 组件 moot。**修正 feasibility 实验**："create_ram_gpa_range 生产已证"是从未真机测过的推断（i440bx 是 Gen1，本 VM Gen2 从不走它）；本 POC 首次真机调用即 FAILED。
+**唯一未测变体 = 真 declared 设备-BAR gpa_start**（标"未证伪/概念存疑"，不并进已证伪：CMB BAR 落 MMIO 空洞 + VTL2-intercept，与 create_ram_gpa_range 工作前提概念冲突，强推断也 FAIL 但未实测）。
+**净**：OpenHCL 上**可用的 CMB = trap 模式**（拷贝式，L4 已 PASS）；零拷贝在真 Gen2 Hyper-V 被 create_ram_gpa_range 的 FAILED 挡住。
 
 ## 非目标 / 边界
 - 不碰 VTL2 私有内存暴露（已证死路）。
