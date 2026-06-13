@@ -5,27 +5,38 @@
 > 历史上本文件叫 "NVMe-oF TCP Target Roadmap"，2026-06-08 升为项目级 (因
 > firmware-as-core 愿景 + usnvmemu/ 独立)。
 
-> **最后更新**: 2026-06-08 (usnvmemu/ 子目录化 + crate 改名 + 文档归属重组)
+> **最后更新**: 2026-06-13 (NVMe-oF V-series 冻结于 V-interop-8；前沿转 firmware-as-core
+> 三接入真机化 — W 系列 vfio-user-in-underhill / Layer C Option B / CMB 双模 / #4c-b PRP)
 
 ## 0. 当前坐标
 
+**NVMe-oF TCP track（全栈 shipped，已冻结）** — 详 [MILESTONES §4](MILESTONES.md)：
 ```
-V1 ──> V2 ──> V3 ──> V4abc ──> V5abcd ──> V5e/f-followup ──> V6abc ──> V7abc ──> V8a-f ──> V8e tokio ──>
-V-followup-tls(1..4) ──> V-followup-mtls ──> V-followup-auth(1..2) ──> V-followup-dhchap(1..3,3-wire) ──>
-V-followup-interop(1..7) ──> V-followup-prp-list ──> V-followup-dhchap-4 + 4d ──> V-interop-8 ──> [HERE]
+V1 ──> V2 ──> V3 ──> V4abc ──> V5abcd ──> V6abc ──> V7abc ──> V8a-f ──> V8e tokio ──>
+V-followup-tls/mtls/auth/dhchap(1..4d) ──> V-followup-prp-list ──> V-interop-8 ✅
 ```
+
+**当前前沿 — firmware-as-core 三接入真机化**（详 [MILESTONES §3](MILESTONES.md) + live memory `vfio-user-underhill-state`）：
+- **vfio-user-in-underhill**：W0 ──> W6c（DMA 零拷贝真机 PROVEN）──> Layer C C0/C2-0 ──>
+  **Option B 收口**（usnvmemu Lost = transient 停顿 + C-3 透明重连；hot-remove/re-add 模型真机证伪，
+  改"设备恒在 + 透明重连"贴真硬件 controller reset）✅
+- **CMB 双模（trap-based + map-based 并存）**、**#4c-b PRP 统一段抽象**：进行中（有 commit 落地，详各 crate `docs/plans/`）
+- **下一步（vfio-underhill track）**：W6 usnvmemu 独立托管服务（VTL2 boot 自启动，替代 operator 手动 push）—— 规划中，尚无 commit 落地
 
 **项目愿景** (用户 2026-06-06 explicit, [PROJECT_VISION.md](PROJECT_VISION.md))：
 **用户态 NVMe firmware** 为核心 + 三种接入 (OpenHCL VTL2 / OpenVMM dev / QEMU vfio-user) +
 NVMe-oF TCP 第 4 条接入。当前架构 ✅ 已对齐：firmware (controller) runtime-agnostic +
 `trait Transport` 边界已抽出。
 
-**当前状态**：
-- 306 lib + integration tests pass，clippy 0 warning，#![forbid(unsafe_code)] + #![deny(clippy::await_holding_lock)] 维持。
+**当前状态（NVMe-oF TCP track，已冻结）**：
+- nvme_of_tcp_target crate：306 lib + integration tests pass，clippy 0 warning，#![forbid(unsafe_code)] + #![deny(clippy::await_holding_lock)] 维持。
 - Linux nvme-cli plaintext discover + connect + IO 互通已实证。
 - DHCHAP simplified wire + spec § 8.13.5 4-message wire 都通，多 descriptor 兼容。
 - TLS / mTLS / NQN<->cert binding 端到端 (server-auth 全栈)。
 - TLS PSK TP-8011 deterministic crypto 已落，**rustls 注入待上游**。
+
+> 其余 track（firmware-core / vfio-user-in-underhill / CMB / PRP）各有自己的 test 套件（持续增长），
+> 详各 crate `cargo test` + [MILESTONES](MILESTONES.md) §1/§3。
 
 ## 1. 短期 (1-3 phase, 不依赖上游)
 
