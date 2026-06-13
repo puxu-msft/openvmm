@@ -575,6 +575,16 @@ fn do_main() -> anyhow::Result<()> {
         log::info!("registered vfio-pci as driver for nvme");
     }
 
+    // W6: env-gated auto-start of the baked-in `/bin/usnvmemu` vfio-user NVMe
+    // server, so the VTL0 guest gets the emulated NVMe disk with zero operator
+    // action. Failures degrade SILENTLY to "boot-absent" (the device shim's
+    // persistent reconnect tolerates usnvmemu not running) — and must NEVER
+    // escape `do_main` (an `Err` here -> `main` `exit(1)` -> PID1 death ->
+    // kernel panic). Hence the explicit swallow-and-warn here.
+    if let Err(err) = try_start_vfio_user_nvme() {
+        log::warn!("vfio_user_nvme autostart skipped: {err:#}");
+    }
+
     // Start loading modules in parallel.
     let thread = std::thread::spawn(|| {
         if let Err(err) = load_modules("/lib/modules") {
@@ -588,6 +598,149 @@ fn do_main() -> anyhow::Result<()> {
     run(&options, new_env)
 }
 
+/// Parse the vfio-user-NVMe auto-start configuration from the two env strings,
+/// deriving the listen socket from the **device** env (single source of truth —
+/// no socket duplication / mismatch footgun).
+///
+/// - `device` = `OPENHCL_VFIO_USER_NVME` = `<guid>:<sock>[,opt=...][;<more>]`.
+///   The socket is the first entry's `<sock>` (before any `,opts`); multi-device
+///   auto-start is future work.
+/// - `autostart` = `OPENHCL_VFIO_USER_NVME_AUTOSTART` = `<size_mb>:<backing>`
+///   (launcher-only params the device side doesn't need). **Colon-delimited and
+///   space-free** so the whole value survives kernel-cmdline → init-env passing
+///   (the cmdline splits on whitespace; a space in the value would be truncated).
+///   `<backing>` must live under `/tmp` (the only writable tmpfs in VTL2) and
+///   contain no `..` (traversal); `<size_mb>` must be 1..=1 TiB (`NvmeController::open`
+///   rejects a backing file < 512 bytes, and the upper bound avoids absurd sizes).
+///
+/// Returns `(sock, backing, size_mb)`.
+fn parse_vfio_user_nvme_autostart(
+    device: &str,
+    autostart: &str,
+) -> anyhow::Result<(String, String, u64)> {
+    let first = device.split(';').next().unwrap_or("");
+    let (_guid, rest) = first
+        .split_once(':')
+        .context("OPENHCL_VFIO_USER_NVME missing ':' (expected <guid>:<sock>)")?;
+    let sock = rest.split(',').next().unwrap_or("").trim();
+    anyhow::ensure!(
+        !sock.is_empty(),
+        "OPENHCL_VFIO_USER_NVME has an empty socket path"
+    );
+
+    // `<size_mb>:<backing>` — size first so `split_once(':')` cleanly separates
+    // the numeric size (no colon) from the path remainder.
+    let (size_str, backing) = autostart
+        .split_once(':')
+        .context("OPENHCL_VFIO_USER_NVME_AUTOSTART expected <size_mb>:<backing>")?;
+    let size_mb: u64 = size_str
+        .trim()
+        .parse()
+        .context("OPENHCL_VFIO_USER_NVME_AUTOSTART <size_mb> is not a number")?;
+    let backing = backing.trim();
+    anyhow::ensure!(
+        (1..=1024 * 1024).contains(&size_mb),
+        "OPENHCL_VFIO_USER_NVME_AUTOSTART <size_mb> must be 1..=1048576 (1 TiB); got {size_mb}"
+    );
+    anyhow::ensure!(
+        backing.starts_with("/tmp/") && !backing.contains(".."),
+        "OPENHCL_VFIO_USER_NVME_AUTOSTART <backing> must be under /tmp with no '..'; got {backing:?}"
+    );
+
+    Ok((sock.to_string(), backing.to_string(), size_mb))
+}
+
+/// Env-gated launch of the baked-in `/bin/usnvmemu` vfio-user NVMe server inside
+/// VTL2 (see [`parse_vfio_user_nvme_autostart`] for the config).
+///
+/// Gate: `OPENHCL_VFIO_USER_NVME_AUTOSTART` unset -> no-op, zero behavior change.
+///
+/// Design (architect-reviewed):
+/// - **Confidential-VM gate**: never auto-start on a CVM — usnvmemu DMAs guest
+///   RAM via the non-isolated VTL0 shared view (`/dev/mshv_vtl_low`), which is
+///   unavailable under isolation. (The device side is also CVM-gated; this is
+///   defense-in-depth + avoids a pointless resident process in a CVM.)
+/// - **Un-core-dumpable (`RLIMIT_CORE=0`)**: VTL2 sets
+///   `core_pattern=|/bin/underhill-crash`, which has *no* PID filter and would
+///   stream a core dump to the host = a **false "VTL2 crashed" report** if
+///   usnvmemu ever segfaults. With `RLIMIT_CORE=0` an abnormal exit reaps as a
+///   plain signal death (no `core_pattern`), degrading silently to boot-absent —
+///   the same mechanism `underhill_crash` uses for recursion safety.
+/// - **`setsid`**: own session, decoupling usnvmemu's lifecycle signals from
+///   PID1's boot session.
+/// - **Not waited on**: `reap_until`'s `libc::wait()` reaps it on death (its pid
+///   != the underhill child, so the loop doesn't return). **No restart loop** —
+///   VTL2 treats unexpected process death as fatal; graceful restart is the
+///   operator/reconnect's job.
+/// - stdout is **redirected to stderr** (`dup2(2,1)` in `pre_exec`), and init's
+///   stderr is `/dev/ttyprintk` -> kmsg. usnvmemu's `tracing` writes to stdout,
+///   so this folds its logs into the same kmsg stream operators already watch
+///   for "reconnected, Live" — without it they'd hit init's inherited stdout =
+///   `/dev/null` and vanish, making the silent-degrade path undiagnosable.
+fn try_start_vfio_user_nvme() -> anyhow::Result<()> {
+    let Ok(autostart) = std::env::var("OPENHCL_VFIO_USER_NVME_AUTOSTART") else {
+        return Ok(()); // gate unset -> no-op
+    };
+
+    if underhill_confidentiality::is_confidential_vm() {
+        log::warn!("vfio_user_nvme autostart: skipped on confidential VM");
+        return Ok(());
+    }
+
+    let device = std::env::var("OPENHCL_VFIO_USER_NVME").context(
+        "OPENHCL_VFIO_USER_NVME_AUTOSTART set but OPENHCL_VFIO_USER_NVME (device) is unset",
+    )?;
+    let (sock, backing, size_mb) = parse_vfio_user_nvme_autostart(&device, &autostart)?;
+
+    // usnvmemu's `NvmeController::open` requires the backing file to already
+    // exist (it opens without `.create`); create + size it here.
+    let f = fs_err::File::create(&backing).context("create vfio_user_nvme backing file")?;
+    f.set_len(size_mb << 20)
+        .context("size vfio_user_nvme backing file")?;
+    drop(f);
+
+    let mut command = Command::new("/bin/usnvmemu");
+    command
+        .arg("--vfio-user-sock")
+        .arg(&sock)
+        .arg("--backing-file")
+        .arg(&backing)
+        .stdin(Stdio::null());
+    // SAFETY: `pre_exec` runs in the forked child before `exec`. `setrlimit`
+    // and `setsid` are async-signal-safe and touch only this child's state.
+    unsafe {
+        command.pre_exec(|| {
+            // C-1: un-core-dumpable so a segfault never fires
+            // core_pattern=|/bin/underhill-crash (false host crash report).
+            let rlim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::setrlimit(libc::RLIMIT_CORE, &rlim) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // H-3: own session.
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // HIGH-1: route usnvmemu's stdout (where its `tracing` writes) to
+            // stderr (= init's /dev/ttyprintk -> kmsg); otherwise it inherits
+            // init's stdout = /dev/null and its logs vanish. `dup2` is
+            // async-signal-safe.
+            if libc::dup2(STDERR_FILENO, STDOUT_FILENO) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    command.spawn().context("spawn /bin/usnvmemu")?;
+    log::info!(
+        "vfio_user_nvme autostart: launched /bin/usnvmemu on {sock} (backing {backing}, {size_mb} MiB)"
+    );
+    Ok(())
+}
+
 pub fn main() -> ! {
     match do_main() {
         Ok(_) => unreachable!(),
@@ -595,5 +748,69 @@ pub fn main() -> ! {
             log::error!("fatal: {:#}", err);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_vfio_user_nvme_autostart;
+
+    #[test]
+    fn derives_sock_and_parses_backing_size() {
+        let (sock, backing, size_mb) = parse_vfio_user_nvme_autostart(
+            "11111111-2222-3333-4444-555555555555:/tmp/vfio_nvme.sock",
+            "256:/tmp/nvme.img",
+        )
+        .unwrap();
+        assert_eq!(sock, "/tmp/vfio_nvme.sock");
+        assert_eq!(backing, "/tmp/nvme.img");
+        assert_eq!(size_mb, 256);
+    }
+
+    #[test]
+    fn sock_strips_device_opts_and_extra_entries() {
+        // Device env may carry per-device opts (,bar0=..) and multiple entries (;).
+        let (sock, ..) = parse_vfio_user_nvme_autostart(
+            "g:/tmp/a.sock,bar0=4000,msix=4;h:/tmp/b.sock",
+            "64:/tmp/nvme.img",
+        )
+        .unwrap();
+        assert_eq!(sock, "/tmp/a.sock"); // first entry, opts stripped
+    }
+
+    #[test]
+    fn autostart_value_must_be_space_free_colon_form() {
+        // Space-separated would be truncated by the kernel cmdline -> env path,
+        // so the parser requires the colon form. A value with no colon fails.
+        assert!(parse_vfio_user_nvme_autostart("g:/tmp/a.sock", "/tmp/nvme.img 256").is_err());
+        assert!(parse_vfio_user_nvme_autostart("g:/tmp/a.sock", "256").is_err()); // no backing
+    }
+
+    #[test]
+    fn rejects_backing_outside_tmp_or_traversal() {
+        // /tmp is the only writable tmpfs in VTL2; refuse anything else / `..`.
+        assert!(parse_vfio_user_nvme_autostart("g:/tmp/a.sock", "256:/var/nvme.img").is_err());
+        assert!(
+            parse_vfio_user_nvme_autostart("g:/tmp/a.sock", "256:/tmp/../etc/x").is_err(),
+            "must reject path traversal"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_size() {
+        assert!(parse_vfio_user_nvme_autostart("g:/tmp/a.sock", "0:/tmp/x.img").is_err()); // zero
+        assert!(parse_vfio_user_nvme_autostart("g:/tmp/a.sock", "abc:/tmp/x.img").is_err()); // non-numeric
+        assert!(
+            parse_vfio_user_nvme_autostart("g:/tmp/a.sock", "9999999:/tmp/x.img").is_err(),
+            "must reject > 1 TiB"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_device_env() {
+        // No ':' separator -> can't derive sock.
+        assert!(parse_vfio_user_nvme_autostart("no-colon-here", "256:/tmp/x.img").is_err());
+        // Empty sock.
+        assert!(parse_vfio_user_nvme_autostart("g:", "256:/tmp/x.img").is_err());
     }
 }
