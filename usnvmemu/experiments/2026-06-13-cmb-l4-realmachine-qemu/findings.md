@@ -5,7 +5,15 @@
 （`CMB_MODE=trap|map`，三 oracle：guest IO PASS + host backing marker + firmware `CMB-RESIDENT-ACCESS`）
 **firmware 观测性**：`controller/cmb.rs::note_first_cmb_access`（首次 CMB-resident 访问打日志）
 
-## 结论：L4 部分达成 —— **CMB enable 握手 + 真 IO 已对真驱动验证；SQ-in-CMB 数据放置卡在 guest p2pdma**
+## 结论：**L4 完全达成（trap+map 双模真机 PASS）** —— 真根因是两个 firmware 寄存器 bug，非 dma-buf/fork
+
+> **重大更新（S8）**：S2–S7 一路以为"SQ 落 host RAM"卡在 vfio-user dma-buf 暴露层、需 fork QEMU。
+> guest-ftrace（S7 part-1）+ 修复实测**推翻**此结论：真根因是**两个 firmware 自身的寄存器 bug**
+> （CMBSZ 位布局 + CMBMSC 跨 Controller Reset 生命周期），都是 **self-consistent trap**（in-process
+> 测试 + 误读 spec 两端自洽通过，只有真 Linux 驱动作独立 oracle 才暴露）。**修两个 bug 后 L4
+> trap+map 双模真机全 PASS**（guest IO + host backing + firmware CMB-RESIDENT-ACCESS 三 oracle 一致）。
+> **不需要 fork QEMU、不需要 dma-buf**——SQ-in-CMB 的 firmware 自读 backing 路径与 host dma-buf 无关。
+> 下方 S2–S7 保留为**弯路存档**（教训价值：见 self-consistent trap 与 oracle 选择）。
 
 ### ✅ 已验证（firmware-correctness 关键部分）
 真 Linux `nvme` 驱动对本 firmware**完整走通 CMB 发现 + 启用握手**（trap 与 map 两模一致）：
@@ -123,3 +131,48 @@ dma-buf 路径**不读任何 region capability**（`vfio_region_create_dma_buf` 
 
 ### S7 part-1（guest 侧 ftrace `pci_alloc_p2pmem` vs `virt_to_bus`）
 进行中（子 agent）——定位 guest 回退在哪个内核函数，与 host-side dma-buf 缺口对账（reconcile 是 guest 自身 pool 问题，还是 host dma-buf 缺失的下游 guest-visible 后果）。
+
+## S8 真根因定位 + 修复 + L4 完全达成（决定性，推翻 S2–S7 的 fork 方向）
+
+### guest-ftrace（S7 part-1）暴露真根因 ①：firmware CMBSZ 位布局 bug
+boot-time kretprobe 抓 `pci_alloc_p2pmem` **命中 0 次** → guest 根本没进 p2pmem 分支（判定 (c)：`cmb_use_sqes=false`）。根因：firmware `regs.rs::cmbsz` 常量**非 spec-aligned**：
+
+| 字段 | NVMe spec §3.1.14 / Linux nvme.h / QEMU | firmware（错） |
+|---|---|---|
+| SQS | **bit 0** | bit 4 |
+| CQS/LISTS/RDS/WDS | bit 1/2/3/4 | bit 5/6/7/8 |
+| SZU | **bits 11:8** | bits 3:0 |
+
+firmware 意图广告全能力却写出 `0x002001f0`，Linux 按 spec 解码成 **SQS=0** → 驱动拒绝 SQ-in-CMB。`cmbsz_field_offsets_match_spec` 测试**反而 enshrine 了错误布局**（断言 `SQS==1<<4`）——典型 self-consistent trap。
+
+### 真根因 ②：CMBMSC 跨 Controller Reset 生命周期 bug
+修 ① 后 guest 真把 SQ 放进 CMB（`Create IO SQ gpa=0xfe000000`），但 firmware `guest_read`→`cmb_hit` 返 **Miss** → `dma_read 0xfe000000 not in any DMA region` → 起不来。debug 日志坐实：
+```
+CMBMSC programmed cmse=true cba=0xfe000000   ← driver 启用 CMB
+CC.EN 1→0 disabling                          ← Controller Reset
+CC.EN 0→1 enabling                           ← 重新 enable，driver 不重编程 CMBMSC
+Create IO SQ gpa=0xfe000000 → fetch cmb_hit Miss（cmse 被 reset 清了）
+```
+firmware `disable()`（CC.EN→0）**误清** CMBMSC 的 cre/cmse/cba。真 Linux `nvme_map_cmb` 仅编程一次（`if (dev->cmb_size) return` 守卫）、init 的 CC.EN 周期后不重编程，依赖 CMBMSC **跨 Controller Reset 持久**。**QEMU `nvme_ctrl_reset(NVME_RESET_CONTROLLER)` 同样不动 cmbmsc**（源码核对，interop 参考）。原"reset 清 CMBMSC"标注 `spec §3.1.24 + architect 复核 #4`——又一个 self-consistent trap（spec 误读 + architect review 都错，真驱动才暴露）。
+
+### 修复（两处，spec + interop 对齐）
+1. `regs.rs::cmbsz`：SQS→bit0…WDS→bit4、SZU→bits11:8；修 `cmbsz_field_offsets_match_spec` 测试断言正确布局 + 整字回归锚 `0x0020_001f`。
+2. CMB 生命周期：`disable()`（Controller Reset CC.EN→0）**保留** CMBMSC；只 `reset()`（FLR/PCIe = Controller Level Reset）才清。改 `controller_reset_clears_cmb_enable_state`→`controller_reset_preserves_cmb_enable_state`。
+
+### L4 真机结果：**trap + map 双模全 PASS**
+```
+=== PASS (L4,trap)：真 nvme 驱动真用 CMB + 真 IO，三 oracle 一致 ===
+=== PASS (L4,map) ：真 nvme 驱动真用 CMB + 真 IO，三 oracle 一致 ===
+oracle: guest IO PASS=True ; host backing marker=True ; CMB-USED=True
+```
+真 Linux nvme：SQS 识别 → cmb_use_sqes=true → CMBMSC 启用且跨 reset 持久 → SQ 落 CMB(0xfe000000) → firmware 从 CMB backing 取 SQE（CMB-RESIDENT-ACCESS fired）→ 真 write/read/flush 全程 PASS。
+
+### 对 fork 问题的最终答案（推翻 S6/S7）
+- **SQ-in-CMB 完全是 firmware 自身能力**：firmware（= NVMe controller）从**自己的** CMB backing 读 SQE，**不经** host DMA/IOMMU/dma-buf。S6/S7 的"vfio-user dma-buf 缺口 → 需 fork QEMU"是**追错了下游症状**——guest 根本没走到 dma-buf 那层（卡在更前的 CMBSZ.SQS 判定）。
+- **不需要 fork QEMU，不需要 dma-buf**。两个 firmware 寄存器 bug 修完即真机打通。
+- dma-buf 那条路（S7 三层缺口分析）**仅对"host DMA 引擎/别的设备直接 DMA 到 CMB BAR"（如 data-in-CMB 的 P2P）才相关**，与 SQ/CQ/PRP-in-CMB（firmware 自读自写 backing）正交。留作未来若做真 P2P-data 才需。
+
+### 通用教训
+- **self-consistent trap 连发两例**：wire 寄存器布局 + 寄存器生命周期，两端（firmware 编码/解码、firmware 测试、误读 spec、architect review）自洽 → 全绿，唯有真 host 驱动作独立 oracle 才暴露。凡"firmware 自定义 + 自测 + 自证 spec"的 wire 契约，必须有真对端或独立 oracle。
+- **oracle 选择**：`map_addr_cmb`（误）→ `create_sq addr`（对）；`CMB-RESIDENT-ACCESS 缺失`（症状）→ guest-ftrace `pci_alloc_p2pmem 命中数`（根因）。症状层 oracle 会把人导向错误的上游归因（dma-buf/fork）。
+- **追下游症状 vs 定位根因**：S2–S7 五轮在 dma-buf/fork 上深挖，根因却在最前一环（CMBSZ.SQS）。遇"驱动不按预期用某能力"，先 ftrace 驱动**第一个**决策分支，别从最深的失败处反推。

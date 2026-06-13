@@ -25,13 +25,14 @@ QEMU 11.0.1（brew）+ Ubuntu 6.8.0-31 guest kernel + busybox initramfs（缓存
 | S4 | IOMMU 配置实验（intel-iommu + intel_iommu=on）| ✅ 完成：**不解**（SQ 仍非 CMB）|
 | S5 | 独立 subagent 审计 | ✅ 完成（f8c1384fb）：**推翻**我"内核 p2pdma 分配限制"的错误归因；真烟枪=QEMU `failed to create dma-buf` on CMB BAR（vfio-user BAR-DMA 暴露层）；根因**仍未坐实** |
 | **S6** | **QEMU-emulated-nvme 对照**（决定 fork 对不对路）| ✅ **完成（677ec341f，独立审计达成共识）**。QEMU 自带 `-device nvme,cmb_size_mb=2` 同 guest，真 oracle=`create_sq` 的 addr（非 `map_addr_cmb`，一度误用已纠）。**IO SQ 落 `0xfe000000`（CMB 内，QEMU `nvme_addr_is_cmb`→memcpy CMB backing）** ⟹ ①guest+kernel CAN（坐实）+ ②瓶颈在 vfio-user BAR-DMA 暴露链（坐实）。**③fork 对象未定**：EINVAL 可能是 QEMU client 缺 dma-buf 支持**或** firmware region_info 缺 flag（改 firmware 远省）——审计纠正过早收敛，**不该先 fork**，先做 S7 定位 |
-| **S7** | **定位实验**（决定 fork 对象/是否需 fork）| ✅ **协议侧源码溯源完成（决定性）**：`-22 EINVAL` = QEMU client 自身短路（`region.c:288` 建 dma-buf 时 `io_ops->device_feature` NULL）。**推翻审计的"region_info flag"廉价解**（dma-buf 不读 region cap，走 device-feature cmd16）。三层缺口：host kernel ✅／QEMU client（11.0.1 缺转发，**用户 fork 11.0.50 已含**）／firmware server（缺 DMA_BUF GET 实现）。用户 fork 仅差 `vfio_user_device_io_ops_sock.capabilities \|= VFIO_IO_CAP_DMA_BUF`（~1 行过 `region.c:297` 门）。🔄 part-1（guest ftrace `pci_alloc_p2pmem` vs `virt_to_bus`）子 agent 进行中 |
-| S8 | （若投入）有界三步：①fork 加 1 行 capability ②firmware 实现 `VFIO_USER_DEVICE_FEATURE` DMA_BUF GET（map 模式 memfd 作 fd 源）③**先 POC 残留 (D)**：host `vfio_pci_dmabuf.c` 是否肯为软件 vfio-user BAR（无真 PCI 资源）导 dma-buf | ⏸ 待用户定夺 |
+| **S7** | **定位实验** | ✅ **part-2 协议侧源码溯源**：`-22 EINVAL` = QEMU client 短路（dma-buf 路径）。✅ **part-1 guest-ftrace（决定性）**：boot-kretprobe 抓 `pci_alloc_p2pmem` **命中 0 次** → guest 根本没进 p2pmem 分支（`cmb_use_sqes=false`）→ **真根因在更前一环 = firmware CMBSZ.SQS 位布局 bug**，与 dma-buf 无关。S2–S7 追错了下游 |
+| **S8** | **真根因修复 + L4 完全达成** | ✅ **完成（fix 3a1779c1d）**：修两个 firmware 寄存器 bug（CMBSZ 位布局 + CMBMSC 跨 reset 生命周期，均 self-consistent trap）→ **L4 真机 trap+map 双模全 PASS**（三 oracle 一致）。**不需 fork QEMU、不需 dma-buf** |
 
-## 净结论（截至 S6，独立审计达成共识，详见 `findings.md`）
-- ✅ **firmware 侧已真机证**：CMB 广告 + 真驱动完整启用握手（CAP.CMBS→CMBMSC.CRE→CMBSZ[SQS]→CMBLOC[BIR=2]→CMSE+CBA）+ 真 NVMe IO + **p2pdma 资源注册**（64-bit prefetchable BAR 后）。in-process 测不出的真价值，已 keep。
-- ✅ **S6 坐实**①guest+kernel 完全有能力 SQ-in-CMB（QEMU emulated nvme 同 guest 实证，SQE 真走 CMB backing memcpy）+ ②瓶颈在 **vfio-user 的 BAR-as-DMA-target 暴露链**（native-BAR 成功 / vfio-user-BAR `failed to create dma-buf` + map 模式同败排除假 BAR）。
-- ⚠️ **fork 裁定（S7 源码级细化）**：反转 S5"先别 fork"——但**不是从零 fork**。用户 fork `/home/xp/src/qemu-fork`（11.0.50）**已含 vfio-user device_feature 转发**（client 短路缺口已闭合），仅差 **1 行 capability 广告**（`io_ops.capabilities |= VFIO_IO_CAP_DMA_BUF`）过 `region.c:297` 门。真正待补 = **firmware server 端 `VFIO_USER_DEVICE_FEATURE` DMA_BUF GET 实现** + **先 POC 残留 (D)**（host `vfio_pci_dmabuf.c` 是否肯为无真 PCI 资源的软件 vfio-user BAR 导 dma-buf）。审计的"region_info flag 廉价解"被源码**证伪**。
+## 净结论（S8，L4 完全达成）
+- ✅ **L4 真机完全打通**：真 Linux nvme 驱动 over QEMU vfio-user，trap+map 双模把 IO SQ 放进 CMB（0xfe000000）+ firmware 从 CMB backing 取 SQE（CMB-RESIDENT-ACCESS）+ 真 write/read/flush 全 PASS（三 oracle 一致）。
+- ✅ **真根因 = 两个 firmware 寄存器 bug**（非 dma-buf/fork）：① CMBSZ 位布局非 spec-aligned（SQS 编 bit4 而非 bit0）→ 真驱动判 SQS=0 拒用 CMB；② CMBMSC 跨 Controller Reset 误清 → 驱动不重编程致 cmse 丢失。两者都是 **self-consistent trap**（in-process 测试 + 误读 spec + architect review 自洽，唯真 Linux 驱动作独立 oracle 才暴露）。
+- ❌ **S2–S7 的"需 fork QEMU / dma-buf"被推翻**：SQ-in-CMB 是 firmware 从**自己的** CMB backing 自读 SQE，**不经** host DMA/IOMMU/dma-buf。guest 卡在最前的 CMBSZ.SQS 判定，根本没走到 dma-buf 层。dma-buf 那条路仅对真 P2P-data（host DMA 引擎直写 CMB BAR）才相关，与 SQ/CQ/PRP-in-CMB 正交，留作未来。
+- **教训**：连发两例 self-consistent trap（wire 布局 + 寄存器生命周期）；oracle 选择（症状层 `CMB-RESIDENT-ACCESS 缺失` → 根因层 guest-ftrace `pci_alloc_p2pmem 命中数`）；遇"驱动不按预期用某能力"先 ftrace 驱动**第一个**决策分支，别从最深失败处反推（S2–S7 五轮在下游 dma-buf 深挖，根因在最前一环）。
 
 ## 关联 commit
-be501b07f(harness+观测性) / 568f8d037(① 64-bit BAR) / f8c1384fb(审计纠正) / 677ec341f(S6 对照+审计共识) / 本目录归档。
+be501b07f(harness+观测性) / 568f8d037(① 64-bit BAR) / f8c1384fb(审计纠正) / 677ec341f(S6 对照) / a542a6226(S7 源码溯源) / **3a1779c1d(真根因双 bug 修复 → L4 达成)** / 本目录归档。

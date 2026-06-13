@@ -1,7 +1,7 @@
 # NVMe CMB 双模设计 —— trap-based + map-based 并存,配置可选
 
 **日期**：2026-06-12
-**状态**：✅ 已实现（P1a–P5 全部落地，7+1 commit，每相独立 review；两模均有 e2e。真 QEMU/Hyper-V guest-boot 驱动 CMB 属真机验证、尚未跑）
+**状态**：✅ 已实现 + **L4 真机完全达成**（P1a–P5 全部落地，每相独立 review；两模均有 e2e。2026-06-13 真 QEMU + 真 Linux 6.8 nvme 驱动 trap+map 双模 SQ-in-CMB 全 PASS，达成前修了两个真机暴露的 firmware 寄存器 bug — CMBSZ 位布局 + CMBMSC 跨 reset 生命周期，commit 3a1779c1d）
 **归属**：`nvme_firmware`（主）+ `vfio_user_transport` / `vfio_user_wire` / `pcie_device_core`（协议）+ `vfio_user_pci_device`（OpenHCL client，仅 map 模式）
 **前置可行性**：见 `usnvmemu/experiments/2026-06-12-vtl-memory-direction-feasibility/`（VSM 单向墙 + transport 不对称的三重证据）。
 
@@ -190,8 +190,8 @@ CMB 验证金字塔自下而上 4 层；前两层**已做**,后两层是**已知
 | **L1 单元/行为**(234 测试) | ✅ 已做 | 寄存器/dispatch/非重入/SGL/strict-0x16/SGLS/negotiate/BAR 访问/`apply_cmb_*` glue | —— |
 | **L2 in-process e2e**(trap + map) | ✅ 已做 | 真 controller+session/socketpair:trap REGION_RW 往返 + map memfd 零拷贝(断言无 REGION_RW) | —— |
 | **L3 binary-startup smoke**(起真 server + 连 client 跑通 main run 路径) | ❌ 缺口 | `run_vfio_user`/`run_main` 的**启动胶水**:negotiate→apply→serve 的时序、feature-gate、真 socket 起服务。构成它的零件全测了,但"二进制真起来并服务 CMB"这层没自动化 | **main.rs 启动路径重构后** / **CI 要 gate"二进制能起 CMB"** / 怀疑启动时序回归时。当前边际价值低(零件已测 + glue 已单测),是回归守护性质 |
-| **L4 真机 guest-boot**(真 NVMe 驱动驱动 CMB) | ◐ **部分达成**(2026-06-13,QEMU+真 Linux 6.8) | ✅ 真 `nvme.ko` 完整走 CMB 发现+启用握手(CAP.CMBS→CMBMSC.CRE→CMBSZ[SQS]→CMBLOC[BIR=2]→CMSE+CBA)+ 真 NVMe IO PASS + host backing 独立核到 → firmware CMB 寄存器/启用序列对真驱动确切时序**已真机证**;⚠️ 驱动把 IO SQ 放进 host RAM 非 CMB(Linux `pci_alloc_p2pmem` 需 CONFIG_PCI_P2PDMA + p2p-capable BAR;疑 32-bit non-prefetchable BAR 是 blocker)——**SQ-in-CMB 数据放置待补**。详见 `experiments/2026-06-13-cmb-l4-realmachine-qemu/findings.md`;harness `qemu_interop/run_qemu_vfio_guest_cmb.py` | 下一步:CMB BAR 改 64-bit prefetchable 后一键复跑验 SQ-in-CMB(跨切+多轮不确定) |
+| **L4 真机 guest-boot**(真 NVMe 驱动驱动 CMB) | ✅ **完全达成**(2026-06-13,QEMU+真 Linux 6.8,trap+map 双模) | 真 `nvme.ko` 把 IO SQ 放进 CMB(0xfe000000)+ firmware 从 CMB backing 取 SQE(CMB-RESIDENT-ACCESS)+ 真 write/read/flush 全 PASS,三 oracle(guest IO/host backing/CMB-USED)一致。**达成前修了两个 firmware 真机 bug**(均 self-consistent trap):① CMBSZ 位布局非 spec-aligned(SQS 编 bit4 而非 §3.1.14 bit0、SZU bits3:0 而非 11:8)→ 真驱动判 SQS=0 拒用 CMB;② CMBMSC 跨 Controller Reset 误清(disable 清 cre/cmse/cba,但真 Linux nvme_map_cmb 仅编程一次依赖其持久)。修复 commit 3a1779c1d。**SQ-in-CMB 是 firmware 自读 backing,不需 host dma-buf/fork QEMU**。详见 `experiments/2026-06-13-cmb-l4-realmachine-qemu/findings.md` | — |
 
 另:**P6**(map-on-OpenHCL 的 `create_ram_gpa_range` 别名推测路径,§5/§8)是独立 track 的真机 POC,与 L4 不同——L4 是"已实现的 trap/map 在真机跑通",P6 是"验证一条尚未实现的 OpenHCL 零拷贝推测路径是否可行"。
 
-**结论**:CMB 在 L1+L2 完整;L3/L4 是有意识保留的上层验证,补全条件如上。不补不代表特性不完整(行为正确性已 L1+L2 证),只代表"真二进制起服务"与"真驱动真机"两层未自动化。
+**结论**:CMB 在 L1+L2 完整;**L4 真机已完全达成**(trap+map 双模真 Linux 驱动 SQ-in-CMB PASS);L3 真二进制起服务由 L4 harness 一并覆盖。P6(map-on-OpenHCL §5)仍是独立未决 track。
