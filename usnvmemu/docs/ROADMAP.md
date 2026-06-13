@@ -91,6 +91,17 @@ NVMe-oF TCP 第 4 条接入。当前架构 ✅ 已对齐：firmware (controller)
 >   **注**：spec-strict 的 S1（CHAP spec-wire transcript）是纯代码且解锁 dhchap-4 真
 >   互通，建议提前单独做。
 
+### vfio-user-in-underhill（W6b/c + Layer C + autostart）— ✅ 主线收口，列后续 todos
+
+完整里程碑见 [MILESTONES.md §3](MILESTONES.md) + memory `vfio-user-underhill-state`。截至
+2026-06-13：W6b/c（guest 枚举+驱动+真零拷贝 IO）/ Layer C（真机证 Windows 平台硬限 → Option B
+transient 停顿+透明重连）/ usnvmemu VTL2 自启动托管服务（init env-gated，零-operator 出盘真机 PASS，
+MILESTONES §3.6）均落地。**后续 todos（按价值挑，无固定主战场）**：
+- supervised restart（区分 graceful-exit vs crash，对齐 VTL2「非预期死即 fatal」哲学；`RLIMIT_CORE=0` 后门已留）。
+- persistent backing（现 tmpfs backing 重启即失；真 persistent storage 是更大课题）。
+- build-igvm 一等 `--with-vfio-user-nvme` flag（仿 `--with-perf-tools`，替 `--custom-extra-rootfs`+env 手设）。
+- 多 vfio-user 设备 / 多 NS；L3 真 guest-boot e2e（与 vfio/OpenHCL real-guest 档一致，须 Windows）。
+
 ### Phase W — pcie_device_sdk 补全 hexagonal 结构 (Tier 2-结构, HIGH 优先, 分 W1-W4)
 
 **What**：Phase T 只抽了出站半边，入站/描述/crate 边界仍泄漏 OpenHCL。把
