@@ -4192,7 +4192,7 @@ impl PcieDevice for NvmeController {
             // CMB BAR 用独立 slot（CMBLOC.BIR）。**64-bit prefetchable**（CMB-L4 ①）：真
             // NVMe CMB BAR 通常即 64-bit prefetchable（spec-aligned），且 Linux `pci_alloc_p2pmem`
             // 走 p2pdma 需 BAR 可作 p2p 资源——32-bit non-prefetchable 是 SQ-in-CMB 不落地的
-            // 疑似 blocker（见 docs/plans/2026-06-13-cmb-l4-realmachine-result.md）。64-bit BAR
+            // 疑似 blocker（见 experiments/2026-06-13-cmb-l4-realmachine-qemu/findings.md）。64-bit BAR
             // 占两 slot（bir 低 dword + bir+1 高 dword=0），故 bir 须 ≤4。size 须 2 的幂。
             bars.push(BarLayout {
                 index: cmb.bir,
