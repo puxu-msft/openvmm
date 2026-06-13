@@ -3973,6 +3973,96 @@ fn disable_clears_cfs_so_gate_does_not_brick_on_recovery() {
     );
 }
 
+/// **truncated-read 硬化(ivory-vole fuzz#2)— 短 PRP-list 页 → DATA_TRANSFER_ERROR 而非 panic/欠填**。
+///
+/// Transport trait 契约**允许**截断(device.rs:backend 自行截断)。`NvmReadPrpListFetch` 若收到短
+/// list 页(ok=true 但字节欠),`list_entries` 欠填 → 旧码 `debug_assert_eq!(list.len()+1,total_pages)`
+/// 在 debug build panic、release 静默短 scatter(data-integrity:guest 读到欠写的页)。硬化:欠填 →
+/// 精确 fail 命令(DATA_TRANSFER_ERROR),先于 scatter,单一 gate 兜住任一 list 页短读。
+///
+/// 构造:READ nlb=3(3 页 = PRP1 + 2 个 list GPA),喂只含 1 个 GPA(8 字节)的短 list 页。
+/// 独立 oracle:capture 出 1 条 DATA_TRANSFER_ERROR CQE(写 cq base)+ **无 scatter**(0 条 data-write
+/// 到 DATA1)+ prp_list_ops/pending_ios 清空。**no-panic 由本测试在 debug build 跑通本身证明**。
+/// revert-verify:把硬化换回 `debug_assert_eq!` → debug build 本测试 panic(欠填触发)。
+#[test]
+fn prp_list_short_read_fails_clean_not_panic_or_underfill() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    const PRP1: u64 = 0x10_0000;
+    const LIST0: u64 = 0x1000;
+    const DATA1: u64 = 0x20_0000;
+    const CQ_BASE: u64 = 0x1_0000;
+
+    let mut c = make_ctrl_with_tmp("prp_short_read");
+    {
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 0;
+        ns.pi_type = 0;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / (1u64 << ns.lbads);
+    }
+    c.cqs.insert(
+        1,
+        crate::regs::CompletionQueue {
+            base_gpa: CQ_BASE,
+            size: 64,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        },
+    );
+    let mut cap = CaptureTransport::with_start_token(0x100);
+    {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let mut sqe = io_sqe(0x02, 1, 0, 3, PRP1, false, 0x55);
+        sqe.prp2 = LIST0;
+        let r = c.dispatch_io(&mut ctx, 1, sqe, 0x55, 0, 1);
+        assert!(r.is_none(), "PRP-list READ 走异步");
+    }
+    let tok_list = *c.pending_ios.keys().next().expect("应有 list fetch");
+    let pre = cap.events().len();
+    {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        // 短 list 页:只 1 个 GPA(8 字节),但 total_pages=3 需 2 个 → 欠填。
+        c.on_dma_complete_impl(&mut ctx, tok_list, true, DATA1.to_le_bytes().to_vec());
+    }
+    // oracle 1:accum + sibling 清理。
+    assert!(c.prp_list_ops.is_empty(), "短读应清 prp_list_ops accum");
+    assert!(c.pending_ios.is_empty(), "短读应清 sibling pending_ios");
+    // oracle 2:无 scatter 到 data GPA(没把欠填的页静默写出去)。
+    let scattered = cap
+        .events()
+        .iter()
+        .skip(pre)
+        .any(|e| matches!(e, TransportEvent::DmaWrite { gpa, .. } if *gpa == DATA1));
+    assert!(!scattered, "短读不应 scatter 到 data GPA(DATA1)");
+    // oracle 3:post 了 1 条 DATA_TRANSFER_ERROR CQE(写 cq base 区)。
+    let err_status = cap
+        .events()
+        .iter()
+        .skip(pre)
+        .filter_map(|e| match e {
+            TransportEvent::DmaWrite { gpa, data, .. }
+                if *gpa >= CQ_BASE && *gpa < CQ_BASE + 64 * 16 && data.len() >= 16 =>
+            {
+                let dw3 = u32::from_le_bytes(data[12..16].try_into().unwrap());
+                Some((((dw3 >> 17) & 0xff) | (((dw3 >> 25) & 0x7) << 8)) as u16)
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("短读应 post 1 条 error CQE");
+    assert_eq!(
+        err_status,
+        crate::cmd::sc::DATA_TRANSFER_ERROR,
+        "PRP-list 短读/欠填 → DATA_TRANSFER_ERROR"
+    );
+}
+
 /// **L-2：PRP-list 多-sibling DMA-fail 清理（spec § 4.6.1 "one CQE per command"）差分
 /// oracle** —— 一条 PRP-list 命令派生多条共享 op_id 的 sibling 子-DMA（list-fetch +
 /// 每数据页 DMA）。当 scatter 已发出**多条** data sibling、其中一条 DMA 失败时，

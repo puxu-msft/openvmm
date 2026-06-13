@@ -90,6 +90,16 @@ TCP / OpenHCL)全受益:同步 transport 得硬终止,async transport 自动得"
 因此唯一 DoS 面就是"无界喂 drain 队列的链",正好被上表 hop cap 堵死——cap 的封顶量与威胁
 模型精确对齐。
 
+## 相关硬化：截断读(数据完整性轴,非 DoS)
+
+同一 chain-fetch 代码还有一条**数据完整性**(非存活性)硬化:Transport trait 契约**允许**截断
+(device.rs:backend 自行截断)。`NvmReadPrpListFetch` 收到短 list 页时 `list_entries` 欠填 →
+此前 `debug_assert_eq!(list.len()+1,total_pages)` 在 debug build panic、release 静默短 scatter
+(guest 读到欠写页)。现改:欠填 → 先于 scatter 精确 fail 命令(`DATA_TRANSFER_ERROR` + sweep
+sibling + 移 accum),不依赖某 transport 偶然强制满长读(self-consistent 陷阱)。test
+`prp_list_short_read_fails_clean_not_panic_or_underfill`(in-crate SC 断言)+ ivory-vole fuzz#2
+的外部 robustness 回归 case(契约允许的短读)。来源:coverage-guided fuzz#2(PRP-list chain)。
+
 ## PR 回归闸(改这块代码时必读)
 
 1. **新增/修改任何在 `on_dma_complete_impl` 里再发起后续 DMA 的 `PendingOp` 路径**:必须在

@@ -2485,12 +2485,35 @@ impl NvmeController {
                             .collect();
                         (op.total_pages, op.prp1_gpa, list, pages)
                     };
-                    // 不变量：list.len() + 1 (PRP1) == total_pages（chaining 后仍成立）。
-                    debug_assert_eq!(
-                        list.len() as u32 + 1,
-                        total_pages,
-                        "PRP list (chained) size != total_pages-1"
-                    );
+                    // **truncated-read 硬化（ivory-vole fuzz#2）** — Transport 契约允许截断
+                    // （device.rs：backend 自行截断）。短读/截断会让 `list_entries` 欠填 →
+                    // `list.len()+1 < total_pages`。此前是 `debug_assert_eq!`（debug build panic /
+                    // release 静默短 scatter → guest 读到欠写页，data-integrity）。改运行时检查：
+                    // 欠填 → 精确 fail 命令（sweep 同 op_id sibling + 移 accum + 单条
+                    // DATA_TRANSFER_ERROR），**先于 scatter**。单一 gate 兜住任一 list 页短读；
+                    // 不依赖某 transport 偶然强制满长读（self-consistent 陷阱）。
+                    if list.len() as u32 + 1 != total_pages {
+                        self.pending_ios.retain(|_, q| match q.op {
+                            PendingOp::NvmWritePrpListFetch { op_id: o }
+                            | PendingOp::NvmWritePrpListData { op_id: o, .. }
+                            | PendingOp::NvmReadPrpListFetch { op_id: o }
+                            | PendingOp::NvmReadPrpListData { op_id: o, .. }
+                            | PendingOp::NvmWritePrpListSepMeta { op_id: o }
+                            | PendingOp::NvmReadPrpListSepMeta { op_id: o } => o != op_id,
+                            _ => true,
+                        });
+                        self.prp_list_ops.remove(&op_id);
+                        let phase = self.cqs.get(&cq_id).map(|c| c.phase).unwrap_or(1);
+                        let cqe = Cqe::error(cid, sq_id, sq_head, phase, sc::DATA_TRANSFER_ERROR);
+                        tracing::warn!(
+                            op_id,
+                            got = list.len(),
+                            want = total_pages.saturating_sub(1),
+                            "PRP-list 短读/欠填 → DATA_TRANSFER_ERROR（截断硬化）"
+                        );
+                        self.post_cqe(ctx, cq_id, cqe);
+                        return;
+                    }
                     // **Step 2a**: dma_write PRP1 数据（page idx 0）
                     let mut pages_iter = pages.into_iter();
                     let prp1_buf = pages_iter.next().unwrap_or_default();
