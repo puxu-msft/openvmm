@@ -490,10 +490,10 @@ pub(super) enum PendingOp {
     SepMetaReadDone {
         op_id: u64,
     },
-    /// **B6c-1（inline metadata，PRACT=0）** — extended-LBA PI Write 的一段 host DMA-read
-    /// 到达（nlb=1 dual-PRP：PRP1 4096 head，PRP2 8 tail）。两段都到齐后 InlineMetaWriteAccum
-    /// 拼成完整 block → 按 pi_first 切 data/tuple → 按 PRCHK verify host PI → 通过则原样
-    /// write_at（host buffer 与 backing 同 interleaved 布局）。`is_prp1=true` 标第一段。
+    /// **B6c-1（inline metadata，PRACT=0）/ #4c-b P3③** — extended-LBA PI Write 的一段 host
+    /// DMA-read 到达（nlb=1 dual-PRP：PRP1 首段 4096−O = head，PRP2 余 8+O = tail；PRP1 偏移
+    /// O>0 时切分点左移）。两段都到齐后 InlineMetaWriteAccum 拼成完整 4104 block → 按 pi_first
+    /// 切 data/tuple → 按 PRCHK verify host PI → 通过则原样 write_at。`is_prp1=true` 标首段。
     InlineMetaWriteSeg {
         op_id: u64,
         is_prp1: bool,
@@ -916,10 +916,11 @@ pub(super) struct InlineMetaWriteAccum {
     pub(super) cq_id: u16,
     pub(super) nsid: u32,
     pub(super) lba: u64,
-    /// PRP1 段（前 4096 字节，包含 data + 可能的部分 tuple，取决于 pi_first 与 block_bytes 切分）。
-    /// 当前 lbads=12+meta_size=8 → block_bytes=4104，PRP1=4096，PRP2=8。
+    /// **#4c-b P3③** — PRP1 段（extended block 首段 = 4096−O，含 data + 可能的部分 tuple）。
+    /// PRP1 页内偏移 O 把切分点左移：O=0 → 4096，O>0 → 4096−O。与 `prp2_data` 拼回 == 完整
+    /// 4104 extended block（`prp1_data.len() + prp2_data.len() == block_bytes`，finalize 校验）。
     pub(super) prp1_data: Option<Vec<u8>>,
-    /// PRP2 段（末 8 字节）。
+    /// **#4c-b P3③** — PRP2 段（extended block 余段 = 8+O，承载 tail）。
     pub(super) prp2_data: Option<Vec<u8>>,
     /// PRCHK 逐项校验门控（dispatch 时从 cdw12 PRINFO 解析）。
     pub(super) prchk: crate::pi::PrChk,
@@ -927,7 +928,8 @@ pub(super) struct InlineMetaWriteAccum {
 
 /// **B6c-2（inline metadata，PRACT=0）** — extended-LBA PI Read 累积器（nlb=1）。
 /// dispatch 时已从 backing 读 4104 byte interleaved block + 按 PRCHK verify stored PI +
-/// 发两条 DMA-write（前 4096→PRP1、末 8→PRP2）；两条都完成（remaining→0）后 post success。
+/// 发两条 DMA-write（**#4c-b P3③**：head 4096−O→PRP1、tail 8+O→PRP2，PRP1 偏移 O>0 时切分
+/// 点左移）；两条都完成（remaining→0）后 post success。
 pub(super) struct InlineMetaReadAccum {
     pub(super) sq_id: u16,
     pub(super) cid: u16,

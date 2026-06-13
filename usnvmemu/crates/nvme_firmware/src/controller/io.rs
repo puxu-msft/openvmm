@@ -830,10 +830,16 @@ impl NvmeController {
                     // + N×8 PI tuple concat 回 MPTR（N+1 条 DMA-write）。N≤2（dual-PRP）；N>2
                     // （PRP-list data）defer。inline NS（extended LBA）的 PRACT=0 仍未实现。
                     if meta_inline_r {
-                        // **B6c-2（inline metadata，PRACT=0）READ** — nlb=1 dual-PRP 路径：
-                        // backing 读 4104 byte block → 按 PRCHK verify stored PI → 前 4096 → PRP1、
-                        // 末 8 → PRP2（两条 DMA-write）。**B6c-3** nlb≥2 走 PRP-list scatter。
-                        if nlb >= 2 {
+                        // **B6c-2（inline metadata，PRACT=0）READ** — backing 读 4104 byte extended
+                        // block → 按 PRCHK verify stored PI → scatter 回 host。**#4c-b P3③**：分流
+                        // 判据从 `nlb>=2` 改为 PRP tier（与 WRITE 对称）：tier==List（nlb≥2 恒 List；或
+                        // nlb=1 但 PRP1 偏移 O>4088 致 4104 跨 3 页）走 PrpListOp inline scatter；
+                        // tier==Dual（nlb=1 O≤4088）走下方 dual-PRP（head 4096−O → PRP1、tail 8+O → PRP2）。
+                        let inline_off = crate::controller::prp::prp1_offset(prp1);
+                        let inline_total = nlb as u64 * ns.block_bytes() as u64;
+                        if crate::controller::prp::tier(inline_off, inline_total)
+                            == crate::controller::prp::PrpTier::List
+                        {
                             // 同步读 nlb×block_bytes → 逐块 verify stored PI → 把连续 extended-block
                             // 流当普通字节流走 plain PRP-list scatter（scatter 不需 inline 标记）。
                             let pi_type = ns.pi_type;
@@ -1010,19 +1016,12 @@ impl NvmeController {
                             );
                             return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                         }
-                        if prp2 == 0 {
-                            tracing::warn!(nsid, "inline-meta READ 需 PRP2（block tail 8 字节）");
-                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
-                        }
-                        // **M-2**：本路径假设 PRP1/PRP2 都页对齐（教学简化，与 K4c/plain 一致）。
-                        if (prp1 & (NVME_PAGE_SIZE - 1)) != 0 || (prp2 & (NVME_PAGE_SIZE - 1)) != 0
-                        {
-                            tracing::warn!(
-                                prp1 = format_args!("{:#x}", prp1),
-                                prp2 = format_args!("{:#x}", prp2),
-                                "inline-meta READ 要求 PRP1/PRP2 页对齐（教学边界）"
-                            );
-                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                        // **#4c-b P3③** — PRP2 校验收敛到 `validate_prp2`（与 WRITE 对称）：Dual 档
+                        // = DataPage，PRP2 承载 extended block 的 tail（8+O），须非 0 且页对齐。**去掉
+                        // 旧 M-2 强拒 PRP1 非页对齐**：PRP1 可带页内偏移 O，scatter 时 head=4096−O→PRP1、
+                        // tail=8+O→PRP2，由 dispatch_segs 算出。
+                        if let Some(sc_byte) = validate_prp2(prp2, inline_off, inline_total) {
+                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte));
                         }
                         if slba >= total_lba {
                             return Some(Cqe::error(
@@ -1078,10 +1077,25 @@ impl NvmeController {
                                 ));
                             }
                         }
-                        // 整个 block 原样回 host：前 4096 → PRP1、末 8 → PRP2（host buffer 同 backing
-                        // 一致是 interleaved 布局，不区分 pi_first 拆分——直接按页边界切回）。
-                        let head: Vec<u8> = block[..NVME_PAGE_SIZE as usize].to_vec();
-                        let tail: Vec<u8> = block[NVME_PAGE_SIZE as usize..].to_vec();
+                        // **#4c-b P3③** — extended block 原样回 host，按 host 段切：Dual{head 4096−O →
+                        // PRP1, tail 8+O → PRP2}（O=0 退化为旧 (4096,8)）。host buffer 与 backing 同
+                        // interleaved 布局，按段边界切回即可（不区分 pi_first）。
+                        let (len0, len1) =
+                            match crate::controller::prp::dispatch_segs(prp1, prp2, inline_total) {
+                                crate::controller::prp::DispatchSegs::Dual {
+                                    len0, len1, ..
+                                } => (len0, len1),
+                                other => {
+                                    unreachable!("inline nlb=1 非 List 必为 Dual，得 {other:?}")
+                                }
+                            };
+                        debug_assert_eq!(
+                            len0 as usize + len1 as usize,
+                            block_bytes,
+                            "Dual 两段拼回须 == block_bytes"
+                        );
+                        let head: Vec<u8> = block[..len0 as usize].to_vec();
+                        let tail: Vec<u8> = block[len0 as usize..].to_vec();
                         let op_id = self.alloc_op_id();
                         let tok1 = self.guest_write(ctx, prp1, head);
                         self.pending_ios.insert(
@@ -1985,10 +1999,18 @@ impl NvmeController {
                     // 走 dual-PRP（PRP1=4096 head + PRP2=8 tail，因 block_bytes=4104 > NVME_PAGE_SIZE）；
                     // nlb≥2 inline 需 PRP-list（与 N>2 separate 同走 PrpListOp 机件）作为最终扩展 defer。
                     if meta_inline {
-                        // **B6c-1（inline metadata，PRACT=0）WRITE** — nlb=1 dual-PRP 路径；
-                        // **B6c-3** nlb≥2 走 PRP-list（连续 nlb×block_bytes extended-block 流，
-                        // 按 4096 页分段 gather，finalize 逐块 verify host PI 后原子存盘）。
-                        if nlb >= 2 {
+                        // **B6c（inline metadata，PRACT=0）WRITE** — host 经 PRP 提供完整 extended
+                        // block（data+inline tuple，block_bytes=4104）。**#4c-b P3③**：分流判据从
+                        // `nlb>=2` 改为 PRP tier（spec §4.1.1）：总传输 = nlb × block_bytes（含 inline
+                        // meta）；tier==List（nlb≥2 恒 List；或 nlb=1 但 PRP1 偏移 O>4088 致 4104 跨 3 页）
+                        // 走 PrpListOp inline gather；tier==Dual（nlb=1 O≤4088）走下方 dual-PRP（首段
+                        // 4096−O @PRP1 + 余 8+O @PRP2）。block_bytes 非标准（≠4104）时各分支自有
+                        // INVALID_FIELD 兜底，tier 即便误算也只在两分支间路由、终被拒。
+                        let inline_off = crate::controller::prp::prp1_offset(prp1);
+                        let inline_total = nlb as u64 * ns.block_bytes() as u64;
+                        if crate::controller::prp::tier(inline_off, inline_total)
+                            == crate::controller::prp::PrpTier::List
+                        {
                             let block_bytes = ns.block_bytes() as usize;
                             let data_bytes = ns.data_bytes() as usize;
                             // B6c-3 当前仅标准 PI NS（4104）；非标准布局是 #3 子系统级改动 defer。
@@ -2136,28 +2158,15 @@ impl NvmeController {
                             );
                             return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                         }
-                        if prp2 == 0 {
-                            // dual-PRP：tail 8 字节经 PRP2，driver 必须提供。
-                            tracing::warn!(nsid, "inline-meta WRITE 需 PRP2（block tail 8 字节）");
-                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                        // **#4c-b P3③** — PRP2 校验收敛到 `validate_prp2`（Dual 档 = DataPage：PRP2 是
+                        // 第二数据页、承载 extended block 的 tail，须非 0 且页对齐）。**去掉旧 M-2 强拒
+                        // PRP1 非页对齐**：PRP1 可带任意页内偏移 O（spec §4.1.1），首段缩为 4096−O、tail
+                        // 段增为 8+O，由 dispatch_segs 算出，不再 silent PI mismatch。
+                        if let Some(sc_byte) = validate_prp2(prp2, inline_off, inline_total) {
+                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte));
                         }
-                        // **M-2**：本路径假设 PRP1/PRP2 都页对齐（与 K4c / plain dual-PRP
-                        // 一致的教学简化）。非对齐 PRP1 会让 4096+8 切分错位 → silent PI
-                        // mismatch。把假设升为 enforced precondition，避免 future driver 真
-                        // 按 spec 非对齐 PRP 时的 silent breakage。
-                        if (prp1 & (NVME_PAGE_SIZE - 1)) != 0 || (prp2 & (NVME_PAGE_SIZE - 1)) != 0
-                        {
-                            tracing::warn!(
-                                prp1 = format_args!("{:#x}", prp1),
-                                prp2 = format_args!("{:#x}", prp2),
-                                "inline-meta WRITE 要求 PRP1/PRP2 页对齐（教学边界）"
-                            );
-                            return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
-                        }
-                        // **H-1**：与 READ 分支对称的 LBA 越界校验（即便当前 nlb 锁定 1，仍
-                        // 用 checked_add 风格为 nlb≥2 PRP-list 扩展铺路）。spec 要求
-                        // LBA_OUT_OF_RANGE 在 dispatch 期返回，不能让越界 write_at 默默扩展
-                        // backing。
+                        // **H-1**：LBA 越界校验（dispatch 期返回 LBA_OUT_OF_RANGE，不让越界 write_at
+                        // 默默扩展 backing）。
                         let total_lba = ns.total_lba;
                         match slba.checked_add(nlb as u64) {
                             Some(end) if end <= total_lba => {}
@@ -2171,9 +2180,22 @@ impl NvmeController {
                                 ));
                             }
                         }
+                        // **#4c-b P3③** — extended block（4104）按 host 段切：Dual{PRP1 首段 4096−O,
+                        // PRP2 余 8+O}（O=0 退化为旧 (4096,8)）。两段拼回 == 完整 4104 extended block，
+                        // finalize verify inline PI 后原样落盘。
+                        let (len0, len1) =
+                            match crate::controller::prp::dispatch_segs(prp1, prp2, inline_total) {
+                                crate::controller::prp::DispatchSegs::Dual {
+                                    len0, len1, ..
+                                } => (len0, len1),
+                                // tier==Dual 已由上方 List 守卫排除 List；Single 不可能（4104 > 一页）。
+                                other => {
+                                    unreachable!("inline nlb=1 非 List 必为 Dual，得 {other:?}")
+                                }
+                            };
                         let op_id = self.alloc_op_id();
-                        // PRP1：前 4096 字节（head）；PRP2：末 8 字节（tail）。
-                        let tok1 = self.guest_read(ctx, prp1, NVME_PAGE_SIZE as u32);
+                        // PRP1：首段 4096−O（head，含 data + 可能部分 tuple）。
+                        let tok1 = self.guest_read(ctx, prp1, len0);
                         self.pending_ios.insert(
                             tok1,
                             PendingIo {
@@ -2188,7 +2210,8 @@ impl NvmeController {
                                 },
                             },
                         );
-                        let tok2 = self.guest_read(ctx, prp2, 8);
+                        // PRP2：余段 8+O（tail）。
+                        let tok2 = self.guest_read(ctx, prp2, len1);
                         self.pending_ios.insert(
                             tok2,
                             PendingIo {

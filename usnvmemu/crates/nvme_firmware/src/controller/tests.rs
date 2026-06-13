@@ -4207,6 +4207,311 @@ fn b6c_inline_nlb_ge_2_prp1_offset() {
     }
 }
 
+/// **#4c-b P3③ — inline-metadata nlb=1 的 PRP1 页内偏移（Dual split 左移 + O>4088 升 List）** 差分 oracle。
+///
+/// inline NS：host 经 PRP 提供完整 4104B extended block（[tuple][data] interleaved，pi_first）。
+/// block_bytes=4104 > 一页，故 nlb=1 恒需 ≥2 段。PRP1 偏移 O 把切分点左移：
+/// - O∈[0,4088]：**Dual**，head=4096−O @PRP1 + tail=8+O @PRP2（bespoke InlineMetaWrite）；
+/// - O∈(4088,4095]：8+O>4096 → 4104 跨 **3** 页 → **List**，PRP2=PRP-list 页，走 PrpListOp inline。
+///
+/// P3③ 核心 + 承重假设验证：旧路径硬编码 (4096,8) split + M-2 强拒非页对齐 PRP1，O>0 必错；
+/// O>4088 List corner **真做不拒**（spec-legal，known-answer 直构造验 List 机件接管，不靠真 driver）。
+///
+/// 四件套：① `PiTuple::compute` 期望；② 显式断 DmaRead/DmaWrite (gpa,len)；③ 断 tier 分支
+/// （Dual=InlineMetaWrite vs List=PrpListOp，accum map 双证）；④ revert-verify：completion.rs
+/// 长度校验退回 `==4096&&==8` → O>0 Dual 落 DATA_TRANSFER_ERROR → roundtrip 断言转红。
+#[test]
+fn b6c_inline_nlb1_prp1_offset() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    const BLOCK: usize = 4104;
+    fn inline_ns(tag: &str) -> NvmeController {
+        let mut c = make_ctrl_with_tmp(tag);
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+        ns.pi_first = true;
+        ns.meta_inline = true;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / ns.block_bytes();
+        c.cqs.insert(
+            1,
+            crate::regs::CompletionQueue {
+                base_gpa: 0x1_0000,
+                size: 64,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 0,
+                interrupt_enabled: false,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        c
+    }
+    let data: Vec<u8> = (0..4096).map(|i| ((i * 13 + 5) & 0xff) as u8).collect();
+    let tuple = crate::pi::PiTuple::compute(&data, 0, 1).to_bytes();
+    // extended block = [tuple][data]（pi_first）。
+    let mut ext = Vec::with_capacity(BLOCK);
+    ext.extend_from_slice(&tuple);
+    ext.extend_from_slice(&data);
+
+    // ═══════════════ Dual 档：O ∈ {0, 100, 4088}（bespoke InlineMetaWrite）═══════════════
+    fn dual_case(o: u64, ext: &[u8], tag: u32) {
+        let inline_ns_local = || inline_ns(&format!("p3c_dual_{o}_{tag}"));
+        let prp1 = 0x4000 + o;
+        let prp2 = 0x5000u64;
+        let len0 = 4096 - o as usize;
+        let len1 = 8 + o as usize;
+        let cid_w = 0x60 + tag as u16;
+        // ── WRITE ──
+        {
+            let mut c = inline_ns_local();
+            let mut cap = CaptureTransport::with_start_token(0x100);
+            {
+                let mut ctx = DeviceCtx::new(&mut cap);
+                let mut sqe = io_sqe(0x01, 1, 0, 1, prp1, false, cid_w);
+                sqe.prp2 = prp2;
+                let r = c.dispatch_io(&mut ctx, 1, sqe, cid_w, 0, 1);
+                assert!(r.is_none(), "inline nlb=1 O={o} Dual WRITE 异步");
+                // ③ tier 分支：Dual → InlineMetaWrite，非 PrpListOp。
+                assert_eq!(c.inline_meta_writes.len(), 1, "O={o} Dual bespoke");
+                assert!(c.prp_list_ops.is_empty(), "O={o} 不入 List");
+                assert_eq!(c.pending_ios.len(), 2, "2 段 InlineMetaWriteSeg");
+                let toks: Vec<(u64, bool)> = c
+                    .pending_ios
+                    .iter()
+                    .map(|(&t, p)| match p.op {
+                        PendingOp::InlineMetaWriteSeg { is_prp1, .. } => (t, is_prp1),
+                        _ => panic!("Dual 只产 InlineMetaWriteSeg"),
+                    })
+                    .collect();
+                for (t, is_prp1) in toks {
+                    let d = if is_prp1 {
+                        ext[..len0].to_vec()
+                    } else {
+                        ext[len0..].to_vec()
+                    };
+                    c.on_dma_complete_impl(&mut ctx, t, true, d);
+                }
+            }
+            // ② DmaRead [(prp1,len0),(prp2,len1)]（prp1 < prp2，sort 后 prp1 先）。
+            let mut reads: Vec<(u64, u32)> = cap
+                .events()
+                .iter()
+                .filter_map(|e| match e {
+                    TransportEvent::DmaRead { gpa, len, .. } if *gpa == prp1 || *gpa == prp2 => {
+                        Some((*gpa, *len))
+                    }
+                    _ => None,
+                })
+                .collect();
+            reads.sort();
+            assert_eq!(
+                reads,
+                vec![(prp1, len0 as u32), (prp2, len1 as u32)],
+                "O={o} Dual WRITE：head 4096−O @PRP1 + tail 8+O @PRP2（非固定 4096/8）"
+            );
+            let ns = c.namespaces.get(&1).unwrap();
+            let mut buf = vec![0u8; BLOCK];
+            ns.read_at(&mut buf, 0).unwrap();
+            assert_eq!(
+                &buf[..],
+                ext,
+                "O={o} WRITE backing == extended block（跨段拼回）"
+            );
+        }
+        // ── READ ──
+        {
+            let mut c = inline_ns_local();
+            c.namespaces.get_mut(&1).unwrap().write_at(ext, 0).unwrap();
+            let mut cap = CaptureTransport::with_start_token(0x100);
+            {
+                let mut ctx = DeviceCtx::new(&mut cap);
+                let mut sqe = io_sqe(0x02, 1, 0, 1, prp1, false, cid_w + 0x10);
+                sqe.prp2 = prp2;
+                let r = c.dispatch_io(&mut ctx, 1, sqe, cid_w + 0x10, 0, 1);
+                assert!(r.is_none(), "inline nlb=1 O={o} Dual READ 异步");
+                assert!(c.prp_list_ops.is_empty(), "O={o} READ 不入 List");
+                assert_eq!(c.pending_ios.len(), 2, "2 段 InlineMetaReadDone");
+                let toks: Vec<u64> = c.pending_ios.keys().copied().collect();
+                for t in toks {
+                    c.on_dma_complete_impl(&mut ctx, t, true, Vec::new());
+                }
+            }
+            let mut writes: std::collections::HashMap<u64, Vec<u8>> =
+                std::collections::HashMap::new();
+            for e in cap.events() {
+                if let TransportEvent::DmaWrite { gpa, data, .. } = e {
+                    writes.insert(*gpa, data.clone());
+                }
+            }
+            assert_eq!(
+                writes.get(&prp1).map(|d| d.len()),
+                Some(len0),
+                "O={o} READ PRP1 head"
+            );
+            assert_eq!(
+                writes.get(&prp2).map(|d| d.len()),
+                Some(len1),
+                "O={o} READ PRP2 tail"
+            );
+            let mut got = Vec::new();
+            got.extend_from_slice(&writes[&prp1]);
+            got.extend_from_slice(&writes[&prp2]);
+            assert_eq!(got, ext, "O={o} READ scatter 重组 == 盘上 extended block");
+        }
+    }
+    dual_case(0, &ext, 0);
+    dual_case(100, &ext, 1);
+    dual_case(4088, &ext, 2); // Dual 边界（首段缩到 8、tail 涨到 4096）
+
+    // ═══════════════ List 档：O ∈ {4090, 4095}（PrpListOp inline，corner 真做不拒）═══════════════
+    fn list_case(o: u64, ext: &[u8], tag: u32) {
+        let prp1 = 0x4000 + o;
+        let list = 0x9000u64;
+        let pg1 = 0x5000u64;
+        let pg2 = 0x6000u64;
+        let seg = [4096 - o as usize, 4096, BLOCK - (4096 - o as usize) - 4096];
+        let seg_slice = |i: usize| -> Vec<u8> {
+            let s: usize = seg[..i].iter().sum();
+            ext[s..s + seg[i]].to_vec()
+        };
+        let mut list_page = vec![0u8; 4096];
+        list_page[0..8].copy_from_slice(&pg1.to_le_bytes());
+        list_page[8..16].copy_from_slice(&pg2.to_le_bytes());
+        let cid_w = 0x70 + tag as u16;
+        // ── WRITE ──
+        {
+            let mut c = inline_ns(&format!("p3c_list_{o}_{tag}_w"));
+            let mut cap = CaptureTransport::with_start_token(0x100);
+            {
+                let mut ctx = DeviceCtx::new(&mut cap);
+                let mut sqe = io_sqe(0x01, 1, 0, 1, prp1, false, cid_w);
+                sqe.prp2 = list;
+                let r = c.dispatch_io(&mut ctx, 1, sqe, cid_w, 0, 1);
+                assert!(r.is_none(), "inline nlb=1 O={o} List WRITE 异步");
+                // ③ tier 分支：List → PrpListOp inline，非 bespoke InlineMetaWrite。
+                assert_eq!(c.prp_list_ops.len(), 1, "O={o} List → PrpListOp");
+                assert!(
+                    c.inline_meta_writes.is_empty(),
+                    "O={o} 不走 bespoke InlineMetaWrite"
+                );
+                enum T {
+                    List,
+                    Data(u32),
+                }
+                let init: Vec<(u64, T)> = c
+                    .pending_ios
+                    .iter()
+                    .map(|(&t, p)| match p.op {
+                        PendingOp::NvmWritePrpListFetch { .. } => (t, T::List),
+                        PendingOp::NvmWritePrpListData { page_idx, .. } => (t, T::Data(page_idx)),
+                        _ => panic!("List 只产 NvmWritePrpList*"),
+                    })
+                    .collect();
+                for (t, tg) in init {
+                    match tg {
+                        T::List => c.on_dma_complete_impl(&mut ctx, t, true, list_page.clone()),
+                        T::Data(p) => {
+                            c.on_dma_complete_impl(&mut ctx, t, true, seg_slice(p as usize))
+                        }
+                    }
+                }
+                let rest: Vec<(u64, u32)> = c
+                    .pending_ios
+                    .iter()
+                    .filter_map(|(&t, p)| match p.op {
+                        PendingOp::NvmWritePrpListData { page_idx, .. } => Some((t, page_idx)),
+                        _ => None,
+                    })
+                    .collect();
+                for (t, p) in rest {
+                    c.on_dma_complete_impl(&mut ctx, t, true, seg_slice(p as usize));
+                }
+            }
+            // ② DmaRead data 段 [(prp1,seg0),(pg1,seg1),(pg2,seg2)]（首段 4096−O，非固定 4096）。
+            let mut reads: Vec<(u64, u32)> = cap
+                .events()
+                .iter()
+                .filter_map(|e| match e {
+                    TransportEvent::DmaRead { gpa, len, .. }
+                        if *gpa == prp1 || *gpa == pg1 || *gpa == pg2 =>
+                    {
+                        Some((*gpa, *len))
+                    }
+                    _ => None,
+                })
+                .collect();
+            reads.sort();
+            assert_eq!(
+                reads,
+                vec![
+                    (prp1, seg[0] as u32),
+                    (pg1, seg[1] as u32),
+                    (pg2, seg[2] as u32),
+                ],
+                "O={o} List WRITE gather 段长含 PRP1 偏移（首段 {}，非 4096）",
+                seg[0]
+            );
+            let ns = c.namespaces.get(&1).unwrap();
+            let mut buf = vec![0u8; BLOCK];
+            ns.read_at(&mut buf, 0).unwrap();
+            assert_eq!(&buf[..], ext, "O={o} List WRITE backing == extended block");
+        }
+        // ── READ ──
+        {
+            let mut c = inline_ns(&format!("p3c_list_{o}_{tag}_r"));
+            c.namespaces.get_mut(&1).unwrap().write_at(ext, 0).unwrap();
+            let mut cap = CaptureTransport::with_start_token(0x100);
+            {
+                let mut ctx = DeviceCtx::new(&mut cap);
+                let mut sqe = io_sqe(0x02, 1, 0, 1, prp1, false, cid_w + 0x4);
+                sqe.prp2 = list;
+                let r = c.dispatch_io(&mut ctx, 1, sqe, cid_w + 0x4, 0, 1);
+                assert!(r.is_none(), "inline nlb=1 O={o} List READ 异步");
+                assert_eq!(c.prp_list_ops.len(), 1, "O={o} READ List → PrpListOp");
+                let t_list = *c.pending_ios.keys().next().unwrap();
+                c.on_dma_complete_impl(&mut ctx, t_list, true, list_page.clone());
+                let toks: Vec<u64> = c.pending_ios.keys().copied().collect();
+                for t in toks {
+                    c.on_dma_complete_impl(&mut ctx, t, true, Vec::new());
+                }
+            }
+            let mut writes: std::collections::HashMap<u64, Vec<u8>> =
+                std::collections::HashMap::new();
+            for e in cap.events() {
+                if let TransportEvent::DmaWrite { gpa, data, .. } = e {
+                    writes.insert(*gpa, data.clone());
+                }
+            }
+            assert_eq!(
+                writes.get(&prp1).map(|d| d.len()),
+                Some(seg[0]),
+                "O={o} READ PRP1 首段"
+            );
+            assert_eq!(
+                writes.get(&pg1).map(|d| d.len()),
+                Some(seg[1]),
+                "O={o} READ PG1 整页"
+            );
+            assert_eq!(
+                writes.get(&pg2).map(|d| d.len()),
+                Some(seg[2]),
+                "O={o} READ PG2 末段"
+            );
+            let mut got = Vec::new();
+            got.extend_from_slice(&writes[&prp1]);
+            got.extend_from_slice(&writes[&pg1]);
+            got.extend_from_slice(&writes[&pg2]);
+            assert_eq!(got, ext, "O={o} List READ 重组 == 盘上 extended block");
+        }
+    }
+    list_case(4090, &ext, 0); // 8+O=4098 > 4096 → 3 页 List corner
+    list_case(4095, &ext, 1); // 极限偏移（首段仅 1 字节）
+}
+
 /// 之前 admin Get Log Page > 2 MiB 被早退 INVALID_FIELD（防 chaining 未实现的 DoS）。
 /// 现 chaining walk 已上 `MAX_PRP_LIST_PAGES` 深度封顶，cap 抬到 32 MiB；本测试驱
 /// **真 dispatch_admin** 一条 numd=2.4 MiB 的 Get Log Page，证明 chaining 端到端真激活：

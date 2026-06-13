@@ -218,11 +218,17 @@ impl NvmeController {
             let pi_first = ns.pi_first;
             let block_bytes = ns.block_bytes() as usize;
             let data_bytes = ns.data_bytes() as usize;
-            if prp1.len() != crate::regs::NVME_PAGE_SIZE as usize || prp2.len() != 8 {
+            // **#4c-b P3③** — host 两段（PRP1 首段 4096−O + PRP2 余 8+O）拼回须恰为完整 extended
+            // block（block_bytes=4104）。旧硬编码 `prp1==4096 && prp2==8` 只认 O=0 切分，PRP1 偏移
+            // O>0 时段长左移（如 O=100 → head 3996 + tail 108）会被误判"长度不符"——改为校验**拼回
+            // 总长**。host 把 4104 extended block 连续铺在 PRP1@offset 起：前 4096−O 落 PRP1 页、
+            // 余 8+O 落 PRP2，故 `prp1_data ++ prp2_data` 恰为顺序完整 block。
+            if prp1.len() + prp2.len() != block_bytes {
                 tracing::warn!(
                     p1 = prp1.len(),
                     p2 = prp2.len(),
-                    "inline-meta Write DMA 长度不符（期望 4096+8）"
+                    block_bytes,
+                    "inline-meta Write DMA 长度不符（两段拼回须 == block_bytes）"
                 );
                 Cqe::error(
                     acc.cid,
