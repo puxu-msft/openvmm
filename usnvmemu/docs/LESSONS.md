@@ -2,6 +2,13 @@
 
 > 每条都是真踩过 + 修过的坑；带 commit / phase 引用。新踩坑 + 修后第一时间
 > 加这里，下次别重蹈。
+>
+> **完成定义（蒸馏槽位）**：每条 LESSONS 末尾**强制三选一**标一行蒸馏判定——
+> `→ 蒸馏：PRINCIPLES「<节名·条名>」`（**仅当**规则在 **≥2 个独立场景**复现，同
+> §19/§27 的"两家才证成抽象"门槛）/ `→ 已是：PRINCIPLES「<...>」` /
+> `→ 纯 incident，无可迁移规则`（**默认 / 最常见答案**）。问"是否含可迁移规则"——
+> 答案常是否；默认产物是 0 个新原则，别硬塞。空着 = 像缺 anchor test 一样的可见
+> 缺口。锚一律按**标题 / 命名**引，不按 §号（§号随插条重排会悬挂，见 §18）。
 
 ## 1. 不要手算 packed struct 偏移 (CRITICAL)
 
@@ -376,6 +383,8 @@ MMIO read/write、cfg、reset、dma-completion 统一成一个 `Inbound` enum)�
 **来源**: ADR-010 / Phase W; architect subagent 复核否决了 generic 对称 trait
 这个过度设计。教训: 抽象前先问"三个实现里有几个真用得上这个 variant"。
 
+→ 蒸馏：PRINCIPLES「设计 review 追问清单 · 抽象前数实现 / 对称性常是伪需求」
+
 ## 20. self-consistent 假设当 wire 判据是反模式 —— 修自家两端也逃不过 (HIGH)
 
 **坑**: 修 vfio-user DMA head-of-line 阻塞(等 reply 时 defer 插入帧)时,
@@ -407,6 +416,9 @@ if frame_id == expected_msg_id && frame.header.flags().is_reply() { return Ok(fr
 
 **来源**: vfio-user head-of-line fix 的 review H-1(rust-reviewer),commit
 `b1cb8574` 引入 → fixup 修。
+
+→ 蒸馏：PRINCIPLES「设计 review 追问清单 · 判据来自独立 oracle」(保留"写码判据用
+协议字段不用自家默契"这半)；"独立第二实现才能 catch"那半已升结构律 → ADR-013。
 
 ---
 
@@ -476,6 +488,9 @@ backing / TOCTOU shrink 残留依赖（生产须 `F_SEAL_SHRINK`）/ u8 并发�
 
 **来源**: vfio-user mmap DMA 的 rust-reviewer 2 轮（首轮 BLOCK CRITICAL C-1），
 commit dfa9fefb；回归测试 `dma_map_fd_smaller_than_declared_size_falls_back_no_sigbus`。
+
+→ 蒸馏：PRINCIPLES「设计 review 追问清单 · 判据来自独立 oracle」(SAFETY 不变量必用
+独立 oracle，不可用不可信输入自证)。
 
 ## 23. 改对称代码要 sweep 所有 reachable sibling；自写两端的测试必 revert-verify (HIGH)
 
@@ -572,6 +587,9 @@ R2T 发**错 cccid** → 比错 buffer → **静默 CAS corruption**。还有 HI
 capture-based BLOCK HIGH-1/2/3 → hoisted 重设计 APPROVE）；firmware 单元
 `fused_cas_atomic_compare_and_write`（FAIL→backing 不变 原子性不变量）+ wire e2e
 `fused_cw_e2e.py` 9 检查含对抗状态机。
+
+→ 蒸馏：PRINCIPLES「设计 review 追问清单 · 结构修 vs 简化的公因子」(简化半：对抗
+BLOCK 优先换更简单设计消掉对抗态)。
 
 ## 25. spec 常量值（SC/offset）必须 anchor 到 canonical 源, 手填的迟早错 (HIGH)
 
@@ -671,6 +689,9 @@ SC+SCT 由 `sf_of(status)` 自动派生。调用点再也不传 SCT → **整类
 （全 sc:: == nvme_spec::Status）；rust-reviewer 2 轮（确认 4 处 intended SCT 校正 + 额外
 挖出 RESERVATION_CONFLICT/LOCKDOWN 2 处错值，HIGH-1 一处 PI error-log 漏 Media SCT）。
 
+→ 蒸馏：PRINCIPLES「设计 review 追问清单 · 结构修 vs 简化的公因子」(结构修半：同一易错
+决策 N 处重复 = 一个结构缺口，决策移进数据/类型)。
+
 ## 28. realize-only（CPU 暂停）e2e 掩盖真 guest 才触发的整类 bug —— vfio-user 4 bug (HIGH)
 
 **症状**: vfio-user realize-only harness（QEMU `-S` 暂停 CPU + 只读 config space + 验 PCI
@@ -760,6 +781,8 @@ HIGH-2 wrap-saturation → point-3 vfio 自馈死锁（每轮修完下一轮挖�
 `high2_realistic_maxdepth_wrap_settles_never_trips_cfs` / `high2_inrange_oscillating_chain_
 trips_cfs_at_cap` 等，全 revert-verify）；真 QEMU 11 vfio 2-vCPU guest GREEN（19 次 shadow 领先
 MMIO，burst 0 CFS）。
+
+→ 蒸馏：PRINCIPLES「设计 review 追问清单 · 防御性界限：界定『对的量』+ 必证能触发」
 
 ## 30. 清理"死代码"前先分辨：过时残留 vs 前瞻 scaffolding (HIGH)
 
