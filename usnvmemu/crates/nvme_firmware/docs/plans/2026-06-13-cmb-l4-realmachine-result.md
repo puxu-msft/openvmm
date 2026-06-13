@@ -48,3 +48,16 @@ guest dmesg 新增：`nvme 0000:00:03.0: added peer-to-peer DMA memory 0xfe00000
 - **SQ 物理落 CMB** 卡在 `pci_alloc_p2pmem`(QEMU/p2pdma 分配层),**firmware 无杠杆**。三个 lever 试毕(64-bit BAR ✅注册 / use_cmb_sqes ✗ / 都不改变分配失败)。
 - **建议**:L4 在此收束于"握手+真 IO+p2p 注册已真机证";SQ-in-CMB 需换一个 p2pdma 分配能成的环境(真硬件 NVMe-CMB,或 p2p 拓扑更完整的 guest/hypervisor),非 QEMU-vfio-user-emulated 可达。
 - **follow-up**:OpenHCL client(`vfio_user_pci_device` P3b)的 BAR2 也应改 64-bit prefetchable 以与 firmware 一致(当前 OpenHCL CMB 路径未真机验证,记此待办)。
+
+## 修订（独立 subagent 审计后，2026-06-13）—— 根因归因纠正
+
+上文 ① 节把根因写成"`pci_alloc_p2pmem` 在内核 p2pdma 分配层失败 / distance·ACS·拓扑"——**独立审计据 Linux v6.8 源码推翻此归因**，纠正如下（与审计协商一致）：
+
+- **内核源码反证**：`nvme_alloc_sq_cmds`(pci.c) 里设备从**自己**的 p2p pool 分配 SQ（`pci_alloc_p2pmem(pdev,…)`）**不走** distance/ACS/拓扑判定（那些只在给*别的*设备找 provider 的 `calc_map_type_and_dist`）；且 `add_resource` 已成功（pool 已建、2 MiB 已 memremap），8 KiB 不会耗尽 → **`pci_alloc_p2pmem` 在此场景没有合理的返 NULL 路径**。原"内核分配器限制"归因是从"SQ 落 host RAM"的**错误反推**。
+- **真正的烟枪（原分析漏看）**：QEMU log 有明确报错——`BAR 2: failed to create dma-buf: PCI BAR IOMMU mappings may fail: Invalid argument`（map run）/ `vfio_container_dma_unmap(…,0xfe000000,0x800000) = -22`（trap run）。→ 洞在 **QEMU vfio-user 把 CMB BAR 暴露为"可作 DMA 目标 / IOMMU 可映射的 MMIO"这层**（介于 BAR 寄存器暴露[已过] 与内核纯分配[按源码应成功] 之间）。`pci_p2pmem_virt_to_bus` 返 0（bus 地址链路异常）比"分配器返 NULL"更贴 QEMU 报错。
+- **map 模式（真 memfd 共享 BAR）同样失败** → 排除"trap 假 BAR 无 struct page"解释；坐实洞在 BAR-DMA 暴露层而非 backing 性质。
+- **根因目前仍是推测，未坐实**：需 ① guest 侧 `nvme` dyndbg / ftrace `nvme_alloc_sq_cmds` 直接抓是 `pci_alloc_p2pmem` NULL 还是 `virt_to_bus` 0 + `/sys/.../p2pmem/`；② **QEMU 自带 emulated `nvme`(`-device nvme,cmb_size_mb=…`) 同 guest 对照**——其 SQ 也不落 CMB ⟹ QEMU 模拟-BAR p2pdma 通病(fork 自家 vfio-user 白搭);落了 ⟹ 洞在 vfio-user 路径(fork 才对路)。**此对照须先于 fork 决策。**
+
+### fork-QEMU 裁定（修订后，与审计一致）
+- **当前不该先 fork**——但理由从"洞在内核"修正为"洞虽指回 QEMU vfio-user 的 BAR-DMA 暴露,但根因未坐实,且具体动作不是改已通过的 BAR 寄存器暴露,而是深水区的 vfio-user dma-buf/IOMMU-mappable 路径,确定性低成本高"。
+- **决策前置实验**:先 QEMU-emulated-nvme 对照 + 内核侧观测,坐实洞在 vfio-user 还是 QEMU 模拟通病,再谈 fork。

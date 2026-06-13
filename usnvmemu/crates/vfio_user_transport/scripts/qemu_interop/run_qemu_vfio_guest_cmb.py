@@ -85,15 +85,23 @@ def main() -> int:
 
         print(f"=== server up（--cmb-mode {mode}）；boot 真 guest（marker={marker}）===", flush=True)
         qemu_log = open(qemu_log_path, "w")
+        # QEMU_IOMMU=1 → 加 intel-iommu（intremap 需 q35 kernel-irqchip=split）。p2pdma
+        # 的 DMA bus 地址在纯无-IOMMU 模拟下可能算不出；IOMMU 在位是常见前提。
+        machine = "q35,accel=kvm:tcg"
+        iommu_dev: list[str] = []
+        if os.environ.get("QEMU_IOMMU"):
+            machine += ",kernel-irqchip=split"
+            iommu_dev = ["-device", "intel-iommu,intremap=on,caching-mode=on"]
         qemu = subprocess.Popen(
             [
                 qemu_bin,
-                "-machine", "q35,accel=kvm:tcg",
+                "-machine", machine,
                 "-cpu", "host",
                 "-smp", "2",
                 "-m", "512M",
                 "-object", "memory-backend-memfd,id=mem,size=512M,share=on",
                 "-machine", "memory-backend=mem",
+                *iommu_dev,
                 "-kernel", str(kernel),
                 "-initrd", str(initrd),
                 "-append", f"console=ttyS0 panic=-1 rdinit=/init gmarker={marker} {extra_cmdline}".strip(),
