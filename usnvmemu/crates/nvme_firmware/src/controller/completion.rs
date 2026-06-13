@@ -477,6 +477,21 @@ impl NvmeController {
             !self.cmb_in_access_guest,
             "on_dma_complete_impl 在 access_guest 栈内被调（违反 CMB §10#2 非重入铁律）"
         );
+        // **I2 强制（台账 docs/DMA_COMPLETION_INVARIANTS.md）** — controller 已 fatal
+        // （CSTS.CFS 置位）：completion 必须 O(1) 终止性消化、**绝不**再派生后续 DMA。
+        // NVMe spec：CFS 后 host 须 reset（CC.EN→0），届时 `disable`(enable.rs) 清所有
+        // in-flight 表（pending_ios / prp_list_ops / sgl_ops / pi_reads / …），故此处消费
+        // token 即返回、残留 pending 表项由 mandatory reset 收。这把同步-drain transport 上
+        // “cap 撞顶置 CFS 后别的 in-flight 完成仍 scatter 出新 DMA / shadow-poll 续读”堵死
+        // （存活性由各链 hop cap 保证；本门关的是 fatal 后的无谓/不合规派生 + 收紧收链语义）。
+        if self.csts & crate::regs::csts::CFS != 0 {
+            tracing::debug!(
+                token,
+                ok,
+                "CSTS.CFS 置位：completion 丢弃，不派生 DMA（I2）"
+            );
+            return;
+        }
         // **H-3 修复** — 之前是 mod.rs 中 1500+ 行的单方法。已移到本
         // controller/completion.rs 文件级隔离。按 PendingOp variant 再
         // 细拆 sub-method 收益不大（多数 variant 共享 phase/cq/post_cqe

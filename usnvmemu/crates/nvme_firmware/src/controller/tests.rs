@@ -3871,6 +3871,108 @@ fn cmb_drain_iters_cap_fires_and_sets_cfs() {
     );
 }
 
+/// **I2 强制 — CFS 置位后 completion 不再派生 DMA**(台账
+/// `docs/DMA_COMPLETION_INVARIANTS.md` I2;NVMe spec:CFS = controller fatal,host 须 reset)。
+///
+/// I2 此前**未强制**(`on_dma_complete_impl` 无 CFS 门控,grep 实证)。本测试 + 入口 CFS 短路
+/// 一起把 I2 从"目标"变"已强制"。
+///
+/// 构造:一条 PRP-list READ(nlb=3 > 2 页 → 异步,list-fetch 在飞)。**置 CSTS.CFS** 后喂 list-fetch
+/// 完成——无门控时 handler 会 parse list + scatter 出多条 data-write DMA;门控令其消费 token 即
+/// 返回 → **零新 DMA 出账**。
+///
+/// 独立 oracle:喂完成后 capture 的 DmaRead/DmaWrite 事件数较喂前不变(无派生)。
+/// revert-verify:删入口 `if csts & CFS {..return}` → scatter 发生 → 事件数增 → 断言转红
+/// （= TDD 的 red 阶段实测确认)。
+#[test]
+fn cfs_set_completion_derives_no_further_dma() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    const PRP1: u64 = 0x10_0000;
+    const LIST0: u64 = 0x1000;
+    const DATA1: u64 = 0x20_0000;
+    const DATA2: u64 = 0x21_0000;
+
+    let mut c = make_ctrl_with_tmp("i2_cfs_gate");
+    // NS1 plain 4K(无 meta/PI)→ nlb=3 = 12288 B > 2 page → PRP-list READ。
+    {
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 0;
+        ns.pi_type = 0;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / (1u64 << ns.lbads);
+    }
+    c.cqs.insert(
+        1,
+        crate::regs::CompletionQueue {
+            base_gpa: 0x1_0000,
+            size: 64,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        },
+    );
+    let mut list0 = vec![0u8; crate::regs::NVME_PAGE_SIZE as usize];
+    list0[0..8].copy_from_slice(&DATA1.to_le_bytes());
+    list0[8..16].copy_from_slice(&DATA2.to_le_bytes());
+
+    let mut cap = CaptureTransport::with_start_token(0x100);
+    {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let mut sqe = io_sqe(0x02, 1, 0, 3, PRP1, false, 0x55);
+        sqe.prp2 = LIST0;
+        let r = c.dispatch_io(&mut ctx, 1, sqe, 0x55, 0, 1);
+        assert!(r.is_none(), "PRP-list READ 走异步");
+    }
+    let tok_list = *c.pending_ios.keys().next().expect("应有 list fetch");
+    // 关键:controller 进入 fatal。
+    c.csts |= crate::regs::csts::CFS;
+    let pre = cap.events().len();
+    {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        c.on_dma_complete_impl(&mut ctx, tok_list, true, list0);
+    }
+    // oracle:CFS 后该完成不派生任何后续 DMA(无 scatter)。
+    let new_dma = cap
+        .events()
+        .iter()
+        .skip(pre)
+        .filter(|e| {
+            matches!(
+                e,
+                TransportEvent::DmaRead { .. } | TransportEvent::DmaWrite { .. }
+            )
+        })
+        .count();
+    assert_eq!(new_dma, 0, "CFS 置位后 completion 不应派生新 DMA(I2)");
+}
+
+/// **I2 前提 — Controller Reset(CC.EN→0)清 CSTS.CFS(spec § 3.1.4.2),否则 I2 门控砖化**。
+///
+/// I2 门控(completion.rs `on_dma_complete_impl` 入口)在 CFS 置位时丢弃所有 completion。若
+/// `disable`(reset)不清 CFS,CFS 跨 reset 粘滞 → driver 标准恢复(CC.EN 1→0→1)后 controller 虽
+/// 报 RDY=1,但门控继续拦截所有新 completion → IO 永不完成 = **砖化**。故清 CFS 是门控成立的
+/// **必要前提**(同时修一处既有 spec 违规:此前 CFS 一旦置位永不清)。
+///
+/// 独立 oracle:置 CFS → `disable()` → `csts & CFS == 0`。CFS 清后门控条件转假 → 重新 enable 的
+/// controller 恢复正常派发(逻辑蕴含)。revert-verify:把 `disable` 的 `& !(RDY|CFS)` 改回
+/// `& !RDY` → CFS 粘滞 → 本断言转红。
+#[test]
+fn disable_clears_cfs_so_gate_does_not_brick_on_recovery() {
+    let mut c = make_ctrl_with_tmp("i2_cfs_clear");
+    c.csts |= crate::regs::csts::CFS;
+    c.disable();
+    assert_eq!(
+        c.csts & crate::regs::csts::CFS,
+        0,
+        "Controller Reset(CC.EN→0)应清 CSTS.CFS(spec § 3.1.4.2)——否则 I2 门控跨 reset 砖化"
+    );
+}
+
 /// **L-2：PRP-list 多-sibling DMA-fail 清理（spec § 4.6.1 "one CQE per command"）差分
 /// oracle** —— 一条 PRP-list 命令派生多条共享 op_id 的 sibling 子-DMA（list-fetch +
 /// 每数据页 DMA）。当 scatter 已发出**多条** data sibling、其中一条 DMA 失败时，

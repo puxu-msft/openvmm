@@ -240,6 +240,11 @@ impl NvmeController {
             cmb.cbai = false;
         }
         self.state = CtrlState::Disabled;
-        self.csts &= !csts::RDY;
+        // spec § 3.1.4.2：Controller Reset（CC.EN→0）清 CSTS.RDY **与 CSTS.CFS**。
+        // 清 CFS 是 I2 门控（completion.rs `on_dma_complete_impl` 入口）的**成立前提**：
+        // 否则 CFS 跨 reset 粘滞 → 重新 enable 的 controller 虽 RDY=1，但门控对所有新
+        // completion `return` → IO 永不完成 = 砖化。本行同时修一处既有 spec 违规
+        // （此前 CFS 一旦置位永不清）。
+        self.csts &= !(csts::RDY | csts::CFS);
     }
 }

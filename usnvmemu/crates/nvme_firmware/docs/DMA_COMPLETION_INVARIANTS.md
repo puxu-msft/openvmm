@@ -26,19 +26,21 @@ device 侧,两条 transport 都受益(见下 I3)。
 (推进命令数)会误伤真高吞吐 driver(稳态合法推进无界);计 ring 距离脆弱且 dead;只有
 计"每链自续深度,仅链起始重置"既不误伤又能终止。**计进展型 cap = 漏洞**(会被振荡/自环绕过)。
 
-**I2 —（目标不变式,⚠️ 当前未强制）CFS 置位后,`on_dma_complete_impl` 应对任何 token O(1)
-终止性消化、不再派生 DMA。** **现状核实(2026-06-13 grep)**:`completion.rs`/`io.rs` 里
-**没有任何 CFS 门控**——CFS 只被「置位」(8 处)、从不在 completion 派生 DMA 前「检查」。
-故本属性是**目标 / spec-cleanliness 期望,不是已成立的承重前提**。
+**I2 —（✅ 已强制）CFS 置位后,`on_dma_complete_impl` 对任何 token O(1) 终止性消化、不再
+派生 DMA。** 入口门控:`if self.csts & CFS != 0 { 消费 token + return }`(completion.rs 顶部,
+debug_assert 之后),在任何路由（shadow-poll 续读 / PRP·SGL scatter / CMB cascade）之前短路。
+残留 in-flight 表项由 mandatory reset 收（`disable` 清 `pending_ios`/`prp_list_ops`/`sgl_ops`/
+`pi_reads`/… 全表,enable.rs）。**前提:`disable`(CC.EN→0)必须清 CSTS.CFS（spec § 3.1.4.2）**——
+否则 CFS 跨 reset 粘滞,重新 enable 的 controller 虽 RDY=1 但门控继续拦截所有新 completion =
+砖化（test `disable_clears_cfs_so_gate_does_not_brick_on_recovery` 守此前提）。firing 测试
+`cfs_set_completion_derives_no_further_dma`（controller/tests.rs：置 CFS 后喂会 scatter 的
+PRP-list 完成 → 断言 0 条新 DMA;TDD red 实测无门控时 scatter 出 3 条）。
 - **澄清(纠正早期措辞)**:这一类的**存活性闭合靠 I1(每条链各自 hop cap)**,**不**靠 I2——
   即便某条链撞 cap 置 CFS 后别的 in-flight 完成仍正常处理,只要每条链各自有界,drain 循环
   仍终止。I2 关乎的是「CFS 后不再做无谓/不合规的工作」(NVMe spec:CFS = controller fatal,
-  host 须 reset),属正确性/整洁,**非 DoS 闭合条件**。
-- **若要强制 I2**(可选增强):在 `on_dma_complete_impl` 入口加 `if self.csts & CFS != 0
-  { /* 消费 token、清对应 pending、不再 issue */ return; }`,并加 firing 测试(CFS 置位后
-  喂一条会派生 DMA 的完成 → 断言 0 条新 DMA 出账)。这是清晰的小增强,触发面=spec 一致性。
+  host 须 reset),属正确性/整洁 + 收紧 cap 撞顶后的收链语义,**非 DoS 存活性闭合条件**。
 - transport 侧:**不该**强行 `clear()` 自己的队列(它不持有 token↔链 的语义,强清会让 device 的
-  `pending_ios` 表与队列失步、泄漏 op)——这一条与 I2 是否强制无关,恒成立。
+  `pending_ios` 表与队列失步、泄漏 op)——这一条与 I2 恒成立。
 
 **I3 — 封顶归属在 device 侧(`pcie_device_core` 的 controller),不在 transport(session.rs)。**
 `pcie_device_core` 是 runtime-agnostic 的,device 不该假设 transport 同步性。挂死的根因量
