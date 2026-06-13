@@ -115,6 +115,18 @@ guest RAM——guest 直访(本是它的 RAM)、firmware 经 `/dev/mshv_vtl_low`
 FAILED stub、flags 仅 `rom_mb`、可写 BAR 窗口别名未知 → **未验证承重假设,真 Hyper-V POC 才能定**。
 按 `poc-before-settling-design`:**先 POC,后设计/接线**。
 
+> **2026-06-13 深挖纠正(两轮 subagent code-trace)**:此路**不是"只缺 wiring"**,有两个比接线更深的缺口:
+> - **缺口①**:underhill 里 `MemoryMapper` 实现 = 0,VPCI relay 硬编码 `shared_mem_mapper: None`
+>   (`underhill_core/src/worker.rs:3540`);`vfio_user_pci_device` BAR 是 `BarMemoryKind::Dummy`(纯 trap)。
+>   通用真-back 路径(`SharedMem`+`MemoryMapper`)对软件设备开放(virtio-pci 在用)但实现全在 host 侧。
+>   → 需**新写**一个 "GET-backed `MemoryMapper`"(包 `create_ram_gpa_range`)+ CMB BAR `Dummy`→`SharedMem`。
+> - **缺口②(承重、源码定不了)**:`mshv_vtl_low` 内核只覆盖 **boot-time VTL0 RAM PFN**
+>   (`MSHV_VTL_ADD_VTL0_MEMORY`←`mem_layout.ram()`);`create_ram_gpa_range`(运行时)不重新注册。生产唯一
+>   用例 i440bx 是**别名到已有 VTL0 RAM**(非新分配)——证别名可达却揭穿"新建 backing"前提。host 闭源
+>   实现给新区落 VTL0 池页(firmware 够 ✅)还是 host 私有页(够不到 ❌→退化 framebuffer、对 CMB 无用)
+>   **源码无法判定**。→ **缺口②须先真机探针(POC),再投缺口①组件**。详见
+>   `experiments/2026-06-12-vtl-memory-direction-feasibility/README.md`(2026-06-13 纠正段)。
+
 ## 6. NVMe-oF TCP 的 CMB(完整性补充)
 
 TCP transport 无 PCIe BAR 概念。CMB 在 NVMe-oF 语境对应 **in-capsule data** / **host/controller memory

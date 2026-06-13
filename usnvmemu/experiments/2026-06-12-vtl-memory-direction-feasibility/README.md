@@ -107,16 +107,33 @@ host-backed、RAM-backed 的区**，guest 零拷贝直访。
   已被生产代码强锚定**——shipping OpenHCL 的 `i440bx_host_pci_bridge` 真调它并按 success 处理，若真
   Hyper-V 不实现 `IVmGuestMemoryAccess::CreateRamGpaRange`，该生产路径会坏。即"推断"实为"生产代码依赖"。
 
-**离今天 vfio-user 的差距**：`vfio_user_pci_device` BAR0 现为 trap-and-forward（每访问 = 往返
-firmware message）。要拿零拷贝共享区需新接线：(a) 设备经 `create_ram_gpa_range` 申请 RAM GPA 区，
-(b) 呈现为 BAR/子区，(c) firmware 经 `mshv_vtl_low` 映同一页。**原语齐备，缺 vfio-user 这条的 wiring
-——工程量，非架构禁区。** 这也修正了早前"CMB/PMR 无意义"判断的一半：CMB/shared-BAR 有现成 host
-原语支撑，不是凭空发明。
+**离今天 vfio-user 的差距（2026-06-13 深挖纠正——原"只缺 wiring"判断偏乐观）**：`vfio_user_pci_device`
+BAR 现为 trap-and-forward（`BarMemoryKind::Dummy`，注释明写"仅测试用、不背内存"，每访问 = 往返
+firmware message）。要拿零拷贝共享区**不是"只缺 wiring"，而是两个比接线更深的缺口**：
+
+- **缺口①（造一个不存在的新组件）**：通用真-back 路径 `BarMemoryKind::SharedMem` + `MemoryMapper`
+  **对软件设备开放**（virtio-pci 在用），但 `MemoryMapper` 实现**全在 host 侧**；`openhcl/` 树 0 个
+  实现，且 underhill VPCI relay 硬编码 `shared_mem_mapper: None`（`underhill_core/src/worker.rs:3540`，
+  正因此 assigned 设备在该路 `bail!("memory mapper is required")`）。`create_ram_gpa_range` **从未被
+  包成 `MemoryMapper`**（只服务 i440bx framebuffer）。→ 需**新写**一个 "GET-backed `MemoryMapper`"
+  （把 `new_region`/`map_to_guest` 翻成 `create_ram_gpa_range`/`reset_ram_gpa_range` GET 调用）+ 把
+  CMB BAR 从 `Dummy` 改 `SharedMem`。是造组件，非接现成线。
+- **缺口②（源码定不了的闭源反手够到，默认 ❌）**：`mshv_vtl_low` 内核覆盖 = **boot-time VTL0 RAM
+  PFN 段**（`MSHV_VTL_ADD_VTL0_MEMORY`，喂 `mem_layout.ram()`）；`create_ram_gpa_range`（运行时 slot
+  28）**不重新注册**进去。生产唯一用例 i440bx 是**别名到已有 VTL0 RAM**（gpa_offset → 主 RAM 顶端
+  ROM 镜像），**非新分配**——证了别名可达，却**揭穿** CMB 要的"host 新建 backing"前提。host 闭源的
+  `IVmGuestMemoryAccess::CreateRamGpaRange` 给新区落 VTL0 池页（firmware 够得到 ✅）还是 host 私有页
+  （够不到 ❌ → 退化纯 framebuffer，firmware 取不到 SQE、对 CMB 无用），**源码层无法判定，需真机探针**。
+
+**修正裁定**：CMB/shared-BAR 有现成 host 原语（`create_ram_gpa_range`）支撑、不是凭空发明（早前"CMB
+无意义"判断的一半仍纠正）；但**零拷贝 CMB-on-OpenHCL 是两缺口的未证路径，缺口②是承重假设、源码定不了、
+真机探针前应按 ❌ 默认**——不是"工程量、非禁区"那么轻。
 
 ## 对 firmware 的净意义
 
 - firmware-in-VTL2 **暴露自有内存给 guest 零拷贝直访 = 死路**，勿在此设计任何特性。
 - zero-copy 共享只能经 **VTL0 侧的页**，由 VTL2 反手够下去 —— 这对 NVMe data plane 已够用且
   是唯一能用的（正是 W6c DMA 零拷贝的形态）。
-- 若将来要"共享内存设备区"，按 framebuffer 模式落地（host/GET 映 VTL0-RAM BAR），不要赌
-  VTL2→VTL0 暴露。
+- 若将来要"共享内存设备区"，按 framebuffer 模式落地（host/GET 映 VTL0-RAM BAR），**但先真机探针定
+  缺口②（host 给 create_ram_gpa_range 落的页 firmware 经 mshv_vtl_low 够不够得到）**，再投缺口①的组件；
+  不要赌 VTL2→VTL0 暴露，也不要把零拷贝 CMB 当"只缺 wiring"。
