@@ -12,10 +12,12 @@
 #
 # 实现说明：
 # - 钉 Rust 1.95（同 rust-toolchain.toml；1.96 的 Path::absolute 与 flowey 撞名）。
-# - **不需 protoc / restore-packages**：usnvmemu 不启用 mesh 的 `prost` feature
-#   （mesh_protobuf/build.rs 的 protoc 调用在 `#[cfg(feature = "prost")]` 下），实测干净
-#   `cargo build`/`cargo test` 无 protoc 即通过。
-# - 每个 excluded crate 是独立构建单元（无共享 workspace），故用 matrix 逐 crate。
+# - **需 protoc**：usnvmemu crate（至少 nvme_of_tcp_target）经 mesh_protobuf 的 prost
+#   feature 在 build.rs 调 protoc。openvmm 用固定版本 protoc，由 `cargo xflowey
+#   restore-packages` 下到 repo-root `.packages/`（mesh_protobuf 走该硬路径，非 PATH；
+#   故一次 restore 覆盖所有子 crate 构建）。同 .github/workflows/copilot-setup-steps.yml 模式。
+# - 单 job + 循环（非 matrix）：restore-packages 较重，跑一次共享给所有 crate；
+#   `fail-fast` 关闭等价物 = 循环内收集失败、跑完再退非零。
 # - 真-host 集成测试（nvme_of v_interop_1/6 需 nvme-cli/root）已 `#[ignore]`，默认跳过。
 
 name: usnvmemu CI
@@ -38,21 +40,8 @@ permissions:
 
 jobs:
   test:
-    name: test ${{ matrix.crate }}
+    name: usnvmemu cargo test
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        crate:
-          - pcie_device_core
-          - vfio_user_wire
-          - pcie_device_sdk
-          - vfio_user_transport
-          - vfio_user_device
-          - nvme_firmware
-          - nvme_of_tcp_target
-          - pcie_remote_test_harness
-          - rng_device_example
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -63,8 +52,34 @@ jobs:
             | sh -s -- --default-toolchain=1.95.0 -y
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: cargo test
-        working-directory: usnvmemu/crates/${{ matrix.crate }}
-        # 默认 features：nvme_firmware = openhcl + vfio-user，含 §28 vfio 控制面 wire
-        # 独立 oracle（vfio_user_wire_e2e）+ openhcl 跨进程 e2e。Linux 原生可测。
-        run: cargo test
+      # 取 protoc（+ 其它固定版本构建依赖）到 repo-root .packages/，供 mesh_protobuf build.rs。
+      - name: Restore packages (protoc)
+        run: cargo xflowey restore-packages --no-compat-igvm
+
+      # 逐 crate cargo test（9 个 = workspace.exclude 表全覆盖）。默认 features：
+      # nvme_firmware = openhcl + vfio-user，含 §28 vfio 控制面 wire 独立 oracle
+      # (vfio_user_wire_e2e) + openhcl 跨进程 e2e。收集失败、跑完再退非零（不 fail-fast）。
+      - name: cargo test (all usnvmemu crates)
+        run: |
+          set -uo pipefail
+          fail=0
+          for crate in \
+            pcie_device_core \
+            vfio_user_wire \
+            pcie_device_sdk \
+            vfio_user_transport \
+            vfio_user_device \
+            nvme_firmware \
+            nvme_of_tcp_target \
+            pcie_remote_test_harness \
+            rng_device_example; do
+            echo "::group::cargo test ${crate}"
+            if ( cd "usnvmemu/crates/${crate}" && cargo test ); then
+              echo "${crate}: ok"
+            else
+              echo "::error::${crate} cargo test failed"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "${fail}"
