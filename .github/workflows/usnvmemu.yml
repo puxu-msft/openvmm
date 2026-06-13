@@ -83,3 +83,28 @@ jobs:
             echo "::endgroup::"
           done
           exit "${fail}"
+
+      # nvme_firmware coverage-guided fuzz crate（nested workspace，PRP/SGL/admin 指针追逐
+      # target）防 bit-rot：libfuzzer + arbitrary 在 stable 可 build；真 coverage-guided run
+      # 需 nightly + cargo-fuzz（不在本 gate）。此处 = build 三个 target + 极短**定 seed** blind
+      # smoke（regression 守卫：harness 不在 trivial 输入上 panic、controller API 漂移即编译炸）。
+      # `if: always()` → 与 cargo test 各自独立 gate，任一坏都 fail job。
+      - name: fuzz build + smoke (nvme_firmware)
+        if: always()
+        run: |
+          set -uo pipefail
+          cd usnvmemu/crates/nvme_firmware/fuzz
+          cargo build
+          fail=0
+          for t in fuzz_sgl_chain fuzz_prp_list_chain fuzz_admin_dispatch; do
+            echo "::group::fuzz smoke ${t}"
+            # 定 seed → 确定性（不引入 flaky）；blind（无 coverage instrument）仅作回归 smoke。
+            if "./target/debug/${t}" -runs=5000 -max_total_time=15 -timeout=10 -seed=1; then
+              echo "${t}: ok"
+            else
+              echo "::error::${t} fuzz smoke failed (crash/hang on blind corpus)"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "${fail}"
