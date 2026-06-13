@@ -100,6 +100,22 @@ sibling + 移 accum),不依赖某 transport 偶然强制满长读(self-consisten
 `prp_list_short_read_fails_clean_not_panic_or_underfill`(in-crate SC 断言)+ ivory-vole fuzz#2
 的外部 robustness 回归 case(契约允许的短读)。来源:coverage-guided fuzz#2(PRP-list chain)。
 
+## coverage-guided fuzz 覆盖现状(A,邻居 ivory-vole 已执行)
+
+真 coverage-guided 跑通(nightly+cargo-fuzz,未动 1.95 pin;commit `c1ce9edca` 接 fuzzing-feature
+不变量 oracle,`975536142` 修 admin harness 误报)。a 类 4 条路径覆盖:
+- **#1 SGL chain — ✅ fuzz 覆盖**(108k exec + ASan 全绿)。
+- **#2 Read PRP-list chain — ✅ fuzz 覆盖**(107k exec + ASan 全绿;副产 truncated-read 缺口已修,见上)。
+- **#3 shadow-poll cascade / #4 CMB-drain cascade — ⏳ 待 fuzz**(已有确定性 firing 测试守;补 fuzz 是叠加)。
+- **CFS-后-0-DMA(I2)多步不变式 — ⏳ 待 fuzz**(I2 已强制 `b3e8b4350`,可做成多步 fuzz 不变式)。
+
+**fuzz 副产的威胁模型订正(NUMD 分配)**:admin fuzz 跑出一条大 NUMD Get Log Page(~16 MiB,
+total_dmas≈4137)——**controller 完全有界正确**(自然 drain、表全 0、cfs=false),但暴露出
+`MAX_PRP_LIST_PAGES` 的 ~32 MiB 上界守的是 **host-NUMD-controlled 的分配**(`bytes=(NUMD+1)*4`),
+**不是**"真实 log 产物很小"。即 buffer 分配跟 attacker NUMD 走、由 cap(非内容大小)封顶。doc 已订正
+(mod.rs `MAX_PRP_LIST_PAGES`)。可选收紧(未做,bounded+freed 非 DoS):Get Log Page 把 NUMD 截到
+该 LID 真实 log 尺寸(spec 允许返 ≤ 请求量)。
+
 ## PR 回归闸(改这块代码时必读)
 
 1. **新增/修改任何在 `on_dma_complete_impl` 里再发起后续 DMA 的 `PendingOp` 路径**:必须在

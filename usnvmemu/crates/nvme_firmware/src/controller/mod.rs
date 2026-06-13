@@ -793,10 +793,15 @@ pub(super) const MAX_SGL_SEGMENTS: u32 = 64;
 
 /// **C1② PRP-list chaining depth cap** —— PRP list 经 chain pointer 可串多页（spec § 4.1.2），
 /// 但 controller 必须给 host-malicious chain（自环 / 极端长链）封顶，与 SGL `MAX_SGL_SEGMENTS`
-/// 同思路。上限 16 list 页 ≈ 16 × 511 = 8176 data entry ≈ 31.9 MiB transfer，远超本 controller
-/// 当前所有暴露的 read 方向 log/report 路径产物大小（教学 Error Info ≤ 几 KB，Zone Report
-/// 单次 ≤ MiB 级；NVMe 1.4+ Telemetry Host-Initiated 真要 >32 MiB 也由 driver 用 LPO
-/// 分块拉）。超限 → INVALID_FIELD。
+/// 同思路。上限 16 list 页 ≈ 16 × 511 = 8176 data entry ≈ 31.9 MiB transfer。**这是 cap 把守的
+/// host-NUMD-controlled 分配/传输上界**：Get Log Page 的 payload buffer 按 host 给的 NUMD 分配
+/// （`bytes = (NUMD+1)*4`，见 admin.rs `GET_LOG_PAGE`），**非按真实 log 内容大小**——attacker 用
+/// 小命令即可把 NUMD 撑到该上界（coverage-guided fuzz 实测 Get Log Page ~16 MiB、total_dmas≈4137，
+/// 仍自然 drain、表全 0、无泄漏、cfs=false → cap 正确兜住 ≈32 MiB 上界）。真实 log 内容（教学
+/// Error Info ≤ 几 KB，Zone Report ≤ MiB 级；NVMe 1.4+ Telemetry >32 MiB 由 driver 用 LPO 分块拉）
+/// 远小于此，**但分配量受 NUMD 控、由 cap（非内容大小）封顶**——这才是该 cap 的承重作用。
+/// 超限 → INVALID_FIELD。可选收紧（未做，bounded+freed 非 DoS，spec 允许返 ≤ 请求量）：Get Log
+/// Page 把 NUMD 截到该 LID 的真实 log 尺寸，使分配跟内容而非 attacker NUMD。
 ///
 /// **作用域注**：本 cap 仅在 read 方向（device→host）`NvmReadPrpListFetch` arm 维护
 /// `list_pages_fetched` 计数；write 方向（`NvmWritePrpListFetch`、`NvmComparePrpListFetch`）
