@@ -46,6 +46,8 @@ def main() -> int:
     kernel = base.find_kernel()
     initrd = base.ensure_initrd()
     marker = "CMB-L4-" + time.strftime("%Y%m%d%H%M%S")
+    # 额外 guest 内核 cmdline（如 `nvme.use_cmb_sqes=1` 强制 CMB SQEs）。
+    extra_cmdline = os.environ.get("GUEST_EXTRA_CMDLINE", "")
 
     tmp = Path(tempfile.mkdtemp(prefix="qemu_vfio_cmb_"))
     sock = tmp / "nvme.sock"
@@ -94,7 +96,7 @@ def main() -> int:
                 "-machine", "memory-backend=mem",
                 "-kernel", str(kernel),
                 "-initrd", str(initrd),
-                "-append", f"console=ttyS0 panic=-1 rdinit=/init gmarker={marker}",
+                "-append", f"console=ttyS0 panic=-1 rdinit=/init gmarker={marker} {extra_cmdline}".strip(),
                 "-device", f'{{"driver":"vfio-user-pci","socket":{{"path":"{sock}","type":"unix"}}}}',
                 "-serial", f"file:{serial_path}",
                 "-display", "none",

@@ -4189,14 +4189,16 @@ impl PcieDevice for NvmeController {
             prefetchable: false,
         }];
         if let Some(cmb) = &self.cmb {
-            // CMB BAR 用独立 slot（CMBLOC.BIR）。32-bit MMIO（教学版 CMB ≤ 数 MiB，
-            // 32 位地址空间足够；与 BAR0 一致省 slot）。size 须为 2 的幂（PCI 要求）；
-            // enable_cmb 保证 size 是 4 KiB 倍数，调用方应传 2 的幂大小。
+            // CMB BAR 用独立 slot（CMBLOC.BIR）。**64-bit prefetchable**（CMB-L4 ①）：真
+            // NVMe CMB BAR 通常即 64-bit prefetchable（spec-aligned），且 Linux `pci_alloc_p2pmem`
+            // 走 p2pdma 需 BAR 可作 p2p 资源——32-bit non-prefetchable 是 SQ-in-CMB 不落地的
+            // 疑似 blocker（见 docs/plans/2026-06-13-cmb-l4-realmachine-result.md）。64-bit BAR
+            // 占两 slot（bir 低 dword + bir+1 高 dword=0），故 bir 须 ≤4。size 须 2 的幂。
             bars.push(BarLayout {
                 index: cmb.bir,
                 size: cmb.size,
-                kind: BarKind::Mmio32,
-                prefetchable: false,
+                kind: BarKind::Mmio64,
+                prefetchable: true,
             });
         }
         // BAR index 唯一性不变量（reviewer MEDIUM-1）：transport `region_size` 用 `find`
