@@ -818,3 +818,39 @@ scaffolding。改判：**保留 + 锚到 nvme_spec（验值）+ `#[allow(dead_co
   无违规——在 Wave 4 真删之前就被用户铁律拦下）。
 
 **来源**：测试覆盖率 Wave 4 计划评审（2026-06-11，用户两次强调 + 要求长记）。
+
+## 31. 把"重/真机 oracle"变成 standing CI gate：frozen-vector 回放，冻确定性前缀 (HIGH)
+
+**背景**：[ADR-013](DECISIONS.md) 档2 frozen-vector —— 真 guest-boot harness（真 Linux nvme 驱动
+驱动 vfio-user 设备）是最强独立 oracle，但太重（整 guest 引导 + QEMU + initramfs），进不了无人
+值守 CI（档3）。要把它的权威信号搬进 standing gate，做法 = **抓一次真 oracle 的 byte-exact wire
+transcript → 冻成黄金 → 对新起 server 回放真 oracle 的 client stimulus，断言响应逐字节等黄金**。
+
+**三个非显然承重事实——全靠分析真 transcript 坐实，不是靠假设（[[poc-before-settling-design]]）**：
+1. **回放可线性 ⇔ 对端不主动发消息**。本 server 走 **mmap-based DMA**（经 DMA_MAP mmap guest
+   memfd 后直读内存），**从不**主动发 wire DMA_READ/WRITE → 整条流是纯 client-request→server-reply
+   → 同步 send-one→read-one 可线性回放。若 server 会主动发起请求（要 client 反应），回放就得模拟
+   对端状态机——量级翻倍。**先在真 transcript 里 grep 有无"对端主动消息"再定能否线性回放**。
+2. **冻结边界 = 响应开始依赖隐藏状态的那一点**。enable（CC.EN=1）后首个 doorbell ring 触发 server
+   读 **mmap'd guest 内存**取 SQ entry → 回放用零填充合成 memfd 会读到零、行为分叉。故黄金**只能冻
+   到首 doorbell 之前**的纯寄存器/枚举前缀（响应与内存内容无关、确定）。**边界由"server 何时首次
+   读外部不可复现状态"定**，机械判据（首个 BAR0 offset≥0x1000 的 REGION_WRITE）写进抽取脚本。
+3. **fd-bearing 消息若响应 mode-无关，可不传 fd 回放**。前缀含 DMA_MAP（带 memfd），但其 reply 是
+   mode-无关的 OK（server 对无-fd DMA_MAP 走 message-mode fallback），且前缀不访问内存 → **0-fd
+   回放的响应与原 mmap-mode 黄金逐字节相同**（POC 实证）→ 省掉 SCM_RIGHTS 复杂度，纯阻塞 socket。
+
+**牙 / 独立性**：stimulus 是**真 kernel 实际发的字节**（独立 oracle，catch 手搓 client 想不到的真实
+用法）；golden 是 server 自身响应被冻在 guest-PASS 时刻 → 回归 gate。与手搓-client oracle（[[lesson §28]]
+那条 `vfio_user_wire_e2e`）互补：手搓 = "我以为该发什么"，frozen = "真 kernel 实际发了什么"。
+
+**纪律（防 frozen 退化成 §20 假安心）**：① 抓包代理对 fd 必须**透明转发**（自验=guest 经代理仍
+PASS）；② golden 必带 provenance（kernel/QEMU 版本 + marker）+ **机械抽取脚本**（消除 JSON→txt 人工
+断点）+ refresh owner；③ 回放配对**双向锚定**（reply.id==刚发请求 id + golden s2c id 唯一），把
+"server 回错请求/失步"也纳入牙；④ 硬编码帧数锚定防 golden 被悄改截断；⑤ revert-verify（注入 server
+前缀-面回归看测试红）。
+
+**来源**：vfio-user 档2 frozen-vector 落地（2026-06-13）。抓包 `run_qemu_vfio_guest_capture.py`
+（fd-aware MITM）+ 抽取 `extract_wire_prefix.py` + golden `vfio_guest_wire_prefix.txt` + 回放
+`vfio_user_guest_replay_e2e.rs`；POC 3× 0-mismatch；rust-reviewer 2 层独立 revert-verify（revision
+字节 / BAR size 皆 catch）。**连带发现**：建这个 gate 的前置 usnvmemu CI（[[usnvmemu-no-ci-gate-workspace-excluded]]）
+首跑就会抓到 CMB 工作引入的 `NvmeController: !Send` HEAD 回归——standing gate 的价值即时兑现。
