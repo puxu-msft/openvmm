@@ -33,7 +33,8 @@
 //! **oracle（observable-only，无 golden）**：libfuzzer 自动 catch panic / 超时（守卫
 //! 失效 → 无限 fetch）；本 harness 另设 `ITER_SAFETY_CAP` 兜底超限即 `panic!`。
 //! READ 方向的 data scatter 是 `DmaWrite`（device→host），**不喂**；只对未服务的
-//! `DmaRead`（= list-页 fetch）喂回。暂不开 `fuzzing` feature（留后续）。
+//! `DmaRead`（= list-页 fetch）喂回。**已开 `fuzzing` feature**：drain 后经
+//! `__fuzz_invariants()` 断言 op 表清空（无 op_id 泄漏，CFS 例外）。
 
 #![cfg_attr(all(target_os = "linux", target_env = "gnu"), no_main)]
 
@@ -172,52 +173,79 @@ fn run(input: PrpListChainInput) {
         let _ = c.nvme_io_dispatch(&mut ctx, /*sq_id*/ 1, sqe, 0x40, /*cq_id*/ 1);
     }
 
-    // 同步驱动循环：对每个未服务的 DmaRead（= list-页 fetch）喂回下一张 list 页。
-    // READ 方向的 data scatter 是 DmaWrite，不喂（不影响排空判定）。
-    // 依赖不变量：`guest_read` 每次 mint 唯一 token、`CaptureTransport` 不回收 token。
+    // 同步驱动循环：服务**所有**未服务 DMA——DmaRead（= list-页 fetch，喂 fuzzer list 页）
+    // 与 DmaWrite（= data scatter / CQE-post，喂空）。服务 write 是 op 表 drain oracle 的前提
+    // （只服务 read 会留 in-flight write → op 永不收尾 → 误判泄漏）。
+    // 依赖不变量：`guest_read`/`guest_write` 每次 mint 唯一 token、`CaptureTransport` 不回收。
     let mut serviced = std::collections::HashSet::new();
     let mut fetch_idx = 0usize;
     let mut dma_reads = 0u32;
+    let mut total_dmas = 0u32;
     loop {
+        // 优先未服务 DmaRead（带 len）；其次未服务 DmaWrite（None = 喂空 ok=true）。
         let next = cap.events().iter().find_map(|e| match e {
-            TransportEvent::DmaRead { token, gpa, len } if !serviced.contains(token) => {
-                Some((*token, *gpa, *len))
+            TransportEvent::DmaRead { token, len, .. } if !serviced.contains(token) => {
+                Some((*token, Some(*len)))
+            }
+            TransportEvent::DmaWrite { token, .. } if !serviced.contains(token) => {
+                Some((*token, None))
             }
             _ => None,
         });
-        let Some((token, _gpa, len)) = next else {
-            break; // 排空：链收尾（成功 scatter 完 / 精确错误 CQE / 截断）。
+        let Some((token, read_len)) = next else {
+            break; // 全 drain：链收尾（成功 scatter+CQE / 精确错误 CQE / 截断）。
         };
         serviced.insert(token);
-
-        if dma_reads > ITER_SAFETY_CAP {
-            // 守卫失效信号：libfuzzer 视 panic 为 crash。
+        total_dmas += 1;
+        if total_dmas > ITER_SAFETY_CAP {
             panic!(
                 "PRP-list chain 超 ITER_SAFETY_CAP 仍未排空（疑似 MAX_PRP_LIST_PAGES 守卫失效/无限 fetch）"
             );
         }
 
-        // 喂回的 list-页字节：耗尽 input.list_pages 后回退到 chain→prp2 自身自环页
-        // （压 MAX_PRP_LIST_PAGES 深度守卫）。
-        let mut bytes = if fetch_idx < input.list_pages.len() {
-            let page = &input.list_pages[fetch_idx];
-            let n = page.entries.len().min(MAX_ENTRIES_PER_FED_PAGE);
-            serialize_entries(&page.entries[..n])
-        } else {
-            self_loop_list_page(PRP2_GPA)
-        };
-        // 模型真 transport（dma_read_sync 强制 reply.len == 请求 len）：补/截到请求长度。
-        // 见 serialize_entries doc——latent 短读硬化缺口已单独报 silver-heron。
-        bytes.resize(len as usize, 0);
-
-        // DMA 完成 ok 标志：fail_mask 的对应 bit（覆盖失败清理路径）。`& 31` 防 shift 溢出。
-        let ok = (input.fail_mask >> (dma_reads & 31)) & 1 == 0;
-        fetch_idx += 1;
-        dma_reads += 1;
-
         let mut ctx = DeviceCtx::new(&mut cap);
-        c.on_dma_complete(&mut ctx, token, ok, bytes);
+        match read_len {
+            Some(len) => {
+                // list-页 fetch：耗尽 input.list_pages 后回退到 chain→prp2 自身自环页
+                // （压 MAX_PRP_LIST_PAGES 深度守卫）。
+                let mut bytes = if fetch_idx < input.list_pages.len() {
+                    let page = &input.list_pages[fetch_idx];
+                    let n = page.entries.len().min(MAX_ENTRIES_PER_FED_PAGE);
+                    serialize_entries(&page.entries[..n])
+                } else {
+                    self_loop_list_page(PRP2_GPA)
+                };
+                // 模型真 transport（dma_read_sync 强制 reply.len == 请求 len）：补/截到请求长度。
+                bytes.resize(len as usize, 0);
+                // DMA-read 完成 ok 标志：fail_mask 对应 bit（覆盖读失败清理路径）。`& 31` 防溢出。
+                let ok = (input.fail_mask >> (dma_reads & 31)) & 1 == 0;
+                fetch_idx += 1;
+                dma_reads += 1;
+                c.on_dma_complete(&mut ctx, token, ok, bytes);
+            }
+            None => {
+                // DmaWrite 完成：data 空、ok=true（正常落盘 / CQE-post）。
+                c.on_dma_complete(&mut ctx, token, true, Vec::new());
+            }
+        }
     }
+
+    // ── 内部不变式 oracle（`fuzzing` feature，见 DMA_COMPLETION_INVARIANTS.md）──
+    // 命令全 drain 后 op 表必清空（无 op_id 泄漏）。**CFS 例外**（I2）：CFS 置位时入口短路、
+    // 表由 disable()/reset 回收而非 drain（本 harness 不驱 doorbell 故 cfs 恒 false；守未来）。
+    let inv = c.__fuzz_invariants();
+    assert!(
+        inv.cfs || inv.prp_list_ops == 0,
+        "PRP-list op 泄漏：drain 后 prp_list_ops={}（cfs={}）",
+        inv.prp_list_ops,
+        inv.cfs
+    );
+    assert!(
+        inv.cfs || inv.pending_ios == 0,
+        "pending_ios 泄漏：drain 后={}（cfs={}）",
+        inv.pending_ios,
+        inv.cfs
+    );
 }
 
 fuzz_target!(|input: PrpListChainInput| {

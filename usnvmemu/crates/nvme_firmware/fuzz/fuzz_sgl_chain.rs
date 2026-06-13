@@ -16,9 +16,9 @@
 //! fuzzer 控 type/sub_type/length/address/对齐 + continuation 拓扑：自环 / 超长链 / 空段 /
 //! 非 16 倍数）。比 POC 多覆盖：DMA 失败路径（`ok=false`）+ address-dependent 段页。
 //!
-//! **oracle（observable-only，无 golden）**：libfuzzer 自动 catch panic / 超时（无限 fetch）；
-//! 本 harness 另设 `ITER_SAFETY_CAP` 兜底，超限即 `panic!`（守卫失效信号）。step 6 加
-//! `fuzzing` feature 访问器后再补内部不变量（表清空 / hop ≤ 常量）。
+//! **oracle**：libfuzzer 自动 catch panic / 超时（无限 fetch）；本 harness 另设
+//! `ITER_SAFETY_CAP` 兜底，超限即 `panic!`（守卫失效信号）。**已开 `fuzzing` feature**：
+//! drain 后经 `__fuzz_invariants()` 断言 op 表清空（无 op_id 泄漏，CFS 例外）。
 
 #![cfg_attr(all(target_os = "linux", target_env = "gnu"), no_main)]
 
@@ -140,28 +140,39 @@ fn run(input: SglChainInput) {
         let _ = c.nvme_io_dispatch(&mut ctx, /*sq_id*/ 1, sqe, 0x40, /*cq_id*/ 1);
     }
 
-    // 同步驱动循环：对每个未服务的 DmaRead 喂回下一段页字节。
-    // 依赖不变量：`guest_read` 每次 mint 唯一 token、`CaptureTransport` 不回收 token。
+    // 同步驱动循环：服务**所有**未服务 DMA——DmaRead（= segment-页 fetch，喂 fuzzer 段页）
+    // 与 DmaWrite（= data scatter / CQE-post，喂空 ok=true）。服务 write 是 op 表 drain oracle
+    // 的前提（只服务 read 会留 in-flight write → op 永不收尾 → 误判泄漏）。
+    // 依赖不变量：`guest_read`/`guest_write` 每次 mint 唯一 token、`CaptureTransport` 不回收。
     let mut serviced = std::collections::HashSet::new();
     let mut fetch_idx = 0usize;
     let mut dma_reads = 0u32;
+    let mut total_dmas = 0u32;
     loop {
+        // 优先未服务 DmaRead（Some(())=read）；其次未服务 DmaWrite（None = 喂空）。
         let next = cap.events().iter().find_map(|e| match e {
-            TransportEvent::DmaRead { token, gpa, len } if !serviced.contains(token) => {
-                Some((*token, *gpa, *len))
+            TransportEvent::DmaRead { token, .. } if !serviced.contains(token) => Some((*token, true)),
+            TransportEvent::DmaWrite { token, .. } if !serviced.contains(token) => {
+                Some((*token, false))
             }
             _ => None,
         });
-        let Some((token, _gpa, _len)) = next else {
-            break; // 排空：链收尾（成功或精确错误 CQE）。
+        let Some((token, is_read)) = next else {
+            break; // 全 drain：链收尾（成功 scatter+CQE / 精确错误 CQE / hop 截断）。
         };
         serviced.insert(token);
-
-        if dma_reads > ITER_SAFETY_CAP {
-            // 守卫失效信号：libfuzzer 视 panic 为 crash。
+        total_dmas += 1;
+        if total_dmas > ITER_SAFETY_CAP {
             panic!("SGL chain 超 ITER_SAFETY_CAP 仍未排空（疑似 hop guard 失效/无限 fetch）");
         }
-        // 喂回的段页字节：耗尽 input.segments 后回退到 cont→自身自环页（压 hop guard）。
+
+        let mut ctx = DeviceCtx::new(&mut cap);
+        if !is_read {
+            // DmaWrite 完成：data 空、ok=true（正常落盘 / CQE-post）。
+            c.on_dma_complete(&mut ctx, token, true, Vec::new());
+            continue;
+        }
+        // segment-页 fetch：耗尽 input.segments 后回退到 cont→自身自环页（压 hop guard）。
         let bytes = if fetch_idx < input.segments.len() {
             let page = &input.segments[fetch_idx];
             let n = page.descs.len().min(MAX_DESCS_PER_PAGE);
@@ -174,17 +185,31 @@ fn run(input: SglChainInput) {
             d[15] = 0x20;
             d.to_vec()
         };
-        // DMA 完成 ok 标志：fail_mask 的对应 bit（reviewer 覆盖项：失败清理路径）。
-        // `& 31` 防 shift 溢出 panic；副作用是 >32 hop 后失败 pattern 以 32 为周期复用
-        // （长链/自环区的 mixed ok/fail 空间受限，非 bug——coverage 完整性 nit，step6 可
-        // 改用更宽的 fail 来源）。
+        // DMA-read 完成 ok 标志：fail_mask 对应 bit（覆盖读失败清理路径）。`& 31` 防溢出
+        // （>32 hop 后失败 pattern 周期复用，coverage nit 非 bug）。
         let ok = (input.fail_mask >> (dma_reads & 31)) & 1 == 0;
         fetch_idx += 1;
         dma_reads += 1;
-
-        let mut ctx = DeviceCtx::new(&mut cap);
         c.on_dma_complete(&mut ctx, token, ok, bytes);
     }
+
+    // ── 内部不变式 oracle（`fuzzing` feature，见 DMA_COMPLETION_INVARIANTS.md）──
+    // 命令全 drain 后 SGL op 表必清空（无 op_id 泄漏）。**CFS 例外**（I2）：CFS 置位时
+    // `on_dma_complete_impl` 入口短路、表由 disable()/reset 回收而非 drain，故 cfs 下跳过
+    // 泄漏检查（本 harness 不驱 doorbell/DBBUF 故 cfs 恒 false；`inv.cfs ||` 守未来 harness）。
+    let inv = c.__fuzz_invariants();
+    assert!(
+        inv.cfs || inv.sgl_ops == 0,
+        "SGL op 泄漏：drain 后 sgl_ops={}（cfs={}）",
+        inv.sgl_ops,
+        inv.cfs
+    );
+    assert!(
+        inv.cfs || inv.pending_ios == 0,
+        "pending_ios 泄漏：drain 后={}（cfs={}）",
+        inv.pending_ios,
+        inv.cfs
+    );
 }
 
 fuzz_target!(|input: SglChainInput| {

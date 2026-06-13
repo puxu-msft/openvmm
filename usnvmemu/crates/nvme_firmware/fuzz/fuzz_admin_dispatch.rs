@@ -33,7 +33,8 @@
 //!     我们让 prp2 页对齐以稳定触发 fetch；其余 opcode 不依赖此）。
 //!
 //! **oracle（observable-only，无 golden）**：libfuzzer 自动 catch panic / 超时；本
-//! harness 另设 `ITER_SAFETY_CAP` 兜底超限即 `panic!`。暂不开 `fuzzing` feature。
+//! harness 另设 `ITER_SAFETY_CAP` 兜底超限即 `panic!`。**已开 `fuzzing` feature**：drain 后
+//! 经 `__fuzz_invariants()` 断言 op 表清空（无 op_id 泄漏，CFS 例外）。
 
 #![cfg_attr(all(target_os = "linux", target_env = "gnu"), no_main)]
 
@@ -169,47 +170,75 @@ fn run(input: AdminDispatchInput) {
         let _ = c.nvme_admin_dispatch(&mut ctx, sqe, 0x40, /*cq_id*/ 0);
     }
 
-    // 同步驱动循环：对每个未服务的 DmaRead（= Get Log Page 大 payload 的 PRP-list 页
-    // fetch）喂回下一张 list 页。payload 写 host 的 DmaWrite 不喂（不影响排空判定）。
+    // 同步驱动循环：服务**所有**未服务 DMA——DmaRead（= Get Log Page 大 payload 的 PRP-list
+    // 页 fetch，喂 fuzzer list 页）与 DmaWrite（= payload 写 host / CQE-post，喂空 ok=true）。
+    // 服务 write 是 op 表 drain oracle 的前提（否则留 in-flight write → 误判泄漏）。
     let mut serviced = std::collections::HashSet::new();
     let mut fetch_idx = 0usize;
     let mut dma_reads = 0u32;
+    let mut total_dmas = 0u32;
     loop {
         let next = cap.events().iter().find_map(|e| match e {
-            TransportEvent::DmaRead { token, gpa, len } if !serviced.contains(token) => {
-                Some((*token, *gpa, *len))
+            TransportEvent::DmaRead { token, len, .. } if !serviced.contains(token) => {
+                Some((*token, Some(*len)))
+            }
+            TransportEvent::DmaWrite { token, .. } if !serviced.contains(token) => {
+                Some((*token, None))
             }
             _ => None,
         });
-        let Some((token, _gpa, len)) = next else {
-            break; // 排空：admin 命令收尾（同步早返 / 异步 DMA 链结束 / 守卫截断）。
+        let Some((token, read_len)) = next else {
+            break; // 全 drain：admin 命令收尾（同步早返 / 异步 DMA 链结束 / 守卫截断）。
         };
         serviced.insert(token);
-
-        if dma_reads > ITER_SAFETY_CAP {
+        total_dmas += 1;
+        if total_dmas > ITER_SAFETY_CAP {
             panic!(
                 "admin PRP-list fetch 超 ITER_SAFETY_CAP 仍未排空（疑似 MAX_PRP_LIST_PAGES 守卫失效/无限 fetch）"
             );
         }
 
-        let mut bytes = if fetch_idx < input.fed_pages.len() {
-            let page = &input.fed_pages[fetch_idx];
-            let n = page.entries.len().min(MAX_ENTRIES_PER_FED_PAGE);
-            serialize_entries(&page.entries[..n])
-        } else {
-            final_list_page()
-        };
-        // 模型真 transport（dma_read_sync 强制 reply.len == 请求 len）：补/截到请求长度
-        // （同 fuzz_prp_list_chain；latent 短读硬化缺口已报 silver-heron）。
-        bytes.resize(len as usize, 0);
-
-        let ok = (input.fail_mask >> (dma_reads & 31)) & 1 == 0;
-        fetch_idx += 1;
-        dma_reads += 1;
-
         let mut ctx = DeviceCtx::new(&mut cap);
-        c.on_dma_complete(&mut ctx, token, ok, bytes);
+        match read_len {
+            Some(len) => {
+                let mut bytes = if fetch_idx < input.fed_pages.len() {
+                    let page = &input.fed_pages[fetch_idx];
+                    let n = page.entries.len().min(MAX_ENTRIES_PER_FED_PAGE);
+                    serialize_entries(&page.entries[..n])
+                } else {
+                    final_list_page()
+                };
+                // 模型真 transport（dma_read_sync 强制 reply.len == 请求 len）：补/截到请求长度。
+                bytes.resize(len as usize, 0);
+                let ok = (input.fail_mask >> (dma_reads & 31)) & 1 == 0;
+                fetch_idx += 1;
+                dma_reads += 1;
+                c.on_dma_complete(&mut ctx, token, ok, bytes);
+            }
+            None => {
+                // DmaWrite 完成：data 空、ok=true（payload 落 host / CQE-post）。
+                c.on_dma_complete(&mut ctx, token, true, Vec::new());
+            }
+        }
     }
+
+    // ── 内部不变式 oracle（`fuzzing` feature，见 DMA_COMPLETION_INVARIANTS.md）──
+    // admin 命令全 drain 后异步 op 表必清空（无 op_id 泄漏）。AER（0x0c）等 pending 由独立
+    // aen_pending 跟踪、不入 pending_ios，故本断言不被合法 AER 误伤。**CFS 例外**（I2）：CFS
+    // 置位时入口短路、表由 reset 回收而非 drain（本 harness 不驱 doorbell 故 cfs 恒 false；守未来）。
+    let inv = c.__fuzz_invariants();
+    assert!(
+        inv.cfs || inv.prp_list_ops == 0,
+        "admin PRP-list op 泄漏：drain 后 prp_list_ops={}（cfs={}）",
+        inv.prp_list_ops,
+        inv.cfs
+    );
+    assert!(
+        inv.cfs || inv.pending_ios == 0,
+        "admin pending_ios 泄漏：drain 后={}（cfs={}）",
+        inv.pending_ios,
+        inv.cfs
+    );
 }
 
 fuzz_target!(|input: AdminDispatchInput| {

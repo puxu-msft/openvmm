@@ -41,6 +41,11 @@ default = ["openhcl", "vfio-user"]
 openhcl = ["dep:pcie_device_sdk", "dep:pal_async", "dep:guid"]
 # vfio-user transport（QEMU 接管）。
 vfio-user = ["dep:vfio_user_transport"]
+# fuzz-only：放宽 controller 内部 async-op 表 / 守卫常量 / CFS 状态的可见性，供
+# coverage-guided fuzz target（usnvmemu/crates/nvme_firmware/fuzz/）把
+# DMA_COMPLETION_INVARIANTS.md 的不变式做成可断言 oracle。**生产构建不开 → 零额外公共面**
+# （先例 firmware_uefi 的 `fuzzing` feature）。空 feature：仅 gate `#[cfg(feature="fuzzing")]` 访问器。
+fuzzing = []
 
 # 跨进程 e2e 测试（tests/openhcl_pcie_remote_e2e.rs）：harness 扮 OpenHCL/VTL2 侧，
 # 起真 nvme_firmware bin（--tcp-addr）经 pcie_remote 协议驱动 NVMe。仅 dev 用。

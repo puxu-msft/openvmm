@@ -13,9 +13,10 @@ edition = "2024"
 rust-version = "1.95"
 
 [dependencies]
-# step 1/2 用 observable-only oracle（无 panic + 迭代有界），暂不开 `fuzzing` feature；
-# 待 step 6 加不变量访问器时再 `features = ["fuzzing"]`（见 plan §4 step6）。
-nvme_firmware = { path = ".." }
+# `fuzzing` feature 暴露 controller 内部不变量访问器（__fuzz_invariants）——把
+# DMA_COMPLETION_INVARIANTS.md 的承重不变式做成可断言 oracle（op 表 drain / hop ≤ cap /
+# CFS 语义）。生产构建不开此 feature → 零额外公共面（先例 firmware_uefi）。
+nvme_firmware = { path = "..", features = ["fuzzing"] }
 pcie_device_core = { path = "../../pcie_device_core" }
 arbitrary = { version = "1.3", features = ["derive"] }
 xtask_fuzz = { path = "../../../../xtask/xtask_fuzz" }
