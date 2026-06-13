@@ -1,0 +1,70 @@
+# usnvmemu（用户态 NVMe firmware）专属 CI gate。
+#
+# 为什么单独一个 workflow：usnvmemu 全 9 crate 在根 Cargo.toml 的 [workspace.exclude]
+# 内（ADR-008 仓库外置意图：用 tokio、独立依赖模型、注定外迁，不并入 openvmm workspace），
+# 故主 openvmm CI 的 `cargo test --workspace` **不覆盖** usnvmemu。在本 workflow 之前，
+# usnvmemu 的所有测试（firmware-core §29 interleaving / §26 mmio、openhcl/vfio 跨进程
+# e2e 独立 oracle、nvme-of wire e2e）只能 `cd <crate> && cargo test` 手动跑、无人值守不跑。
+#
+# 本 gate 把它们变成真正的 standing gate —— 兑现 ADR-013「per-transport 独立-oracle 须有
+# standing CI gate」结构律的前置开关。详 usnvmemu/docs/DECISIONS.md ADR-013 +
+# usnvmemu/docs/ROADMAP.md Tier-1 元项。
+#
+# 实现说明：
+# - 钉 Rust 1.95（同 rust-toolchain.toml；1.96 的 Path::absolute 与 flowey 撞名）。
+# - **不需 protoc / restore-packages**：usnvmemu 不启用 mesh 的 `prost` feature
+#   （mesh_protobuf/build.rs 的 protoc 调用在 `#[cfg(feature = "prost")]` 下），实测干净
+#   `cargo build`/`cargo test` 无 protoc 即通过。
+# - 每个 excluded crate 是独立构建单元（无共享 workspace），故用 matrix 逐 crate。
+# - 真-host 集成测试（nvme_of v_interop_1/6 需 nvme-cli/root）已 `#[ignore]`，默认跳过。
+
+name: usnvmemu CI
+
+on:
+  pull_request:
+    paths:
+      - 'usnvmemu/**'
+      - '.github/workflows/usnvmemu.yml'
+      - 'rust-toolchain.toml'
+  push:
+    paths:
+      - 'usnvmemu/**'
+      - '.github/workflows/usnvmemu.yml'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test ${{ matrix.crate }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - pcie_device_core
+          - vfio_user_wire
+          - pcie_device_sdk
+          - vfio_user_transport
+          - vfio_user_device
+          - nvme_firmware
+          - nvme_of_tcp_target
+          - pcie_remote_test_harness
+          - rng_device_example
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust 1.95
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- --default-toolchain=1.95.0 -y
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: cargo test
+        working-directory: usnvmemu/crates/${{ matrix.crate }}
+        # 默认 features：nvme_firmware = openhcl + vfio-user，含 §28 vfio 控制面 wire
+        # 独立 oracle（vfio_user_wire_e2e）+ openhcl 跨进程 e2e。Linux 原生可测。
+        run: cargo test
