@@ -726,8 +726,6 @@ pub(super) struct InlinePiPrp {
 ///   `meta` 为 N×8 tuple concat；scatter 时把 `meta` 写到 `mptr`（额外一条 DMA-write
 ///   计入 `total_pages` 之外的"meta 子任务"，由 `meta_pending` 标记）。
 pub(super) struct SepMetaPrp {
-    /// 期望传输的纯 data 字节数（= N × data_bytes）。
-    pub(super) data_bytes_total: u32,
     /// PI tuple buffer 的 host GPA（MPTR）。
     pub(super) mptr: u64,
     /// PI tuple 形态相关。

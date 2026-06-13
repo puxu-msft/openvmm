@@ -1276,7 +1276,6 @@ impl NvmeController {
                                 data_pages: prp_data_pages,
                                 list_pages_fetched: 0,
                                 sep_meta: Some(crate::controller::SepMetaPrp {
-                                    data_bytes_total: nlb * data_bytes as u32,
                                     mptr,
                                     pi_type,
                                     pi_first,
@@ -2196,7 +2195,7 @@ impl NvmeController {
                         //   4) LBA 越界检查（slba+nlb<=total_lba）。
                         //   5) 起 fetch PRP list 页 + fetch PRP1 数据页 + DMA-read MPTR。
                         //   6) walk 完成 → 起每页 sub-DMA-read（NvmWritePrpListData）。
-                        // finalize（completion.rs `prp_list_write_sep_meta_finalize`）：
+                        // finalize（completion.rs `prp_pi_write_finalize`）：
                         //   data 全到齐 + meta 到齐 → verify-all-then-store-all 原子。
                         if sqe.mptr == 0 {
                             tracing::warn!(nsid, "B6b-4 N>2 WRITE 需 MPTR");
@@ -2284,7 +2283,6 @@ impl NvmeController {
                                 data_pages,
                                 list_pages_fetched: 0,
                                 sep_meta: Some(crate::controller::SepMetaPrp {
-                                    data_bytes_total: nlb * data_bytes as u32,
                                     mptr,
                                     pi_type,
                                     pi_first,

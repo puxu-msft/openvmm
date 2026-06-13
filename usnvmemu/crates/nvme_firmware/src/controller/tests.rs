@@ -2367,7 +2367,7 @@ fn b6b_n_gt_2_prp_list_separate_meta() {
     }
     // revert-verify（手动）：把 io.rs B6b-4 READ dispatch 的 verify 循环 `for i in 0..nlb`
     // 改为 `for i in 0..1` → 负例（block 1 坏）漏过 → 回送 host → "不回送"断言转红。
-    // 把 completion.rs `prp_list_write_sep_meta_finalize` 的 verify 循环同样改 → WRITE
+    // 把 completion.rs `prp_pi_write_finalize` 的 verify 循环同样改 → WRITE
     // 负例（block 2 坏）漏过 → 落盘 → "全不落盘"断言转红。两侧已实测，恢复后绿。
 }
 
@@ -3371,7 +3371,7 @@ fn b6c3_inline_meta_nlb_ge_2_prp_list() {
         assert!(!leaked, "verify 失败不应 scatter 到 host");
         assert!(c.prp_list_ops.is_empty(), "失败不应留 accum");
     }
-    // revert-verify（手动）：把 completion.rs prp_list_write_inline_pi_finalize 的 verify
+    // revert-verify（手动）：把 completion.rs prp_pi_write_finalize 的 verify
     // 循环 `for i in 0..num_blocks` 改成 `for i in 0..1` → WRITE 负例（坏 block1）漏过落盘
     // → "全不落盘"红；把 io.rs B6c-3 READ 的 verify 循环同改 → READ 负例（坏 block0）仍能
     // 抓住（block0 在 0..1 内），故 READ 负例改测 block1 时才转红。已实测，恢复绿。
