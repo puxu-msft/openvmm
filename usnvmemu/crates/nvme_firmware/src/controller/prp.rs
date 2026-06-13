@@ -86,9 +86,10 @@ pub(crate) fn tier(offset: u64, total_len: u64) -> PrpTier {
 
 // ───────────────────────── #4c-b 统一段抽象（P0 地基）─────────────────────────
 //
-// 下列符号是 #4c-b（PI 全路径 PRP1 偏移）的统一消费层地基，P1–P3 在 io.rs / completion.rs
-// 接入（plain 三档判定、PI dual/list dispatch、finalize 收敛），届时 `#[allow(dead_code)]`
-// 移除。设计见 docs/plans/2026-06-13-4cb-unified-prp-segment-abstraction.md。
+// 下列符号是 #4c-b（PI 全路径 PRP1 偏移）的统一消费层。**P1–P3 已全部接入**（io.rs：plain
+// 三档判定 + PI separate/inline 的 dual/list dispatch 经 `validate_prp2`/`dispatch_segs`；
+// completion.rs：finalize 收敛），故无 `#[allow(dead_code)]`。设计见
+// docs/plans/2026-06-13-4cb-unified-prp-segment-abstraction.md。
 
 /// PRP2 在某 tier 下的语义（spec § 4.1.1 / § 4.4）—— "tier → PRP2 解读"的**唯一裁决点**。
 /// 供所有 dispatch 路径共用，消灭各路径各自 if/else 判 PRP2 对齐/非零的散落逻辑。
@@ -114,49 +115,10 @@ pub(crate) fn prp2_role(offset: u64, total_len: u64) -> Prp2Role {
     }
 }
 
-/// 逻辑流按 host 页边界切出的**段长度序列**（不含 GPA），dispatch 与 finalize 共用同一
-/// 几何真相。段 0 = `first_seg_len(O)`（含 PRP1 偏移），段 i≥1 = 整页或末段 partial。
-/// O(1) 借用迭代器，无 Vec 分配（hot-path 友好）—— 是 `total_pages`/`page_size` 的迭代包装。
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // #4c-b P0 地基；P1+ 在 gather/scatter/finalize 消费
-pub(crate) struct SegLens {
-    offset: u64,
-    total_len: u64,
-    idx: u32,
-    n: u32,
-}
-
-#[allow(dead_code)] // #4c-b P0 地基
-impl SegLens {
-    #[inline]
-    pub(crate) fn new(offset: u64, total_len: u64) -> Self {
-        Self {
-            offset,
-            total_len,
-            idx: 0,
-            n: total_pages(offset, total_len),
-        }
-    }
-}
-
-impl Iterator for SegLens {
-    type Item = u32; // 该段逻辑字节数
-    #[inline]
-    fn next(&mut self) -> Option<u32> {
-        if self.idx >= self.n {
-            return None;
-        }
-        let sz = page_size(self.idx, self.offset, self.total_len);
-        self.idx += 1;
-        Some(sz)
-    }
-}
-
 /// dispatch 期已知的 host 段布局。Single/Dual 的全部段 GPA 即时可知（PRP1、PRP2 是直接
 /// GPA）；List 仅首段（PRP1）即时可知，其余段 GPA 须等 PRP-list 页 DMA-read 回来（接现有
 /// offset-aware List 机件，`page_size` 同一几何），故 List 变体只携首段长度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // #4c-b P0 地基；P1+ 在 6 条 dispatch 路径消费
 pub(crate) enum DispatchSegs {
     /// 单段：data 全在 PRP1（含偏移）页内。
     Single { prp1: u64, len: u32 },
@@ -174,7 +136,6 @@ pub(crate) enum DispatchSegs {
 /// 按 (prp1 偏移, prp2, 总字节) 解析 dispatch 期 host 段。`prp2` 在 Dual 档是第二数据页
 /// 指针、List 档是 list 页指针（caller 据返回的 `DispatchSegs` 变体区分用途，无需再判 tier）。
 #[inline]
-#[allow(dead_code)] // #4c-b P0 地基；P1+ 消费
 pub(crate) fn dispatch_segs(prp1: u64, prp2: u64, total_len: u64) -> DispatchSegs {
     let off = prp1_offset(prp1);
     match tier(off, total_len) {
@@ -313,28 +274,6 @@ mod tests {
         assert_eq!(prp2_role(0, page), Prp2Role::Unused);
         assert_eq!(prp2_role(0, 2 * page), Prp2Role::DataPage);
         assert_eq!(prp2_role(0, 2 * page + 1), Prp2Role::ListPage);
-    }
-
-    /// `SegLens` 迭代序列 == 逐 `page_size` 序列，且总和 == total（任意 offset）。
-    #[test]
-    fn seglens_matches_page_size_and_sums() {
-        for &offset in &[0u64, 1, 100, 4088, 4095] {
-            for &total in &[0u64, 1, 8, 4096, 4104, 8192, 12288, 100000] {
-                let got: Vec<u32> = SegLens::new(offset, total).collect();
-                let n = total_pages(offset, total);
-                assert_eq!(got.len(), n as usize, "段数 offset={offset} total={total}");
-                let mut sum = 0u64;
-                for (i, &sz) in got.iter().enumerate() {
-                    assert_eq!(
-                        sz,
-                        page_size(i as u32, offset, total),
-                        "段 {i} offset={offset} total={total}"
-                    );
-                    sum += sz as u64;
-                }
-                assert_eq!(sum, total, "SegLens 总和 offset={offset} total={total}");
-            }
-        }
     }
 
     /// `dispatch_segs` 三档：GPA + 段长正确，含偏移与 4104 corner。
