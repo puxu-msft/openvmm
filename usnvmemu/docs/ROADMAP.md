@@ -121,26 +121,37 @@ setup/queue 创建,**不只 IO payload**——§28 bug 多藏 control 边角),�
 drift、**非**独立 oracle(§20 反模式);【独立-ish】=手搓二次解码、不同代码路径;算法类如 CHAP
 crypto/TLS-PSK 的**真**独立只能靠档2 frozen vector/档3 真机。"⛔"=据律欠缺待补)：
 
-| 层 / 接入 | 档1 standing gate 现状【独立性】 | 档1 待补独立-ish gate | 档2 frozen-vector | 档3 cadence live(不计 gate) |
+| 层 / 接入 | 档1 oracle 现状【独立性】(⚠ 见下:**均未 CI-gate**) | 档1 独立-ish oracle | 档2 frozen-vector | 档3 cadence live(不计 gate) |
 |---|---|---|---|---|
 | **firmware-core**(全 transport 共享) | interleaving(§29)/ mmio qword(§26)/ prp 单测【回归】 | — | — | —(盲区借各 transport 档3) |
 | OpenHCL pcie_remote | `openhcl_pcie_remote_e2e`(手搓 wire driver)【独立-ish ✅】 | — | ⛔ 欠 L3 代理 | L3 真 Hyper-V guest(§26 >4 GiB,未自动化) |
-| vfio-user | `loopback_*`(生产 `VfioUserClient`⇄`Session`)【**非独立**=§20 反模式】 | ⛔ **手搓 Rust vfio wire e2e**(下一步做) | ⛔ 欠真 guest 代理 | `run_qemu_vfio_guest.py`(§28 4-bug,已有未 gate) |
+| vfio-user | `loopback_*`(生产 `VfioUserClient`⇄`Session`)【**非独立**=§20 反模式】 | ✅ **已写** `vfio_user_wire_e2e`(手搓 client,§28 4-bug,revert-verified,commit 8284c45d4) | ⛔ 欠真 guest 代理 | `run_qemu_vfio_guest.py`(§28 4-bug,已有未 gate) |
 | NVMe-oF TCP | Rust wire e2e(`vt_dhchap4` 等)【framing 手搓 indep / crypto 用生产 `compute_response` 自洽】 | (crypto 真独立靠档2/3) | tls-psk kernel vector(待 dump) | dhchap-4 真 `nvme connect` |
 
-**诚实结论**(纠上版 over-claim:把"已 gate"误当"独立已满足")：三 transport 里**只有 OpenHCL** 有
-手搓独立-ish standing gate;**vfio 是最硬缺口**——其 standing gate 全是生产-client-两端的 loopback
-(正是律要打击的 §20 反模式),连手搓独立 gate 都没有。真第三方(libvfio-user / 真 QEMU / 真 kernel /
-真 nvme-cli)对**所有** transport 仍未 standing,只在档2/档3 收口。故结构律此刻对 vfio **未满足**。
+> **⚠ 承重发现(2026-06-13,执行 POC 时坐实,纠正本元项一个根本错误假设)**：**usnvmemu 全 9 crate
+> 在根 `Cargo.toml` 的 `[workspace.exclude]`**(非 members)。故 openvmm CI 的 `cargo test --workspace`
+> (flowey `TestPackages::Workspace{exclude}`)**根本不含任何 usnvmemu crate**;`.github/` 0 处提及
+> usnvmemu。即 **usnvmemu 当前没有任何 standing CI gate——上表所有"现状"测试(openhcl / firmware-core /
+> 新 vfio)都只是 `cargo test` 手动/cadence 可跑,无一在 CI 自动跑**。这本身就是 §20/§28 在元层面的重演:
+> 我(及 architect)先前假设"usnvmemu 测试已骑 workspace nextest 门"而没核验 workspace 成员——**正是律
+> 要打击的"假设 gate 覆盖你却没验证"**。
+>
+> **故结构律对全 usnvmemu 的"standing"维度此刻全部未实现**;真正前置 = **先建一个 usnvmemu 专属 CI gate**
+> (exclude 是 [ADR-008] 仓库外置意图,不宜并入 members → 需独立 workflow:`cd usnvmemu/crates/<X> &&
+> cargo test`,toolchain 钉 1.95)。这是比"某 transport 缺独立 oracle"更靠前的系统缺口——**评论家
+> finding-1 的最深一层**:不只"缺 per-transport 独立 oracle",而是"独立 oracle 全在 CI 之外、无人值守不跑"。
 
-**下一步(经 architect 对抗审定案,弃"包 python"路径)**：给 vfio 补一个**手搓 Rust 跨进程 wire e2e
-`#[test]`**(照 `openhcl_pcie_remote_e2e.rs` 样板:`CARGO_BIN_EXE` spawn 真 bin + 唯一 unix socket +
-独立于生产 `VfioUserClient` 的手搓 wire),骑现有 workspace nextest 门(预算已由 OpenHCL 同型测试验证
-fit 10s ci profile)、**不碰 flowey/python**。理由:包 python 在 hermetic(CI 无 python3/uv)、ci 超时
-预算(解释器+嵌套 build 冷启动)、独立性(同份 python 与 Rust 端共享 spec=半自洽)三轴同时更差。
+**诚实结论**(两层纠正)：① 独立性维度——三 transport 里只有 OpenHCL + 新写的 vfio(`vfio_user_wire_e2e`)
+有手搓独立-ish oracle;nvme_of 的 framing 半独立、crypto 自洽;真第三方(libvfio-user/真QEMU/真kernel)
+对所有 transport 仍缺。② **standing 维度——全部未实现(usnvmemu 不在 CI)**。结构律 = 独立性 ✅ **且**
+standing ✅,故对每条 transport 此刻都**未满足**(vfio 独立性刚补上,但仍欠 CI gate)。
 
-**Tier B(opt-in,非 standing)**：libvfio-user differential(真第三方 C,但需 apt+GitHub clone+meson →
-非 hermetic)走 `#[ignore]` + pinned 专用 job;Python wire harness 留作 cadence/差分 oracle,不入 always-on gate。
+**下一步(按依赖排序,前置先行)**：
+1. **(前置·新发现)建 usnvmemu CI gate** —— 独立 workflow `cd usnvmemu/crates/<X> && cargo test`(钉
+   1.95)。**这是把上表任何"已写 oracle"变成"standing"的唯一开关**;没它,vfio/openhcl/firmware-core
+   的独立 oracle 全在 CI 外裸奔。属 outward-facing CI 基建,需用户拍板(见会话末决策)。
+2. (已做)vfio 手搓独立 oracle `vfio_user_wire_e2e`(commit 8284c45d4)——独立性补齐,等步骤 1 转 standing。
+3. (opt-in)libvfio-user differential → Tier B `#[ignore]` + pinned job;Python wire harness 留 cadence。
 
 **据律自暴缺口(⛔)**：vfio 已有档-3 live(`run_qemu_vfio_guest.py`)欠档-2 frozen 代理;OpenHCL L3
 真 guest 同样欠代理——按"凡有档3 必配档2"律,这两格须补冻结代理,非"不适用"。

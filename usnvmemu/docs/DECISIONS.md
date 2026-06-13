@@ -107,6 +107,18 @@ Blocker 已写明),不能与轻量 deterministic oracle 齐头并进。
 - **revisit**:当 real-guest-boot CI(如 Windows runner)或 WSL2 `CONFIG_NVME_AUTH` 可得时,把
   对应档-3 升为档-1/2,矩阵相应收紧。
 
+> **⚠ 承重发现(2026-06-13,执行首个 vfio oracle 的 POC 时坐实,纠正本 ADR 的一个隐含错误前提)**：
+> **usnvmemu 全 9 crate 在根 `Cargo.toml` 的 `[workspace.exclude]`**,故 openvmm CI 的
+> `cargo test --workspace`(flowey `TestPackages::Workspace{exclude}`)**不含任何 usnvmemu crate**,
+> `.github/` 0 处提及 usnvmemu —— 即 **usnvmemu 当前无任何 standing CI gate**,现有所有测试(含
+> firmware-core §29/§26 单测、openhcl/vfio 跨进程 e2e)都只是 `cargo test` 手动 cadence 可跑。
+> 这意味着本 ADR 的"档1 必须进 cargo test 或 **CI standing gate**"中的后半截对 usnvmemu **尚无载体**。
+> 反讽:此前起草本 ADR 时假设"usnvmemu 测试已骑 workspace nextest 门"而未核验 workspace 成员——
+> **正是本 ADR 要打击的「假设 gate 覆盖你却没验证」(§20/§28 元层面)**。**新增前置条款**:把任一已写
+> 独立 oracle 变成真正的 standing gate,先决条件 = **建一个 usnvmemu 专属 CI workflow**(`cd usnvmemu/
+> crates/<X> && cargo test`,toolchain 钉 1.95;exclude 是 [ADR-008](#adr-008) 仓库外置意图,不宜并入
+> members)。在该 CI gate 落地前,矩阵的"standing"维度对全 usnvmemu **记为未实现**(独立性维度照常推进)。
+
 **Status**：active;**锐化** [ADR-009](#adr-009) Tier-1(不取代,补其执行机制与分层;ADR-009
 Tier-1 执行细则回指本 ADR)。
 
