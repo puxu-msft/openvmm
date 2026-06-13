@@ -90,7 +90,7 @@ underhill-crash（信号死 ≠ core dump）—— 这正是 W6b operator 模型
   - `OPENHCL_VFIO_USER_NVME_AUTOSTART=<size_mb>:<backing>`（启动器，init，新；sock 自动从设备 env 派生，**不**重复）。
 - 更新 `usnvmemu/docs/MILESTONES.md §3.4`（标 auto-start 落地）+ committed harness
   `scripts/hyperv_vfio_user_interop/`（加「不推 usnvmemu，纯靠 autostart」的 e2e 变体）+ ROADMAP。
-- **build-igvm 便利 flag**（可选 nicety，非必须）：build_igvm.rs 加 `--with-vfio-user-nvme` 自动
+- ✅ **build-igvm 一等 flag 已落地**（rust-reviewer APPROVE，零回归）：`--with-vfio-user-nvme <musl-bin>` 自动
   push `openhcl/usnvmemu_fs.config`（仿 `--with-perf-tools` push perftoolsfs.config，build_igvm.rs:326）。
 
 ### ✅ Task 4 — 真机验证（承重假设② PASS）
@@ -111,7 +111,7 @@ guest PSDirect 出盘「OpenHCL Userspace NVMe v2.0」+ 4MiB IO markerMatch + or
 ## 未来（非本期）
 - supervised restart（区分 graceful-exit vs crash，对齐 VTL2 fatal-death 哲学）——有张力，留后续。
 - 持久 backing（VTL2 tmpfs backing 重启即失；真 persistent storage 是更大课题）。
-- 多设备 / build-igvm 一等 flag。
+- 多设备。
 
 > **真机 PASS（commit 见下）**：boot 两 env（device + `AUTOSTART=256:/tmp/nvme_backing.img`，皆空格-free 过 cmdline）→
 > init 自启 `/bin/usnvmemu`（pid 35，args 由 env 构造）+ 建 256MiB backing → device shim 连上 → guest

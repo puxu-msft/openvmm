@@ -241,6 +241,7 @@ impl SimpleFlowNode for Node {
                             custom_kernel: custom_kernel_abs.clone(),
                             custom_sidecar: None,
                             custom_extra_rootfs: vec![],
+                            vfio_user_nvme_bin: None,
                         });
                         OpenhclIgvmRecipe::LocalOnlyCustom(details)
                     } else {

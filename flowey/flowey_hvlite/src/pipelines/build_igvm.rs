@@ -115,6 +115,14 @@ pub struct BuildIgvmCliCustomizations {
     #[clap(long, requires = "release")]
     pub with_perf_tools: bool,
 
+    /// Bake the usnvmemu (vfio-user NVMe server) static-musl binary at the given
+    /// path into the VTL2 initrd at `/bin/usnvmemu`, for boot auto-start (see
+    /// `underhill_init`'s `OPENHCL_VFIO_USER_NVME_AUTOSTART`). Convenience for
+    /// `--custom-extra-rootfs openhcl/usnvmemu_fs.config` plus setting
+    /// `OPENHCL_USNVMEMU_PATH`.
+    #[clap(long, value_name = "USNVMEMU_MUSL_BIN")]
+    pub with_vfio_user_nvme: Option<PathBuf>,
+
     /// Preserve debuginfo in the openvmm_hcl binary in the IGVM file.
     ///
     /// This increases the VTL2 memory requirements significantly, and will
@@ -301,6 +309,7 @@ impl IntoPipeline for BuildIgvmCli {
                     override_arch,
                     override_manifest,
                     with_perf_tools,
+                    with_vfio_user_nvme,
                     with_debuginfo,
                     with_mi_secure,
                     disable_secure_avic,
@@ -452,6 +461,7 @@ impl IntoPipeline for BuildIgvmCli {
                 }),
                 with_sidecar,
                 custom_extra_rootfs,
+                vfio_user_nvme_bin: with_vfio_user_nvme,
                 override_openvmm_hcl_feature,
                 custom_sidecar,
                 override_manifest,

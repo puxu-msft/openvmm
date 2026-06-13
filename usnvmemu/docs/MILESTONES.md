@@ -283,13 +283,13 @@ W6a（单 commit `571ad805`）：
 
 ### 3.6 usnvmemu VTL2 自启动托管服务（W6 收尾）— ✅ 零-operator 出盘真机 PASS（commit `738ab808d`）
 
-让 vfio-user NVMe 设备在 OpenHCL boot 自动出现，替代 operator 手动 `ohcldiag-dev push + setsid` 起 usnvmemu。三层 env-gated（未设零回归）：① usnvmemu(static musl) 烤进 IGVM initrd `/bin/usnvmemu`（新 `openhcl/usnvmemu_fs.config` + `cargo xflowey build-igvm --custom-extra-rootfs`，**零 flowey 改动**）；② `underhill_init`(PID1) env-gated 在 spawn underhill 前 spawn usnvmemu；③ underhill_core 现有 device + 持久 reconnect（不改）。
+让 vfio-user NVMe 设备在 OpenHCL boot 自动出现，替代 operator 手动 `ohcldiag-dev push + setsid` 起 usnvmemu。三层 env-gated（未设零回归）：① usnvmemu(static musl) 烤进 IGVM initrd `/bin/usnvmemu`（新 `openhcl/usnvmemu_fs.config`；一等 flag `cargo xflowey build-igvm --with-vfio-user-nvme <musl-bin>`，或手动 `--custom-extra-rootfs`+`OPENHCL_USNVMEMU_PATH`）；② `underhill_init`(PID1) env-gated 在 spawn underhill 前 spawn usnvmemu；③ underhill_core 现有 device + 持久 reconnect（不改）。
 
 - **配置**：`OPENHCL_VFIO_USER_NVME_AUTOSTART=<size_mb>:<backing>`（colon、**空格-free** 以过 kernel cmdline→init env 不被截断；sock 从设备 env `OPENHCL_VFIO_USER_NVME` 派生**不重复**）。init 建 backing file（usnvmemu `NvmeController::open` 无 `.create`，要文件已在）。
 - **PID1 安全（architect + rust-reviewer 评审纳入）**：`pre_exec` 内 `RLIMIT_CORE=0`（usnvmemu segfault **不触发** `core_pattern=|/bin/underhill-crash`——其无 PID 过滤会向 host 流 core=**假 VTL2 崩报**；令异常退出**静默退化 boot-absent**）+ `setsid` + `dup2(2,1)`（usnvmemu `tracing` 走 stdout，dup→stderr=ttyprintk→kmsg，否则继承 init `/dev/null` 静默丢日志）；CVM-gate（隔离 VM 不 autostart）；错误**绝不**逃出 `do_main`（逃出→`main` `exit(1)`→PID1 死→kernel panic）→ `if let Err` 吞掉。**不加 crash-restart**（VTL2「非预期进程死即 fatal」哲学；graceful 重启留 operator/reconnect；C-1 后未来若做仅 `WIFEXITED(0)`/`SIGTERM` 重启）。
 - **真机 PASS（承重假设②）**：boot 两 env（皆空格-free 过 cmdline）、**零手动推/起** → init 自启 `/bin/usnvmemu`(pid 35，args 由 env 构造)+建 256MiB backing → device shim 连上 → guest 自动出盘「OpenHCL Userspace NVMe v2.0」256MB + 4MiB IO markerMatch（oracle-1）+ oracle-2 raw backing @22577152。6 单测 + clippy/fmt 净。
 - 设计/承重假设/评审 archive：`docs/superpowers/plans/2026-06-13-w6-usnvmemu-vtl2-autostart.md`。
-- **未来（非本期）**：supervised restart（区分 graceful-exit vs crash，对齐 fatal-death 哲学）/ persistent backing（tmpfs backing 重启即失）/ build-igvm 一等 `--with-vfio-user-nvme` flag（仿 `--with-perf-tools`）/ 多设备。
+- **未来（非本期）**：supervised restart（区分 graceful-exit vs crash，对齐 fatal-death 哲学）/ persistent backing（tmpfs backing 重启即失）/ 多设备。
 
 ---
 

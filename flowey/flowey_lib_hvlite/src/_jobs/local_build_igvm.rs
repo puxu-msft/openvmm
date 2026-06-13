@@ -33,6 +33,9 @@ pub struct Customizations {
     pub custom_sidecar: Option<PathBuf>,
     pub custom_vtl0_kernel: Option<PathBuf>,
     pub custom_extra_rootfs: Vec<PathBuf>,
+    /// Path to a usnvmemu static-musl binary to bake into the initrd at
+    /// `/bin/usnvmemu` (boot auto-start). `None` = not included.
+    pub vfio_user_nvme_bin: Option<PathBuf>,
     pub disable_secure_avic: bool,
     pub override_arch: Option<CommonArch>,
     pub override_kernel_pkg: Option<OpenhclKernelPackage>,
@@ -101,6 +104,7 @@ impl SimpleFlowNode for Node {
             with_perf_tools,
             with_sidecar,
             custom_extra_rootfs,
+            vfio_user_nvme_bin,
         } = customizations;
 
         if release_cfg && !release {
@@ -167,6 +171,7 @@ impl SimpleFlowNode for Node {
                     .into_iter()
                     .map(|p| p.absolute())
                     .collect::<Result<_, _>>()?,
+                vfio_user_nvme_bin: vfio_user_nvme_bin.map(|p| p.absolute()).transpose()?,
             });
 
             if let Some(p) = override_manifest {

@@ -74,6 +74,10 @@ pub struct OpenhclIgvmRecipeDetailsLocalOnly {
     pub custom_kernel: Option<PathBuf>,
     pub custom_sidecar: Option<PathBuf>,
     pub custom_extra_rootfs: Vec<PathBuf>,
+    /// Path to a usnvmemu static-musl binary to bake into the initrd at
+    /// `/bin/usnvmemu` (boot auto-start). When set, `openhcl/usnvmemu_fs.config`
+    /// is added to the rootfs and `OPENHCL_USNVMEMU_PATH` is exported for it.
+    pub vfio_user_nvme_bin: Option<PathBuf>,
 }
 
 #[expect(clippy::large_enum_variant)]
@@ -324,6 +328,7 @@ impl SimpleFlowNode for Node {
             custom_kernel,
             custom_sidecar,
             custom_extra_rootfs,
+            vfio_user_nvme_bin,
         } = local_only.unwrap_or(OpenhclIgvmRecipeDetailsLocalOnly {
             openvmm_hcl_no_strip: false,
             openhcl_initrd_extra_params: None,
@@ -332,6 +337,7 @@ impl SimpleFlowNode for Node {
             custom_kernel: None,
             custom_sidecar: None,
             custom_extra_rootfs: Vec::new(),
+            vfio_user_nvme_bin: None,
         });
 
         let target = custom_target.unwrap_or(target);
@@ -560,14 +566,27 @@ impl SimpleFlowNode for Node {
         openvmm_hcl_bin.write_into(ctx, built_openvmm_hcl, |x| x);
 
         let initrd = {
-            let rootfs_config = [openvmm_repo_path.map(ctx, |p| p.join("openhcl/rootfs.config"))]
-                .into_iter()
-                .chain(
-                    custom_extra_rootfs
-                        .into_iter()
-                        .map(|p| ReadVar::from_static(p)),
-                )
-                .collect();
+            let mut rootfs_config: Vec<ReadVar<PathBuf>> =
+                [openvmm_repo_path.map(ctx, |p| p.join("openhcl/rootfs.config"))]
+                    .into_iter()
+                    .chain(custom_extra_rootfs.into_iter().map(ReadVar::from_static))
+                    .collect();
+
+            // When a usnvmemu binary is provided, bake it into the initrd at
+            // /bin/usnvmemu via openhcl/usnvmemu_fs.config (which interpolates
+            // ${OPENHCL_USNVMEMU_PATH}, exported here) for boot auto-start. See
+            // underhill_init's OPENHCL_VFIO_USER_NVME_AUTOSTART gate.
+            let extra_env = if let Some(bin) = vfio_user_nvme_bin {
+                rootfs_config
+                    .push(openvmm_repo_path.map(ctx, |p| p.join("openhcl/usnvmemu_fs.config")));
+                Some(ReadVar::from_static(BTreeMap::from([(
+                    "OPENHCL_USNVMEMU_PATH".to_string(),
+                    bin.to_string_lossy().into_owned(),
+                )])))
+            } else {
+                None
+            };
+
             let openvmm_hcl_bin = openvmm_hcl_bin.map(ctx, |o| o.bin);
 
             ctx.reqv(|v| crate::build_openhcl_initrd::Request {
@@ -575,7 +594,7 @@ impl SimpleFlowNode for Node {
                 arch,
                 extra_params: openhcl_initrd_extra_params,
                 rootfs_config,
-                extra_env: None,
+                extra_env,
                 kernel_package_root: vtl2_kernel_package_root.clone(),
                 kernel_modules: vtl2_kernel_modules,
                 kernel_metadata: vtl2_kernel_metadata,
