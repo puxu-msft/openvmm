@@ -103,6 +103,41 @@ deferred）→ W4 dma-completion 语义文档。
 mmap DMA / GET_REGION_IO_FDS）—— 不属 Phase W 结构范围，见 plan §8 + 下方
 V-followup-vfio-user-qemu-harness。
 
+### ⭐ Tier-1 元项 — Per-transport 独立-oracle 覆盖矩阵 + 结构律 (2026-06-13, 锐化 ADR-009 Tier-1)
+
+> **依据**：[ADR-013](DECISIONS.md)。[LESSONS](LESSONS.md) §2/§20/§26/§28/§29 同一根——
+> 便宜/happy/self-consistent harness 绿 = 结构性假安心;最承重 lesson 是 §20(self-consistent
+> 假设当判据是反模式)。下方三个 V-followup 不是三件独立事,是**同一缺口("缺 per-transport
+> 独立-oracle 覆盖")的三个执行实例**。本元项是它们的伞:定结构律 + 按"可否每-commit 无人值守
+> standing"分档,避免把重/特权 oracle 错当 standing gate。
+
+**结构律**：任何 transport 的**数据/wire 路径**(含 control plane:握手/寄存器 MMIO/中断
+setup/queue 创建,**不只 IO payload**——§28 bug 多藏 control 边角),缺**至少一个『另一条
+代码路径』独立 oracle 作 standing CI gate** 时不算"完成";oracle 取该路径**可 standing 化的
+最强档**。**横切子条款**:自写 harness 的 guest-memory 须能生成 **≥4 GiB/高地址**(§26),否则
+结构性排除"64-bit 高半截断"整类 bug(此为对所有 transport 的承重款,根因在 firmware-core)。
+
+**覆盖矩阵(判别轴=可否每-commit 无人值守 standing;"—"=不适用,"⛔"=据律欠缺待补)**：
+
+| 层 / 接入 | 档1 standing gate(已有) | 档1 应升 gate(一次性→standing) | 档2 frozen-vector | 档3 cadence live(不计 gate,须配档2 代理) |
+|---|---|---|---|---|
+| **firmware-core**(全 transport 共享) | interleaving 单测(§29) / mmio qword size-aware(§26) / prp 单测 | — | — | —(其盲区由各 transport 档3 真机覆盖) |
+| OpenHCL pcie_remote | 跨进程 TCP e2e | — | ⛔ 欠(L3 真 guest 的冻结代理) | L3 真 Hyper-V guest(§26 >4 GiB,**尚未自动化**) |
+| vfio-user | realize e2e | **libvfio-user differential**(需 libjson-c)/ 真 QEMU realize e2e(3b 重,cadence) | ⛔ 欠(真 guest-boot 的冻结代理) | 真 guest-boot **已有** `run_qemu_vfio_guest.py`(§28 4-bug,不计 gate) |
+| NVMe-oF TCP | Python wire-conformance(已存在) | **纯-4K / CHAP wire 升 gate** | tls-psk kernel vector(待 dump) | dhchap-4 真 `nvme connect`(尚缺) |
+
+**立即可做(本元项最廉价兑现,无 root)**：①把 vfio `interop_py` 的 libvfio-user differential
+从一次性手跑做成 CI job(依赖 `libjson-c-dev`,有 C 依赖但无需 root);②把 Python CHAP wire +
+纯-4K wire conformance 入 CI standing gate。这些档-1 oracle 早已存在,只缺 gate 化。
+
+**据律自动暴露的缺口(⛔)**：vfio 已有档-3 live(`run_qemu_vfio_guest.py`)却**欠档-2 frozen
+代理**;OpenHCL L3 真 guest 同样欠代理——按"凡有档3 必配档2"律,这两格须补冻结代理,非"不适用"。
+
+**新 transport checklist(并入 [HOW_TO_ADD_TRANSPORT](HOW_TO_ADD_TRANSPORT.md))**：列三档各自
+oracle → 档1 必 gate → 凡有档3 路径必配档2 frozen 代理 → 自写 harness 满足 ≥4 GiB 子条款。
+
+**下方三执行实例**(保留各自 runbook/blocker 执行细节,状态归本元项统辖)：
+
 ### V-followup-dhchap-4-real-host-interop (Tier 1, HIGH 优先, 预计 1 day)
 
 **What**：让 V-interop-8 Python harness 通过即代表 Linux nvme-cli `--dhchap-secret` 也通；
