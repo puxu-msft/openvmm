@@ -1,0 +1,100 @@
+diff --git a/openhcl/underhill_core/src/worker.rs b/openhcl/underhill_core/src/worker.rs
+index b67438a6b..a83cd1d31 100644
+--- a/openhcl/underhill_core/src/worker.rs
++++ b/openhcl/underhill_core/src/worker.rs
+@@ -411,6 +411,8 @@ fn new(params: Self::Parameters) -> anyhow::Result<Self> {
+                     .await;
+             } else {
+                 get_client.complete_start_vtl0(None).await;
++                // CMB-POC v2：VTL0 已 start，再跑一遍 sweep 对比 early-init 时序。
++                cmb_poc_probe_create_ram_gpa_range(&get_client, "late-vtl0-started").await;
+             }
+ 
+             result.map(|worker| UnderhillVmWorker {
+@@ -497,6 +499,13 @@ async fn new_or_restart(
+             .instrument(tracing::info_span!("init/dps", CVM_ALLOWED))
+             .await?;
+ 
++        // **CMB-POC Phase 1a（零拷贝 CMB-on-OpenHCL 缺口② 承重假设探针）** — 验真机 host 的
++        // `IVmGuestMemoryAccess::CreateRamGpaRange` 是否接受"BAR-hole gpa_start + 异址 gpa_offset"
++        // 的别名（i440bx 生产用法全是等址低位 RAM，此维无源码托底；GED stub 硬编码 FAILED）。
++        // 递进三探针隔离失败维度，各打 STATUS 后 reset，不留 range。throwaway custom IGVM 专用。
++        // 计划：usnvmemu/docs/superpowers/plans/2026-06-13-cmb-zerocopy-openhcl-gap-closure.md
++        cmb_poc_probe_create_ram_gpa_range(&get_client, "early-init").await;
++
+         // Build the thread pool now that we know the IO ring size to use.
+         let threadpool = {
+             let io_ring_size = {
+@@ -1181,6 +1190,72 @@ pub(crate) struct ChipsetMmioRanges {
+     pub high: MemoryRange,
+ }
+ 
++/// **CMB-POC Phase 1a** — 探针 GET `create_ram_gpa_range` 是否接受"BAR-hole gpa_start +
++/// 异址 gpa_offset"的别名（零拷贝 CMB-on-OpenHCL 缺口② 承重假设；计划见
++/// `usnvmemu/docs/superpowers/plans/2026-06-13-cmb-zerocopy-openhcl-gap-closure.md`）。
++///
++/// v2（iter-1 全 FAILED 后纠正）：实测 VTL0 内存图 RAM [0x0,0xf8000000)+[0x100000000,0x108000000)、
++/// 低位 MMIO 空洞 [0xf8000000,0x100000000)。sweep 真 MMIO-hole gpa_start + 有效 RAM gpa_offset
++/// （iter-1 误用 8GB 远洞 + 高位 RAM）。同一 boot 在 early(init) 与 late(VTL0-started) 各跑一遍隔离
++/// 时序（i440bx 的成功调用在 guest PAM-write 晚于 init）。各打 STATUS 后 reset。throwaway custom IGVM。
++async fn cmb_poc_probe_create_ram_gpa_range(
++    get_client: &GuestEmulationTransportClient,
++    phase: &str,
++) {
++    use guest_emulation_transport::api::CreateRamGpaRangeFlags;
++
++    // (探针名, gpa_start, gpa_count, gpa_offset, rom_mb)
++    // v3：gpa_start 改打**真 VPCI 设备 MMIO 窗口** 0x127400000-0x128000000（inspect 实测 = 配置的
++    // vfio_user_nvme 设备 BAR 真落点；前轮的 0xf9000000/0x200000000 不在此窗口 → device-BAR 实际未测）。
++    let probes: [(&str, u64, u64, u64, bool); 5] = [
++        ("vpci_win_to_lowram", 0x1_2740_0000, 0x1000, 0x1000_0000, false),
++        ("vpci_win_to_lowram_rom", 0x1_2740_0000, 0x1000, 0x1000_0000, true),
++        ("vpci_win_to_ramtop", 0x1_2740_0000, 0x1000, 0xf7f0_0000, false),
++        ("vpci_win_mid_64k", 0x1_2750_0000, 0x10000, 0x1000_0000, false),
++        ("low_hole_ctrl", 0xf900_0000, 0x1000, 0x1000_0000, false),
++    ];
++
++    tracing::error!(CVM_ALLOWED, phase, "CMB-POC v2: create_ram_gpa_range sweep 开始");
++    for (i, (name, gpa_start, gpa_count, gpa_offset, rom)) in probes.iter().enumerate() {
++        let slot = i as u32;
++        let flags = if *rom {
++            CreateRamGpaRangeFlags::new().with_rom_mb(true)
++        } else {
++            CreateRamGpaRangeFlags::new()
++        };
++        match get_client
++            .create_ram_gpa_range(slot, *gpa_start, *gpa_count, *gpa_offset, flags)
++            .await
++        {
++            Ok(handle) => {
++                tracing::error!(
++                    CVM_ALLOWED,
++                    phase,
++                    probe = *name,
++                    gpa_start = format_args!("{:#x}", gpa_start),
++                    gpa_offset = format_args!("{:#x}", gpa_offset),
++                    slot,
++                    "CMB-POC v2 = SUCCESS"
++                );
++                get_client.reset_ram_gpa_range(handle).await;
++            }
++            Err(e) => {
++                tracing::error!(
++                    CVM_ALLOWED,
++                    phase,
++                    probe = *name,
++                    gpa_start = format_args!("{:#x}", gpa_start),
++                    gpa_offset = format_args!("{:#x}", gpa_offset),
++                    slot,
++                    error = %e,
++                    "CMB-POC v2 = FAILED"
++                );
++            }
++        }
++    }
++    tracing::error!(CVM_ALLOWED, phase, "CMB-POC v2: sweep 结束");
++}
++
+ /// Build the VTL0 memory map after carving out any memory requested for shared
+ /// visibility memory to be used by VTL2.
+ fn build_vtl0_memory_layout(
