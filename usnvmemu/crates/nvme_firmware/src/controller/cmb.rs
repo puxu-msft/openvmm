@@ -31,6 +31,23 @@ use super::CmbCompletion;
 use super::NvmeController;
 use pcie_device_core::DeviceCtx;
 
+/// **CMB-L4 可观测性** — 首次 CMB-resident 访问时打一条 info 日志（含 gpa），供真机
+/// e2e harness（`vfio_user_transport/scripts/qemu_interop/`）grep 作 oracle：证"真 NVMe
+/// 驱动真把 SQ/CQ/data 放进 CMB BAR、firmware 真从 CMB backing 服务"（in-process 测不出的
+/// 真机层）。一次性（`AtomicBool` 闸，非热路径 per-访问 spam）；不改任何行为，纯观测。
+fn note_first_cmb_access(gpa: u64, len: u32, write: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    if !SEEN.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            gpa = format_args!("{:#x}", gpa),
+            len,
+            write,
+            "CMB-RESIDENT-ACCESS — guest 真用 CMB，firmware 从 backing 服务（首次命中）"
+        );
+    }
+}
+
 /// **CMB-P1b** — CMB 命中判定结果。
 enum CmbHit {
     /// 整段 `[gpa, gpa+len)` **完全落在** CMB 内 → 偏移（相对 backing 起点）。
@@ -213,10 +230,13 @@ impl NvmeController {
         let cmb = self.cmb.as_ref().expect("cmb_hit 命中 → cmb 存在");
         let (ok, data) = match off {
             // cmb_hit 已保证 Contained 整段在 backing 内（off+len ≤ size == backing.len()）。
-            Some(off) => (
-                true,
-                Some(cmb.backing.as_bytes()[off..off + len as usize].to_vec()),
-            ),
+            Some(off) => {
+                note_first_cmb_access(gpa, len, false);
+                (
+                    true,
+                    Some(cmb.backing.as_bytes()[off..off + len as usize].to_vec()),
+                )
+            }
             None => {
                 tracing::warn!(
                     gpa = format_args!("{:#x}", gpa),
@@ -249,6 +269,7 @@ impl NvmeController {
         let ok = match off {
             Some(off) => {
                 // cmb_hit 已保证整段在 backing 内。
+                note_first_cmb_access(gpa, data.len() as u32, true);
                 cmb.backing.as_bytes_mut()[off..off + data.len()].copy_from_slice(&data);
                 true
             }
