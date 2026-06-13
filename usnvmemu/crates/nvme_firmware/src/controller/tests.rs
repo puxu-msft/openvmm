@@ -1398,7 +1398,7 @@ fn b6b_separate_meta_write_multi() {
             .pending_ios
             .iter()
             .map(|(&t, p)| match p.op {
-                PendingOp::SepMetaWriteData { page_idx, .. } => (t, Some(page_idx)),
+                PendingOp::SepMetaWriteData { seg_idx, .. } => (t, Some(seg_idx)),
                 PendingOp::SepMetaWriteMeta { .. } => (t, None),
                 _ => unreachable!("only sep-meta write sub-DMAs expected"),
             })
@@ -2690,7 +2690,7 @@ fn b6b_separate_meta_nlb2_tier_boundary() {
                 .pending_ios
                 .iter()
                 .map(|(&t, p)| match p.op {
-                    PendingOp::SepMetaWriteData { page_idx, .. } => (t, page_idx),
+                    PendingOp::SepMetaWriteData { seg_idx, .. } => (t, seg_idx),
                     PendingOp::SepMetaWriteMeta { .. } => (t, u32::MAX),
                     _ => panic!("O=0 Dual 应只产 SepMetaWrite{{Data,Meta}}"),
                 })
@@ -2952,6 +2952,276 @@ fn b6b_separate_meta_nlb2_tier_boundary() {
             writes.get(&L_MPTR).map(|d| &d[..]),
             Some(&meta_concat[..]),
             "2×8 PI tuple concat → MPTR"
+        );
+    }
+}
+
+/// **#4c-b P3② — separate-metadata nlb=1 的 PRP1 页内偏移（O=0 Single vs O>0 Dual）** 差分 oracle。
+///
+/// nlb=1 separate：data 平面 = 1×4096 = 4096B。spec §4.1.1 仅 PRP1 可带页内偏移 O。
+///
+/// - **O=0**：data 恰 1 host 页 → **Single** 档，1 条 PRP1 sub-DMA（整 4096）。
+/// - **O>0**：首段缩为 4096−O，单个 LBA 的 data 跨 **2** host 段 → **Dual** 档：PRP1 首段
+///   `4096−O` + PRP2 余 `O`（PRP2 必须是第二数据页，非 0 且页对齐）。**永不 List**。
+///
+/// 这是 P3② 核心：旧 bespoke 路径对 nlb=1 恒发 1 条 `sector_bytes(4096)` sub-DMA，O>0 时会
+/// 从 PRP1@offset 盲读整 4096B 跨页（且 PRP2 那截 data 丢失）——真实数据完整性洞。修复后按
+/// `dispatch_segs` 拆 2 段、finalize 拼回单块 verify/落盘。取 O=100：段 [3996,100]。
+///
+/// 四件套：① `PiTuple::compute` 期望；② **显式断每条 DmaRead/DmaWrite 的 (gpa,len)**（O>0
+/// 须为 [3996,100] 非 [4096]，直击盲读盲点）；③ **断 host 段数**（O=0 1 段 / O>0 2 段，且
+/// 恒 bespoke 不入 PrpListOp）；④ revert-verify：把段判据退回"恒 1 段 sector_bytes" → O>0 段长
+/// 断言（首段 3996）转红。
+#[test]
+fn b6b_separate_meta_nlb1_prp1_offset() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    fn sep_ns(tag: &str) -> NvmeController {
+        let mut c = make_ctrl_with_tmp(tag);
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+        ns.pi_first = true;
+        ns.meta_inline = false;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / ns.block_bytes();
+        c.cqs.insert(
+            1,
+            crate::regs::CompletionQueue {
+                base_gpa: 0x1_0000,
+                size: 64,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 0,
+                interrupt_enabled: false,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        c
+    }
+    let data: Vec<u8> = (0..4096).map(|i| ((i * 11 + 7) & 0xff) as u8).collect();
+    let tuple = crate::pi::PiTuple::compute(&data, 0, 1).to_bytes();
+
+    // ═══════════════ O=0：Single 档（1 段整页）═══════════════
+    const S_PRP1: u64 = 0x4000;
+    const S_MPTR: u64 = 0x7000;
+    // ── WRITE ──
+    {
+        let mut c = sep_ns("p3b_single_wr");
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x01, 1, 0, 1, S_PRP1, false, 0x50);
+            sqe.mptr = S_MPTR; // prp2 = 0（Single 不需要）
+            let r = c.dispatch_io(&mut ctx, 1, sqe, 0x50, 0, 1);
+            assert!(r.is_none(), "nlb=1 O=0 separate WRITE 走异步");
+            // ③ 段数：Single → 1 个 SepMetaWriteData + 1 Meta；恒 bespoke。
+            assert_eq!(c.sep_meta_writes.len(), 1, "bespoke SepMetaWriteAccum");
+            assert!(c.prp_list_ops.is_empty(), "nlb=1 永不 List");
+            assert_eq!(c.pending_ios.len(), 2, "1 data 段 + 1 meta");
+            let ops: Vec<(u64, u32)> = c
+                .pending_ios
+                .iter()
+                .map(|(&t, p)| match p.op {
+                    PendingOp::SepMetaWriteData { seg_idx, .. } => (t, seg_idx),
+                    PendingOp::SepMetaWriteMeta { .. } => (t, u32::MAX),
+                    _ => panic!("Single 应只产 SepMetaWrite{{Data,Meta}}"),
+                })
+                .collect();
+            for (t, idx) in ops {
+                let d = if idx == u32::MAX {
+                    tuple.to_vec()
+                } else {
+                    data.clone()
+                };
+                c.on_dma_complete_impl(&mut ctx, t, true, d);
+            }
+        }
+        // ② DmaRead：1 整页 data + 8B meta。
+        let mut reads: Vec<(u64, u32)> = cap
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                TransportEvent::DmaRead { gpa, len, .. } if *gpa == S_PRP1 || *gpa == S_MPTR => {
+                    Some((*gpa, *len))
+                }
+                _ => None,
+            })
+            .collect();
+        reads.sort();
+        assert_eq!(
+            reads,
+            vec![(S_PRP1, 4096), (S_MPTR, 8)],
+            "Single：整页 + meta"
+        );
+        let ns = c.namespaces.get(&1).unwrap();
+        let mut buf = vec![0u8; 4104];
+        ns.read_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf[0..8], &tuple[..], "O=0 WRITE tuple");
+        assert_eq!(&buf[8..4104], &data[..], "O=0 WRITE data");
+    }
+    // ── READ ──
+    {
+        let mut c = sep_ns("p3b_single_rd");
+        {
+            let ns = c.namespaces.get_mut(&1).unwrap();
+            let mut block = vec![0u8; 4104];
+            block[0..8].copy_from_slice(&tuple);
+            block[8..4104].copy_from_slice(&data);
+            ns.write_at(&block, 0).unwrap();
+        }
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x02, 1, 0, 1, S_PRP1, false, 0x51);
+            sqe.mptr = S_MPTR;
+            let r = c.dispatch_io(&mut ctx, 1, sqe, 0x51, 0, 1);
+            assert!(r.is_none(), "nlb=1 O=0 separate READ 走异步");
+            assert_eq!(c.pending_ios.len(), 2, "1 data 段 scatter + 1 meta");
+            let toks: Vec<u64> = c.pending_ios.keys().copied().collect();
+            for t in toks {
+                c.on_dma_complete_impl(&mut ctx, t, true, Vec::new());
+            }
+        }
+        let mut writes: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+        for e in cap.events() {
+            if let TransportEvent::DmaWrite { gpa, data, .. } = e {
+                writes.insert(*gpa, data.clone());
+            }
+        }
+        assert_eq!(
+            writes.get(&S_PRP1).map(|d| &d[..]),
+            Some(&data[..]),
+            "PRP1=整页 data"
+        );
+        assert_eq!(
+            writes.get(&S_MPTR).map(|d| &d[..]),
+            Some(&tuple[..]),
+            "MPTR=tuple"
+        );
+    }
+
+    // ═══════════════ O=100：Dual 档（单 LBA 跨 2 段）═══════════════
+    const O: u64 = 100;
+    const D_PRP1: u64 = 0x4000 + O;
+    const D_PRP2: u64 = 0x5000;
+    const D_MPTR: u64 = 0x7000;
+    let seg0 = 4096 - O as usize; // 3996
+    let seg1 = O as usize; // 100
+    // ── WRITE ──
+    {
+        let mut c = sep_ns("p3b_dual_wr");
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x01, 1, 0, 1, D_PRP1, false, 0x52);
+            sqe.prp2 = D_PRP2;
+            sqe.mptr = D_MPTR;
+            let r = c.dispatch_io(&mut ctx, 1, sqe, 0x52, 0, 1);
+            assert!(r.is_none(), "nlb=1 O>0 separate WRITE 走异步 dual-段");
+            // ③ 段数：Dual → 2 个 SepMetaWriteData + 1 Meta；恒 bespoke（不入 List）。
+            assert_eq!(c.sep_meta_writes.len(), 1, "bespoke SepMetaWriteAccum");
+            assert!(c.prp_list_ops.is_empty(), "nlb=1 O>0 仍 Dual，永不 List");
+            assert_eq!(c.pending_ios.len(), 3, "2 data 段 + 1 meta");
+            let ops: Vec<(u64, u32)> = c
+                .pending_ios
+                .iter()
+                .map(|(&t, p)| match p.op {
+                    PendingOp::SepMetaWriteData { seg_idx, .. } => (t, seg_idx),
+                    PendingOp::SepMetaWriteMeta { .. } => (t, u32::MAX),
+                    _ => panic!("Dual 应只产 SepMetaWrite{{Data,Meta}}"),
+                })
+                .collect();
+            for (t, idx) in ops {
+                let d = match idx {
+                    0 => data[0..seg0].to_vec(),
+                    1 => data[seg0..seg0 + seg1].to_vec(),
+                    u32::MAX => tuple.to_vec(),
+                    _ => unreachable!("nlb=1 Dual 仅 2 段"),
+                };
+                c.on_dma_complete_impl(&mut ctx, t, true, d);
+            }
+        }
+        // ② DmaRead：首段 3996 @PRP1 + 余 100 @PRP2 + 8B meta（**非** 单条 4096）。
+        let mut reads: Vec<(u64, u32)> = cap
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                TransportEvent::DmaRead { gpa, len, .. }
+                    if *gpa == D_PRP1 || *gpa == D_PRP2 || *gpa == D_MPTR =>
+                {
+                    Some((*gpa, *len))
+                }
+                _ => None,
+            })
+            .collect();
+        reads.sort();
+        assert_eq!(
+            reads,
+            vec![(D_PRP1, seg0 as u32), (D_PRP2, seg1 as u32), (D_MPTR, 8)],
+            "Dual：PRP1 首段 3996 + PRP2 余 100 + meta（非盲读 4096）"
+        );
+        let ns = c.namespaces.get(&1).unwrap();
+        let mut buf = vec![0u8; 4104];
+        ns.read_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf[0..8], &tuple[..], "O>0 WRITE tuple");
+        assert_eq!(&buf[8..4104], &data[..], "O>0 WRITE data（跨段拼回正确）");
+    }
+    // ── READ ──
+    {
+        let mut c = sep_ns("p3b_dual_rd");
+        {
+            let ns = c.namespaces.get_mut(&1).unwrap();
+            let mut block = vec![0u8; 4104];
+            block[0..8].copy_from_slice(&tuple);
+            block[8..4104].copy_from_slice(&data);
+            ns.write_at(&block, 0).unwrap();
+        }
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let mut sqe = io_sqe(0x02, 1, 0, 1, D_PRP1, false, 0x53);
+            sqe.prp2 = D_PRP2;
+            sqe.mptr = D_MPTR;
+            let r = c.dispatch_io(&mut ctx, 1, sqe, 0x53, 0, 1);
+            assert!(
+                r.is_none(),
+                "nlb=1 O>0 separate READ 走异步 dual-段 scatter"
+            );
+            assert!(c.prp_list_ops.is_empty(), "nlb=1 O>0 READ 仍 bespoke");
+            assert_eq!(c.pending_ios.len(), 3, "2 data 段 scatter + 1 meta");
+            let toks: Vec<u64> = c.pending_ios.keys().copied().collect();
+            for t in toks {
+                c.on_dma_complete_impl(&mut ctx, t, true, Vec::new());
+            }
+        }
+        // ② DmaWrite：首段 3996 @PRP1 + 余 100 @PRP2 + tuple @MPTR。
+        let mut writes: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+        for e in cap.events() {
+            if let TransportEvent::DmaWrite { gpa, data, .. } = e {
+                writes.insert(*gpa, data.clone());
+            }
+        }
+        assert_eq!(
+            writes.get(&D_PRP1).map(|d| d.len()),
+            Some(seg0),
+            "PRP1 首段 3996"
+        );
+        assert_eq!(
+            writes.get(&D_PRP2).map(|d| d.len()),
+            Some(seg1),
+            "PRP2 余 100"
+        );
+        let mut got = Vec::new();
+        got.extend_from_slice(&writes[&D_PRP1]);
+        got.extend_from_slice(&writes[&D_PRP2]);
+        assert_eq!(got, data, "O>0 READ scatter 重组 == 盘上 data");
+        assert_eq!(
+            writes.get(&D_MPTR).map(|d| &d[..]),
+            Some(&tuple[..]),
+            "MPTR=tuple"
         );
     }
 }

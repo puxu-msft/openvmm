@@ -73,15 +73,28 @@ impl NvmeController {
             let pi_first = ns.pi_first;
             let block_bytes = ns.block_bytes() as usize;
             let data_bytes = ns.data_bytes() as usize;
-            // 长度校验：N 块 data 都到齐且每块 = data_bytes，且 meta ≥ N×8。
-            let all_data_ok = acc.data_pages.len() == num_blocks
-                && acc
-                    .data_pages
-                    .iter()
-                    .all(|p| p.as_ref().map(|d| d.len()) == Some(data_bytes));
-            if !all_data_ok || meta.len() < num_blocks * 8 {
+            // **#4c-b P3②** — 拼回 host 段 → 连续 data 流（separate：纯 data，无 tuple），再按
+            // data_bytes 重切 num_blocks 块逐块 verify/落盘。PRP1 偏移 O>0 时一个 LBA 的 data 可跨
+            // 2 host 段，故段数与块数不一一对应——先拼后切（与 N>2 PrpListOp finalize 同范式）。
+            let mut stream = Vec::with_capacity(num_blocks * data_bytes);
+            let mut all_segs_present = true;
+            for s in &acc.seg_data {
+                match s {
+                    Some(d) => stream.extend_from_slice(d),
+                    None => {
+                        all_segs_present = false;
+                        break;
+                    }
+                }
+            }
+            // 长度校验：全段到齐、拼回流恰 num_blocks×data_bytes、meta ≥ N×8。
+            if !all_segs_present
+                || stream.len() != num_blocks * data_bytes
+                || meta.len() < num_blocks * 8
+            {
                 tracing::warn!(
                     num_blocks,
+                    stream = stream.len(),
                     meta = meta.len(),
                     "separate-meta Write DMA 长度不符"
                 );
@@ -102,7 +115,7 @@ impl NvmeController {
                 // ── ① verify 全部 N 块（任一失败 → 不落盘，原子）──
                 let mut verify_err: Option<crate::pi::PiCheck> = None;
                 for i in 0..num_blocks {
-                    let data = acc.data_pages[i].as_ref().unwrap();
+                    let data = &stream[i * data_bytes..(i + 1) * data_bytes];
                     let tuple_arr: [u8; 8] = meta[i * 8..i * 8 + 8].try_into().unwrap();
                     let host_tuple = crate::pi::PiTuple::from_bytes(&tuple_arr);
                     match host_tuple.verify(data, acc.lba + i as u64, pi_type, acc.prchk) {
@@ -136,7 +149,7 @@ impl NvmeController {
                     // 已落盘的前序块无法回滚（文件后端教学边界），返 DATA_TRANSFER_ERROR。
                     let mut store_err = false;
                     for i in 0..num_blocks {
-                        let data = acc.data_pages[i].as_ref().unwrap();
+                        let data = &stream[i * data_bytes..(i + 1) * data_bytes];
                         let tuple_arr: [u8; 8] = meta[i * 8..i * 8 + 8].try_into().unwrap();
                         let mut block = vec![0u8; block_bytes];
                         if pi_first {
@@ -968,12 +981,12 @@ impl NvmeController {
                     };
                     self.post_cqe(ctx, p.cq_id, cqe);
                 }
-                PendingOp::SepMetaWriteData { op_id, page_idx } => {
-                    // **B6b-2/B6b-4** — separate-meta PI Write 的第 page_idx 块 data 到达。
-                    // 填 accum 对应 slot；N 块 data 全到齐（data_remaining→0）且 meta 也到齐
-                    // → finalize（verify-all-then-store-all）。
+                PendingOp::SepMetaWriteData { op_id, seg_idx } => {
+                    // **B6b-2/B6b-4 / #4c-b P3②** — separate-meta PI Write 的第 seg_idx 个 **host 段**
+                    // data 到达。填 accum 对应 slot；全段到齐（data_remaining→0）且 meta 也到齐 →
+                    // finalize（拼回 host 段→按 data_bytes 重切 verify-all-then-store-all）。
                     if let Some(acc) = self.sep_meta_writes.get_mut(&op_id) {
-                        if let Some(slot) = acc.data_pages.get_mut(page_idx as usize)
+                        if let Some(slot) = acc.seg_data.get_mut(seg_idx as usize)
                             && slot.is_none()
                         {
                             *slot = Some(data);

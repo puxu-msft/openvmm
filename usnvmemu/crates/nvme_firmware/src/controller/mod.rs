@@ -476,11 +476,11 @@ pub(super) enum PendingOp {
     /// **B6b-2/B6b-4（separate metadata，PRACT=0）** — separate-buffer PI Write 的
     /// 子-DMA：host data 经 PRP（多 LBA 时第 0 块 PRP1、第 1 块 PRP2）、host PI tuple
     /// 经 MPTR（一条 N×8 字节）分别 DMA-read。N 条 data + 1 条 meta 都到齐后
-    /// `SepMetaWriteAccum` finalize：verify-all-then-store-all（原子）。
-    /// `page_idx` 标识本条 data 属于第几块（0..num_blocks）。
+    /// `SepMetaWriteAccum` finalize：拼回 host 段→重切逐块 verify-all-then-store-all（原子）。
+    /// `seg_idx` 标识本条 data 属于第几个 **host 段**（0..段数；段序见 `dispatch_segs`）。
     SepMetaWriteData {
         op_id: u64,
-        page_idx: u32,
+        seg_idx: u32,
     },
     SepMetaWriteMeta {
         op_id: u64,
@@ -871,11 +871,14 @@ pub(super) struct SepMetaWriteAccum {
     pub(super) nsid: u32,
     /// 起始 LBA（slba）；第 i 块落在 `lba + i`。
     pub(super) lba: u64,
-    /// 本命令的 LBA 数（nlb，1..=2；N>2 走 PRP-list，待续）。
+    /// 本命令的 LBA 数（nlb；finalize 据此把拼回的连续 data 流重切成 num_blocks 块）。
     pub(super) num_blocks: u32,
-    /// host data，按 page_idx 填（len=num_blocks）。第 i 项 = 第 i 块的纯 data（无 tuple）。
-    pub(super) data_pages: Vec<Option<Vec<u8>>>,
-    /// 尚未到达的 data 子-DMA 数（初值 num_blocks，每条 SepMetaWriteData 减 1）。
+    /// **#4c-b P3②** — host data 按 **host 段**（非 per-LBA）填，段序 == `dispatch_segs`
+    /// 产出顺序：Single=[PRP1 整 data]，Dual=[PRP1 首段 page−O, PRP2 余 O]。finalize 拼回
+    /// 连续 data 流（长度 == num_blocks × data_bytes）再按 data_bytes 重切逐块 verify/落盘。
+    /// PRP1 页内偏移 O>0 时一个 LBA 的 data 跨 2 段，故段数与块数不再一一对应。
+    pub(super) seg_data: Vec<Option<Vec<u8>>>,
+    /// 尚未到达的 data 段子-DMA 数（初值 = 段数，每条 SepMetaWriteData 减 1）。
     pub(super) data_remaining: u32,
     /// host PI tuple，N×8 字节（MPTR 一条 DMA-read 填）。第 i 个 tuple 在 `meta[i*8..i*8+8]`。
     pub(super) meta: Option<Vec<u8>>,
@@ -884,15 +887,16 @@ pub(super) struct SepMetaWriteAccum {
 }
 
 /// **B6b-3/B6b-4（separate metadata，PRACT=0）** — separate-buffer PI Read 累积器。
-/// dispatch 时已从 backing 读 N 个 interleaved block + verify-all stored PI + 发 N+1 条
-/// DMA-write（N×data→PRP[1/2]、tuple concat→MPTR）；全部完成（remaining→0）后 post
-/// success CQE。`num_blocks` 仅供 stat 计数（LBA 读数）。
+/// dispatch 时已从 backing 读 N 个 interleaved block + verify-all stored PI + 把拼回的连续
+/// data 流按 **host 段**（`dispatch_segs`：Single 1 段 / Dual 2 段，PRP1 偏移 O>0 时一个 LBA
+/// 跨 2 段）scatter 发 DMA-write，外加 tuple concat→MPTR 一条；全部完成（remaining→0）后
+/// post success CQE。`num_blocks` 仅供 stat 计数（LBA 读数）。
 pub(super) struct SepMetaReadAccum {
     pub(super) sq_id: u16,
     pub(super) cid: u16,
     pub(super) sq_head: u16,
     pub(super) cq_id: u16,
-    /// 尚未完成的 DMA-write 数（初值 N data + 1 meta = num_blocks + 1）。
+    /// 尚未完成的 DMA-write 数（初值 = host 段数 + 1 个 MPTR meta）。
     pub(super) remaining: u32,
     /// 本命令的 LBA 数（stat 用）。
     pub(super) num_blocks: u32,
@@ -6516,5 +6520,51 @@ mod cmb_datapath_tests {
         let c = mk_cmb_live();
         assert!(!c.is_cmb_bar(0), "CMB 绝不能 shadow BAR0 寄存器区");
         assert!(c.is_cmb_bar(CMB_BIR as u32), "CMB BAR 正常识别");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// **fuzz-only 不变量访问器**（`fuzzing` cargo feature；不开 feature 时本块整体不编译
+// → 生产公共面零增量。先例 `firmware_uefi` 的 `fuzzing` feature）。
+//
+// coverage-guided fuzz target（`usnvmemu/crates/nvme_firmware/fuzz/`）是**外部 crate**，
+// 看不到 `pending_ios` 等 `pub(super)`/私有内部态。本访问器把 `DMA_COMPLETION_INVARIANTS.md`
+// 的承重不变式暴露成可断言量，使 fuzz oracle 从纯 observable（不 panic / 事件有界）升级为
+// **内部不变式断言**：① op 全 drain 后 async-op 表清空（无 op_id 泄漏）；② hop ≤ 守卫常量；
+// ③ I2 — CFS 置位后 completion 不再派生 DMA（silver-heron commit b3e8b4350 已强制）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// fuzz oracle 快照（见上方块注）。`#[cfg(feature = "fuzzing")]` → 仅 fuzz 构建存在。
+#[cfg(feature = "fuzzing")]
+#[derive(Debug, Clone, Copy)]
+pub struct FuzzInvariants {
+    /// in-flight DMA token 数（`pending_ios` 表）。一个命令的全部 DMA drain 后应回 0。
+    pub pending_ios: usize,
+    /// in-flight SGL segment-chain op 数（`sgl_ops` 表）。op 收尾后应回 0（无泄漏）。
+    pub sgl_ops: usize,
+    /// in-flight PRP-list-chain op 数（`prp_list_ops` 表）。op 收尾后应回 0（无泄漏）。
+    pub prp_list_ops: usize,
+    /// CSTS.CFS 是否置位（controller fatal）。I2：CFS 后 `on_dma_complete_impl` 入口短路、
+    /// 不再派生新 DMA（喂会派生 DMA 的完成 → 0 条新出账）。
+    pub cfs: bool,
+    /// SGL segment chain hop 上限（`MAX_SGL_SEGMENTS`）。
+    pub max_sgl_segments: u32,
+    /// PRP-list chain 页数上限（`MAX_PRP_LIST_PAGES`）。
+    pub max_prp_list_pages: u32,
+}
+
+#[cfg(feature = "fuzzing")]
+impl NvmeController {
+    /// fuzz-only：当前 device 侧不变量快照。供 `fuzz/` target 在每条命令 drain 后断言
+    /// 「表清空 + hop ≤ cap + CFS 语义」。**不在任何生产路径调用**（feature-gated）。
+    pub fn __fuzz_invariants(&self) -> FuzzInvariants {
+        FuzzInvariants {
+            pending_ios: self.pending_ios.len(),
+            sgl_ops: self.sgl_ops.len(),
+            prp_list_ops: self.prp_list_ops.len(),
+            cfs: (self.csts & csts::CFS) != 0,
+            max_sgl_segments: MAX_SGL_SEGMENTS,
+            max_prp_list_pages: MAX_PRP_LIST_PAGES,
+        }
     }
 }

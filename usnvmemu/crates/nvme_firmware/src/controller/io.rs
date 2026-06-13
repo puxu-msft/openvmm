@@ -1317,10 +1317,12 @@ impl NvmeController {
                         tracing::warn!(nsid, "separate-meta READ 需 MPTR（host PI buffer）");
                         return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                     }
-                    if nlb == 2 && prp2 == 0 {
-                        // dual-PRP：第 1 块 data 回 PRP2，driver 必须提供。
-                        tracing::warn!(nsid, "separate-meta READ nlb=2 需 PRP2（第二块 data）");
-                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                    // **#4c-b P3②** — PRP2 校验收敛到 `validate_prp2`（与 WRITE 对称）：Single 档
+                    // （nlb=1 O=0）PRP2 不参与不校验；Dual 档（nlb=1 O>0 或 nlb=2 O=0）PRP2=第二
+                    // 数据页须非 0（INVALID_FIELD）且页对齐（PRP_OFFSET_INVALID）。`sep_off`/
+                    // `sep_data_total` 已在上方 tier 路由处算好复用。
+                    if let Some(sc_byte) = validate_prp2(prp2, sep_off, sep_data_total) {
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte));
                     }
                     let mptr = sqe.mptr;
                     let pi_type = ns.pi_type;
@@ -1389,12 +1391,36 @@ impl NvmeController {
                         data_pages.push(data_part.to_vec());
                         tuples.push(tuple_bytes);
                     }
-                    // 全 OK → N data → PRP[0=prp1,1=prp2] + tuple concat（N×8）→ MPTR。
-                    // 共 N+1 条 DMA-write，全完成（remaining→0）后 success CQE。
+                    // **#4c-b P3②** — 全 OK → 拼回连续 data 流 → 按 **host 段**（`dispatch_segs`）
+                    // scatter：Single=PRP1 整 data；Dual=PRP1 首段 page−O + PRP2 余 O（PRP1 偏移
+                    // O>0 时一个 LBA 的 data 跨 2 段）。外加 tuple concat（N×8）→ MPTR 一条。全部
+                    // 完成（remaining→0）后 success CQE。O=0 时段恰整页、与旧 per-LBA scatter 逐字节
+                    // 一致。
+                    let mut stream = Vec::with_capacity(nlb as usize * data_bytes);
+                    for page in &data_pages {
+                        stream.extend_from_slice(page);
+                    }
+                    let segs: Vec<(u64, u32)> =
+                        match crate::controller::prp::dispatch_segs(prp1, prp2, sep_data_total) {
+                            crate::controller::prp::DispatchSegs::Single { prp1, len } => {
+                                vec![(prp1, len)]
+                            }
+                            crate::controller::prp::DispatchSegs::Dual {
+                                prp1,
+                                len0,
+                                prp2,
+                                len1,
+                            } => vec![(prp1, len0), (prp2, len1)],
+                            crate::controller::prp::DispatchSegs::List { .. } => {
+                                unreachable!("List 档已在上方按 tier 路由走 PrpListOp")
+                            }
+                        };
                     let op_id = self.alloc_op_id();
-                    let data_prps = [prp1, prp2];
-                    for (i, page) in data_pages.into_iter().enumerate() {
-                        let tok_d = self.guest_write(ctx, data_prps[i], page);
+                    let mut seg_off = 0usize;
+                    for &(gpa, len) in &segs {
+                        let chunk = stream[seg_off..seg_off + len as usize].to_vec();
+                        seg_off += len as usize;
+                        let tok_d = self.guest_write(ctx, gpa, chunk);
                         self.pending_ios.insert(
                             tok_d,
                             PendingIo {
@@ -1430,7 +1456,7 @@ impl NvmeController {
                             cid,
                             sq_head,
                             cq_id,
-                            remaining: nlb + 1,
+                            remaining: segs.len() as u32 + 1,
                             num_blocks: nlb,
                         },
                     );
@@ -2361,20 +2387,38 @@ impl NvmeController {
                         tracing::warn!(nsid, "separate-meta WRITE 需 MPTR（host PI buffer）");
                         return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                     }
-                    if nlb == 2 && prp2 == 0 {
-                        // dual-PRP：第 1 块 data 经 PRP2，driver 必须提供。
-                        tracing::warn!(nsid, "separate-meta WRITE nlb=2 需 PRP2（第二块 data）");
-                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                    // **#4c-b P3②** — PRP2 校验收敛到 `validate_prp2`（按 tier 语义单点裁定）：
+                    // Single 档（nlb=1 O=0）PRP2 不参与、不校验；Dual 档（nlb=1 O>0 或 nlb=2 O=0）
+                    // PRP2 = 第二数据页，须非 0（INVALID_FIELD）且页对齐（PRP_OFFSET_INVALID，
+                    // 仅 PRP1 可带页内偏移）。取代旧 `nlb==2&&prp2==0` 漏判（漏了 nlb=1 O>0 需 PRP2
+                    // + Dual PRP2 页对齐）。`sep_off`/`sep_data_total` 已在上方 tier 路由处算好复用。
+                    if let Some(sc_byte) = validate_prp2(prp2, sep_off, sep_data_total) {
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte));
                     }
                     let mptr = sqe.mptr;
                     let op_id = self.alloc_op_id();
-                    // N 条 data 子-DMA：第 0 块 PRP1、第 1 块 PRP2（dual-PRP）。每条传输
-                    // sector_bytes（=data_bytes，纯 data，不含 tuple）。**切忌**用 block_bytes
-                    // 当 host 传输 size（reviewer C1① CRITICAL 教训：会多读/写 host buffer）。
-                    let data_prps = [prp1, prp2];
-                    for page_idx in 0..nlb {
-                        let prp = data_prps[page_idx as usize];
-                        let tok_d = self.guest_read(ctx, prp, sector_bytes as u32);
+                    // **#4c-b P3②** — data 平面按 **host 段**发子-DMA（`dispatch_segs`）：Single=PRP1
+                    // 整 data；Dual=PRP1 首段 page−O + PRP2 余 O（PRP1 偏移 O>0 时一个 LBA 跨 2 段）。
+                    // 每段只传纯 data（不含 tuple）；**切忌**用 block_bytes 当 host 传输 size（reviewer
+                    // C1① CRITICAL 教训：会多读 host buffer）。finalize 拼回连续流→按 data_bytes 重切
+                    // 逐块 verify/落盘。O=0 时段恰为整页、与旧 per-LBA 路径逐字节一致。
+                    let segs: Vec<(u64, u32)> =
+                        match crate::controller::prp::dispatch_segs(prp1, prp2, sep_data_total) {
+                            crate::controller::prp::DispatchSegs::Single { prp1, len } => {
+                                vec![(prp1, len)]
+                            }
+                            crate::controller::prp::DispatchSegs::Dual {
+                                prp1,
+                                len0,
+                                prp2,
+                                len1,
+                            } => vec![(prp1, len0), (prp2, len1)],
+                            crate::controller::prp::DispatchSegs::List { .. } => {
+                                unreachable!("List 档已在上方按 tier 路由走 PrpListOp")
+                            }
+                        };
+                    for (seg_idx, &(gpa, len)) in segs.iter().enumerate() {
+                        let tok_d = self.guest_read(ctx, gpa, len);
                         self.pending_ios.insert(
                             tok_d,
                             PendingIo {
@@ -2383,7 +2427,10 @@ impl NvmeController {
                                 sq_head,
                                 cq_id,
                                 nsid,
-                                op: PendingOp::SepMetaWriteData { op_id, page_idx },
+                                op: PendingOp::SepMetaWriteData {
+                                    op_id,
+                                    seg_idx: seg_idx as u32,
+                                },
                             },
                         );
                     }
@@ -2410,8 +2457,8 @@ impl NvmeController {
                             nsid,
                             lba: slba,
                             num_blocks: nlb,
-                            data_pages: vec![None; nlb as usize],
-                            data_remaining: nlb,
+                            seg_data: vec![None; segs.len()],
+                            data_remaining: segs.len() as u32,
                             meta: None,
                             prchk: crate::pi::PrChk::from_cdw12(cdw12),
                         },
