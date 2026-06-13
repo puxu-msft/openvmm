@@ -1119,10 +1119,20 @@ impl NvmeController {
                         );
                         return None;
                     }
-                    if nlb > 2 {
-                        // **B6b-4-N>2 READ**：backing 读 N 个 interleaved block → 按 PRCHK
-                        // verify-all stored PI（同步，失败 Media SCT=2 不发任何 host DMA）→
-                        // 全通过才走 PrpListOp scatter：N 个 data 页（PRP1+PRP-list）+ MPTR
+                    // **#4c-b P3①** — 分流判据从 `nlb>2` 改为 PRP tier（spec §4.1.1）：当 data 平面
+                    // 需 >2 host 页时（N>2 恒 List，或 nlb=2 但 PRP1 偏移 O>0 致 data 跨 3 页）统一走
+                    // 已 offset-aware 的 PrpListOp scatter；tier=Dual（nlb=2 且 O=0）/Single 仍走下方
+                    // bespoke dual-PRP。让 tier 当唯一裁判，消除 `nlb==2&&O>0` 脆弱耦合（spec：data
+                    // >2 页须 PRP-list）。separate NS data 平面 = nlb × sector_bytes（=data_bytes，
+                    // metadata 经 MPTR 不在流里）。
+                    let sep_off = crate::controller::prp::prp1_offset(prp1);
+                    let sep_data_total = nlb as u64 * sector_bytes;
+                    if crate::controller::prp::tier(sep_off, sep_data_total)
+                        == crate::controller::prp::PrpTier::List
+                    {
+                        // **B6b-4 List-tier READ**（N>2，或 nlb=2 偏移）：backing 读 N 个 interleaved
+                        // block → 按 PRCHK verify-all stored PI（同步，失败 Media SCT=2 不发任何 host
+                        // DMA）→ 全通过才走 PrpListOp scatter：N 个 data 页（PRP1+PRP-list）+ MPTR
                         // PI tuple concat（共 N+1 条 DMA-write）。完成由 NvmReadPrpListData
                         // (N) + NvmReadPrpListSepMeta (1) 双门控 success CQE。
                         if sqe.mptr == 0 {
@@ -2183,10 +2193,19 @@ impl NvmeController {
                         );
                         return None;
                     }
-                    if nlb > 2 {
-                        // **B6b-4-N>2 WRITE**：N>2 separate-meta WRITE 走 PrpListOp 机件——
-                        // data N 页经 PRP1 + PRP-list（因 data_bytes=4096=NVME_PAGE_SIZE，每
-                        // 数据页恰好 1 个 LBA 的 data），N×8 PI tuple 经 MPTR 单条 DMA-read。
+                    // **#4c-b P3①** — 分流判据从 `nlb>2` 改为 PRP tier（spec §4.1.1，与 READ 对称）：
+                    // data 平面需 >2 host 页时（N>2 恒 List，或 nlb=2 但 PRP1 偏移 O>0 致 data 跨 3 页）
+                    // 统一走已 offset-aware 的 PrpListOp gather；tier=Dual（nlb=2 且 O=0）/Single 仍走
+                    // 下方 bespoke dual-PRP。separate NS data 平面 = nlb × sector_bytes（=data_bytes，
+                    // metadata 经 MPTR 不在流里）。
+                    let sep_off = crate::controller::prp::prp1_offset(prp1);
+                    let sep_data_total = nlb as u64 * sector_bytes;
+                    if crate::controller::prp::tier(sep_off, sep_data_total)
+                        == crate::controller::prp::PrpTier::List
+                    {
+                        // **B6b-4 List-tier WRITE**（N>2，或 nlb=2 偏移）：separate-meta WRITE 走
+                        // PrpListOp 机件——data N 页经 PRP1 + PRP-list（因 data_bytes=4096=NVME_PAGE_SIZE，
+                        // 每数据页恰好 1 个 LBA 的 data），N×8 PI tuple 经 MPTR 单条 DMA-read。
                         // dispatch：
                         //   1) MDTS 按 block_bytes(=4104) 含 metadata 复查（C1① 教训）。
                         //   2) PRP1 必须页对齐 + PRP2 指向 PRP-list 页（也必须页对齐）。
