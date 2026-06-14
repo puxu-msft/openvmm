@@ -1,0 +1,95 @@
+
+
+ParentCheckpointId                  : 
+ParentCheckpointName                : 
+VMName                              : xdp-ws25-1
+VMId                                : c8d0dfaa-044f-467d-9b48-e3e9e7416987
+CheckpointFileLocation              : C:\hv\xdp-ws25-1
+ConfigurationLocation               : C:\hv\xdp-ws25-1
+GuestStatePath                      : C:\hv\xdp-ws25-1\Virtual 
+                                      Machines\C8D0DFAA-044F-467D-9B48-E3E9E7416987.vmgs
+SmartPagingFileInUse                : False
+SmartPagingFilePath                 : C:\hv\xdp-ws25-1
+SnapshotFileLocation                : C:\hv\xdp-ws25-1
+AutomaticStartAction                : Nothing
+AutomaticStartDelay                 : 0
+AutomaticStopAction                 : Save
+AutomaticCriticalErrorAction        : Pause
+AutomaticCriticalErrorActionTimeout : 30
+AutomaticCheckpointsEnabled         : False
+CPUUsage                            : 0
+MemoryAssigned                      : 8589934592
+MemoryDemand                        : 0
+MemoryStatus                        : 
+NumaAligned                         : False
+NumaNodesCount                      : 1
+NumaSocketCount                     : 1
+Heartbeat                           : NoContact
+IntegrationServicesState            : 
+IntegrationServicesVersion          : 0.0
+Uptime                              : 00:00:00.0960000
+OperationalStatus                   : {Ok}
+PrimaryOperationalStatus            : Ok
+SecondaryOperationalStatus          : 
+StatusDescriptions                  : {Operating normally}
+PrimaryStatusDescription            : Operating normally
+SecondaryStatusDescription          : 
+Status                              : Operating normally
+ReplicationHealth                   : NotApplicable
+ReplicationMode                     : None
+ReplicationState                    : Disabled
+ResourceMeteringEnabled             : False
+CheckpointType                      : Disabled
+EnhancedSessionTransportType        : VMBus
+Groups                              : {}
+Version                             : 12.0
+VirtualMachineType                  : RealizedVirtualMachine
+VirtualMachineSubType               : Generation2
+GuestStateIsolationType             : OpenHCL
+Notes                               : 
+State                               : Running
+ComPorts                            : {COM 1, COM 2}
+ComPort1                            : VMComPort (Name = 'COM 1', VMName = 'xdp-ws25-1') 
+                                      [Id = 'Microsoft:C8D0DFAA-044F-467D-9B48-E3E9E74169
+                                      87\8E3A359F-559A-4B6A-98A9-1690A6100ED7\0', VMId = 
+                                      'c8d0dfaa-044f-467d-9b48-e3e9e7416987']
+ComPort2                            : VMComPort (Name = 'COM 2', VMName = 'xdp-ws25-1') 
+                                      [Id = 'Microsoft:C8D0DFAA-044F-467D-9B48-E3E9E74169
+                                      87\8E3A359F-559A-4B6A-98A9-1690A6100ED7\1', VMId = 
+                                      'c8d0dfaa-044f-467d-9b48-e3e9e7416987']
+DVDDrives                           : {}
+FibreChannelHostBusAdapters         : {}
+FloppyDrive                         : 
+HardDrives                          : {Hard Drive on SCSI controller number 0 at 
+                                      location 0, Hard Drive on SCSI controller number 1 
+                                      at location 0}
+RemoteFxAdapter                     : 
+VMIntegrationService                : {Guest Service Interface, Heartbeat, Key-Value 
+                                      Pair Exchange, Shutdown...}
+DynamicMemoryEnabled                : True
+MemoryMaximum                       : 1099511627776
+MemoryMinimum                       : 536870912
+MemoryStartup                       : 8589934592
+ProcessorCount                      : 4
+BatteryPassthroughEnabled           : False
+Generation                          : 2
+IsClustered                         : False
+ParentSnapshotId                    : 
+ParentSnapshotName                  : 
+Path                                : C:\hv\xdp-ws25-1
+SizeOfSystemFiles                   : 76277
+GuestControlledCacheTypes           : False
+LowMemoryMappedIoSpace              : 134217728
+HighMemoryMappedIoSpace             : 536870912
+HighMemoryMappedIoBaseAddress       : 68182605824
+LockOnDisconnect                    : Off
+CreationTime                        : 5/29/2026 7:35:13 AM
+Id                                  : c8d0dfaa-044f-467d-9b48-e3e9e7416987
+Name                                : xdp-ws25-1
+NetworkAdapters                     : {Network Adapter}
+CimSession                          : CimSession: .
+ComputerName                        : XPU-3
+IsDeleted                           : False
+
+
+

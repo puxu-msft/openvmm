@@ -1,0 +1,2 @@
+# OpenHCL IGVM payload 二进制是 build artifact（~20 MB），不入 git 历史
+baseline/payload/*.bin

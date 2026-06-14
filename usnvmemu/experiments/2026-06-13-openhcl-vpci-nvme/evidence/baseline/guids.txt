@@ -1,0 +1,3 @@
+Backing GUID: 81fc9728-2c27-48ae-8649-bb8e9ab2e29b
+Guest NVMe GUID: e481dfaf-633e-4679-a4a0-294eca61cb79
+Guest NSID: 1

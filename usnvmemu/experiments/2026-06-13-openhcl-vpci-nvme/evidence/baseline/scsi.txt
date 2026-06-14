@@ -1,0 +1,36 @@
+
+
+ControllerNumber : 0
+IsTemplate       : False
+Drives           : {Hard Drive on SCSI controller number 0 at location 0}
+Name             : SCSI Controller
+Id               : Microsoft:C8D0DFAA-044F-467D-9B48-E3E9E7416987\3F4A3B78-C094-43E1-B227
+                   -B3E480B39345\0
+VMId             : c8d0dfaa-044f-467d-9b48-e3e9e7416987
+VMName           : xdp-ws25-1
+VMSnapshotId     : 00000000-0000-0000-0000-000000000000
+VMSnapshotName   : 
+CimSession       : CimSession: .
+ComputerName     : XPU-3
+IsDeleted        : False
+VMCheckpointId   : 00000000-0000-0000-0000-000000000000
+VMCheckpointName : 
+
+ControllerNumber : 1
+IsTemplate       : False
+Drives           : {Hard Drive on SCSI controller number 1 at location 0}
+Name             : SCSI Controller
+Id               : Microsoft:C8D0DFAA-044F-467D-9B48-E3E9E7416987\9756E1E7-EF62-430C-BE4F
+                   -E6509EDCC71A\0
+VMId             : c8d0dfaa-044f-467d-9b48-e3e9e7416987
+VMName           : xdp-ws25-1
+VMSnapshotId     : 00000000-0000-0000-0000-000000000000
+VMSnapshotName   : 
+CimSession       : CimSession: .
+ComputerName     : XPU-3
+IsDeleted        : False
+VMCheckpointId   : 00000000-0000-0000-0000-000000000000
+VMCheckpointName : 
+
+
+

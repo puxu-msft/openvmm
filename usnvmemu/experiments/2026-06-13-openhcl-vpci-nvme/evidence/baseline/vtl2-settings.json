@@ -1,0 +1,32 @@
+﻿{
+    "version":  "V1",
+    "dynamic":  {
+                    "storage_controllers":  [
+                                                {
+                                                    "protocol":  "NVMe",
+                                                    "luns":  [
+                                                                 {
+                                                                     "device_id":  "7ed0c8db-03e2-4e87-b30a-28be43d9d8ab",
+                                                                     "product_revision_level":  "1.0",
+                                                                     "chunk_size_in_kb":  0,
+                                                                     "vendor_id":  "OpenVMM",
+                                                                     "is_dvd":  false,
+                                                                     "serial_number":  "spike03-001",
+                                                                     "location":  1,
+                                                                     "product_id":  "Disk",
+                                                                     "model_number":  "OpenHCL-NVMe",
+                                                                     "physical_devices":  {
+                                                                                              "type":  "single",
+                                                                                              "device":  {
+                                                                                                             "device_type":  "vscsi",
+                                                                                                             "device_path":  "81fc9728-2c27-48ae-8649-bb8e9ab2e29b",
+                                                                                                             "sub_device_path":  0
+                                                                                                         }
+                                                                                          }
+                                                                 }
+                                                             ],
+                                                    "instance_id":  "e481dfaf-633e-4679-a4a0-294eca61cb79"
+                                                }
+                                            ]
+                }
+}

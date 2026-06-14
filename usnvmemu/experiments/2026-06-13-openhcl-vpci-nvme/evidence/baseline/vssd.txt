@@ -1,0 +1,8 @@
+
+
+GuestFeatureSet         : 513
+FirmwareFile            : C:\spike03\openhcl-x64.bin
+VMBusMessageRedirection : 1
+
+
+
