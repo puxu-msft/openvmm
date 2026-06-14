@@ -49,6 +49,13 @@ iter-2（真 MMIO-hole GPA + i440bx 风格 + early/late 双时序，5×2=10 探�
   印证架构推断（vfio-user BAR 是 VTL2-emulated，host 不会把它转成 host-backed RAM）。
 - **故承重假设 A 现无条件证伪（本 Gen2 host）**：任意空洞 / RAM identity / i440bx 式 / **真 VPCI 设备 BAR 窗口**——
   20+ 配置（含两时序）一律 FAILED。零拷贝 CMB-on-OpenHCL 被 host primitive 彻底挡住。
+- **iter-4 backend-live（最后口子直接关，2026-06-14）**：用 `--custom-extra-rootfs openhcl/usnvmemu_fs.config`
+  把 usnvmemu 烤入 IGVM，autostart 让 firmware 上线——`inspect` 确认 `vfio_user_nvme:device-...` **state="Live"**、
+  `/bin/usnvmemu` 进程在跑。late-vtl0-started 探针（device Live 之后）打真 BAR 窗口 `0x127400000` default/rom_mb/
+  RAM-顶/64KB **全 FAILED**。→ **device backend Live（非 missing-pci）下结果不变**，直接坐实 reviewer 的预测
+  （拒绝点在 host 内存管理层、在 backend 之前）。诚实余量：探针在 complete_start_vtl0 后即跑，此刻 device 已
+  Live/offered 但 guest 尚未 PCI-claim 该 BAR——reviewer 已论证 guest-claim 不改 host 评估（窗口 VTL2-intercept
+  归类在 offer 时已定），且 claim 后只会更冲突；故此余量不影响裁定。
 
 ## 对缺口①②的影响
 - **缺口②（承重）实测彻底受阻**：§5 零拷贝路径卡在 host primitive（create_ram_gpa_range 对任意 GPA、含真设备 BAR 窗口全 FAILED），非"只缺 wiring"。
