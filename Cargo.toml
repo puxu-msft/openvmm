@@ -77,6 +77,7 @@ exclude = [
   "usnvmemu/crates/vfio_user_device",
   "usnvmemu/crates/vfio_user_transport",
   "usnvmemu/crates/nvme_of_tcp_target",
+  "usnvmemu/crates/rdma_transport",
   "docs/superpowers/examples/vmrs_log_scanner",
 ]
 

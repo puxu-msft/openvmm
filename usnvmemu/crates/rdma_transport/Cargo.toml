@@ -1,0 +1,18 @@
+[package]
+name = "rdma_transport"
+version = "0.1.0"
+edition = "2024"
+description = "NVMe-oF RDMA transport 的 verbs 抽象层（`trait RdmaVerbs`）+ 进程内 MockRdma 假实现。R1' 阶段产出：把 ibverbs/rdma_cm 操作藏在 trait 后，让 RDMA target 逻辑可在无内核 RDMA 设备下全测；真 FFI 实现（IbverbsRdma，sideway/rdma-sys backing）留 R5a，故本 crate 不 `forbid(unsafe_code)`（是 RDMA unsafe 边界 crate）。语义契约见 nvme_of_tcp_target/docs/specs/2026-06-14-nvme-rdma-wire-and-verbs-contract.md §D。"
+
+# 注：本 crate 在根 Cargo.toml [workspace.exclude]（同其它 usnvmemu crate），standalone
+# `cd usnvmemu/crates/rdma_transport && cargo test` 构建；toolchain 钉 1.95（命令不加 +1.95）。
+
+[lints.rust]
+# 本 crate 是 RDMA FFI 的 unsafe 边界（未来 IbverbsRdma）。R1' 全安全；unsafe 仅许将来
+# FFI 模块用，且每处须 SAFETY + reviewer + 真 oracle（项目 §22 纪律）。
+unsafe_code = "warn"
+
+[dependencies]
+thiserror = "1.0"
+
+[dev-dependencies]

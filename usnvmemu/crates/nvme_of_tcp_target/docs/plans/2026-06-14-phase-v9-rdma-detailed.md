@@ -157,6 +157,12 @@ trait RdmaVerbs {
 - **价值**：纯结构收益、独立有价值（让 session 真 transport-agnostic），是 RDMA 地基。
 
 ### R1' — `RdmaVerbs` + `MockRdma` + hello-QP mock smoke（roadmap 详度，详化 gate=R0 结论）
+
+> **✅ 2026-06-14 DONE** → 新 crate [`rdma_transport`](../../../rdma_transport/)（`src/verbs.rs` trait +
+> `src/mock.rs` MockRdma + 12 tests，全绿/clippy/fmt clean）。MockRdma **忠实模拟 §D 语义**（completion
+> 保序 / QP-error→flush→重建 / RNR / ORD 限深，**非乐观 FIFO**）。rust-reviewer APPROVE（ORD 守恒 4 站点
+> 核实平衡）+ 修 M1（QP→ERR flush posted recv WR，防教错 recv-reposting 模型）+ 4 回归守卫。crate 不
+> `forbid(unsafe_code)`（RDMA FFI 边界，IbverbsRdma 留 R5a）；根 Cargo.toml exclude 加 1 行。
 - **What**：按 R0 语义契约实现 trait + `MockRdma`（**模拟真 completion/RNR/QP-error 语义**，非乐观 FIFO）+ 进程内 hello-QP smoke。
 - **Acceptance**：mock smoke 跑通 QP 建/RDMA R/W/SEND 模拟 + 错误注入测试（QP-error 转移）。
 - **Reviewer gate**：rust-reviewer + architect（mock 语义是否忠实 R0 契约，非反向迁就）。
