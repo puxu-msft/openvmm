@@ -103,6 +103,7 @@ pub use async_session::DispatchOutcome;
 pub use async_session::PumpEvent;
 pub use async_session::accept_and_handshake_async;
 pub use async_session::accept_and_handshake_async_with_auth;
+pub use async_session::accept_rdma;
 pub use async_session::ic_handshake_async;
 pub use digest::crc32c;
 pub use fabric::ConnectData;

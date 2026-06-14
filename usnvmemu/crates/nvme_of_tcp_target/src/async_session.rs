@@ -222,37 +222,12 @@ where
     // **V7 / V8b** — derive discovery mode 于 handshake 前。短锁 read。
     let discovery_mode = controller.controller.lock().nvme_is_discovery_mode();
     let negotiated = ic_handshake_async(&mut stream).await?;
-    // **Phase V3 / V8b** — 给 controller 装一个"假" admin CQ（idempotent）。
-    {
-        let mut c = controller.controller.lock();
-        c.nvme_install_admin_cq(crate::CQ_BASE_GPA, crate::ADMIN_CQ_SIZE)
-            .context("V8e-3: admin CQ install (multi-conn share params mismatch)")?;
-    }
-    let next_token = controller.allocate_token_slab();
-    let conn_id = controller.allocate_conn_id();
-    let aen_notify = controller.aen_notify_handle();
-    Ok(AsyncSession {
-        backend: crate::fabric_backend::TcpFabricBackend::new(stream, crate::MAXH2CDATA_BYTES),
+    AsyncSession::from_backend(
+        crate::fabric_backend::TcpFabricBackend::new(stream, crate::MAXH2CDATA_BYTES),
         controller,
-        negotiated,
-        conn_id,
-        next_token,
         discovery_mode,
-        aen_notify,
-        kato_tmo: Duration::from_secs(0),
-        kato_deadline: None,
-        cntlid: fabric::TEACHING_CNTLID,
-        admin_connected: false,
-        current_qid: 0,
-        io_queues: std::collections::HashMap::new(),
-        pending_aers: Vec::new(),
-        host_nqn_allowlist: None,
-        bound_host_identities: None,
-        chap_secret_store: None,
-        chap: None,
-        allow_format: false,
-        pending_fused: None,
-    })
+        negotiated,
+    )
 }
 
 /// **V-followup-auth** — `accept_and_handshake_async` 的带白名单变体。
@@ -276,7 +251,72 @@ where
     Ok(sess)
 }
 
+/// **R3c-2** — RDMA session 构造（类比 [`accept_and_handshake_async`]，但**无 ICReq 握手**——
+/// RDMA 协商走 CM Private Data，QP 已由 `backend` 持有、recv 池已 post）。
+///
+/// `negotiated` 填 RDMA-relevant 默认：`maxh2cdata`/`maxr2t` 等是 TCP framing 概念，对 RDMA
+/// backend vestigial（dispatch 路径不读，rust-reviewer R3c-1 已核实）；填 `MAXH2CDATA_BYTES`/0
+/// 保持字段非零卫生。后续 Fabric Connect / enable / Identify 等 admin 命令经 SEND 胶囊驱动，
+/// 与 TCP 共享 pump/dispatch/桥。
+pub fn accept_rdma<V: rdma_transport::RdmaVerbs>(
+    backend: crate::rdma_backend::RdmaFabricBackend<V>,
+    controller: SharedController,
+) -> anyhow::Result<AsyncSession<crate::rdma_backend::RdmaFabricBackend<V>>> {
+    let discovery_mode = controller.controller.lock().nvme_is_discovery_mode();
+    let negotiated = crate::NegotiatedIc {
+        pfv: 0,
+        hpda: 0,
+        hdgst: false,
+        ddgst: false,
+        maxh2cdata: crate::MAXH2CDATA_BYTES,
+        maxr2t: 0,
+    };
+    AsyncSession::from_backend(backend, controller, discovery_mode, negotiated)
+}
+
 impl<B: crate::fabric_backend::FabricBackend> AsyncSession<B> {
+    /// **R3c-2** — 共享构造：从已建好的 backend + 已解析握手结果（discovery_mode/negotiated）
+    /// 构造 session，填默认字段（DRY）。TCP（ICReq 协商，[`accept_and_handshake_async`]）与
+    /// RDMA（CM 协商，[`AsyncSession::accept_rdma`]）两条 handshake 入口都汇到这里。
+    /// 安装"假" admin CQ（`CQ_BASE_GPA` 哨值，桥用，idempotent，两 transport 共享）。
+    pub(crate) fn from_backend(
+        backend: B,
+        controller: SharedController,
+        discovery_mode: bool,
+        negotiated: crate::NegotiatedIc,
+    ) -> anyhow::Result<Self> {
+        {
+            let mut c = controller.controller.lock();
+            c.nvme_install_admin_cq(crate::CQ_BASE_GPA, crate::ADMIN_CQ_SIZE)
+                .context("R3c-2: admin CQ install (multi-conn share params mismatch)")?;
+        }
+        let next_token = controller.allocate_token_slab();
+        let conn_id = controller.allocate_conn_id();
+        let aen_notify = controller.aen_notify_handle();
+        Ok(AsyncSession {
+            backend,
+            controller,
+            negotiated,
+            conn_id,
+            next_token,
+            discovery_mode,
+            aen_notify,
+            kato_tmo: Duration::from_secs(0),
+            kato_deadline: None,
+            cntlid: fabric::TEACHING_CNTLID,
+            admin_connected: false,
+            current_qid: 0,
+            io_queues: std::collections::HashMap::new(),
+            pending_aers: Vec::new(),
+            host_nqn_allowlist: None,
+            bound_host_identities: None,
+            chap_secret_store: None,
+            chap: None,
+            allow_format: false,
+            pending_fused: None,
+        })
+    }
+
     /// **V-followup-auth-2** — 在 mTLS handshake 完成后注入 host identity 集合
     /// （SAN URI / DNS / CN），开启 NQN ↔ TLS identity binding 校验。
     ///

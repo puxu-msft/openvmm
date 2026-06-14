@@ -441,4 +441,38 @@ mod tests {
                 .is_err()
         );
     }
+
+    /// **R3c-2 keystone e2e**：`accept_rdma` 建 `AsyncSession<RdmaFabricBackend<MockRdma>>`，
+    /// 注入一条命令胶囊 → `pump_one_async`（共享 pump）经 RDMA backend 的 recv_next 取到合成
+    /// CapsuleCmd PDU。证明泛型 AsyncSession + RDMA backend + recv 路径打通（命令真 dispatch
+    /// 到 controller 需 admin 生命周期，留 R3d）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rdma_session_pumps_injected_capsule() {
+        // 共享 controller（backing tempfile）。
+        let f = tempfile::NamedTempFile::new().unwrap();
+        f.as_file().set_len(1024 * 1024).unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let c = nvme_firmware::NvmeController::open(std::slice::from_ref(&path), 0x1414, 0, &[])
+            .unwrap();
+        let controller = std::sync::Arc::new(crate::SharedControllerInner::new(c));
+
+        // RDMA backend + 注入一条 admin 命令胶囊（Identify opcode 作标记）。
+        let mut backend = RdmaFabricBackend::new(MockRdma::new(8), 4, 256).unwrap();
+        let mut sqe = [0u8; 64];
+        sqe[0] = 0x06; // Identify
+        sqe[2..4].copy_from_slice(&0x42u16.to_le_bytes()); // cid
+        backend.verbs_mut().inject_send(&sqe, None).unwrap();
+
+        // 建 RDMA session + pump 一次。
+        let mut sess = crate::accept_rdma(backend, controller).unwrap();
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        match sess.pump_one_async(&mut rx).await.unwrap() {
+            crate::PumpEvent::Pdu(pdu) => {
+                assert_eq!(pdu.header.pdu_type, pdu_type::CMD);
+                assert_eq!(pdu.psh[0], 0x06, "psh 应是注入的 SQE（Identify）");
+                assert_eq!(&pdu.psh[2..4], &0x42u16.to_le_bytes(), "cid 透传");
+            }
+            other => panic!("expected Pdu, got {other:?}"),
+        }
+    }
 }
