@@ -176,6 +176,22 @@ trait RdmaVerbs {
 - **Reviewer gate**：rust-reviewer + architect（mock 语义是否忠实 R0 契约，非反向迁就）。
 
 ### R3 — RDMA-CM Connect + admin over SEND + recv 池 + 多 QP 聚合（roadmap 详度）
+
+> **进度（2026-06-15）**：拆 R3a/b/c/d。
+> - **✅ R3a DONE**（commit `86f1e0be7`）：`FabricBackend::recv_next` 抽象（还 R2 的 select! 直借 stream 债）+
+>   `RecvFrame{Frame(Pdu),PeerClosed}`；pump 经 trait recv；`stream` 转私有；324 tests 绿 + byte-identical +
+>   rust-reviewer 无 C/H。**RecvFrame::Frame(Pdu) 已验对 R3b 充分**（RDMA 从 RECV completion 合成 CapsuleCmd
+>   PDU 复用 dispatch）。
+> - **⏳ R3b**（待做，建议 fresh context）：`RdmaFabricBackend`（impl `FabricBackend`，owns `MockRdma` QP）——
+>   recv_next = poll_cq RECV→合成 CapsuleCmd PDU；send_response_capsule = post_send；recv-buffer 池 + 响应前
+>   repost（RNR）；CM Private Data Connect（`nvme_rdma_cm_req/rep/rej` zerocopy struct，R0 §A，喂 `fabric.rs`
+>   复用解码）。起手须评估：上层桥 run_post_dispatch 的 CQE 分流（CQ_BASE_GPA 哨值）按 R0 §E 区分 CQE-SEND
+>   vs data-verb——是先抽桥层分流还是 RdmaFabricBackend 内自洽（R4 桥层分流的前置一半）。
+> - **⏳ R3c**：多 QP ↔ session 聚合（per-QP backend，共享 `SharedControllerInner` keyed by cntlid，R0 §F）+
+>   association teardown / QP drain。
+> - **⏳ R3d**：admin 全路径过 RDMA mock（Identify/Set-Features/AER/Keep-Alive）+ Discovery-over-RDMA
+>   （`NVME_TRTYPE_RDMA`）+ IRD/ORD/CQ-depth sizing。
+
 - **What**：CM Private Data Connect（喂 `fabric.rs` 复用解码）+ admin capsule over SEND（against Mock）+ **recv-buffer 池 + repost（遗漏 RNR）** + IRD/ORD/CQ-depth sizing + **多 QP ↔ session 聚合（落实 R0(c) 决策：admin+IO queue 各 QP 如何挂进 session 模型）** + **association teardown / QP drain 时序（in-flight R/W flush 后才释放）** + Discovery-over-RDMA 填 `NVME_TRTYPE_RDMA`/RDMA TRADDR。
 - **Acceptance**：controller admin 全路径过 RDMA mock（Identify/Set-Features/AER/Keep-Alive）；recv 池耗尽/repost 测试;多 QP 建立/拆除 + drain 时序测试。
 - **Reviewer gate**：rust-reviewer + architect。
