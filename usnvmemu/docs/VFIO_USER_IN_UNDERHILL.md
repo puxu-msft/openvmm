@@ -128,6 +128,13 @@ happy-path 看不见、但错了就真机翻车（同 DBBUF shadow-doorbell 一�
   `/bin/usnvmemu` + `underhill_init`(PID1) env-gated 自启 → **零-operator 出盘真机 PASS**。一等
   `--with-vfio-user-nvme` build flag 已落地（commit `f5f00c98c`）。
 
+**内存共享方向（探索性结论，2026-06-14）**：本架构的零拷贝是**单向**的——**firmware→guest RAM 的正向
+零拷贝 DMA 已真机证**（W6c，firmware 经 `/dev/mshv_vtl_low` 反手读写 guest 页）；而 **guest→设备/VTL2
+内存的反向零拷贝**（让 guest 直访 firmware 暴露的一段内存，如 NVMe CMB 的零拷贝 BAR）**架构受限**：
+VSM 单向墙（VTL0 的 SLAT 归 host 拥有，paravisor 无加-backing 原语）+ host GET `create_ram_gpa_range`
+真机证伪（对任意 GPA／真 VPCI 设备 BAR 窗口／backend-live 一律 FAILED，4 轮真机+2 reviewer）→ **OpenHCL
+上 CMB 只能 trap（每访问拷贝）**，零拷贝 CMB-on-OpenHCL 被 host primitive 挡死。详 §8 两篇 feasibility/POC。
+
 **后续 todos**（[ROADMAP §1](ROADMAP.md) vfio-user-in-underhill 节，按价值挑、无固定主战场）：
 - supervised restart（区分 graceful-exit vs crash，对齐 VTL2「非预期死即 fatal」哲学）。
 - persistent backing（现 tmpfs backing 重启即失）。
@@ -145,6 +152,8 @@ happy-path 看不见、但错了就真机翻车（同 DBBUF shadow-doorbell 一�
 | **Layer A reconnect 设计** | [plans/2026-06-12-w6b-reconnect-usnvmemu-lifecycle.md](../../docs/superpowers/plans/2026-06-12-w6b-reconnect-usnvmemu-lifecycle.md) + 同名 spec |
 | **W6c DMA 零拷贝真机验证** | [experiments/2026-06-12-w6c-dma-poc/RESULT.md](../experiments/2026-06-12-w6c-dma-poc/RESULT.md) |
 | **W6 autostart 设计 + 真机 PASS** | [plans/2026-06-13-w6-usnvmemu-vtl2-autostart.md](../../docs/superpowers/plans/2026-06-13-w6-usnvmemu-vtl2-autostart.md) |
+| **内存共享方向可行性**（guest 能否零拷贝直访 VTL2/host 内存——VSM 单向墙三层证据） | [experiments/2026-06-12-vtl-memory-direction-feasibility/README.md](../experiments/2026-06-12-vtl-memory-direction-feasibility/README.md) |
+| **零拷贝 CMB-on-OpenHCL 真机证伪**（host `create_ram_gpa_range` 一律 FAILED，4 轮真机+2 reviewer） | [experiments/2026-06-14-cmb-zerocopy-openhcl-phase1/README.md](../experiments/2026-06-14-cmb-zerocopy-openhcl-phase1/README.md) + [plans/2026-06-13-cmb-zerocopy-openhcl-gap-closure.md](../../docs/superpowers/plans/2026-06-13-cmb-zerocopy-openhcl-gap-closure.md) |
 | **总体架构 spec** | [specs/2026-06-11-openhcl-vfio-user-vtl2-firmware-design.md](../../docs/superpowers/specs/2026-06-11-openhcl-vfio-user-vtl2-firmware-design.md) |
 | **当前 live 状态 / 下一步** | [ROADMAP.md](ROADMAP.md) §1 + auto-memory `vfio-user-underhill-state` |
 
