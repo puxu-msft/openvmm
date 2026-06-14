@@ -135,6 +135,12 @@ trait RdmaVerbs {
 > **详度标注**：R0/R2 = **execution-ready**（可直接起手）；R1'/R3/R4/R5/M2 = **roadmap 详度 + 详化 gate**（依赖前序 POC 结论，起手前须把该阶段详化到 execution-ready，不伪详化，[[handoff-needs-full-prompt-plus-plan]]）。每阶段独立 commit + 过对应 reviewer。
 
 ### R0 — 设计期 oracle + binding 选型（execution-ready，零阻塞）
+
+> **✅ 2026-06-14 DONE** → 交付 [nvme-rdma-wire-and-verbs-contract](../specs/2026-06-14-nvme-rdma-wire-and-verbs-contract.md)
+> （字段级 wire A/B/C + verbs 语义契约 D + 设计决策 E `HostBuf`/F per-QP session + binding ADR 草案 G +
+> 陷阱 H + smoke 清单 I）。2 路 oracle 抽 Linux 真驱动 + architect review（§F 源码核实 production-ready；
+> §E 补 multi-SGL/separate-meta segments 模型 + len 不变式 + 两层 cntlid + completion 派发 open-Q + 3 smoke）。
+> **binding 选定**：`sideway`（主，唯一完整 rdma_cm + 活跃）+ `rdma-sys`（兜底裸 FFI），藏 `trait RdmaVerbs` 后。
 - **What**：①追踪 Linux `nvmet-rdma`/`nvme-rdma` 源码，把 `RdmaVerbs` 的 completion/错误/QP-state/RNR 语义 + `nvme_rdma_cm_req` 字节布局定成文档化契约。②`ibverbs` Rust binding 选型 survey（**GitHub search first**，development-workflow）：候选 `rdma`/`rust-rdma`（高层含 rdma-cm）、`ibverbs` crate、`rdma-sys`/fork `ibverbs-sys`（裸 FFI 兜底）；评估维护度/安全/是否覆盖 RDMA-CM；**结论藏在 `RdmaVerbs` trait 后，可换**。
 - **Acceptance（architect review 拆成三个明确产出物，分别喂下游不同阶段）**：
   - **(a) 喂 R1'**：`RdmaVerbs` 语义契约（completion 乱序 / RNR / `IBV_WC_*_ERR`→QP-error-state / poll 模型）+ binding 选型 ADR 草案。
