@@ -210,6 +210,15 @@ pub enum PduError {
         /// 报告的 hlen。
         hlen: u8,
     },
+    /// **§22-style wire-DoS 修（2026-06-14，fuzz_read_pdu 实证）** — hlen < CH_LEN(8)：
+    /// CommonHdr 本身就 8 字节，hlen（CH+PSH 长）必 ≥ CH_LEN。漏查会让 framing 的
+    /// `psh_len = hlen - CH_LEN` 整数下溢（debug panic / release `vec![0u8; ~2^64]` OOM abort）
+    /// → 恶意 peer 发 hlen<8 即 DoS。
+    #[error("hlen ({hlen}) < CH_LEN ({CH_LEN})")]
+    HlenTooSmall {
+        /// 报告的 hlen。
+        hlen: u8,
+    },
     /// **review H1** — `pdo` 必须 ≥ hlen+HDGST 或 = 0；其它值非法。
     #[error("pdo ({pdo}) < consumed header bytes ({consumed})")]
     InvalidPdo {
@@ -253,8 +262,9 @@ pub const MAX_PDU_SIZE: usize = 1024 * 1024;
 ///
 /// 严格校验：
 /// 1. `buf.len() >= CH_LEN`
-/// 2. `plen >= hlen` 且 `plen <= MAX_PDU_SIZE`
-/// 3. PDU type ∈ 已定义值
+/// 2. `hlen >= CH_LEN`（否则 framing `hlen-CH_LEN` 下溢 DoS；§22-style 修，fuzz 实证）
+/// 3. `plen >= hlen` 且 `plen <= MAX_PDU_SIZE`
+/// 4. PDU type ∈ 已定义值
 pub fn decode_common_hdr(buf: &[u8]) -> Result<CommonHdr, PduError> {
     if buf.len() < CH_LEN {
         return Err(PduError::BufferShort { got: buf.len() });
@@ -263,6 +273,12 @@ pub fn decode_common_hdr(buf: &[u8]) -> Result<CommonHdr, PduError> {
         .map_err(|_| PduError::BufferShort { got: buf.len() })?;
     let plen = hdr.plen;
     let hlen = hdr.hlen;
+    // **§22-style wire-DoS 修（fuzz_read_pdu 实证）** — hlen 必 ≥ CH_LEN(8)，否则 framing 的
+    // `psh_len = hlen - CH_LEN` 下溢 → DoS。中心化在此：sync read_pdu + async read_pdu_async 两路
+    // 都先经本函数，一处修两路全覆盖。
+    if (hlen as usize) < CH_LEN {
+        return Err(PduError::HlenTooSmall { hlen });
+    }
     if (plen as usize) < hlen as usize {
         return Err(PduError::PlenLessThanHlen { plen, hlen });
     }
@@ -426,6 +442,27 @@ mod tests {
         };
         let r = decode_common_hdr(bad.as_bytes());
         assert!(matches!(r, Err(PduError::PlenLessThanHlen { .. })));
+
+        // **hlen < CH_LEN（§22-style wire-DoS 回归，fuzz_read_pdu 实证）**：hlen=0 必被拒
+        // HlenTooSmall——否则 framing 的 `psh_len = hlen - CH_LEN` 下溢 DoS。check 在 plen<hlen 前，
+        // 故 hlen=0,plen=0 走 HlenTooSmall 而非 PlenLessThanHlen。revert-verify：删 decode_common_hdr
+        // 的 hlen check → 本断言红（且 framing 在 hlen=0 下溢 panic/OOM）。
+        for bad_hlen in [0u8, 1, 7] {
+            let bad_h = CommonHdr {
+                pdu_type: pdu_type::ICREQ,
+                flags: 0,
+                hlen: bad_hlen,
+                pdo: 0,
+                plen: 0,
+            };
+            assert!(
+                matches!(
+                    decode_common_hdr(bad_h.as_bytes()),
+                    Err(PduError::HlenTooSmall { hlen }) if hlen == bad_hlen
+                ),
+                "hlen={bad_hlen} (< CH_LEN) 必拒 HlenTooSmall"
+            );
+        }
 
         // plen > MAX
         let too_big = CommonHdr {

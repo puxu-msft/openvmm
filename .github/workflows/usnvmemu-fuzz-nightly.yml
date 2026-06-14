@@ -66,6 +66,7 @@ jobs:
           path: |
             usnvmemu/crates/nvme_firmware/fuzz/corpus
             usnvmemu/crates/vfio_user_transport/fuzz/corpus
+            usnvmemu/crates/nvme_of_tcp_target/fuzz/corpus
           key: usnvmemu-fuzz-corpus-${{ github.run_id }}
           restore-keys: |
             usnvmemu-fuzz-corpus-
@@ -77,7 +78,8 @@ jobs:
           rm -f /tmp/fuzz_fail   # 子 shell（`while` 循环）经文件传出失败标记，先清干净。
           for crate_dir in \
             usnvmemu/crates/nvme_firmware/fuzz \
-            usnvmemu/crates/vfio_user_transport/fuzz; do
+            usnvmemu/crates/vfio_user_transport/fuzz \
+            usnvmemu/crates/nvme_of_tcp_target/fuzz; do
             # cargo fuzz 从 crate 根（fuzz/ 的父目录）调用。
             proj_dir="$(dirname "${crate_dir}")"
             # **先捕获 target 列表并对 list 失败 fail-loud**（review MEDIUM）：直接 `... | while`
@@ -111,4 +113,5 @@ jobs:
           path: |
             usnvmemu/crates/nvme_firmware/fuzz/artifacts
             usnvmemu/crates/vfio_user_transport/fuzz/artifacts
+            usnvmemu/crates/nvme_of_tcp_target/fuzz/artifacts
           if-no-files-found: ignore

@@ -24,7 +24,6 @@ use crate::pdu::CommonHdr;
 use crate::pdu::PduError;
 use crate::pdu::decode_common_hdr;
 use anyhow::Context as _;
-use std::io::Read;
 use std::io::Write;
 use std::net::TcpStream;
 use thiserror::Error;
@@ -65,7 +64,12 @@ pub enum FramingError {
 }
 
 /// 阻塞读一帧完整 PDU。
-pub fn read_pdu(stream: &mut TcpStream) -> anyhow::Result<Pdu> {
+///
+/// **泛型化 `<R: std::io::Read>`（2026-06-14 §22-style wire fuzz）**：原硬绑 `&mut TcpStream`；
+/// 改泛型让 fuzz 用 `std::io::Cursor<&[u8]>` 喂 attacker 字节驱**真** read_pdu（非抄一份）。
+/// `TcpStream: Read`，**调用方零改、行为不变**——timeout/partial-resume(V6b) 语义全在调用方的
+/// `set_read_timeout`，不在本 body；`WouldBlock/TimedOut` 臂对非-socket R 死代码但保留无害。
+pub fn read_pdu<R: std::io::Read>(stream: &mut R) -> anyhow::Result<Pdu> {
     // 1. read CommonHdr
     let mut hbuf = [0u8; CH_LEN];
     read_exact_or_eof(stream, &mut hbuf, "while reading CommonHdr")?;
@@ -309,8 +313,8 @@ where
     }
 }
 
-fn read_exact_or_eof(
-    stream: &mut TcpStream,
+fn read_exact_or_eof<R: std::io::Read>(
+    stream: &mut R,
     buf: &mut [u8],
     at: &'static str,
 ) -> anyhow::Result<()> {

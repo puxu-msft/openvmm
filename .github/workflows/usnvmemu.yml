@@ -128,3 +128,21 @@ jobs:
             exit 1
           fi
           echo "::endgroup::"
+
+      # nvme_of_tcp_target PDU framing fuzz crate（nested workspace）防 bit-rot：read_pdu 的 wire
+      # 长度算术（attacker 控字节）。真 coverage-guided（nightly+ASan，10.6M runs 全绿、修了 hlen<8
+      # 下溢 DoS）不在本 gate；此处 = build + 定 seed blind smoke。
+      - name: fuzz build + smoke (nvme_of_tcp_target PDU)
+        if: always()
+        run: |
+          set -uo pipefail
+          cd usnvmemu/crates/nvme_of_tcp_target/fuzz
+          cargo build --bin fuzz_read_pdu
+          echo "::group::fuzz smoke fuzz_read_pdu"
+          if ./target/debug/fuzz_read_pdu -runs=20000 -max_total_time=15 -timeout=10 -seed=1; then
+            echo "fuzz_read_pdu: ok"
+          else
+            echo "::error::fuzz_read_pdu smoke failed"
+            exit 1
+          fi
+          echo "::endgroup::"
