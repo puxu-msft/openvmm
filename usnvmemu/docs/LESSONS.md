@@ -921,3 +921,30 @@ tests 绿、已"冻结"。但真 WS2025 Windows inbox initiator 一连，IO 队�
 **来源**：V-followup-static-controller-model C1（`e2c022575`）/ C2（`9f1ae4d87`）/ C3（`4df5c3f83`），
 2026-06-14 真 WS2025 出盘 PROVEN。详 MILESTONES §4.14 + ADR-008 + 证据本位回应
 `experiments/2026-06-13-openhcl-vpci-nvme/usnvmemu-response-to-ws-handbook.md`。
+
+## 34. CMB 真机：两 self-consistent-trap 寄存器 bug + 「源码追踪异-config 消费方 ≠ 验证 primitive」(HIGH)
+
+CMB L4（真 Linux nvme over QEMU）+ 零拷贝-on-OpenHCL POC 两段，各长一条教训：
+
+**①（self-consistent ≠ spec，连 spec 误读+architect review 都骗过的第 N 次）**：CMB L4 真机暴露两个
+firmware 寄存器 bug，in-process 测试 + 我读的 spec + architect review **三道防线全自洽通过**，唯真 Linux
+驱动作独立 oracle 才捅破：
+- **CMBSZ 位布局非 spec-aligned**——SQS 编 bit4 而非 §3.1.14 bit0、SZU bits3:0 而非 11:8；firmware 意图广告
+  全能力却写出 `0x002001f0`，真 Linux 按 spec 解码成 **SQS=0** 拒用 CMB。测试 `cmbsz_field_offsets_match_spec`
+  **反而 enshrine 了错布局**（断言 `SQS==1<<4`）→ 全绿。
+- **CMBMSC 跨 Controller Reset 误清**——`disable()`(CC.EN→0) 清 cre/cmse/cba，但真 Linux `nvme_map_cmb` 仅
+  编程一次（`if dev->cmb_size return`）依赖其持久；标注「spec §3.1.24 + architect 复核」却都错，QEMU
+  `nvme_ctrl_reset` 不动 cmbmsc = interop oracle 钉死。
+- 泛化（同 §17/§20/§22/§32/§33）：凡 firmware **自定义 wire 寄存器布局/生命周期 + 自测 + 自证 spec**，三者
+  同源不算验证；必须真对端（真驱动 / 参考实现 QEMU 源码）独立核。commit `3a1779c1d`。
+
+**②（源码追踪消费方是廉价 POC，但消费方在异 config 时会给假阳）**：feasibility 实验**做了**「源码追踪
+i440bx 消费 create_ram_gpa_range」这个本仓推荐的最廉价 POC，据此**推断 host 支持**。但真机首调即对任意
+GPA／真 VPCI 设备 BAR 窗口／backend-live **一律 FAILED**——因为 i440bx 是 **Gen1/PCAT、本 VM 是 Gen2 从不
+走它**。「生产代码依赖 X」≠「X 在你的 config 下成功」；闭源对端（真 Hyper-V `IVmGuestMemoryAccess`，仓里
+只有硬编码 FAILED 的 GED stub）+ 唯一消费方在异 config = **必须真机调一次**，别靠「它在别处被依赖」推断。
+4 轮真机 + 2 轮独立 reviewer（GED-stub 假阴性经 INVALID_GPA 排除）。
+
+**来源**：MILESTONES §3.7、auto-memory `review-not-optional-self-consistent-trap`(第6次) /
+`poc-before-settling-design`(2026-06-14 反向) / `debug-root-cause-at-driver-first-branch`；
+归档 `experiments/2026-06-13-cmb-l4-realmachine-qemu/` + `experiments/2026-06-14-cmb-zerocopy-openhcl-phase1/`。
