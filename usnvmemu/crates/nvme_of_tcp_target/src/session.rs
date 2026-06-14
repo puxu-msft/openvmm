@@ -985,10 +985,24 @@ impl V2Session {
     }
 
     fn handle_connect(&mut self, cid: u16, sqe: &[u8], data: &[u8]) -> anyhow::Result<()> {
-        if data.len() != fabric::CONNECT_DATA_SIZE {
-            return self.send_capsule_resp_err(cid, fabric_sc::CONNECT_INVALID_PARAM);
-        }
-        let cd = match ConnectData::read_from_bytes(data) {
+        // **transport-SGL Connect data（2026-06-14 真 WS2025 互通）** — Connect data 可
+        // in-capsule 或经 transport SGL 经 R2T 到达（dual-track 与 async handle_connect_async
+        // 共用 fabric::decode_connect_data_source）。sync R2T 的挂起超时靠 stream `set_read_timeout`
+        // 兜底（async 路径用 tokio::time::timeout）。
+        let connect_data: Vec<u8> = match fabric::decode_connect_data_source(sqe, data.len()) {
+            fabric::ConnectDataSource::InCapsule => data.to_vec(),
+            // 注：sync `dma_read_via_r2t`→`await_host_data` **不含** async 的 Windows H2CData
+            // PLEN=HLEN quirk 补读——本 sync 分支仅对 spec-conformant H2CData(PLEN=hlen+data)正确。
+            // 真 Windows 只走 AsyncSession（bin 主路径）；sync V2Session 是 legacy/test，其测试只喂
+            // in-capsule Connect、从不触发 ViaR2t。若将来 sync 路径承载 Windows，须补 quirk 处理。
+            fabric::ConnectDataSource::ViaR2t { len } => self
+                .dma_read_via_r2t(cid, 0, len)
+                .context("Connect data via R2T (transport SGL)")?,
+            fabric::ConnectDataSource::Invalid => {
+                return self.send_capsule_resp_err(cid, fabric_sc::CONNECT_INVALID_PARAM);
+            }
+        };
+        let cd = match ConnectData::read_from_bytes(connect_data.as_slice()) {
             Ok(c) => c,
             Err(_) => {
                 return self.send_capsule_resp_err(cid, fabric_sc::CONNECT_INVALID_PARAM);

@@ -330,7 +330,7 @@ portal；多 portal 走 [[nvme-of-tcp-real-linux-interop-milestone]] 验过。
 **Acceptance**：起 target with `--discovery-target-addr A:p1 -p A:p2 -p A:p3`，
 `nvme discover -t tcp -a A -s 4420` 输出 3 个 entry，每个 NQN/IP/Port 正确。
 
-### ✅ V-followup-static-controller-model (2026-06-14 SHIPPED C1+C2 — Windows interop 盲区已修)
+### ✅ V-followup-static-controller-model (2026-06-14 SHIPPED C1+C2+C3 — 真 WS2025 出盘 PROVEN)
 
 **来源**：母项目 Windows NVMe-oF 互通手册（2026-06-13 交接）暴露 + probe 坐实：Windows inbox
 initiator(`stornvmeofi`/`nvmeofutil`)**默认 static controller model**(`-dy false` / `connect -ci`)，
@@ -349,13 +349,36 @@ Linux `nvme-cli` 默认 dynamic(`0xFFFF`)，故现有全部 Linux interop 测试
 `--discovery-static-cntlid <N>`（usnvmemu 单 controller = 1）→ static-default host 经 `nvme discover`
 学到具体 CNTLID。
 
-**验证**：173 lib + 全 integration + 4 probe + discovery static-advertise 测全绿，clippy clean，
-rust-reviewer APPROVE(C1+C2)。plan [2026-06-14-static-controller-model-conformance.md](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-14-static-controller-model-conformance.md)。
+**✅ C3（transport-SGL Connect data via R2T）— 真 WS2025 出盘的最后一块**：
+真机深挖（relay byte-log 解码）坐实 WS2025 IO-queue Fabric Connect 与 admin 不同：admin Connect
+data 走 in-capsule（SGL `0x01`），但 **IO Connect data 走 Transport SGL（`0x5A` = type 0x5/subtype
+0xA）**，CapsuleCmd 只含 64B SQE、无 in-capsule data → target 须发 **R2T**、host 回 H2CData 推 1024B。
+根因链：[cmd.rs:760](/usnvmemu/crates/nvme_firmware/src/cmd.rs) `IOCCSZ=4`（IO 胶囊=64B SQE，不支持
+in-capsule data，spec-consistent）→ Windows 正确改用 transport SGL → 但旧 `handle_connect` 在 parse
+前 `if data.len()!=1024 { reject }` 拒掉、**从不发 R2T**（内部不一致：广告「IO 无 in-capsule」却要求
+Connect data in-capsule）。修复（保 IOCCSZ=4、不退化加 in-capsule）：
+- `fabric::decode_connect_data_source(sqe, in_capsule_len)` → `InCapsule` / `ViaR2t{len}` / `Invalid`
+  （纯函数，sync/async 共享）；ViaR2t 经 `dma_read_via_r2t` 取 Connect data。
+- **Windows H2CData PLEN=HLEN quirk**：Windows H2CData 把 CommonHdr PLEN 设为 HLEN（不计 data，
+  违 TP-8000），data 长由 PSH DATAL 给；`await_host_data_async` 据 DATAL 补读尾随 data（越界 DATAL
+  仍拒，不补读越界）。所有 R2T host-data 读加 30s inactivity timeout（host 半开/卡死兜底，DoS bound）。
+- regression gate：`vt_windows_transport_sgl_connect.rs`（3 测，精确 Windows wire：SGL 0x5A +
+  H2CData PLEN=HLEN + 越界拒）。
+
+**🎉 真机 e2e PROVEN（2026-06-14）**：真 Windows Server 2025 inbox initiator（`stornvmeofi`/
+`nvmeofutil connect -ci`，static model）→ Hyper-V relay → usnvmemu target 全栈打通：`Get-Disk` 显
+**"NVMe OpenHCL Userspace NVMe v2.0" Online / 67108864 bytes**，raw 4KB write+read **byte-equal**。
+推翻母项目手册「RDMA-only」倾向（**TCP 实证可用**），坐实 static model 默认（验 C1）。
+plan [2026-06-14-connect-transport-sgl-data.md](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-14-connect-transport-sgl-data.md)。
+
+**验证**：176 lib + 全 integration（含 3 transport-SGL）+ 4 probe + discovery static-advertise 全绿，
+clippy clean，architect PASS-with-fixes（PLEN quirk 非-conformant 已确认+timeout 已补）+ rust-reviewer
+APPROVE。plan [2026-06-14-static-controller-model-conformance.md](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-14-static-controller-model-conformance.md)。
 
 **deferred → `V-spec-strict-mode`（非 Windows 承重路径，可拆高级）**：① spec-strict reject
 `cntlid=0`（+ 21 个 legacy fixture 改送 faithful `0xFFFF`）；② IO queue(qid≥1) Connect 拒哨值
-（须送 admin 已分配的具体 cntlid）。real host 不触发，纯 spec 纯化。real Windows 真连待母项目跑
-（companion §6 已给两组必测命令）。
+（须送 admin 已分配的具体 cntlid）。real host 不触发，纯 spec 纯化。~~real Windows 真连待母项目跑~~
+**✅ 2026-06-14 真 WS2025 出盘已实测打通（见 C3）**。
 
 ### ✅ V-followup-py-harness-spec-wire-conformance (2026-06-09 SHIPPED — commit `57d12a7b`)
 

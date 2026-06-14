@@ -46,10 +46,16 @@ use crate::pdu::{CommonHdr, IcPsh, pdu_type};
 use anyhow::Context as _;
 use std::pin::Pin;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
 use tokio::net::TcpStream as TokioStream;
 use tokio::time::{Instant as TokioInstant, Sleep, sleep_until};
 use zerocopy::{FromBytes, IntoBytes};
+
+/// **R2T host-data 读不活跃超时** — host 回 R2T 后须发 H2CData 把数据推过来；此上界防 host
+/// 发了 transport-SGL Connect / IO write 却永不（或半截）回 H2CData 挂死该连接 task（KATO 救不了
+/// ——`await_host_data_async` 在 dispatch 内同步 await，不经 pump select!）。覆盖 Connect data +
+/// IO write + fused 全部 R2T 路径（architect spec-audit MEDIUM）。仿 `TLS_HANDSHAKE_TIMEOUT_SECS` 量级。
+const H2C_DATA_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// **V-followup-tls-1** — `AsyncSession` 接受的 stream trait bound。
 ///
@@ -626,12 +632,24 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         sqe: &[u8],
         data: &[u8],
     ) -> anyhow::Result<()> {
-        if data.len() != fabric::CONNECT_DATA_SIZE {
-            return self
-                .send_capsule_resp_err_async(cid, fabric_sc::CONNECT_INVALID_PARAM)
-                .await;
-        }
-        let cd = match ConnectData::read_from_bytes(data) {
+        // **transport-SGL Connect data（2026-06-14 真 WS2025 互通）** — Connect data（1024B）
+        // 可 in-capsule（Linux/admin）或经 transport SGL 经 R2T 到达（Windows IO Connect）。
+        let connect_data: Vec<u8> = match fabric::decode_connect_data_source(sqe, data.len()) {
+            fabric::ConnectDataSource::InCapsule => data.to_vec(),
+            fabric::ConnectDataSource::ViaR2t { len } => {
+                // Windows IO Connect：发 R2T 取 Connect data。host 半开/卡死的挂起由
+                // `await_host_data_async` 内的 `H2C_DATA_READ_TIMEOUT` 兜底（覆盖全 R2T 路径）。
+                self.dma_read_via_r2t_async(cid, 0, len)
+                    .await
+                    .context("Connect data via R2T (transport SGL)")?
+            }
+            fabric::ConnectDataSource::Invalid => {
+                return self
+                    .send_capsule_resp_err_async(cid, fabric_sc::CONNECT_INVALID_PARAM)
+                    .await;
+            }
+        };
+        let cd = match ConnectData::read_from_bytes(connect_data.as_slice()) {
             Ok(c) => c,
             Err(_) => {
                 return self
@@ -2280,12 +2298,39 @@ where
 {
     let mut r = crate::H2cReassembler::with_base_offset(cid, ttag, base_offset, expected_len);
     loop {
-        let pdu = read_pdu_async(stream)
-            .await
-            .context("V8e-7-3 read H2CData")?;
+        let mut pdu = match tokio::time::timeout(H2C_DATA_READ_TIMEOUT, read_pdu_async(stream)).await
+        {
+            Ok(res) => res.context("V8e-7-3 read H2CData")?,
+            Err(_) => anyhow::bail!("R2T host-data: read H2CData 超时（host 半开/卡死）"),
+        };
         let pt = pdu.header.pdu_type;
         if pt == pdu_type::H2C_TERM {
             anyhow::bail!("V8e-7-3 host sent H2CTermReq while awaiting H2CData");
+        }
+        // **Windows H2CData PLEN quirk（2026-06-14 真 WS2025 互通）** — Windows 把 H2CData 的
+        // PLEN 设为 HLEN（仅头），data 长度由 PSH DATAL 给（Linux/spec 把 data 计进 PLEN）。于是
+        // read_pdu 按 PLEN 读到 0 data、且把 DATAL 字节留在 stream。这里按 DATAL 补读，上界 = R2T
+        // 剩余（`expected_len - received`）防恶意 DATAL DoS；超界则不补读、交 accept_pdu 报错拒。
+        if pt == pdu_type::H2C_DATA
+            && pdu.psh.len() >= 16
+            && let Ok(psh) = crate::pdu::DataPsh::read_from_bytes(&pdu.psh[..16])
+        {
+            let datal = psh.data_length as usize;
+            let remaining = (expected_len as usize).saturating_sub(r.received() as usize);
+            if pdu.data.len() < datal && datal <= remaining {
+                let missing = datal - pdu.data.len();
+                let mut extra = vec![0u8; missing];
+                match tokio::time::timeout(H2C_DATA_READ_TIMEOUT, stream.read_exact(&mut extra)).await
+                {
+                    Ok(res) => {
+                        res.context("Windows H2CData trailing data (PLEN=HLEN quirk)")?;
+                    }
+                    Err(_) => {
+                        anyhow::bail!("R2T host-data: trailing data 读超时（host 半开/卡死）")
+                    }
+                }
+                pdu.data.extend_from_slice(&extra);
+            }
         }
         match r.accept_pdu(&pdu) {
             crate::AcceptOutcome::Continue => continue,

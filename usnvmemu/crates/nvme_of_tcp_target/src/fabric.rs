@@ -228,6 +228,63 @@ pub fn decode_connect_fields(sqe: &[u8]) -> Result<ConnectFabricFields, FabricEr
         .map_err(|_| FabricError::SqeLen { got: sqe.len() })
 }
 
+/// SGL Descriptor Type（SGL Identifier byte 高 4 位，spec NVMe Base 2.0）。
+pub mod sgl_type {
+    /// SGL Data Block descriptor；NVMe-oF 配 subtype 0x1（Offset）= **in-capsule** data。
+    pub const DATA_BLOCK: u8 = 0x0;
+    /// Transport SGL Data Block descriptor；NVMe-oF/TCP 配 subtype 0xA（transport-specific）
+    /// = data **经 transport 传**（host→controller 即 controller 发 R2T、host 回 H2CData）。
+    pub const TRANSPORT_DATA_BLOCK: u8 = 0x5;
+    /// Transport SGL 的 NVMe-oF subtype（transport-specific）。
+    pub const TRANSPORT_SUBTYPE: u8 = 0xA;
+}
+
+/// [`decode_connect_data_source`] 的结果：Connect data（固定 1024B）怎么取。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectDataSource {
+    /// data 已随 command capsule 到达（in-capsule，Linux + admin 常用）。
+    InCapsule,
+    /// transport SGL（type 0x5/subtype 0xA）— 须发 R2T 取 `len` 字节（Windows IO Connect）。
+    ViaR2t {
+        /// SGL 声明的 Connect data 字节数（恒 [`CONNECT_DATA_SIZE`]=1024）。
+        len: u32,
+    },
+    /// 既非合法 in-capsule 也非合法 transport SGL → reject SC=0x82。
+    Invalid,
+}
+
+/// **transport-SGL Connect data（2026-06-14，真 WS2025 互通实测）** — 据 Connect SQE 的
+/// SGL1（SQE byte 24..40 DPTR）+ 已到达的 in-capsule 字节数，判 Connect data 的来源。
+///
+/// SGL Descriptor 16-byte 布局：byte 0..8 Address / **byte 8..12 Length(u32 LE)** / byte 12..15
+/// rsvd / **byte 15 SGL Identifier**（高 nibble type / 低 nibble subtype）。故 SQE 内 Identifier
+/// = `sqe[39]`，Length = `sqe[32..36]`。
+///
+/// - `in_capsule_len == 1024` → `InCapsule`（data 已到齐，SGL 声明冗余；兼容 Linux/admin）。
+/// - `in_capsule_len == 0` 且 SGL = Transport(type 0x5/subtype 0xA) 且 SGL len == 1024 → `ViaR2t`
+///   （Windows：controller 发 R2T、host 回 H2CData 推 1024B Connect data）。
+/// - 其它（部分 in-capsule / 声称 in-capsule 却没送 / 畸形 SGL）→ `Invalid`。
+pub fn decode_connect_data_source(sqe: &[u8], in_capsule_len: usize) -> ConnectDataSource {
+    if in_capsule_len == CONNECT_DATA_SIZE {
+        return ConnectDataSource::InCapsule;
+    }
+    // 非满 in-capsule：只有「零 in-capsule + 合法 transport SGL」才走 R2T，否则畸形拒。
+    if sqe.len() != 64 || in_capsule_len != 0 {
+        return ConnectDataSource::Invalid;
+    }
+    let sgl_type = (sqe[39] >> 4) & 0x0F;
+    let sgl_subtype = sqe[39] & 0x0F;
+    let sgl_len = u32::from_le_bytes(sqe[32..36].try_into().unwrap());
+    if sgl_type == sgl_type::TRANSPORT_DATA_BLOCK
+        && sgl_subtype == sgl_type::TRANSPORT_SUBTYPE
+        && sgl_len == CONNECT_DATA_SIZE as u32
+    {
+        ConnectDataSource::ViaR2t { len: sgl_len }
+    } else {
+        ConnectDataSource::Invalid
+    }
+}
+
 /// 从 SQE byte 40..64 解出 [`PropertyFabricFields`]。
 pub fn decode_property_fields(sqe: &[u8]) -> Result<PropertyFabricFields, FabricError> {
     if sqe.len() != 64 {
@@ -395,5 +452,54 @@ mod tests {
         ));
         // attrib 高位被忽略
         assert_eq!(property_size_bytes(0b1111_1000).unwrap(), 4);
+    }
+
+    /// **transport-SGL Connect data** — `decode_connect_data_source` 全分支。
+    /// 用真 WS2025 互通实测的 SGL byte（admin in-capsule `0x01` / IO transport `0x5A`）。
+    #[test]
+    fn decode_connect_data_source_matrix() {
+        use ConnectDataSource::*;
+        // helper：build 一个 64B SQE，写 SGL1 identifier(byte39) + length(byte32..36)。
+        let sqe_with_sgl = |ident: u8, len: u32| -> [u8; 64] {
+            let mut s = [0u8; 64];
+            s[0] = NVME_OPC_FABRIC;
+            s[4] = fctype::CONNECT;
+            s[32..36].copy_from_slice(&len.to_le_bytes());
+            s[39] = ident;
+            s
+        };
+
+        // in-capsule 满 1024 → InCapsule（不看 SGL）。
+        assert_eq!(
+            decode_connect_data_source(&sqe_with_sgl(0x01, 1024), 1024),
+            InCapsule
+        );
+        // 真 Windows IO Connect：零 in-capsule + Transport SGL(0x5A) + len 1024 → ViaR2t。
+        assert_eq!(
+            decode_connect_data_source(&sqe_with_sgl(0x5A, 1024), 0),
+            ViaR2t { len: 1024 }
+        );
+        // 部分 in-capsule（截断）→ Invalid。
+        assert_eq!(
+            decode_connect_data_source(&sqe_with_sgl(0x01, 1024), 512),
+            Invalid
+        );
+        // 声称 in-capsule(type 0x0)却没送 data → Invalid。
+        assert_eq!(
+            decode_connect_data_source(&sqe_with_sgl(0x01, 1024), 0),
+            Invalid
+        );
+        // Transport SGL 但 subtype 非 0xA（type 0x5 subtype 0x0）→ Invalid（spec-strict）。
+        assert_eq!(
+            decode_connect_data_source(&sqe_with_sgl(0x50, 1024), 0),
+            Invalid
+        );
+        // Transport SGL 但 len != 1024 → Invalid。
+        assert_eq!(
+            decode_connect_data_source(&sqe_with_sgl(0x5A, 512), 0),
+            Invalid
+        );
+        // SQE 非 64 字节 → Invalid（与 decode_connect_fields 严格等长契约一致）。
+        assert_eq!(decode_connect_data_source(&[0u8; 32], 0), Invalid);
     }
 }

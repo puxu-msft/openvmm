@@ -11,12 +11,26 @@
 >
 > **置信度图例**:✅ 源码/probe 确认 / ❓ 仍未决(需真连) / ⚠️ caveat 成立 / ❌ 手册事实错误
 
-> **更新（2026-06-14）— usnvmemu 侧已修复**：static-model 盲区已在 usnvmemu 端落地 spec-conformant
-> 修复（C1 commit `e2c022575` Connect CNTLID 校验 + SCT 0x07→0x01 修复 + IPO/IATTR；C2 discovery
-> static-model 广告 + bin `--discovery-static-cntlid`）。下文 §2.1 描述的「静默 coerce」已改为：具体-
-> CNTLID mismatch → reject SC=0x82 + IPO/IATTR；dynamic/static-any/具体匹配 → accept；discovery 可广告
-> 具体 CNTLID。probe 4 绿 + discovery 测绿 + rust-reviewer APPROVE。**仍待母项目跑 real Windows 真连**
-> （§6 两组必测命令不变；TCP-vs-RDMA 单点 gate §5 仍未决）。
+> **更新（2026-06-14）— usnvmemu 侧已修复 + 🎉 真 WS2025 出盘实测打通**：
+> static-model 盲区已在 usnvmemu 端落地 spec-conformant 修复（C1 commit `e2c022575` Connect CNTLID
+> 校验 + SCT 0x07→0x01 修复 + IPO/IATTR；C2 discovery static-model 广告 + bin
+> `--discovery-static-cntlid`）。下文 §2.1 描述的「静默 coerce」已改为：具体-CNTLID mismatch → reject
+> SC=0x82 + IPO/IATTR；dynamic/static-any/具体匹配 → accept；discovery 可广告具体 CNTLID。
+>
+> **进一步：usnvmemu 团队自建 WS2025 Hyper-V VM 跑了 real Windows 真连**（不再待母项目）。结果：
+> - ✅ **手册「未证的 Windows 能连」现已 PROVEN**：真 WS2025 inbox initiator（`stornvmeofi.sys` /
+>   `nvmeofutil connect -ci`，static model）→ Hyper-V relay → usnvmemu target，`Get-Disk` 显
+>   **"NVMe OpenHCL Userspace NVMe v2.0" Online / 64 MiB**，raw 4KB write+read **byte-equal**。
+> - ✅ **§5 的 TCP-vs-RDMA 单点 gate 现已有答案**：**Windows inbox 支持 TCP**（实测出盘）——推翻手册
+>   「RDMA-only」倾向。VM 内 RDMA 驱动在场但无 RDMA NIC，故 RDMA 路本轮未测（V9 RDMA 仍独立成线）。
+> - 🔧 **真连暴露并修了第三个 transport-无关缺口（C3）**：Windows IO-queue Fabric Connect 的 1024B
+>   Connect data **不走 in-capsule、走 Transport SGL（type 0x5/subtype 0xA）经 R2T/H2CData**（因
+>   IOCCSZ=4 广告 IO 无 in-capsule，Windows 正确）；旧 target 在 parse 前 `data.len()!=1024` 拒掉、
+>   从不发 R2T → IO 队列建不起、不出盘。Linux nvme-cli 总 in-capsule 故纯 Linux 永远盖不到。修复保
+>   IOCCSZ=4、新增 transport-SGL Connect 路由 + R2T fetch + Windows H2CData PLEN=HLEN quirk 补读。
+>   regression gate `vt_windows_transport_sgl_connect.rs`（3 测，精确 Windows wire）。
+>
+> 仅剩 §3 DHCHAP DH-group 缺口未触发（VM 未配 in-band auth），留待需认证的真连场景。
 
 ---
 
