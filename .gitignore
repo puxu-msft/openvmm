@@ -21,6 +21,12 @@
 **/fuzz/corpus
 **/fuzz/artifacts
 **/fuzz/coverage
+# libfuzzer 在 CWD（fuzz/）写的 repro 单元（crash-/leak-/timeout-/oom-/slow-unit-）
+**/fuzz/crash-*
+**/fuzz/leak-*
+**/fuzz/timeout-*
+**/fuzz/oom-*
+**/fuzz/slow-unit-*
 
 # criterion output files
 **/target/criterion

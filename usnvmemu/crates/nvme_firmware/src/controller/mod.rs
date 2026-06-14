@@ -6551,6 +6551,12 @@ pub struct FuzzInvariants {
     pub sgl_ops: usize,
     /// in-flight PRP-list-chain op 数（`prp_list_ops` 表）。op 收尾后应回 0（无泄漏）。
     pub prp_list_ops: usize,
+    /// in-flight DBBUF shadow-poll 链数（`pending_shadow_polls` 表）。链 settle / 撞 cap
+    /// 收尾后应回 0（无泄漏）。**#3 fuzz_shadow_poll** oracle。
+    pub pending_shadow_polls: usize,
+    /// 待 drain 的 CMB 合成完成数（`cmb_completions` 队列）。顶层 drain 后应回 0。
+    /// **#4 fuzz_cmb_drain** oracle。
+    pub cmb_completions: usize,
     /// CSTS.CFS 是否置位（controller fatal）。I2：CFS 后 `on_dma_complete_impl` 入口短路、
     /// 不再派生新 DMA（喂会派生 DMA 的完成 → 0 条新出账）。
     pub cfs: bool,
@@ -6558,6 +6564,11 @@ pub struct FuzzInvariants {
     pub max_sgl_segments: u32,
     /// PRP-list chain 页数上限（`MAX_PRP_LIST_PAGES`）。
     pub max_prp_list_pages: u32,
+    /// DBBUF shadow-poll 每链自续深度上限（`MAX_SHADOW_POLL_ITERS`）。**cap 太大（65536），
+    /// fuzz oracle 用「自环驱动 → cfs 置位」而非数迭代**（见 fuzz_shadow_poll 注释）。
+    pub max_shadow_poll_iters: u32,
+    /// CMB drain 循环单次顶层调用迭代上限（`MAX_CMB_DRAIN_ITERS`）。同上，cap 很大（~1M）。
+    pub max_cmb_drain_iters: u32,
 }
 
 #[cfg(feature = "fuzzing")]
@@ -6569,9 +6580,13 @@ impl NvmeController {
             pending_ios: self.pending_ios.len(),
             sgl_ops: self.sgl_ops.len(),
             prp_list_ops: self.prp_list_ops.len(),
+            pending_shadow_polls: self.pending_shadow_polls.len(),
+            cmb_completions: self.cmb_completions.len(),
             cfs: (self.csts & csts::CFS) != 0,
             max_sgl_segments: MAX_SGL_SEGMENTS,
             max_prp_list_pages: MAX_PRP_LIST_PAGES,
+            max_shadow_poll_iters: Self::MAX_SHADOW_POLL_ITERS,
+            max_cmb_drain_iters: Self::MAX_CMB_DRAIN_ITERS,
         }
     }
 }

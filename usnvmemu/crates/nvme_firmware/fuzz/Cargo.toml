@@ -47,3 +47,10 @@ path = "fuzz_admin_dispatch.rs"
 test = false
 doc = false
 doctest = false
+
+[[bin]]
+name = "fuzz_shadow_poll"
+path = "fuzz_shadow_poll.rs"
+test = false
+doc = false
+doctest = false
