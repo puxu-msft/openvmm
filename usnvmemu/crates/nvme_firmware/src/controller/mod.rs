@@ -960,9 +960,14 @@ impl SglOp {
     }
 }
 
-/// **SGL×PI P-B** — `dispatch_sgl_{read,write}` 的 PI 参数（`None` = plain 路径）。
-/// separate-meta：host SGL 携纯 data（`data_bytes`/块），metadata 经 `mptr` 独立子-DMA
-/// （PRACT=0）；PRACT=1 时 controller 自算/strip tuple、无 MPTR（`mptr` 被忽略）。
+/// **SGL×PI P-B/P-C** — `dispatch_sgl_{read,write}` 的 PI 参数（`None` = plain 路径）。
+/// - **separate-meta**（P-B，`inline=false`）：host SGL 携纯 data（`data_bytes`/块），
+///   metadata 经 `mptr` 独立子-DMA（PRACT=0）。
+/// - **inline-meta**（P-C，`inline=true`）：PRACT=0 时 host SGL 携 **extended-block**
+///   （`block_bytes`/块，tuple 在流内），**无 MPTR**；PRACT=1 退化为 data-only（同 separate
+///   PRACT=1，controller 自算/strip）。
+///
+/// PRACT=1（无论 inline/separate）：controller 自算/strip、host 只传 data、`mptr` 忽略。
 pub(super) struct SglPiArgs {
     pub(super) mptr: u64,
     pub(super) pi_type: u8,
@@ -971,6 +976,8 @@ pub(super) struct SglPiArgs {
     pub(super) block_bytes: u32,
     pub(super) prchk: crate::pi::PrChk,
     pub(super) pract: bool,
+    /// NS metadata 形态：true=inline（extended-LBA，P-C）/ false=separate（MPTR，P-B）。
+    pub(super) inline: bool,
 }
 
 /// **Phase R2** — 单个 SGL 数据 fragment 的传输计划（walk 阶段构建）。

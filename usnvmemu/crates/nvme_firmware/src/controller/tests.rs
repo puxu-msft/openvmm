@@ -8946,6 +8946,202 @@ mod sgl_pi_pb {
         let writes = collect_writes(&cap);
         assert!(!writes.contains_key(&0x4000), "verify 失败不 scatter data");
     }
+
+    // ──────────────── P-C：inline-meta（extended-block 流，无 MPTR） ────────────────
+
+    /// inline-meta PI NS（meta_inline=true，block_bytes=4104，tuple 在流内）+ CQ。
+    fn pi_ns_inline(pi_first: bool) -> NvmeController {
+        let mut c = pi_ns(pi_first);
+        c.namespaces.get_mut(&1).unwrap().meta_inline = true;
+        c
+    }
+
+    /// **P-C WRITE inline PRACT=0 + extended-block 跨 fragment** — host SGL 携 extended-block
+    /// （nlb×4104，tuple 在流内），frag [2000][2104][4104] 让 block0 的 4104 跨 frag0/frag1。
+    /// 断：backing **原样** == host extended-block 流（store as-is，正交切轴守卫——finalize 只在
+    /// 拼回流上按 block_bytes 重切、绝不在 fragment 上切）；无 MPTR DmaRead；走 SglOp；success。
+    /// revert-verify：把 finalize 改在 fragment 上切（而非拼回流按 4104）→ block0 跨 frag 的断言转红。
+    #[test]
+    fn write_inline_pract0_extended_block_cross_fragment() {
+        for pi_first in [true, false] {
+            let mut c = pi_ns_inline(pi_first);
+            let lba0 = 1u64;
+            let n = 2usize;
+            let datas: Vec<Vec<u8>> = (0..n)
+                .map(|i| (0..DATA).map(|b| ((b * 7 + i * 3) & 0xff) as u8).collect())
+                .collect();
+            // host extended-block 流：每块 interleave([host tuple][data]) per pi_first（tuple 正确算）。
+            let mut stream = Vec::new();
+            for i in 0..n {
+                let t = crate::pi::PiTuple::compute(&datas[i], lba0 + i as u64, 1).to_bytes();
+                if pi_first {
+                    stream.extend_from_slice(&t);
+                    stream.extend_from_slice(&datas[i]);
+                } else {
+                    stream.extend_from_slice(&datas[i]);
+                    stream.extend_from_slice(&t);
+                }
+            }
+            assert_eq!(stream.len(), n * BLOCK);
+            // block0（4104）跨 frag0(2000)/frag1(2104)；block1 = frag2(4104)。
+            let (g0, g1, g2) = (0x4000u64, 0x6000u64, 0x8000u64);
+            let seg = seg_page(&[
+                data_block(g0, 2000),
+                data_block(g1, 2104),
+                data_block(g2, 4104),
+            ]);
+            let mut cap = CaptureTransport::with_start_token(0x100);
+            let r = {
+                let mut ctx = DeviceCtx::new(&mut cap);
+                // mptr=0：inline 无 MPTR。
+                let sqe = sgl_sqe(
+                    0x01,
+                    lba0,
+                    n as u32,
+                    0x80,
+                    false,
+                    0,
+                    0x2000,
+                    seg.len() as u32,
+                );
+                c.dispatch_io(&mut ctx, 1, sqe, 0x80, 0, 1)
+            };
+            assert!(r.is_none());
+            assert_eq!(c.sgl_ops.len(), 1, "走 SglOp");
+            drive(&mut c, &mut cap, &seg, Some(&stream), None);
+            assert!(c.sgl_ops.is_empty());
+            // backing == host extended-block 流（原样落盘，跨-fragment 正确重组）。
+            let ns = c.namespaces.get(&1).unwrap();
+            let mut back = vec![0u8; n * BLOCK];
+            ns.read_at(&mut back, lba0 * BLOCK as u64).unwrap();
+            assert_eq!(
+                back, stream,
+                "pi_first={pi_first} inline 原样落盘（extended block 跨 fragment 正确重组）"
+            );
+            // 无 MPTR(gpa=0) DmaRead。
+            let mptr = cap
+                .events()
+                .iter()
+                .any(|e| matches!(e, TransportEvent::DmaRead { gpa, .. } if *gpa == 0));
+            assert!(!mptr, "pi_first={pi_first} inline 无 MPTR DmaRead");
+            assert_eq!(
+                last_cqe_status(&cap),
+                Some(0),
+                "pi_first={pi_first} success"
+            );
+        }
+    }
+
+    /// **P-C READ inline PRACT=0** — backing extended-block → verify-all → scatter **extended
+    /// block**（data+tuple inline）per-frag，无 MPTR。oracle：每 frag DmaWrite == backing
+    /// extended-block 切片（含 inline tuple）。
+    #[test]
+    fn read_inline_pract0_extended_block() {
+        let mut c = pi_ns_inline(true);
+        let lba0 = 0u64;
+        let n = 2usize;
+        let datas: Vec<Vec<u8>> = (0..n)
+            .map(|i| (0..DATA).map(|b| ((b + i * 5) & 0xff) as u8).collect())
+            .collect();
+        let mut blocks = Vec::new();
+        {
+            let ns = c.namespaces.get_mut(&1).unwrap();
+            for i in 0..n {
+                let mut blk = vec![0u8; BLOCK];
+                let t = crate::pi::PiTuple::compute(&datas[i], lba0 + i as u64, 1).to_bytes();
+                blk[0..8].copy_from_slice(&t);
+                blk[8..8 + DATA].copy_from_slice(&datas[i]);
+                ns.write_at(&blk, (lba0 + i as u64) * BLOCK as u64).unwrap();
+                blocks.extend_from_slice(&blk);
+            }
+        }
+        // scatter 2 frag，各 4104（整 extended block）。
+        let (g0, g1) = (0x4000u64, 0x6000u64);
+        let seg = seg_page(&[data_block(g0, 4104), data_block(g1, 4104)]);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let sqe = sgl_sqe(
+                0x02,
+                lba0,
+                n as u32,
+                0x81,
+                false,
+                0,
+                0x2000,
+                seg.len() as u32,
+            );
+            assert!(c.dispatch_io(&mut ctx, 1, sqe, 0x81, 0, 1).is_none());
+        }
+        drive(&mut c, &mut cap, &seg, None, None);
+        let writes = collect_writes(&cap);
+        assert_eq!(
+            writes.get(&g0).map(|d| &d[..]),
+            Some(&blocks[0..BLOCK]),
+            "frag0 收整 extended block（含 inline tuple）"
+        );
+        assert_eq!(
+            writes.get(&g1).map(|d| &d[..]),
+            Some(&blocks[BLOCK..2 * BLOCK]),
+            "frag1 收整 extended block"
+        );
+        assert!(!writes.contains_key(&0x5000), "inline 无 MPTR");
+        assert_eq!(last_cqe_status(&cap), Some(0));
+    }
+
+    /// **P-C inline PRACT=1 strip** — inline NS + PRACT=1：controller strip meta，host 收
+    /// data-only（4096/frag，无 inline tuple、无 MPTR）。验证 inline NS 上 PRACT=1 退化为 data-only。
+    #[test]
+    fn read_inline_pract1_strips_to_data() {
+        let mut c = pi_ns_inline(true);
+        let lba0 = 0u64;
+        let n = 2usize;
+        let datas: Vec<Vec<u8>> = (0..n)
+            .map(|i| (0..DATA).map(|b| ((b * 3 + i) & 0xff) as u8).collect())
+            .collect();
+        {
+            let ns = c.namespaces.get_mut(&1).unwrap();
+            for i in 0..n {
+                let mut blk = vec![0u8; BLOCK];
+                let t = crate::pi::PiTuple::compute(&datas[i], lba0 + i as u64, 1).to_bytes();
+                blk[0..8].copy_from_slice(&t);
+                blk[8..8 + DATA].copy_from_slice(&datas[i]);
+                ns.write_at(&blk, (lba0 + i as u64) * BLOCK as u64).unwrap();
+            }
+        }
+        let (g0, g1) = (0x4000u64, 0x6000u64);
+        let seg = seg_page(&[data_block(g0, 4096), data_block(g1, 4096)]);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            // PRACT=1。
+            let sqe = sgl_sqe(
+                0x02,
+                lba0,
+                n as u32,
+                0x82,
+                true,
+                0,
+                0x2000,
+                seg.len() as u32,
+            );
+            assert!(c.dispatch_io(&mut ctx, 1, sqe, 0x82, 0, 1).is_none());
+        }
+        drive(&mut c, &mut cap, &seg, None, None);
+        let writes = collect_writes(&cap);
+        assert_eq!(
+            writes.get(&g0).map(|d| &d[..]),
+            Some(&datas[0][..]),
+            "PRACT=1 strip：frag0 data-only"
+        );
+        assert_eq!(
+            writes.get(&g1).map(|d| &d[..]),
+            Some(&datas[1][..]),
+            "frag1 data-only"
+        );
+        assert!(!writes.contains_key(&0x5000), "PRACT=1 无 MPTR");
+        assert_eq!(last_cqe_status(&cap), Some(0));
+    }
 }
 
 // ════════════════════════ Wave 3：proptest 属性测试 ════════════════════════
