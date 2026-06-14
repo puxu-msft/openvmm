@@ -57,12 +57,13 @@ NVMe-oF TCP 第 4 条接入。当前架构 ✅ 已对齐：firmware (controller)
 > e2e 仍 defer（须用户+Windows，同 vfio 的 real-guest-boot 档）。另：host-root §0 纯-4K
 > 真 nvme-cli 互通用户实测 PASS（commit bd100f7d）。
 >
-> **下一个 nvme-spec 补全（已 scoped，待实施）** → [admin-prp-data-transfer-completion](/usnvmemu/crates/nvme_firmware/docs/plans/2026-06-10-admin-prp-data-transfer-completion-detailed.md)：
-> `dma_write_then_complete` 把整 buf 连续写 prp1、无视 PRP2/list（7 admin 命令复用）→
-> 4–8 KiB log 在非连续 PRP 的真 host 上 latent silent corruption + > 8 KiB 直接拒。
-> 修=复用 IO read 的 device→host PRP 机件（NvmReadDualPrpSiblingHalf / PrpList*）。
-> silent-corruption-class，须完整严谨循环（含 revert-verify + 用新 OpenHCL harness 测
-> 非连续 PRP）。建议新 context 起手。
+> **✅ admin PRP 数据通路补全（已 SHIPPED 2026-06-10）** → [admin-prp-data-transfer-completion](/usnvmemu/crates/nvme_firmware/docs/plans/2026-06-10-admin-prp-data-transfer-completion-detailed.md)：
+> 原缺口：`dma_write_then_complete` 把整 buf 连续写 prp1、无视 PRP2/list（7 admin 命令复用）→
+> 4–8 KiB log 在非连续 PRP 真 host 上 latent silent corruption + > 8 KiB 直接拒。
+> **已修**（P1 `5a87cf08` 非连续 PRP1+PRP2 修 silent corruption + P2 `2a63a6d5` PRP list >8KiB
+> 去 Get Log Page 上限 + followup `cb48faee` cap Zone/Reservation Report 分配）：复用 IO read 的
+> device→host PRP 机件（NvmReadDualPrpSiblingHalf / PrpList*），8 call site 全传 `sqe.prp2`，删
+> `bytes_req>8192` 上限；OpenHCL harness 非连续 PRP + >8KiB 跨 list 全 revert-verified。
 
 > **2026-06-09 自主会话状态分类**（哪些能无人值守做、哪些卡外部）：
 > - **✅ 本会话已完成**：vfio spec-complete track 全部（握手 minor 协商 / max_msg_fds /

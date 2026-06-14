@@ -53,8 +53,9 @@ sq_head, cq_id)`，IO read 的 device→host 写与 admin 都调它（DRY），�
   + page1→PRP2(`NvmReadDmaWrite` completer)。**实施中发现 helper 非 admin-only**——io.rs 的
   Zone Report / Reservation Report 也用它且可 > 8 KiB，故 **> 2 页加了回退分支**（PRP2 是
   list 指针时回退旧连续写，留 P2），8 个 call site（6 admin + 2 io）全传 `sqe.prp2`。harness
-  test `openhcl_get_log_page_noncontiguous_prp`（非连续 PRP + sentinel）revert-verified。
-- **P2（> 2 页，async，PRP list）📋 待续**：把 P1 的 > 2 页**回退分支**换成真 list 处理。
+  test `openhcl_get_log_page_numd_clamp_no_2page_scatter`（非连续 PRP + sentinel；原名
+  `openhcl_get_log_page_noncontiguous_prp`，`6649ba78b` NUMD clamp 重构后改名）revert-verified。
+- **P2（> 2 页，async，PRP list）✅ SHIPPED `2a63a6d5`（+ followup `cb48faee`）**：把 P1 的 > 2 页**回退分支**换成真 list 处理。
   **复用路径已确认**：io.rs read > 2 页（`io.rs:880-918`）的 device→host list 写机件
   `PrpListOp{is_write:false, data_pages}` + `alloc_op_id` + `prp_list_ops` + 完成 arm
   `NvmReadPrpListFetch`/`NvmReadPrpListData`（completion.rs:1779/1852）可直接套——在
@@ -63,7 +64,7 @@ sq_head, cq_id)`，IO read 的 device→host 写与 admin 都调它（DRY），�
   num_blocks=0 跳过 SMART 计数（NvmReadDmaWrite 有 `if num_blocks>0` 守卫，list arm 须同样）。
   删 `admin.rs` 的 `bytes_req > 8192 → INVALID_FIELD` 上限。测试：> 8 KiB Get Log Page +
   guest-mem 放真 PRP list 页 + 非连续 entry，断言跨 list 正确落地 + revert-verify。
-- **P3（清理）**：审 caller buf 上界；README "未实现" 删该条 / ROADMAP 记 SHIPPED。
+- **P3（清理）✅ DONE**：审 caller buf 上界；README "未实现" 删该条 / ROADMAP 记 SHIPPED。
 
 ## 测试计划（**用本会话新建的 OpenHCL harness** + 单元）
 
@@ -96,7 +97,8 @@ sq_head, cq_id)`，IO read 的 device→host 写与 admin 都调它（DRY），�
 - 全量 firmware lib test + harness 4 test + clippy 0 warning；rust-reviewer 0 C/H/M。
 - `admin.rs` 删 > 8 KiB 上限；README "未实现" 删该条 / ROADMAP 记 SHIPPED。
 
-## 起手提示（新 context）
+## 起手提示（新 context）— ✅ 已执行完毕（保留作历史执行记录）
 
 read 本 plan + [[openhcl-pcie-remote-e2e-harness]]（测试载体）+ `git show <dma_write_then_complete>`
 现状。先 P1（含 revert-verify）单独 commit，再 P2。改 data-path 每步必 rust-reviewer。
+（实际执行：P1 `5a87cf08` → P2 `2a63a6d5` → followup `cb48faee`，全程 revert-verify + rust-reviewer 0 C/H。）
