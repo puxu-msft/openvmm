@@ -17,5 +17,11 @@ bytes = "1.10"
 libc = "0.2"
 memmap2 = "0.9"
 
+# fuzz-only：放宽 §22 unsafe 核（dma::map_dma_fd + 逐页 touch）的可见性，供 §22 mmap fuzz
+# target（fuzz/）把"map 决策 + 触碰每页不 SIGBUS"做成可断言 oracle。**生产构建不开 → 零额外
+# 公共面**（先例 nvme_firmware 的 `fuzzing` feature）。空 feature：仅 gate `__fuzz_map_and_touch`。
+[features]
+fuzzing = []
+
 [dev-dependencies]
 tracing-subscriber = "0.3.23"

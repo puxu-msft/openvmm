@@ -1,0 +1,45 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# **nested workspace** —— vfio_user_transport 被根 workspace exclude（standalone），故本 fuzz
+# crate 自带 `[workspace]` 空表脱离根 + 显式 pin（同 nvme_firmware/fuzz 约定）。
+[workspace]
+
+[package]
+name = "vfio_user_transport_fuzz"
+publish = false
+edition = "2024"
+rust-version = "1.95"
+
+[dependencies]
+# `fuzzing` feature 暴露 __fuzz_map_and_touch（§22 unsafe 核 + 逐页 volatile-touch）。
+# 生产构建不开 → 零额外公共面（先例 nvme_firmware）。
+vfio_user_transport = { path = "..", features = ["fuzzing"] }
+nix = { version = "0.30", features = ["socket", "uio", "fs", "mman"] }
+memmap2 = "0.9"
+libc = "0.2"
+arbitrary = { version = "1.3", features = ["derive"] }
+xtask_fuzz = { path = "../../../../xtask/xtask_fuzz" }
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libfuzzer-sys = "0.4"
+
+[package.metadata]
+cargo-fuzz = true
+
+# **§22 mmap fuzz target** —— 打 dma::map_dma_fd（唯一 unsafe 面）的 fstat 决策 + no-SIGBUS。
+[[bin]]
+name = "fuzz_map_dma_fd"
+path = "fuzz_map_dma_fd.rs"
+test = false
+doc = false
+doctest = false
+
+# **承重假设证明（故意崩，勿入 CI smoke）** —— 证 libfuzzer/ASan 能 catch 触碰未-backing
+# mmap 页的 SIGBUS（§22 用 SIGBUS-as-oracle 的前提）。每次都崩,**CI 必须 exclude**。
+[[bin]]
+name = "_proof_sigbus_catchable"
+path = "_proof_sigbus_catchable.rs"
+test = false
+doc = false
+doctest = false

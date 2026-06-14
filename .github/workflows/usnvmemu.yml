@@ -108,3 +108,23 @@ jobs:
             echo "::endgroup::"
           done
           exit "${fail}"
+
+      # vfio_user_transport §22 mmap fuzz crate（nested workspace）防 bit-rot：唯一 unsafe 面
+      # （dma::map_dma_fd 的 SIGBUS）的 fstat 决策 + no-SIGBUS oracle。真 coverage-guided（nightly+
+      # ASan，4M+ runs 全绿）不在本 gate；此处 = build + 定 seed blind smoke。
+      # **只列 fuzz_map_dma_fd**——绝不跑 `_proof_sigbus_catchable`（它故意触 SIGBUS 证 catch 能力，
+      # 跑必崩）；故显式列 target 名、**不** wildcard。
+      - name: fuzz build + smoke (vfio_user_transport §22)
+        if: always()
+        run: |
+          set -uo pipefail
+          cd usnvmemu/crates/vfio_user_transport/fuzz
+          cargo build --bin fuzz_map_dma_fd
+          echo "::group::fuzz smoke fuzz_map_dma_fd"
+          if ./target/debug/fuzz_map_dma_fd -runs=20000 -max_total_time=15 -timeout=10 -seed=1; then
+            echo "fuzz_map_dma_fd: ok"
+          else
+            echo "::error::fuzz_map_dma_fd smoke failed"
+            exit 1
+          fi
+          echo "::endgroup::"

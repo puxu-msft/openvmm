@@ -516,6 +516,45 @@ fn map_dma_fd(
     }
 }
 
+/// **fuzz-only（`fuzzing` cargo feature；生产构建不编译 → 零公共面增量）** —— §22 mmap fuzz
+/// target 的单一自包含入口：把 client 声明的 `(offset, size)` 经 [`map_dma_fd`]（含 fstat 决策）
+/// 映射 `fd`，**成功则逐页 volatile-touch** 触发任何无-backing 页的 SIGBUS（由 ASan/libfuzzer
+/// 捕获），返 [`map_dma_fd`] 的 `Result` 供 fuzz 决策 oracle 比对。
+///
+/// 见 `docs/plans/2026-06-14-section22-mmap-fuzz.md`。覆盖**仅 `map_dma_fd` 的 backing 完整性**
+/// （§22 SIGBUS 本体）；`mmap_read/write` 的 region-relative 边界（SAFETY #3）由 wire-level fuzz 守。
+///
+/// **volatile 必需**：无副作用的普通读会被优化器 DCE 消除 → SIGBUS 永不触发 → oracle 静默失效。
+#[cfg(feature = "fuzzing")]
+pub fn __fuzz_map_and_touch(
+    fd: &std::os::fd::OwnedFd,
+    offset: u64,
+    size: u64,
+    writeable: bool,
+) -> std::io::Result<()> {
+    let m = map_dma_fd(fd, offset, size, writeable)?;
+    let bytes = m.as_bytes();
+    let ptr = bytes.as_ptr();
+    let len = bytes.len();
+    // 逐页首字节 + 末字节 volatile-touch（per-block `#[allow(unsafe_code)]`，同 map_dma_fd 纪律）。
+    let mut off = 0usize;
+    while off < len {
+        #[allow(unsafe_code)]
+        // SAFETY: `off < len`，`ptr.add(off)` 在映射区间内；read_volatile 防 DCE，触发无-backing
+        // 页 SIGBUS（被测若错误 accept 越界则在此暴露，由 ASan/libfuzzer 捕获）。
+        let v = unsafe { core::ptr::read_volatile(ptr.add(off)) };
+        std::hint::black_box(v);
+        off += 4096;
+    }
+    if len > 0 {
+        #[allow(unsafe_code)]
+        // SAFETY: `len-1 < len`，末字节在映射区间内。
+        let v = unsafe { core::ptr::read_volatile(ptr.add(len - 1)) };
+        std::hint::black_box(v);
+    }
+    Ok(())
+}
+
 /// 处理 DMA_UNMAP cmd。
 pub fn handle_dma_unmap(
     stream: &mut UnixStream,
