@@ -39,9 +39,8 @@
 #![cfg_attr(all(target_os = "linux", target_env = "gnu"), no_main)]
 
 use arbitrary::Arbitrary;
-use nvme_firmware::NvmeController;
 use nvme_firmware::cmd::Sqe;
-use pcie_device_core::{CaptureTransport, DeviceCtx, PcieDevice, TransportEvent};
+use pcie_device_core::DeviceCtx;
 use xtask_fuzz::fuzz_target;
 
 /// NVMe 4 KiB host page；PRP-list 页 = 512 个 u64 entry。
@@ -125,31 +124,14 @@ fn self_loop_list_page(prp2_gpa: u64) -> Vec<u8> {
     serialize_entries(&entries)
 }
 
-/// tmpfile RAII 守卫（panic 也删，不漏 /tmp；同 fuzz_sgl_chain）。
-struct TmpImg(std::path::PathBuf);
-impl Drop for TmpImg {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+mod common;
 
 fn run(input: PrpListChainInput) {
-    // 进程内一次性 tmpfile-backed controller。libfuzzer 每个输入调一次 run()。
-    let path = std::env::temp_dir().join(format!("nvme_fuzz_prplist_{}.img", std::process::id()));
-    let f = match std::fs::File::create(&path) {
-        Ok(f) => f,
-        Err(_) => return,
+    // 进程内一次性 tmpfile-backed controller（建 1 MiB image + open + cap，见 common.rs）。
+    let (mut c, mut cap, _img) = match common::open_tmpfile_controller("prplist") {
+        Some(t) => t,
+        None => return,
     };
-    if f.set_len(1024 * 1024).is_err() {
-        return;
-    }
-    drop(f);
-    let _img = TmpImg(path.clone());
-    let mut c = match NvmeController::open(&[path.to_str().unwrap().to_string()], 0x1414, 0, &[]) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let mut cap = CaptureTransport::with_start_token(0x100);
 
     // prp2 = PRP-list 页 GPA（**页对齐**，否则 validate_prp2 提前拒）。
     const PRP1_GPA: u64 = 0x10_0000; // 页对齐 data 页
@@ -173,62 +155,32 @@ fn run(input: PrpListChainInput) {
         let _ = c.nvme_io_dispatch(&mut ctx, /*sq_id*/ 1, sqe, 0x40, /*cq_id*/ 1);
     }
 
-    // 同步驱动循环：服务**所有**未服务 DMA——DmaRead（= list-页 fetch，喂 fuzzer list 页）
-    // 与 DmaWrite（= data scatter / CQE-post，喂空）。服务 write 是 op 表 drain oracle 的前提
-    // （只服务 read 会留 in-flight write → op 永不收尾 → 误判泄漏）。
-    // 依赖不变量：`guest_read`/`guest_write` 每次 mint 唯一 token、`CaptureTransport` 不回收。
-    let mut serviced = std::collections::HashSet::new();
-    let mut fetch_idx = 0usize;
-    let mut dma_reads = 0u32;
-    let mut total_dmas = 0u32;
-    loop {
-        // 优先未服务 DmaRead（带 len）；其次未服务 DmaWrite（None = 喂空 ok=true）。
-        let next = cap.events().iter().find_map(|e| match e {
-            TransportEvent::DmaRead { token, len, .. } if !serviced.contains(token) => {
-                Some((*token, Some(*len)))
-            }
-            TransportEvent::DmaWrite { token, .. } if !serviced.contains(token) => {
-                Some((*token, None))
-            }
-            _ => None,
-        });
-        let Some((token, read_len)) = next else {
-            break; // 全 drain：链收尾（成功 scatter+CQE / 精确错误 CQE / 截断）。
-        };
-        serviced.insert(token);
-        total_dmas += 1;
-        if total_dmas > ITER_SAFETY_CAP {
-            panic!(
-                "PRP-list chain 超 ITER_SAFETY_CAP 仍未排空（疑似 MAX_PRP_LIST_PAGES 守卫失效/无限 fetch）"
-            );
-        }
-
-        let mut ctx = DeviceCtx::new(&mut cap);
-        match read_len {
-            Some(len) => {
-                // list-页 fetch：耗尽 input.list_pages 后回退到 chain→prp2 自身自环页
-                // （压 MAX_PRP_LIST_PAGES 深度守卫）。
-                let mut bytes = if fetch_idx < input.list_pages.len() {
-                    let page = &input.list_pages[fetch_idx];
-                    let n = page.entries.len().min(MAX_ENTRIES_PER_FED_PAGE);
-                    serialize_entries(&page.entries[..n])
-                } else {
-                    self_loop_list_page(PRP2_GPA)
-                };
-                // 模型真 transport（dma_read_sync 强制 reply.len == 请求 len）：补/截到请求长度。
-                bytes.resize(len as usize, 0);
-                // DMA-read 完成 ok 标志：fail_mask 对应 bit（覆盖读失败清理路径）。`& 31` 防溢出。
-                let ok = (input.fail_mask >> (dma_reads & 31)) & 1 == 0;
-                fetch_idx += 1;
-                dma_reads += 1;
-                c.on_dma_complete(&mut ctx, token, ok, bytes);
-            }
-            None => {
-                // DmaWrite 完成：data 空、ok=true（正常落盘 / CQE-post）。
-                c.on_dma_complete(&mut ctx, token, true, Vec::new());
-            }
-        }
-    }
+    // O(N) DMA-drain（见 common::drive_dma_drain）：服务所有 DMA——DmaRead = list-页 fetch、
+    // DmaWrite = data scatter/CQE-post（喂空 ok=true，helper 自动；服务 write 是 op 表 drain oracle
+    // 前提，只服务 read 会留 in-flight write 致误判泄漏）。read 的 list-页 fetch 逻辑见 feed 闭包。
+    common::drive_dma_drain(
+        &mut c,
+        &mut cap,
+        ITER_SAFETY_CAP,
+        "PRP-list chain 超 ITER_SAFETY_CAP 仍未排空（疑似 MAX_PRP_LIST_PAGES 守卫失效/无限 fetch）",
+        |_token, len, idx| {
+            let i = idx as usize;
+            // list-页 fetch：耗尽 input.list_pages 后回退到 chain→prp2 自身自环页
+            // （压 MAX_PRP_LIST_PAGES 深度守卫）。
+            let mut bytes = if i < input.list_pages.len() {
+                let page = &input.list_pages[i];
+                let n = page.entries.len().min(MAX_ENTRIES_PER_FED_PAGE);
+                serialize_entries(&page.entries[..n])
+            } else {
+                self_loop_list_page(PRP2_GPA)
+            };
+            // 模型真 transport（dma_read_sync 强制 reply.len == 请求 len）：补/截到请求长度。
+            bytes.resize(len as usize, 0);
+            // DMA-read 完成 ok 标志：fail_mask 对应 bit（覆盖读失败清理路径）。`& 31` 防溢出。
+            let ok = (input.fail_mask >> (idx & 31)) & 1 == 0;
+            (ok, bytes)
+        },
+    );
 
     // ── 内部不变式 oracle（`fuzzing` feature，见 DMA_COMPLETION_INVARIANTS.md）──
     // 命令全 drain 后 op 表必清空（无 op_id 泄漏）。**CFS 例外**（I2）：CFS 置位时入口短路、

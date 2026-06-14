@@ -23,9 +23,8 @@
 #![cfg_attr(all(target_os = "linux", target_env = "gnu"), no_main)]
 
 use arbitrary::Arbitrary;
-use nvme_firmware::NvmeController;
 use nvme_firmware::cmd::Sqe;
-use pcie_device_core::{CaptureTransport, DeviceCtx, PcieDevice, TransportEvent};
+use pcie_device_core::DeviceCtx;
 use xtask_fuzz::fuzz_target;
 
 /// 与 `controller::MAX_SGL_SEGMENTS`(=64) 同思路的安全上限：远超之，用来 catch
@@ -97,31 +96,14 @@ fn sgl_read_sqe(cid: u16, slba: u64, nlb: u32, seg_addr: u64, seg_len: u32, id_b
     }
 }
 
-/// tmpfile RAII 守卫（panic 也删，不漏 /tmp；同 POC）。
-struct TmpImg(std::path::PathBuf);
-impl Drop for TmpImg {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+mod common;
 
 fn run(input: SglChainInput) {
-    // 进程内一次性 tmpfile-backed controller。libfuzzer 每个输入调一次 run()。
-    let path = std::env::temp_dir().join(format!("nvme_fuzz_sgl_{}.img", std::process::id()));
-    let f = match std::fs::File::create(&path) {
-        Ok(f) => f,
-        Err(_) => return,
+    // 进程内一次性 tmpfile-backed controller（建 1 MiB image + open + cap，见 common.rs）。
+    let (mut c, mut cap, _img) = match common::open_tmpfile_controller("sgl") {
+        Some(t) => t,
+        None => return,
     };
-    if f.set_len(1024 * 1024).is_err() {
-        return;
-    }
-    drop(f);
-    let _img = TmpImg(path.clone());
-    let mut c = match NvmeController::open(&[path.to_str().unwrap().to_string()], 0x1414, 0, &[]) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let mut cap = CaptureTransport::with_start_token(0x100);
 
     const SEG_GPA: u64 = 0xA_0000;
     let sgl1_len = (input.sgl1_len as u32) & !0xF; // 16 对齐
@@ -140,58 +122,35 @@ fn run(input: SglChainInput) {
         let _ = c.nvme_io_dispatch(&mut ctx, /*sq_id*/ 1, sqe, 0x40, /*cq_id*/ 1);
     }
 
-    // 同步驱动循环：服务**所有**未服务 DMA——DmaRead（= segment-页 fetch，喂 fuzzer 段页）
-    // 与 DmaWrite（= data scatter / CQE-post，喂空 ok=true）。服务 write 是 op 表 drain oracle
-    // 的前提（只服务 read 会留 in-flight write → op 永不收尾 → 误判泄漏）。
-    // 依赖不变量：`guest_read`/`guest_write` 每次 mint 唯一 token、`CaptureTransport` 不回收。
-    let mut serviced = std::collections::HashSet::new();
-    let mut fetch_idx = 0usize;
-    let mut dma_reads = 0u32;
-    let mut total_dmas = 0u32;
-    loop {
-        // 优先未服务 DmaRead（Some(())=read）；其次未服务 DmaWrite（None = 喂空）。
-        let next = cap.events().iter().find_map(|e| match e {
-            TransportEvent::DmaRead { token, .. } if !serviced.contains(token) => Some((*token, true)),
-            TransportEvent::DmaWrite { token, .. } if !serviced.contains(token) => {
-                Some((*token, false))
-            }
-            _ => None,
-        });
-        let Some((token, is_read)) = next else {
-            break; // 全 drain：链收尾（成功 scatter+CQE / 精确错误 CQE / hop 截断）。
-        };
-        serviced.insert(token);
-        total_dmas += 1;
-        if total_dmas > ITER_SAFETY_CAP {
-            panic!("SGL chain 超 ITER_SAFETY_CAP 仍未排空（疑似 hop guard 失效/无限 fetch）");
-        }
-
-        let mut ctx = DeviceCtx::new(&mut cap);
-        if !is_read {
-            // DmaWrite 完成：data 空、ok=true（正常落盘 / CQE-post）。
-            c.on_dma_complete(&mut ctx, token, true, Vec::new());
-            continue;
-        }
-        // segment-页 fetch：耗尽 input.segments 后回退到 cont→自身自环页（压 hop guard）。
-        let bytes = if fetch_idx < input.segments.len() {
-            let page = &input.segments[fetch_idx];
-            let n = page.descs.len().min(MAX_DESCS_PER_PAGE);
-            serialize_descs(&page.descs[..n])
-        } else {
-            // 自环：单条 Segment(0x20) 指回 SEG_GPA。
-            let mut d = [0u8; 16];
-            d[0..8].copy_from_slice(&SEG_GPA.to_le_bytes());
-            d[8..12].copy_from_slice(&16u32.to_le_bytes());
-            d[15] = 0x20;
-            d.to_vec()
-        };
-        // DMA-read 完成 ok 标志：fail_mask 对应 bit（覆盖读失败清理路径）。`& 31` 防溢出
-        // （>32 hop 后失败 pattern 周期复用，coverage nit 非 bug）。
-        let ok = (input.fail_mask >> (dma_reads & 31)) & 1 == 0;
-        fetch_idx += 1;
-        dma_reads += 1;
-        c.on_dma_complete(&mut ctx, token, ok, bytes);
-    }
+    // O(N) DMA-drain（见 common::drive_dma_drain）：服务所有 DMA——DmaRead = segment-页 fetch、
+    // DmaWrite = data scatter/CQE-post（喂空 ok=true，由 helper 自动；服务 write 是 op 表 drain
+    // oracle 前提，只服务 read 会留 in-flight write 致误判泄漏）。read 的 fetch 逻辑见 feed 闭包。
+    common::drive_dma_drain(
+        &mut c,
+        &mut cap,
+        ITER_SAFETY_CAP,
+        "SGL chain 超 ITER_SAFETY_CAP 仍未排空（疑似 hop guard 失效/无限 fetch）",
+        |_token, _len, idx| {
+            let i = idx as usize;
+            // segment-页 fetch：耗尽 input.segments 后回退到 cont→自身自环页（压 hop guard）。
+            let bytes = if i < input.segments.len() {
+                let page = &input.segments[i];
+                let n = page.descs.len().min(MAX_DESCS_PER_PAGE);
+                serialize_descs(&page.descs[..n])
+            } else {
+                // 自环：单条 Segment(0x20) 指回 SEG_GPA。
+                let mut d = [0u8; 16];
+                d[0..8].copy_from_slice(&SEG_GPA.to_le_bytes());
+                d[8..12].copy_from_slice(&16u32.to_le_bytes());
+                d[15] = 0x20;
+                d.to_vec()
+            };
+            // DMA-read 完成 ok 标志：fail_mask 对应 bit（覆盖读失败清理路径）。`& 31` 防溢出
+            // （>32 hop 后失败 pattern 周期复用，coverage nit 非 bug）。
+            let ok = (input.fail_mask >> (idx & 31)) & 1 == 0;
+            (ok, bytes)
+        },
+    );
 
     // ── 内部不变式 oracle（`fuzzing` feature，见 DMA_COMPLETION_INVARIANTS.md）──
     // 命令全 drain 后 SGL op 表必清空（无 op_id 泄漏）。**CFS 例外**（I2）：CFS 置位时
