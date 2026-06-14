@@ -20,7 +20,7 @@ V-followup-tls/mtls/auth/dhchap(1..4d) ──> V-followup-prp-list ──> V-int
 - **vfio-user-in-underhill**：W0 ──> W6c（DMA 零拷贝真机 PROVEN）──> Layer C C0/C2-0 ──>
   **Option B 收口**（usnvmemu Lost = transient 停顿 + C-3 透明重连；hot-remove/re-add 模型真机证伪，
   改"设备恒在 + 透明重连"贴真硬件 controller reset）✅
-- **CMB 双模（trap-based + map-based 并存）**：进行中（有 commit 落地，详 crate `docs/plans/`）；**#4c-b PRP 统一段抽象**：✅ 全 PI 路径（plain / separate nlb=1/2/N>2 / inline nlb=1/≥2）全 tier（Single/Dual/List）PRP1 任意页内偏移零 spec-legal 例外（P0–P3 + 收尾，详 crate plan）
+- **CMB 双模（trap-based + map-based 并存）**：✅ **L4 真机达成**（QEMU+真 Linux nvme trap+map 双模 SQ-in-CMB PASS；达成前修两个真机暴露的寄存器 bug——CMBSZ 位布局非 spec-aligned + CMBMSC 跨 Controller Reset 误清，commit `3a1779c1d`）；**零拷贝 CMB-on-OpenHCL 真机证伪**（host GET `create_ram_gpa_range` 对任意 GPA／含真 VPCI 设备 BAR 窗口／backend-live 一律 FAILED，4 轮真机+2 reviewer，详 `experiments/2026-06-14-cmb-zerocopy-openhcl-phase1/`）→ OpenHCL 上唯一可用 CMB=trap 模式；OpenHCL client BAR prefetchable follow-up 裁定 WONTFIX。详 crate `docs/plans/`。**#4c-b PRP 统一段抽象**：✅ 全 PI 路径（plain / separate nlb=1/2/N>2 / inline nlb=1/≥2）全 tier（Single/Dual/List）PRP1 任意页内偏移零 spec-legal 例外（P0–P3 + 收尾，详 crate plan）
 - **下一步（vfio-underhill track）**：W6 usnvmemu 独立托管服务（VTL2 boot 自启动，替代 operator 手动 push）—— 规划中，尚无 commit 落地
 
 **项目愿景** (用户 2026-06-06 explicit, [PROJECT_VISION.md](PROJECT_VISION.md))：
