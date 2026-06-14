@@ -10,7 +10,7 @@
 > **逐 flag 的 build/run/interop 操作手册**见 [crate README](../crates/nvme_of_tcp_target/README.md)
 > ——本文与 README 分工：**本文讲「为什么 / 怎么运转 / 在哪」，README 讲「怎么 build、怎么开某个 flag」**。
 >
-> **最后更新**：2026-06-13（V-series 冻结于 V-interop-8；全栈 shipped，306 tests）。
+> **最后更新**：2026-06-14（V-series 全栈 shipped；**真 WS2025 Windows interop 打通 C1/C2/C3**，§7）。
 
 ---
 
@@ -20,7 +20,8 @@
 一个普通 Linux/Windows 主机用**未打补丁的 `nvme-cli`**（`nvme connect -t tcp`）就能挂载它、跑真 IO，
 就像连一台真的 NVMe-oF 存储。它是 firmware-as-core 的**第 4 条接入**（前三条走 PCIe：OpenHCL vsock /
 OpenVMM / vfio-user），唯一**不经 PCIe、走网络 fabric** 的那条。已真机实证：真 Linux `nvme-tcp.ko`
-（kernel 6.6.114）plaintext discover + connect + IO 双向互通。
+（kernel 6.6.114）plaintext discover + connect + IO 双向互通；**2026-06-14 真 Windows Server 2025
+inbox initiator（`stornvmeofi`）也实测出盘**（static controller model，§7）。
 
 ## 2. 是什么（拆解）
 
@@ -196,6 +197,29 @@ TLS server-auth（`--tls-*`）→ mTLS 强制 client cert（`--tls-client-ca`）
 - **跨进程 Python harness 22 scenarios 通过**（uv-managed venv，stdlib only，0 sudo；commit
   `57d12a7b8` 为 spec-wire-conformance 收尾）。
 
+### 🎉 2026-06-14 真 WS2025 Windows interop 打通（V-followup-static-controller-model，C1+C2+C3）
+
+V-series 冻结后，母项目 Windows NVMe-oF 互通手册（2026-06-13 交接）暴露一个 usnvmemu 在**纯 Linux
+环境结构性看不见**的盲区 = **static controller model**：Windows inbox initiator（`stornvmeofi.sys` /
+`nvmeofutil`）默认 `connect -ci`（static），而 Linux `nvme-cli` 默认 dynamic（`0xFFFF`）。usnvmemu 团队
+自建 WS2025 Hyper-V VM 跑 real Windows 真连，**全栈打通出盘**——`Get-Disk` 显
+**"NVMe OpenHCL Userspace NVMe v2.0" Online / 64 MiB**，raw 4KB write+read **byte-equal**。推翻手册
+「RDMA-only」倾向 = **Windows inbox 支持 TCP 实证**。三处 transport-无关修复（都因 Linux nvme-cli 默认
+行为而纯 Linux 永远盖不到，[MILESTONES §4.14](MILESTONES.md)）：
+
+- **C1**（commit `e2c022575`）—— Connect CNTLID 校验（dynamic/static-any/具体匹配 → accept；具体
+  mismatch → reject SC=0x82 + IPO/IATTR）+ **SCT 修复 0x07→0x01**（fabrics SC 应 Command Specific，
+  既存 wire bug，self-consistent 测试一起骗过——又一次「自洽≠spec」，见 §6）。
+- **C2**（commit `9f1ae4d87`）—— discovery static-model 广告 + bin `--discovery-static-cntlid`。
+- **C3**（commit `4df5c3f83`）—— **transport-SGL Connect data via R2T**：Windows IO-queue Connect 的
+  1024B data 不走 in-capsule、走 **Transport SGL（`sqe[39]=0x5A`）经 R2T/H2CData**（因 `IOCCSZ=4`
+  广告 IO 无 in-capsule，Windows 正确）；旧 target parse 前 `data.len()!=1024` 拒、从不发 R2T → IO
+  队列建不起、不出盘。修复保 IOCCSZ=4、新增 transport-SGL 路由 + R2T fetch + **Windows H2CData
+  PLEN=HLEN quirk** 补读（Windows CommonHdr PLEN 不计 data、违 TP-8000，data 长由 PSH DATAL 给）。
+
+> 仅剩 §6 的 DHCHAP DH-group 缺口未触发（VM 未配 in-band auth）；RDMA 路 VM 内有驱动但无 RDMA NIC，
+> V9 RDMA 仍独立成线。这条线的 transport-无关 fabric 修复（C1/C2）将被 V9 RDMA 继承。
+
 此后项目重心转向 **firmware-as-core 三 PCIe 接入真机化**（见 auto-memory `vfio-user-underhill-state`），
 NVMe-oF 大体冻结于此状态。**后续 todos 都卡外部依赖**（见 §6 末 + ROADMAP §1）。
 
@@ -204,7 +228,8 @@ NVMe-oF 大体冻结于此状态。**后续 todos 都卡外部依赖**（见 §6
 | 想了解 | 读这篇 |
 |---|---|
 | **逐 flag build / run / nvme-cli interop / 每个安全开关怎么开** | [crate README](../crates/nvme_of_tcp_target/README.md)（使用手册，含 openssl/nvme-cli 配方） |
-| **每个 V phase 的 commit + 带注解弯路 + 9 个 wire blocker** | [MILESTONES.md §4](MILESTONES.md)（4.1–4.13，V4 → V-followup） |
+| **每个 V phase 的 commit + 带注解弯路 + 9 个 wire blocker** | [MILESTONES.md §4](MILESTONES.md)（4.1–4.14，V4 → V-followup → Windows interop） |
+| **Windows inbox interop / static controller model / transport-SGL Connect** | [MILESTONES §4.14](MILESTONES.md) + 证据本位回应 [usnvmemu-response-to-ws-handbook.md](../experiments/2026-06-13-openhcl-vpci-nvme/usnvmemu-response-to-ws-handbook.md) + [ADR-008](../crates/nvme_of_tcp_target/docs/DECISIONS.md) |
 | **wire 字节布局（PDU 各字段 offset）** | [specs/2026-06-04-nvme-tcp-wire-reference.md](../crates/nvme_of_tcp_target/docs/specs/2026-06-04-nvme-tcp-wire-reference.md) |
 | **跨切面决策（为什么这样收口）** | [crate DECISIONS.md](../crates/nvme_of_tcp_target/docs/DECISIONS.md)（ADR-003 tokio / 004 Python harness / 005 双 CHAP wire / 006 session chunking / 007 不 fork rustls）；跨项目 ADR 见 [项目 DECISIONS](DECISIONS.md) |
 | **TLS PSK 为什么不注入 rustls** | [plans/2026-06-06-phase-v-followup-tls-psk-survey.md](../crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v-followup-tls-psk-survey.md) |

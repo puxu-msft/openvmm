@@ -2,8 +2,9 @@
 
 **V-followup-dhchap-4d + V-followup-tls-psk (TP-8011) 全栈** — NVMe-over-Fabrics TCP target backed by
 [`nvme_firmware`](/usnvmemu/crates/nvme_firmware/) `NvmeController`。
-Linux ≥ 5.0 / Windows Server 2025 上的标准 `nvme-cli` 可通过
-`nvme connect -t tcp` 直接挂载并跑 IO。
+Linux ≥ 5.0 上的标准 `nvme-cli`（`nvme connect -t tcp`）或 **Windows Server 2025 inbox initiator**
+（`stornvmeofi.sys` / `nvmeofutil connect`）可直接挂载并跑 IO。**2026-06-14 真 WS2025 实测出盘**
+（static controller model + transport-SGL Connect，见 Status / [NVME_OF_TCP.md §7](/usnvmemu/docs/NVME_OF_TCP.md)）。
 
 > **本 README 是 build/run/interop 使用手册**；想先建立这条线的**全貌**（是什么 / 数据流 / 关键模型 /
 > 教学-生产边界 / 文档地图）请读自上而下导览 **[NVME_OF_TCP.md](/usnvmemu/docs/NVME_OF_TCP.md)**。
@@ -14,7 +15,7 @@ Linux ≥ 5.0 / Windows Server 2025 上的标准 `nvme-cli` 可通过
 > - [ROADMAP.md](/usnvmemu/docs/ROADMAP.md) — 短/中/长期 phase 列表 (动态)，按 Tier 1/2/3 优先级排
 > - [PRINCIPLES.md](/usnvmemu/docs/PRINCIPLES.md) — 不变约束 + coding policy + subagent reviewer prompt 模板 + 测试命名约定
 > - [LESSONS.md](/usnvmemu/docs/LESSONS.md) — 18 条踩坑教训 (含 decision-then-IO 借用模式 / WebFetch 工作流 / 手算 offset 速查表 / doc audit 必配 git log)
-> - [DECISIONS.md](/usnvmemu/crates/nvme_of_tcp_target/docs/DECISIONS.md) — 本 crate ADR (003-007)；跨切面见 [项目 DECISIONS](/usnvmemu/docs/DECISIONS.md)
+> - [DECISIONS.md](/usnvmemu/crates/nvme_of_tcp_target/docs/DECISIONS.md) — 本 crate ADR (003-008)；跨切面见 [项目 DECISIONS](/usnvmemu/docs/DECISIONS.md)
 > - [tls-psk-survey.md](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-06-phase-v-followup-tls-psk-survey.md)
 >   — rustls external-PSK 调研 + 决策
 > - [extract-from-openvmm-survey.md](/usnvmemu/docs/2026-06-06-phase-x-extract-from-openvmm-survey.md)
@@ -26,7 +27,7 @@ Linux ≥ 5.0 / Windows Server 2025 上的标准 `nvme-cli` 可通过
 
 **所有 phase 代码 + 测试 shipped**: 306 lib + integration tests pass，clippy 0 warning（冻结点 commit `714029df1`）。
 
-**已 verified 在真 Linux nvme-cli**: plaintext `discover` + `connect` + IO (kernel 6.6.114 nvme-tcp.ko, WSL2)。**TLS / mTLS / DH-HMAC-CHAP 等安全栈未走真 Linux nvme-cli 实测**，只走 lib test + Python harness (跨进程但同一份 Rust 算法对自家 Python 算法)。真 third-party host interop 是下一步 HIGH (见 [ROADMAP §1](/usnvmemu/docs/ROADMAP.md))。
+**已 verified 在真 Linux nvme-cli**: plaintext `discover` + `connect` + IO (kernel 6.6.114 nvme-tcp.ko, WSL2)。**2026-06-14 真 WS2025 Windows inbox initiator 也实测出盘**（`stornvmeofi`/`nvmeofutil`，static controller model + transport-SGL Connect via R2T，见下表 + [MILESTONES §4.14](/usnvmemu/docs/MILESTONES.md)）。**TLS / mTLS / DH-HMAC-CHAP 等安全栈未走真 host 实测**，只走 lib test + Python harness (跨进程但同一份 Rust 算法对自家 Python 算法)。
 
 | Phase 组 | 状态 | 关键 commit |
 |---------|------|------------|
@@ -44,6 +45,7 @@ Linux ≥ 5.0 / Windows Server 2025 上的标准 `nvme-cli` 可通过
 | V-followup-tls-psk (TP-8011 deterministic crypto) | ✅ shipped | `43040427` |
 | V-interop-1..8 (真 Linux nvme-cli + Python harness) | ✅ shipped | 多 commit |
 | Linux nvme-cli plaintext discover + connect + IO 真互通 | ✅ verified | [LESSONS](/usnvmemu/docs/LESSONS.md) §14 |
+| **真 WS2025 Windows inbox interop (static model + transport-SGL Connect via R2T)** | ✅ verified (真机出盘) | C1 `e2c022575` / C2 `9f1ae4d87` / C3 `4df5c3f83` |
 
 下一步 HIGH 优先 (见 [ROADMAP §1](/usnvmemu/docs/ROADMAP.md)):
 - real-host CHAP interop (跑真 Linux nvme-cli `--dhchap-secret`)

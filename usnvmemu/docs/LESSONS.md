@@ -888,3 +888,36 @@ DmaRead/DmaWrite 的 `(gpa,len)`**——`CaptureTransport` 不截断喂入，光
 **来源**：#4c-b P3（2026-06-14，commits `31ea153`/`3e28ee8`/`823f3fe`/`19bd047`，各 ecc:rust-reviewer
 APPROVE 0 C/H/M）。全 PI 路径全 tier PRP1 偏移零 spec-legal 例外，见 MILESTONES §1.8 + plan
 `2026-06-13-4cb-unified-prp-segment-abstraction.md`。
+
+## 33. 跨实现互通的盲区藏在「另一端默认走的窄路」之外 —— 真异构对端是唯一 oracle (HIGH)
+
+**症状**：NVMe-oF TCP target 在纯 Linux（`nvme-cli` + `nvme-tcp.ko`）全栈 shipped、真机互通绿、306
+tests 绿、已"冻结"。但真 WS2025 Windows inbox initiator 一连，IO 队列建不起来、不出盘。深挖出**三个**
+纯 Linux 永远盖不到的缺口，全因 Linux nvme-cli 的**默认行为**把 spec 允许的岔路遮住了：
+
+1. **static controller model**：Linux nvme-cli 默认 dynamic（Connect CNTLID=`0xFFFF`），Windows inbox
+   默认 `connect -ci`（static 具体 CNTLID）。target 旧码无视 host 请求的 CNTLID 静默返 1——non-conformant，
+   但 dynamic host 永不送具体值，故测不出。修=校验 + reject mismatch（C1）。
+2. **transport-SGL Connect data**：Linux 总把 1024B Connect data 放 **in-capsule**；Windows IO Connect
+   走 **Transport SGL（`sqe[39]=0x5A`）经 R2T/H2CData**（因 target 自己广告 `IOCCSZ=4`=IO 无 in-capsule，
+   Windows 是对的）。target 旧码 parse 前 `data.len()!=1024` 拒、从不发 R2T。修=transport-SGL 路由 + R2T
+   fetch（C3，ADR-008）。
+3. **SCT 0x07→0x01**：fabrics SC(0x80-0x9F) 原用 SCT=0x07 Vendor Specific（既存 wire bug），self-consistent
+   测试一起骗过——**self-consistent ≠ spec-conformant 第 N 次**（见 §17 同根、auto-memory
+   `review-not-optional-self-consistent-trap`）。Windows 校验 SCT 才暴露。
+
+**可迁移教训**：
+- **这是 [[fuzz-the-contract-not-current-impl]] 在 interop 维度的重演**：契约（spec 允许 static + transport-SGL）
+  比"当前唯一消费方（Linux nvme-cli）碰巧怎么调"宽，宽出来的那部分藏 latent 缺口。**真异构对端**（另一个
+  独立实现的 host）是行使契约这些角落的唯一 oracle——自家两端（Rust target ↔ 自家 Python harness）共享
+  同一套窄假设，永远互相盖不到。
+- **定位手法**：relay 旁路抓 **byte-log**，解码 host 的**第一个决策分叉**（admin Connect vs IO Connect 的
+  SGL type byte 差异）一眼定位根因，**别从最深症状（IO 不出盘）反推**——符合 [[debug-root-cause-at-driver-first-branch]]。
+- **真机也可能 non-conformant**：Windows H2CData 把 CommonHdr PLEN 设为 HLEN（不计 data、违 TP-8000），
+  健壮实现据 PSH DATAL 补读（越界仍拒）。对端违规不等于自己跟着违规，而是"宽容接收 + 自己发严格"。
+- **方法论**：一条线"shipped + 真机绿 + 冻结"只代表**测过的那条 host 路径**对，不代表 spec 契约全覆盖。
+  新接一个独立实现的对端 = 一次廉价但高价值的契约 fuzz。
+
+**来源**：V-followup-static-controller-model C1（`e2c022575`）/ C2（`9f1ae4d87`）/ C3（`4df5c3f83`），
+2026-06-14 真 WS2025 出盘 PROVEN。详 MILESTONES §4.14 + ADR-008 + 证据本位回应
+`experiments/2026-06-13-openhcl-vpci-nvme/usnvmemu-response-to-ws-handbook.md`。
