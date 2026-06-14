@@ -1,0 +1,58 @@
+# usnvmemu — libvfio-user differential oracle（ADR-013 vfio 行 Tier B，opt-in / cadence）。
+#
+# 为什么独立于 usnvmemu.yml（always-on gate）：本 job **非 hermetic**——运行时从 GitHub clone
+# 一个 pinned libvfio-user + meson/ninja build + apt 装 libjson-c/cmocka。按 ADR-013，重/非
+# hermetic 的真第三方 oracle 走 **Tier B 专属 opt-in job**，不入每-commit always-on gate
+# （否则无关 PR 会因网络/C 构建波动而红）。
+#
+# 它验什么：Nutanix 官方 C 库 libvfio-user 的 `samples/client`（**真·第三方独立实现**，区别于
+# usnvmemu 自家的 Python harness / 手搓 Rust client / 真 kernel frozen-vector）对我们的 vfio-user
+# server 跑协议前缀，确认 VERSION/GET_INFO/GET_REGION_INFO/GET_IRQ_INFO/config-read/bogus-region
+# wire-conformant。历史上 catch 过 2 个真 conformance bug（commit 533432ec）。判定逻辑 +
+# pin/refresh 见 `usnvmemu/crates/vfio_user_transport/scripts/interop_py/run_libvfio_differential.sh`。
+#
+# 触发：手动 workflow_dispatch（opt-in）+ 周一 cadence（第三方 libvfio-user 上游漂移检查）。
+
+name: usnvmemu libvfio-user differential
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 周一 04:17 UTC（off-peak、非整点 —— 错开 fleet 整点拥塞）。cadence 检 libvfio-user 漂移。
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  differential:
+    name: libvfio-user vs nvme_firmware vfio-user
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust 1.95
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- --default-toolchain=1.95.0 -y
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install libvfio-user build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build libjson-c-dev libcmocka-dev pkg-config build-essential
+
+      # nvme_firmware **必需** protoc：经 pcie_remote_protocol → mesh 的 `prost` feature 进构建图，
+      # `.cargo/config.toml` 把 PROTOC 指向 `.packages/...`（clean runner 无缓存必须 restore）。
+      - name: Restore packages (protoc)
+        run: cargo xflowey restore-packages --no-compat-igvm
+
+      - name: Build nvme_firmware (vfio-user feature)
+        working-directory: usnvmemu/crates/nvme_firmware
+        run: cargo build --features vfio-user
+
+      # runner 自己 clone+build pinned libvfio-user、spawn server、跑官方 client、断言协议前缀
+      # 差分信号（bogus-region EINVAL + 到达 vid 断言）。退出 0=差分通过。
+      - name: Run libvfio-user differential
+        run: bash usnvmemu/crates/vfio_user_transport/scripts/interop_py/run_libvfio_differential.sh

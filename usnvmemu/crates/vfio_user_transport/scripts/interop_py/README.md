@@ -50,6 +50,11 @@ nvme_firmware --vfio-user-sock /tmp/x.sock --backing-file /tmp/x.img &
 /tmp/libvfio-user/build/samples/client /tmp/x.sock
 ```
 
+**已自动化（2026-06-14，ADR-013 vfio Tier B）**：上述手动复现已固化为 runner
+`run_libvfio_differential.sh`（pinned libvfio-user commit + 自动断言"bogus-region EINVAL +
+到达 vid 断言"= 协议前缀差分通过）+ opt-in/cadence CI job `.github/workflows/usnvmemu-libvfio-differential.yml`
+（非 hermetic 故不入 always-on gate）。revert-verify 实证：注入 region-info 回归 → runner FAIL。
+
 **已验证（官方实现确认我们的协议层）**：VERSION 握手 / bogus-region → EINVAL /
 GET_DEVICE_INFO(9 region, 5 irq) / GET_REGION_INFO 全 9 region 尺寸+flags /
 bulk config-space read。
