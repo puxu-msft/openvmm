@@ -124,9 +124,12 @@ READ 侧 `prp_pi_read_scatter`：盘上 verify-all→按 SegLens 切 data_pages�
   - 每路径 O=0 回归（与改造前逐字节一致）+ O>0 新档差分 oracle 全绿；
     `dispatch_segs`/`SegLens` 在此被消费 → 移除其 `#[allow(dead_code)]`。
 
-- **P4（roadmap，需详化 gate）**：评估 plain Dual 是否并入统一 List dispatch。
-  建议裁定：plain Dual 保留直发（热路径零拷贝）但用 `dispatch_segs` 算长度，
-  不强并 List（无正确性缺口）。进入前确认无 spec-legal plain 路径被遗漏。
+- **P4 ✅ `33d60a467`**：plain READ/WRITE dispatch 段长统一经 `dispatch_segs`（单一几何真相源，
+  与各 PI 路径一致）。plain Dual **保留直发零拷贝、不并入 List**（Single 1 DMA / Dual 2 DMA +
+  WriteAccum/ReadAccum / List 走 PrpListOp 不变），只把 `tier()`+散落的 `first_seg_len`/`bytes-first`
+  换成 `dispatch_segs` 枚举取段长，**行为逐字节不变**。价值=设计一致性/单一真相源（用户 2026-06-14
+  纠正：可读性/一致性是本项目目标，非「无性能收益即低价值」）。rust-reviewer APPROVE 0 C/H/M
+  （byte-equivalent 逐点核验）+ 178 tests + revert-verify（Dual len0/len1 对调转红）。
 
 
 ## 测试矩阵（差分 oracle 四件套）
