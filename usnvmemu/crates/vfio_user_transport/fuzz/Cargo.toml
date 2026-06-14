@@ -18,6 +18,8 @@ vfio_user_transport = { path = "..", features = ["fuzzing"] }
 nix = { version = "0.30", features = ["socket", "uio", "fs", "mman"] }
 memmap2 = "0.9"
 libc = "0.2"
+# DmaMapPayload.as_bytes()（§22 B wire-level harness 序列化 DMA_MAP payload）。pin 同 transport crate。
+zerocopy = { version = "0.8", features = ["derive"] }
 arbitrary = { version = "1.3", features = ["derive"] }
 xtask_fuzz = { path = "../../../../xtask/xtask_fuzz" }
 
@@ -31,6 +33,16 @@ cargo-fuzz = true
 [[bin]]
 name = "fuzz_map_dma_fd"
 path = "fuzz_map_dma_fd.rs"
+test = false
+doc = false
+doctest = false
+
+# **§22 B wire-level fuzz target** —— 经真 socketpair + SCM_RIGHTS + 真 wire Message 驱 pub
+# handle_dma_map（wire 解析 + 校验 + checked_add 溢出 + table.insert），再驱 mmap_read/write 的
+# region-relative 边界（SAFETY #3，A 直驱 map_dma_fd 未覆盖）。
+[[bin]]
+name = "fuzz_handle_dma_map"
+path = "fuzz_handle_dma_map.rs"
 test = false
 doc = false
 doctest = false

@@ -555,6 +555,36 @@ pub fn __fuzz_map_and_touch(
     Ok(())
 }
 
+/// **fuzz-only（`fuzzing` cargo feature；生产构建不编译 → 零公共面增量）** —— §22 B wire-level
+/// fuzz target 驱 [`DmaTable::mmap_read`]/[`DmaTable::mmap_write`]（`pub(crate)`，外部 fuzz crate
+/// 不可直接调）的单一入口：用 attacker 控的 `(gpa, len)`/`(gpa, data)` 行使**region-relative 边界**
+/// （`off = gpa - region.addr` + `off+len ≤ 真实映射长度 bytes.len()` 校验，SAFETY #3）。
+///
+/// 见 `docs/plans/2026-06-14-section22-mmap-fuzz.md`（§22 B 段）。区别于 [`__fuzz_map_and_touch`]
+/// （§22 A 直驱 `map_dma_fd` 的 backing 完整性）：本入口打**已映射 region 上的 sub-access 边界**——
+/// 即便 map 本身（fstat）正确，`gpa`/`len` 越过 region 内偏移仍可能 OOB，是 A 未覆盖的缺口。
+///
+/// **不走 `dma_read_sync`/`dma_write_sync`**：那两个 pub 入口在 `mmap_read`/`write` 返 `None`
+/// （Message-backed / 越界）时**回退 wire 路径阻塞等 client reply** → fuzz 无 client 会 hang。直驱
+/// mmap 层隔离 gap-2、无阻塞。
+///
+/// **oracle**：observable-only。`mmap_read` 内 `bytes[off..end].to_vec()` 是真读——若内部边界校验
+/// 错（off 算错 / 用 region.size 而非 bytes.len()），Rust slice 越界 panic（libfuzzer catch）或裸
+/// OOB（ASan catch）。`black_box` 防 DCE 确保读真发生。不加语义自洽断言（避自证陷阱）。
+#[cfg(feature = "fuzzing")]
+pub fn __fuzz_mmap_access(table: &mut DmaTable, gpa: u64, len: u32, write: Option<&[u8]>) {
+    match write {
+        Some(data) => {
+            // mmap_write：copy_from_slice 写真映射；越界校验错则 panic/OOB。
+            std::hint::black_box(table.mmap_write(gpa, data));
+        }
+        None => {
+            // mmap_read：bytes[off..end].to_vec() 读真映射；black_box 防整调用被 DCE。
+            std::hint::black_box(table.mmap_read(gpa, len));
+        }
+    }
+}
+
 /// 处理 DMA_UNMAP cmd。
 pub fn handle_dma_unmap(
     stream: &mut UnixStream,
