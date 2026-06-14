@@ -28,6 +28,7 @@ uv run python <script>.py
 | `load_test.py` | V-interop-7 (多 conn 并发 IO) | 默认 plaintext |
 | `pure_4k_e2e.py` | **纯-4K over fabric** (Format NS→4K + 扇区感知单/dual PRP + chunking + MDTS cap=32) | 加 `--allow-format` |
 | `fused_cw_e2e.py` | **Fused Compare-and-Write over fabric** (原子 CAS：匹配→Write 生效 / 不匹配→Write 不写 + 双 0x85) | 默认 plaintext |
+| `static_cntlid_e2e.py` | **static controller model** (Connect CNTLID 校验：dynamic/static-any/具体匹配 accept、mismatch→SC=0x82+SCT=0x01+IPO/IATTR；`--discovery-static-cntlid` 广告) | 自启 bin，无需手动 flag |
 
 ## 加新 script
 
