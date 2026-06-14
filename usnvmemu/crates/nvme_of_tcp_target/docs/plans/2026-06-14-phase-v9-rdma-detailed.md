@@ -193,8 +193,15 @@ trait RdmaVerbs {
 >     RdmaFabricBackend 接入 AsyncSession（须 AsyncSession 泛化于 FabricBackend）。
 > - **⏳ R3c**：**AsyncSession 泛化于 `FabricBackend`**（现持具体 `TcpFabricBackend<S>`）+ 多 QP ↔ session 聚合
 >   （per-QP backend，共享 `SharedControllerInner` keyed by cntlid，R0 §F）+ association teardown / QP drain。
-> - **⏳ R3d**：admin 全路径过 RDMA mock（Identify/Set-Features/AER/Keep-Alive）+ Discovery-over-RDMA
->   （`NVME_TRTYPE_RDMA`）+ IRD/ORD/CQ-depth sizing。
+>   - **✅ R3c-1 DONE**（commit `05323fe9b`）：AsyncSession `<S:AsyncSessionStream>`→`<B:FabricBackend=TcpFabricBackend
+>     <TokioStream>>`；`FabricBackend` 加 `terminate(fes)`（TCP=C2HTerm/RDMA=QP teardown）；335 tests 绿 byte-identical
+>     clippy clean；rust-reviewer 无 C/H，**确认 dispatch/pump/Drop 已 backend-agnostic、R3d 不翻车**。
+>   - **⏳ R3c-2**：RDMA 构造器（类比 `accept_and_handshake_async`，built `RdmaFabricBackend` + 填 `negotiated` 默认）
+>     + 多 QP 聚合 + teardown（terminate fes→neutral reason 顺手换）。
+> - **⏳ R3d**：admin 全路径过 RDMA mock + Discovery-over-RDMA（`NVME_TRTYPE_RDMA`）+ IRD/ORD/CQ-depth sizing。
+>   **⚠️ 发现（R3c-1 review）**：admin 返数据命令（Identify 4KB）的 e2e 需**桥层把命令 capsule 的 keyed-SGL 抽出
+>   作 `HostBuf::Keyed` 喂 move_local_to_host**（现桥硬编 `FlowControlled`）——这是 R4 的桥层 HostBuf 来源债，故
+>   R3d 真 admin-data e2e 与 R4 keyed-SGL 桥**交织**；CQE-only 命令（Keep-Alive/Set-Features）可先在 R3d 走通。
 
 - **What**：CM Private Data Connect（喂 `fabric.rs` 复用解码）+ admin capsule over SEND（against Mock）+ **recv-buffer 池 + repost（遗漏 RNR）** + IRD/ORD/CQ-depth sizing + **多 QP ↔ session 聚合（落实 R0(c) 决策：admin+IO queue 各 QP 如何挂进 session 模型）** + **association teardown / QP drain 时序（in-flight R/W flush 后才释放）** + Discovery-over-RDMA 填 `NVME_TRTYPE_RDMA`/RDMA TRADDR。
 - **Acceptance**：controller admin 全路径过 RDMA mock（Identify/Set-Features/AER/Keep-Alive）；recv 池耗尽/repost 测试;多 QP 建立/拆除 + drain 时序测试。
