@@ -1361,35 +1361,34 @@ impl NvmeController {
                             sc::DATA_TRANSFER_ERROR,
                         ));
                     }
-                    // 逐块按 pi_first 拆 tuple + data 并 **verify-all stored PI**；任一失败 →
-                    // 同步 Media SCT=2 错误（首个失败类型 via to_sc()），不 DMA-write 到 host。
-                    let mut data_pages: Vec<Vec<u8>> = Vec::with_capacity(nlb as usize);
-                    let mut tuples: Vec<[u8; 8]> = Vec::with_capacity(nlb as usize);
-                    for i in 0..nlb as usize {
-                        let blk = &blocks[i * block_bytes..(i + 1) * block_bytes];
-                        let (tuple_bytes, data_part): ([u8; 8], &[u8]) = if pi_first {
-                            (blk[0..8].try_into().unwrap(), &blk[8..8 + data_bytes])
-                        } else {
-                            (
-                                blk[data_bytes..data_bytes + 8].try_into().unwrap(),
-                                &blk[0..data_bytes],
-                            )
-                        };
-                        let stored_tuple = crate::pi::PiTuple::from_bytes(&tuple_bytes);
-                        match stored_tuple.verify(
-                            data_part,
-                            slba + i as u64,
-                            pi_type,
-                            crate::pi::PrChk::from_cdw12(cdw12),
+                    // **SGL×PI P-A** — verify-all stored PI + split 收敛到共享纯函数
+                    // `pi_read_verify_split`（SGL separate READ P-B 复用，避免两份漂移 §32）。
+                    // 失败 → 同步 Media SCT=2（首个失败类型 via to_sc()，与 WRITE 对称；separate
+                    // 不 push error-log）。OK → dense data 平面（== 旧 data_pages flatten）+ tuple
+                    // concat（N×8，== 旧 tuples flatten，下方一条 MPTR DMA-write）。
+                    let read_geom = crate::controller::PiGeom {
+                        pi_type,
+                        pi_first,
+                        data_bytes: data_bytes as u32,
+                        block_bytes: block_bytes as u32,
+                        prchk: crate::pi::PrChk::from_cdw12(cdw12),
+                        pract: false,
+                    };
+                    let (stream, meta_concat) =
+                        match crate::controller::completion::pi_read_verify_split(
+                            &blocks,
+                            &read_geom,
+                            slba,
+                            nlb as usize,
                         ) {
-                            crate::pi::PiCheck::Ok => {}
-                            other => {
+                            Ok(parts) => parts,
+                            Err((other, lba_i)) => {
                                 // **reviewer M-1**：映射具体失败类型（Guard 0x82 / RefTag 0x84 /
                                 // AppTag 0x83）而非恒 0x82，与 WRITE 侧对称（spec § 4.6.1）。
                                 let sc_byte = other.to_sc().unwrap_or(0x82);
                                 tracing::warn!(
                                     nsid,
-                                    lba = slba + i as u64,
+                                    lba = lba_i,
                                     ?other,
                                     "separate-meta READ: stored PI verify 失败"
                                 );
@@ -1401,19 +1400,12 @@ impl NvmeController {
                                     sc::status(sc_byte, sc::SCT_MEDIA_DATA_INTEGRITY),
                                 ));
                             }
-                        }
-                        data_pages.push(data_part.to_vec());
-                        tuples.push(tuple_bytes);
-                    }
-                    // **#4c-b P3②** — 全 OK → 拼回连续 data 流 → 按 **host 段**（`dispatch_segs`）
+                        };
+                    // **#4c-b P3②** — 全 OK → dense data 流按 **host 段**（`dispatch_segs`）
                     // scatter：Single=PRP1 整 data；Dual=PRP1 首段 page−O + PRP2 余 O（PRP1 偏移
                     // O>0 时一个 LBA 的 data 跨 2 段）。外加 tuple concat（N×8）→ MPTR 一条。全部
                     // 完成（remaining→0）后 success CQE。O=0 时段恰整页、与旧 per-LBA scatter 逐字节
                     // 一致。
-                    let mut stream = Vec::with_capacity(nlb as usize * data_bytes);
-                    for page in &data_pages {
-                        stream.extend_from_slice(page);
-                    }
                     let segs: Vec<(u64, u32)> =
                         match crate::controller::prp::dispatch_segs(prp1, prp2, sep_data_total) {
                             crate::controller::prp::DispatchSegs::Single { prp1, len } => {
@@ -1823,9 +1815,9 @@ impl NvmeController {
                     );
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte));
                 }
-                let prp_tier = crate::controller::prp::tier(prp_off, bytes);
-                match prp_tier {
-                    crate::controller::prp::PrpTier::Single => {
+                // **#4c-b P4** — 段长统一经 `dispatch_segs`（同 WRITE，单一几何源，行为逐字节不变）。
+                match crate::controller::prp::dispatch_segs(prp1, prp2, bytes) {
+                    crate::controller::prp::DispatchSegs::Single { prp1, .. } => {
                         let tok = self.guest_write(ctx, prp1, buf);
                         self.pending_ios.insert(
                             tok,
@@ -1839,8 +1831,10 @@ impl NvmeController {
                             },
                         );
                     }
-                    crate::controller::prp::PrpTier::Dual => {
-                        let s = crate::controller::prp::first_seg_len(prp_off, bytes) as usize;
+                    crate::controller::prp::DispatchSegs::Dual {
+                        prp1, len0, prp2, ..
+                    } => {
+                        let s = len0 as usize;
                         let (b1, b2) = buf.split_at(s);
                         let tok1 = self.guest_write(ctx, prp1, b1.to_vec());
                         let tok2 = self.guest_write(ctx, prp2, b2.to_vec());
@@ -1867,7 +1861,7 @@ impl NvmeController {
                             },
                         );
                     }
-                    crate::controller::prp::PrpTier::List => {
+                    crate::controller::prp::DispatchSegs::List { prp1, .. } => {
                         // **Phase E** — PRP list path (Read > 2 page)。按 prp::page_size 分段
                         // （首段含偏移），data_pages[i] = 该页逻辑切片。
                         let total_pages = crate::controller::prp::total_pages(prp_off, bytes);
@@ -2727,10 +2721,13 @@ impl NvmeController {
                     );
                     return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte));
                 }
-                let prp_tier = crate::controller::prp::tier(prp_off, bytes);
-                match prp_tier {
-                    crate::controller::prp::PrpTier::Single => {
-                        let tok = self.guest_read(ctx, prp1, bytes as u32);
+                // **#4c-b P4** — 三档分流 + 段长统一经 `dispatch_segs`（单一几何真相源，与各 PI
+                // 路径一致）：Single/Dual 段长直取自枚举（替代散落的 first_seg_len+bytes-first）；
+                // List 首段同样取自枚举、余页计数仍用 total_pages/page_size。保留直发（热路径零拷贝，
+                // 不强并 List）。行为与旧 tier-match 逐字节一致。
+                match crate::controller::prp::dispatch_segs(prp1, prp2, bytes) {
+                    crate::controller::prp::DispatchSegs::Single { prp1, len } => {
+                        let tok = self.guest_read(ctx, prp1, len);
                         self.pending_ios.insert(
                             tok,
                             PendingIo {
@@ -2746,7 +2743,12 @@ impl NvmeController {
                             },
                         );
                     }
-                    crate::controller::prp::PrpTier::Dual => {
+                    crate::controller::prp::DispatchSegs::Dual {
+                        prp1,
+                        len0,
+                        prp2,
+                        len1,
+                    } => {
                         let op_id = self.alloc_op_id();
                         self.dual_prp_writes.insert(
                             op_id,
@@ -2762,10 +2764,8 @@ impl NvmeController {
                                 prp2_data: None,
                             },
                         );
-                        let first = crate::controller::prp::first_seg_len(prp_off, bytes);
-                        let prp2_bytes = (bytes - first) as u32;
-                        let tok1 = self.guest_read(ctx, prp1, first as u32);
-                        let tok2 = self.guest_read(ctx, prp2, prp2_bytes);
+                        let tok1 = self.guest_read(ctx, prp1, len0);
+                        let tok2 = self.guest_read(ctx, prp2, len1);
                         self.pending_ios.insert(
                             tok1,
                             PendingIo {
@@ -2795,7 +2795,7 @@ impl NvmeController {
                             },
                         );
                     }
-                    crate::controller::prp::PrpTier::List => {
+                    crate::controller::prp::DispatchSegs::List { prp1, first_len } => {
                         // **Phase E** — PRP list path (Write > 2 page)。
                         let total_pages = crate::controller::prp::total_pages(prp_off, bytes);
                         let op_id = self.alloc_op_id();
@@ -2833,9 +2833,8 @@ impl NvmeController {
                                 op: PendingOp::NvmWritePrpListFetch { op_id },
                             },
                         );
-                        // 同时 fetch PRP1 数据页（页 idx 0）—— 含偏移时首段 = page-O。
-                        let first = crate::controller::prp::first_seg_len(prp_off, bytes) as u32;
-                        let tok_prp1 = self.guest_read(ctx, prp1, first);
+                        // 同时 fetch PRP1 数据页（页 idx 0）—— 含偏移时首段 = page-O（取自 dispatch_segs）。
+                        let tok_prp1 = self.guest_read(ctx, prp1, first_len);
                         self.pending_ios.insert(
                             tok_prp1,
                             PendingIo {
