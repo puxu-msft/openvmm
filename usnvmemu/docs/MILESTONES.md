@@ -301,6 +301,11 @@ W6a（单 commit `571ad805`）：
 - 设计/承重假设/评审 archive：`docs/superpowers/plans/2026-06-13-w6-usnvmemu-vtl2-autostart.md`。
 - **未来（非本期）**：supervised restart（区分 graceful-exit vs crash，对齐 fatal-death 哲学）/ persistent backing（tmpfs backing 重启即失）/ 多设备。
 
+### 3.7 CMB（Controller Memory Buffer）双模真机达成 + 零拷贝-on-OpenHCL 真机证伪（2026-06-13/14）
+
+- **L4 真机达成**（QEMU 11 + 真 Linux 6.8 nvme，trap+map 双模 SQ-in-CMB PASS，三 oracle 一致）。**达成前修两个真机暴露的 firmware 寄存器 bug**（均 self-consistent trap，唯真驱动 oracle 暴露）：① **CMBSZ 位布局非 spec-aligned**（SQS 编 bit4 而非 §3.1.14 bit0、SZU bits3:0 而非 11:8），真 Linux 解码成 SQS=0 拒用 CMB——测试 `cmbsz_field_offsets_match_spec` 反 enshrine 错布局；② **CMBMSC 跨 Controller Reset 误清**（`disable()` 清 cre/cmse/cba，但真 Linux `nvme_map_cmb` 仅编程一次依赖其持久；QEMU `nvme_ctrl_reset` 不动 cmbmsc）。commit `3a1779c1d`，归档 `experiments/2026-06-13-cmb-l4-realmachine-qemu/`。
+- **零拷贝 CMB-on-OpenHCL 真机证伪**（2026-06-14）：custom underhill 探针在真 Gen2 Hyper-V 调 host GET `create_ram_gpa_range`——对任意空洞/RAM identity/i440bx 式/**真 VPCI 设备 BAR 窗口**(0x127400000)/**backend-live device Live** 一律 FAILED（4 轮真机迭代 + 2 轮独立 reviewer 共识；GED-stub 假阴性经 iter-1 的 INVALID_GPA 排除、API 误用经错码排除）。→ §5 零拷贝路径卡在 host primitive，OpenHCL 上**唯一可用 CMB=trap 模式**；推翻 feasibility 实验"create_ram_gpa_range 生产已证"的未验证推断（i440bx 是 Gen1、本 VM Gen2 从不走它）。client BAR prefetchable follow-up 裁定 WONTFIX。归档 `experiments/2026-06-14-cmb-zerocopy-openhcl-phase1/` + 计划 `docs/superpowers/plans/2026-06-13-cmb-zerocopy-openhcl-gap-closure.md`。
+
 ---
 
 ## 4. NVMe-oF TCP target（V4 → V-followup）
