@@ -320,6 +320,28 @@ portal；多 portal 走 [[nvme-of-tcp-real-linux-interop-milestone]] 验过。
 **Acceptance**：起 target with `--discovery-target-addr A:p1 -p A:p2 -p A:p3`，
 `nvme discover -t tcp -a A -s 4420` 输出 3 个 entry，每个 NQN/IP/Port 正确。
 
+### V-followup-static-controller-model (Tier 2, MEDIUM, 纯代码可做 — Windows interop 盲区)
+
+**What**：让 fabric Connect 真读 `cd.cntlid` 并按 spec § 3.3 处理 static controller
+model：honor 已知 CNTLID / 接受 `0xFFFF`(dynamic)·`0xFFFE`(static-any) / 对不可满足的
+**具体** CNTLID 请求返 SC=0x82(Connect Invalid Parameters)，而非现在的**静默 coerce 成 1**。
+Discovery Log 增加 static-portal 选项（可播具体 CNTLID 而非只 `0xFFFF`）。
+
+**Why（来源 = 母项目 Windows NVMe-oF 互通手册 2026-06-13 交接）**：Windows inbox
+initiator(`stornvmeofi`/`nvmeofutil`)**默认 static controller model**(`add SubsystemPort
+-dy false` / `connect -ci`)。Linux `nvme-cli` 默认 dynamic(发 `0xFFFF`)，所以**现有全部
+Linux interop 测试结构性盖不到 static 路径**。实测坐实当前缺口：
+- Discovery 写死 `cntlid: 0xFFFF`（[discovery_log.rs:173](/usnvmemu/crates/nvme_firmware/src/controller/discovery_log.rs)）→ 只播 dynamic。
+- `handle_connect_async` 解析 `ConnectData` 但**从不读 `cd.cntlid`**，无条件返 `TEACHING_CNTLID=1`（[async_session.rs:773](/usnvmemu/crates/nvme_of_tcp_target/src/async_session.rs) / [fabric.rs:44](/usnvmemu/crates/nvme_of_tcp_target/src/fabric.rs)）。
+- probe `tests/vt_static_controller_model_probe.rs`（3 绿）：host 请求 CNTLID=5 → SC=0 + 分配 1（**静默 coerce，无错误**），non-conformant。
+
+**关键**：缺口在 `fabric.rs` Connect + `discovery_log.rs`，是 **transport-无关**层（不在
+`framing.rs` TCP PDU 层）→ 即便 §V9 走 RDMA，这条缺口照样继承。配套 caveat：DHCHAP
+当前 HMAC-only / `DHGROUP_NULL`（[dhchap.rs:517](/usnvmemu/crates/nvme_of_tcp_target/src/dhchap.rs)），若 Windows `authkey` 要求真 DH 组则 auth 不通——同属 Windows-only 盲区。
+
+**Acceptance**：probe 翻红并更新为 spec-conformant 断言（具体-CNTLID 不可满足 → SC=0x82）；
+新增 static-portal discovery 测试；real Windows 真连见母项目 companion（[experiments/2026-06-13-openhcl-vpci-nvme/](/usnvmemu/experiments/2026-06-13-openhcl-vpci-nvme/)）。
+
 ### ✅ V-followup-py-harness-spec-wire-conformance (2026-06-09 SHIPPED — commit `57d12a7b`)
 
 **✅ 已做**：`chap4_spec_wire_e2e.py` 扩到 9 scenarios，覆盖 reviewer M-4 的 5 个
