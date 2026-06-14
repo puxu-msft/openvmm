@@ -469,16 +469,25 @@ dispatch_sqe）被 controller 原子 CAS 处理、双 CQE 回；真 nvme-cli 互
 
 ### V9 — RDMA Transport (HUGE, 6+ months)
 
-**What**：spec § 5.13 NVMe-oF RDMA Transport；新 transport module `src/rdma_*`，
-不复用 tcp_transport。
+> **2026-06-14：detailed plan 已落 + 3 路 subagent 审计 + architect review 过** →
+> [2026-06-14-phase-v9-rdma-detailed.md](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-14-phase-v9-rdma-detailed.md)。
+> 协议事实 8/8 经 Linux `nvme-rdma`/`nvmet-rdma` 真驱动源码 CONFIRM；初版分析 3 处设计错误已纠正
+> （sentinel→remote 映射误读→token-FIFO+keyed-SGL 旁路 / `->Vec<u8>` 违反零拷贝→placement-intent+借 MR /
+> "controller 一行不改"→标 milestone-1 脚手架 vs M2 性能终态）。分阶段 R0(源码定语义)→R2(FabricBackend
+> 泛化,零阻塞)→R1'(RdmaVerbs+Mock)→R3→R4→R5→M2，**mock-first 让 R0-R4 全程不卡内核**。
 
-**Why**：spec 三大 fabric (TCP / RDMA / FC)，TCP 已 done；RDMA 是性能 ceiling。
+**What**：NVMe-oF RDMA Transport binding（spec 三大 fabric 之一）；新 transport module `src/rdma_*`，
+不复用 `tcp_transport`/`framing`/`r2t`（RDMA 不走 PDU、target 驱动单边 RDMA Read/Write、无 R2T 流控）。
 
-**Architectural notes**：
-- 不能复用 `framing.rs` (RDMA 不走 PDU)
-- 需引 `rdma-core` Rust binding 或 fork ibverbs-sys
-- AsyncSession 抽象层要再泛化 (TCP PDU vs RDMA SendRecv)
-- 测试基础设施重写 (soft-RoCE in WSL2)
+**Why**：spec 三大 fabric (TCP / RDMA / FC)，TCP 已 done；RDMA 是性能 ceiling（零拷贝单边 DMA）。
+
+**Architectural notes**（详见 detailed plan §1-§3）：
+- 复用 `NvmeController`（DMA 出口可被 sentinel 拦截）+ `dispatch_plan` 4/7 决策核 + `fabric.rs` 解码 + in-band CHAP。
+- 需引 `ibverbs` Rust binding（R0 选型，候选 `rdma`/`rust-rdma`/裸 `rdma-sys`，藏 trait 后可换）。
+- 两层 trait 泛化：`FabricBackend`（TCP/RDMA placement-intent）+ `RdmaVerbs`（MockRdma + IbverbsRdma）。
+- **测试基建阻塞已坐实纠正**：~~soft-RoCE in WSL2~~ —— 当前 WSL2 内核 `CONFIG_RDMA_RXE/SIW is not set`，
+  **无 soft-RDMA provider、无纯用户态出路**（oracle 经 rdma-core 核实）；真 e2e 须重编内核开 `CONFIG_RDMA_RXE=m`
+  （同 `CONFIG_NVME_AUTH` 模式，用户决策）。**用户 2026-06-14 拍板：推迟到 R5**（mock-first 让 R0-R4 不卡）。
 
 ### V10 — DMA Backend (HUGE)
 

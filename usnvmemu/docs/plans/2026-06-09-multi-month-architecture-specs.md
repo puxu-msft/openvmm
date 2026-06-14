@@ -34,6 +34,13 @@ mmap 零拷贝 DMA（commit dfa9fefb）的**全路径只由 memfd 单测验证**
 
 ## V9. RDMA Transport（spec §5.13，预计 6+ 月，HUGE）
 
+> **2026-06-14 升级**：本段已被**正式 detailed plan 取代** →
+> [2026-06-14-phase-v9-rdma-detailed.md](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-14-phase-v9-rdma-detailed.md)
+> （3 路 subagent 审计 + architect review 过；协议 8/8 经 Linux 真驱动 CONFIRM；3 处设计错误纠正 + R0-R5+M2
+> 分阶段 + mock-first）。**下方原始粗略分阶段保留作历史**；以 detailed plan 为准。**注**：本段原文"AsyncSession
+> 再泛化"已细化为 `FabricBackend`+`RdmaVerbs` 两层 trait；"soft-RoCE in WSL2 做无硬件 e2e"已坐实**当前内核
+> 未编 rxe/siw、无纯用户态出路**（须重编内核，推迟到 R5）。
+
 ### What / Why
 NVMe-oF 三大 fabric（TCP/RDMA/FC），TCP 已 done。RDMA 是性能 ceiling。新 transport
 module `src/rdma_*`，**不复用** `tcp_transport.rs`（RDMA 不走 PDU/PDU framing）。
