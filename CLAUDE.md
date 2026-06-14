@@ -51,4 +51,5 @@ trait Transport，3 个接入（OpenHCL vsock / vfio-user / NVMe-oF TCP），各
 - 设计决策 ADR → `usnvmemu/docs/DECISIONS.md`；技术教训 → `docs/LESSONS.md`；
   历史里程碑 → `docs/MILESTONES.md`；原则 → `docs/PRINCIPLES.md`；愿景 → `docs/PROJECT_VISION.md`。
 - 新增 transport 指南 → `docs/HOW_TO_ADD_TRANSPORT.md`；host-root 运行 → `docs/RUNBOOK_HOST_ROOT.md`。
+- vfio-user-in-underhill 这条线的**概览/导览**（是什么 / 数据流 / Layer A·C / Option B / 文档地图）→ `docs/VFIO_USER_IN_UNDERHILL.md`（单一入口，深层细节指向 MILESTONES §3 / plans / experiments）。
 - 待执行的跨会话任务 + 设计 → `docs/superpowers/plans/*.md` 与 `docs/superpowers/specs/*.md`。
