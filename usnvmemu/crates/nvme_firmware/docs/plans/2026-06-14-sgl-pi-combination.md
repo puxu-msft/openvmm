@@ -83,7 +83,50 @@ PRACT=1 是「谁产 tuple」的 per-block 决策（controller gen/strip vs host
 
 ### P-E（roadmap，高级可后置，裁判轴允许）— Metadata SGL Segment（advertise bit19/MSDS + parser）
 
-advertise SGLS bit19 + metadata-SGL descriptor parser，让 metadata 本身也 SGL。**spec 允许不 advertise 即合法不支持**，纯增量零回归。详化 gate：仅当真需求才进；进入前查 spec § + Linux `nvme_pci_setup_meta_sgls` 精确布局。
+advertise SGLS bit19 + metadata-SGL descriptor parser，让 metadata 本身也 SGL。**spec 允许不 advertise 即合法不支持**，纯增量零回归。详细 gate 见下「P-E 实施前置」。
+
+## P-E 实施前置：PSDT/SGL 模型 spec 对齐（E0）+ metadata-SGL（E1）
+
+> **POC 结论（2026-06-14，承重假设证伪）**：firmware 的 PSDT 模型偏离 spec。
+> - **spec/Linux**：PSDT 是 cdw0 bits 15:14。`01b`=SGL data + **平坦元数据**（Linux `NVME_CMD_SGL_METABUF`=flags 1<<6）；`10b`=SGL data + **元数据-SGL**（`NVME_CMD_SGL_METASEG`=flags 2<<6）。data 单/碎由 **DPTR 里 descriptor 类型**（DataBlock vs Segment）决定，**与 PSDT 无关**；data SGL1 恒在 DPTR。
+> - **firmware 现状**（`resolve_data_pointers`）：`01b`=单内联 DataBlock（Segment 直接 reject "mis-encoded"）；`10b`=Segment-data scatter；元数据**恒当平坦 MPTR**。
+> - **两冲突**：① `PSDT=10` 被 firmware 占作 data-segment → metadata-SGL（P-E）在当前模型**无 spec-legal 信号**；② 真实 Linux 对"碎 data + 平坦元数据"发 `PSDT=01 + Segment-in-DPTR`，firmware 在 `01b` 拒 Segment → P-B/P-C 的 PSDT wire 编码偏离 Linux（data-path 逻辑正确、wire 不兼容）。
+> - **裁定（用户 2026-06-14，Option A）**：先把 PSDT/SGL 模型对齐 spec（E0），再做 metadata-SGL（E1）。接受回touch 已提交的 P-B/P-C wire 编码 + 测试。
+
+### E0 — PSDT/SGL 模型对齐（spec-correct，**单一语义单元 = 单 commit**，architect §1 裁定）
+
+> architect §1（CRITICAL）：E0.1/E0.2 强拆会在 PI NS 上制造 spec-incorrect 中间态（`01+Segment` 一旦 `is_sgl=true` 就立即碰 `meta_inline` 路由，与 `10+Segment` 塌缩成同一条 meta 路由，而 spec 要它们不同）。故 **PSDT 对齐整体作一个 commit**，不拆。
+
+**data SGL 解耦 PSDT**（`resolve_data_pointers`）：
+- `PSDT∈{01,10}` 都 = SGL data；data 单/碎由 **DPTR descriptor 类型**定（`DataBlock≤1page`→`Prp{prp1=addr,prp2=0}` 复用；`Segment/LastSegment`→`SglSegment`；BitBucket/其它→reject），不再按 PSDT 区分。`PSDT=00` PRP 不变；`PSDT=11`→`INVALID_FIELD`（match 合并臂别误吞 11，revert-verify 加一条）。
+- **既有语义逐条守（architect §2 checklist）**：① 新增 `10+DataBlock` 臂**必须复用** `01+DataBlock` 同一段 `subtype_to_sc`+`resolve_sgl_address`（CMB-relative sub_type=1 rebase，**最易漏**）；② 单 DataBlock `length>NVME_PAGE_SIZE`→reject 保留；③ BitBucket-as-sole→reject 保留（SPEC_CONFORMANCE 标注教学裁剪）。
+
+**metadata 双正交轴**（architect §3）：`meta_sgl=(psdt==0b10)` 与 NS 属性 `meta_inline` 是**独立两维**，非互斥。extended-LBA（inline）**无独立 metadata**、MPTR 被忽略、data SGL 必 PSDT=01——故 inline 的 PSDT 由 *data* 指针形态定，**spec 定死为 01**（不是 runtime entry 查清；Linux 对 extended-LBA 走 METABUF/01，从不为 inline 发 METASEG/10）。2×2：
+
+| PSDT | meta_inline | metadata 形态 | 阶段 |
+|---|---|---|---|
+| 01 | false | 平坦 MPTR buffer | P-B |
+| 01 | true | inline 吸收、忽略 MPTR | P-C |
+| 10 | false | metadata-SGL | E1 |
+| 10 | true | **非法**（extended-LBA 无独立 metadata 可作 SGL）→ **reject**（INVALID_FIELD） | — |
+
+- plumb `meta_sgl` 进 dispatch（`SglPiArgs` 或并列信号）；`!meta_sgl`(01)→平坦/inline（P-B/P-C 现有逻辑）、`meta_sgl`(10)+`!meta_inline`→E1、`meta_sgl`+`meta_inline`→reject。
+- **迁移 P-B 与 P-C 测试**：separate 与 inline 的平坦/吸收元数据测试 `sgl_sqe` PSDT **`10→01`**（两者都迁到 01，inline 落在 01+meta_inline=true 这格）。
+- SPEC_CONFORMANCE 注明 PSDT 语义已对齐 spec。
+- **回归**：plain SGL（PSDT=10+Segment 现有 R2 测试）+ PSDT=00 PRP + 01+DataBlock 逐字节不变；新增 `01+Segment` / `10+DataBlock` 接受面有 parse-level oracle。
+
+### E1 — metadata-SGL（P-E proper，单 commit）
+
+- **advertise SGLS bit15**（Metadata SGL Descriptor Supported，**非 bit19**——architect §5 纠正 plan/POC 的 bit 编号错误；`cmd.rs` 改前用 `nvme_spec` 源 + Linux `NVME_CTRL_SGLS_*` **逐位锚定**，自洽编号骗过 review = `[[review-not-optional-self-consistent-trap]]` 第6/7次同型陷阱）。
+- `meta_sgl`(PSDT=10)+`!meta_inline`+有 PI → **MPTR 当 SGL segment 指针**（非平坦 GPA）：DMA-read MPTR 指向的 segment → parse descriptor（单 DataBlock / Segment 链）→ 建**元数据 fragment plan**。MPTR=0→reject `INVALID_FIELD`（与 separate L-2 对称）。meta segment-hop 上限同 `MAX_SGL_SEGMENTS`（防 meta 链自环）。
+- **承重结构（architect §4，不可隐于"独立累积器"措辞）**：
+  - meta 门控**从布尔升级为计数器**：`PiLayout::Separate` 加 `meta_transfers_done/meta_transfers_total`；`try_finish_sgl_pi` 合取从「data_done && meta_ok」升为「data_done && meta_all_frags_done」。
+  - meta-frag walk **必须平行**（独立 `meta_frags: Vec<SglPlanFrag>` + `meta_walk_offset` + **新 PendingOp 变体** `NvmSglMetaFetch`/`NvmSglMetaData`），**不复用** data 的 `NvmSglFetch`/`NvmSglData`/`transfers_total`（H-3 同理由：不污染 data 计数）。`SglPlanFrag` 结构可复用。
+  - **`finish_sgl_error` 的 `retain` 必须同步清理新 PendingOp 变体**（否则 meta-frag walk 失败时孤儿 token 泄漏——真实新面）。
+- **WRITE**：元数据多条 meta-frag DMA-read gather 进 N×8 tuple 缓冲 → 全到齐填 `Separate.meta`。**READ**：`tuple_concat` 按 meta-frag plan 多条 DMA-write scatter。
+- **Bit Bucket 在 meta-SGL**：spec 允许，**默认按 C-1 模型支持**（dense 流全 verify + bucket 仅抑制该段 tuple scatter），非默认 reject（裁判轴：完整支持 spec-legal）。
+- finalize 核心（`pi_*_finalize` helper）**真不变**（只吃拼好的 N×8 concat）。length：meta 覆盖 ≠ N×8 → `METADATA_SGL_LENGTH_INVALID`(0x10)。
+- **E1 进入前 POC**：源码追踪 Linux `nvme_pci_setup_meta_sgls` + spec § 确认 MPTR-as-SGL 精确布局（MPTR→单 descriptor vs segment 链、Bit Bucket 合法性、length 语义）。
 
 ## 测试矩阵（差分 oracle 四件套，§23/§32 具体化）
 
