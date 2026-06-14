@@ -5,7 +5,11 @@
 Linux ≥ 5.0 / Windows Server 2025 上的标准 `nvme-cli` 可通过
 `nvme connect -t tcp` 直接挂载并跑 IO。
 
+> **本 README 是 build/run/interop 使用手册**；想先建立这条线的**全貌**（是什么 / 数据流 / 关键模型 /
+> 教学-生产边界 / 文档地图）请读自上而下导览 **[NVME_OF_TCP.md](/usnvmemu/docs/NVME_OF_TCP.md)**。
+
 > **持续开发的顶层文档** (新加 phase 前必读):
+> - **[NVME_OF_TCP.md](/usnvmemu/docs/NVME_OF_TCP.md)** — 本线自上而下导览 (reader's guide)：全貌入口
 > - **[PROJECT_VISION.md](/usnvmemu/docs/PROJECT_VISION.md)** — 项目愿景: 用户态 NVMe firmware 为核心 + 3 transport (OpenHCL/OpenVMM/QEMU vfio-user) + NVMe-oF TCP
 > - [ROADMAP.md](/usnvmemu/docs/ROADMAP.md) — 短/中/长期 phase 列表 (动态)，按 Tier 1/2/3 优先级排
 > - [PRINCIPLES.md](/usnvmemu/docs/PRINCIPLES.md) — 不变约束 + coding policy + subagent reviewer prompt 模板 + 测试命名约定
@@ -16,9 +20,11 @@ Linux ≥ 5.0 / Windows Server 2025 上的标准 `nvme-cli` 可通过
 > - [extract-from-openvmm-survey.md](/usnvmemu/docs/2026-06-06-phase-x-extract-from-openvmm-survey.md)
 >   — 外部化调研 + 决策推迟 (ADR-008/009)
 
-## Status (2026-06-06)
+## Status (V-series 冻结于 V-interop-8；下方明细 2026-06-06 截面)
 
-**所有 phase 代码 + 测试 shipped**: 306 lib + integration tests pass，clippy 0 warning。
+> 全貌与最新真相见 [NVME_OF_TCP.md §7](/usnvmemu/docs/NVME_OF_TCP.md) + [ROADMAP §0](/usnvmemu/docs/ROADMAP.md)（2026-06-13 更新）。
+
+**所有 phase 代码 + 测试 shipped**: 306 lib + integration tests pass，clippy 0 warning（冻结点 commit `714029df1`）。
 
 **已 verified 在真 Linux nvme-cli**: plaintext `discover` + `connect` + IO (kernel 6.6.114 nvme-tcp.ko, WSL2)。**TLS / mTLS / DH-HMAC-CHAP 等安全栈未走真 Linux nvme-cli 实测**，只走 lib test + Python harness (跨进程但同一份 Rust 算法对自家 Python 算法)。真 third-party host interop 是下一步 HIGH (见 [ROADMAP §1](/usnvmemu/docs/ROADMAP.md))。
 
@@ -230,7 +236,8 @@ cargo test -p nvme_of_tcp_target --test bin_smoke
 cd ../nvme_firmware && cargo test --lib
 ```
 
-预期 78 + 1 + 67 = 146 测试全 green。
+`cargo test -p nvme_of_tcp_target` 当前 **306 lib + integration tests 全 green**（冻结于 V-interop-8）；
+上面三条命令是按用途拆分的子集（早期 78 + 1 + 67 截面仅作示意，以 crate 全量 306 为准）。
 
 ## V8e — tokio async runtime（KATO timer / AER wakeup / 真并发 e2e）
 
