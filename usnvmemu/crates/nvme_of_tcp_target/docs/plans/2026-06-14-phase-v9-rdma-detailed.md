@@ -182,13 +182,17 @@ trait RdmaVerbs {
 >   `RecvFrame{Frame(Pdu),PeerClosed}`；pump 经 trait recv；`stream` 转私有；324 tests 绿 + byte-identical +
 >   rust-reviewer 无 C/H。**RecvFrame::Frame(Pdu) 已验对 R3b 充分**（RDMA 从 RECV completion 合成 CapsuleCmd
 >   PDU 复用 dispatch）。
-> - **⏳ R3b**（待做，建议 fresh context）：`RdmaFabricBackend`（impl `FabricBackend`，owns `MockRdma` QP）——
->   recv_next = poll_cq RECV→合成 CapsuleCmd PDU；send_response_capsule = post_send；recv-buffer 池 + 响应前
->   repost（RNR）；CM Private Data Connect（`nvme_rdma_cm_req/rep/rej` zerocopy struct，R0 §A，喂 `fabric.rs`
->   复用解码）。起手须评估：上层桥 run_post_dispatch 的 CQE 分流（CQ_BASE_GPA 哨值）按 R0 §E 区分 CQE-SEND
->   vs data-verb——是先抽桥层分流还是 RdmaFabricBackend 内自洽（R4 桥层分流的前置一半）。
-> - **⏳ R3c**：多 QP ↔ session 聚合（per-QP backend，共享 `SharedControllerInner` keyed by cntlid，R0 §F）+
->   association teardown / QP drain。
+> - **✅ R3b DONE**（commits `9eb5aac63` R3b-1 + `338de0211` R3b-2）：
+>   - **R3b-1** `src/rdma_cm.rs`：CM Private Data wire 结构（`NvmeRdmaCmReq/Rep/Rej` + cm_status 全 9 码 +
+>     parse/off-by-one `recv_queue_size=hsqsize+1`），独立 oracle 对 Linux `nvme-rdma.h` 逐字 CONFIRM。
+>   - **R3b-2** `src/rdma_backend.rs`：`RdmaFabricBackend<V:RdmaVerbs>`（recv_next=poll_cq RECV→byte_len 截断
+>     →合成 CapsuleCmd PDU→repost；send_response=post_send；move_local/host=RDMA WRITE/READ；CQ demux 分流
+>     RECV vs send-side；recv 池恒定 RNR 避免）。R3b 边界=单段 keyed-SGL，multi-seg/inline/separate-meta/
+>     SEND_WITH_INV/MR 池 bail 显式化（R4）。11 rdma_* tests + rust-reviewer 无 C/H（CQ demux + PDU 合成两承重轴正确）。
+>   - **未做（挪 R3c/d）**：CM Connect 接真 connect 流（用 parsed CM req 设 qid/cntlid 驱 fabric Connect）+
+>     RdmaFabricBackend 接入 AsyncSession（须 AsyncSession 泛化于 FabricBackend）。
+> - **⏳ R3c**：**AsyncSession 泛化于 `FabricBackend`**（现持具体 `TcpFabricBackend<S>`）+ 多 QP ↔ session 聚合
+>   （per-QP backend，共享 `SharedControllerInner` keyed by cntlid，R0 §F）+ association teardown / QP drain。
 > - **⏳ R3d**：admin 全路径过 RDMA mock（Identify/Set-Features/AER/Keep-Alive）+ Discovery-over-RDMA
 >   （`NVME_TRTYPE_RDMA`）+ IRD/ORD/CQ-depth sizing。
 
