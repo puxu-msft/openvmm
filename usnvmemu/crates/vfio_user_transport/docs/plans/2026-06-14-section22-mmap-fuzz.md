@@ -1,6 +1,9 @@
 # §22 vfio-user mmap DMA fuzz target（唯一 unsafe/内存安全面）
 
-> 状态：**承重假设已 POC 验证，待 architect review → 实现**。日期：2026-06-14。归属：`vfio_user_transport`。
+> 状态：**✅ 已落地（2026-06-14，commit ef2c97ec0）**——`fuzz_map_dma_fd` shipped（双 oracle：no-SIGBUS +
+> fstat 决策），真 coverage-guided 4,081,078 runs/61s 全绿无 SIGBUS；承重假设 `_proof_sigbus_catchable`
+> 确定性证 ASan 能 catch SIGBUS（CI exclude）。日期：2026-06-14。归属：`vfio_user_transport`。
+> **架构/约定见 [FUZZING.md](/usnvmemu/docs/FUZZING.md)**。
 > 来源：fuzz 子项目优先级②（B 类内存安全，区别于 nvme_firmware 的 A 类存活性 DoS）。
 
 ## 0. 一句话

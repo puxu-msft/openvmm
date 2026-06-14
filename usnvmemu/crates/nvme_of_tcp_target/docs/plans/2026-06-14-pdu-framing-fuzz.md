@@ -1,7 +1,8 @@
 # NVMe-oF TCP PDU framing fuzz + hlen-underflow DoS 修复
 
-> 状态：**承重假设已厘清（read_pdu 可经泛型重构 Cursor-驱动）+ 已发现高置信 DoS bug（待 fuzz 跑实证）**。
-> 待 architect review → 实现。日期：2026-06-14。归属：`nvme_of_tcp_target`（用户接维护）。
+> 状态：**✅ 已落地（2026-06-14）**——4 target（read_pdu sync/async + h2c_reassembler + dhchap）shipped，
+> 真 coverage-guided 千万级 runs；**修了 hlen<8 整数下溢 DoS**（decode_common_hdr 加 hlen≥CH_LEN + 回归）。
+> 日期：2026-06-14。归属：`nvme_of_tcp_target`（用户接维护）。**架构/约定见 [FUZZING.md](/usnvmemu/docs/FUZZING.md)**。
 > 来源：fuzz 子项目新战线——第三条 transport 的 wire 解析（parser 金矿，0 fuzz 覆盖）。
 
 ## 0. 一句话

@@ -1,7 +1,8 @@
 # Coverage-guided fuzzing：PRP/SGL/admin 指针追逐路径
 
-> 状态：**方案已定，execution-ready**（POC 验承重假设 + architect 复核 v2：B-1 crate 布局已修、
-> W-1/W-2/W-3/W-4 已纳入）。日期：2026-06-13。归属：`nvme_firmware`。
+> 状态：**✅ 已落地（2026-06-14）**——3 target（sgl/prp/admin）shipped + O(N) `common.rs` 共享驱动
+> 重构 + 真 coverage-guided 百万级 runs 干净；admin 顺带跑出独立 controller bug（admin.rs:482 整数溢出，
+> 已报 owner）。立项 2026-06-13。归属：`nvme_firmware`。**架构/约定/how-to 见 [FUZZING.md](/usnvmemu/docs/FUZZING.md)**。
 > 来源：reviewer 提议 + architect 两轮复核 + POC（`tests/fuzz_poc_sgl_chain.rs`，已绿）。
 
 ## 0. 一句话
