@@ -479,9 +479,15 @@ impl NvmeController {
                         // driver 写 cdw11 = (NSQR-1) | ((NCQR-1) << 16) 请
                         // 求 queue 数；controller 在 CQE cdw0 回 (NSQA-1)
                         // | ((NCQA-1) << 16) 表示实际授予（0-based）。
-                        let req_nsq = (cdw11 & 0xffff) as u16 + 1;
-                        let req_ncq = ((cdw11 >> 16) & 0xffff) as u16 + 1;
-                        let granted = req_nsq.min(req_ncq).min(self.io_queue_pairs);
+                        // **整数溢出修复（fuzz_admin_dispatch finding，ivory-vole）**：
+                        // NSQR/NCQR=0xffff（请求 65536 队列）时 `as u16 + 1` 溢出——debug 直接
+                        // panic；release（overflow-checks off）环回 0 → granted=0 → 下方 `granted-1`
+                        // 再环回 0xffff → cdw0=0xffffffff **谎报授予 65536 队列**（wire 错）。
+                        // 修：在 u32 域算 +1 再 clamp 到 cap（req≥1 故 granted≥1，`granted-1` 安全）。
+                        let req_nsq = ((cdw11 & 0xffff) + 1).min(self.io_queue_pairs as u32);
+                        let req_ncq =
+                            (((cdw11 >> 16) & 0xffff) + 1).min(self.io_queue_pairs as u32);
+                        let granted = req_nsq.min(req_ncq) as u16;
                         self.granted_io_queues = granted;
                         let nsqa_minus_1 = (granted - 1) as u32;
                         let ncqa_minus_1 = (granted - 1) as u32;

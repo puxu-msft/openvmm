@@ -4738,6 +4738,63 @@ fn security_receive_clamps_alloc_to_natural_list_size() {
     assert_eq!(list_fetches, 0, "9B≤1page 不应触发 PRP-list");
 }
 
+/// **Set Features NUMBER_OF_QUEUES 整数溢出回归（fuzz_admin_dispatch finding，ivory-vole）**。
+///
+/// NSQR/NCQR=0xffff（cdw11 全控，请求 65536 队列）时旧码 `(cdw11 & 0xffff) as u16 + 1` 溢出：
+/// debug（overflow-checks on）直接 panic；release 环回 0 → granted=0 → `granted-1` 再环回 0xffff
+/// → cdw0=0xffffffff **谎报授予 65536 队列**（实际 0，wire 错，driver 据此建队列会乱）。修：u32 域
+/// 算 +1 再 clamp 到 cap → granted=io_queue_pairs、cdw0 正确。
+///
+/// revert-verify：把 fix 改回 `(cdw11 & 0xffff) as u16 + 1` → debug build 本测试在 dispatch 内 panic。
+#[test]
+fn set_features_number_of_queues_no_overflow_on_max_request() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx};
+    let mut c = make_ctrl_with_tmp("nq_overflow");
+    c.cqs.insert(
+        0,
+        crate::regs::CompletionQueue {
+            base_gpa: 0xF_0000,
+            size: 64,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        },
+    );
+    let cap_pairs = c.io_queue_pairs;
+    let mut cap = CaptureTransport::with_start_token(0x100);
+
+    // SET_FEATURES(0x09) NUMBER_OF_QUEUES(fid 0x07)，cdw11=0xffff_ffff（NSQR-1=NCQR-1=0xffff，
+    // 即请求 65536 队列对——攻击者全控 cdw11，会触溢出）。
+    let zero = [0u8; 64];
+    let mut sqe: crate::cmd::Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+    sqe.cdw0 = (admin_opc::SET_FEATURES as u32) | (0x55u32 << 16);
+    sqe.cdw10 = crate::cmd::fid::NUMBER_OF_QUEUES as u32;
+    sqe.cdw11 = 0xffff_ffff;
+    let cqe = {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        c.dispatch_admin(&mut ctx, sqe, 0x55, 0, 0)
+    };
+
+    // oracle 1：dispatch 内不 panic（debug overflow-checks 下旧码会 panic）= 第一道牙。
+    let cqe = cqe.expect("SET_FEATURES NUMBER_OF_QUEUES 同步返 Cqe");
+    assert_eq!(cqe_status(&cqe), 0, "sc 应=0");
+    // oracle 2：granted clamp 到 cap、且 ≥1（非溢出环回 0）。
+    assert_eq!(
+        c.granted_io_queues, cap_pairs,
+        "granted 应 clamp 到 io_queue_pairs(cap)，非溢出"
+    );
+    assert!(c.granted_io_queues >= 1, "granted ≥1（非环回 0）");
+    // oracle 3：cdw0 = (cap-1)|((cap-1)<<16)，**非** 0xffffffff（谎报 65536）。
+    let cdw0 = cqe.cdw0; // 从 packed Cqe 拷出（避免 E0793 unaligned 引用）
+    let expected = ((cap_pairs - 1) as u32) | (((cap_pairs - 1) as u32) << 16);
+    assert_eq!(cdw0, expected, "cdw0 应正确报授予数");
+    assert_ne!(cdw0, 0xffff_ffff, "不应谎报授予 65536 队列（溢出 bug）");
+}
+
 /// **C1② chaining 深度封顶（defense-in-depth）差分 oracle** — 抬 cap 后仍要给
 /// host-malicious / malformed chain 封顶。`MAX_PRP_LIST_PAGES=16` 上限：直接注入一个
 /// `total_pages` 超过 16 张 list 页能装下（8200 > 16×511=8176）的 PrpListOp，喂同一张
