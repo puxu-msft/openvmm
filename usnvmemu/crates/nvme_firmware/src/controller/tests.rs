@@ -8203,6 +8203,255 @@ fn ns_create_gate_uses_runtime_max_namespaces() {
     );
 }
 
+// ════════════════════════ SGL×PI P-A：gather-agnostic PI helper 直测 ════════════════════════
+//
+// 两个共享 helper（`pi_read_verify_split` 纯函数 / `pi_write_finalize_stream` 方法）的
+// known-answer 直测。PRP/SGL 的 PRACT=0 路径已被既有全套 dispatch 测试逐字节守（P-A 纯
+// 重构）；这里专补 **PRACT=1（M-2）** 这条 P-A 尚未接 dispatch 的前瞻分支 + READ 纯函数的
+// dense-split 契约，独立 oracle = `PiTuple::compute` + 手拼 backing。
+
+/// **SGL×PI P-A** — `pi_read_verify_split` 纯函数 known-answer：构造 N 个 interleaved
+/// extended-block（独立 oracle `PiTuple::compute`），断返回 (dense data 平面, tuple concat)
+/// 逐字节正确；corrupt 一块 data → Err((PiCheck, 失败 LBA))。pi_first 两态各验。
+#[test]
+fn pi_read_verify_split_known_answer_and_corrupt() {
+    for pi_first in [true, false] {
+        let data_bytes = 4096usize;
+        let block_bytes = 4104usize;
+        let lba0 = 7u64;
+        let n = 3usize;
+        let datas: Vec<Vec<u8>> = (0..n)
+            .map(|i| (0..data_bytes).map(|b| ((b + i) & 0xff) as u8).collect())
+            .collect();
+        let tuples: Vec<[u8; 8]> = (0..n)
+            .map(|i| crate::pi::PiTuple::compute(&datas[i], lba0 + i as u64, 1).to_bytes())
+            .collect();
+        let mut interleaved = vec![0u8; block_bytes * n];
+        for i in 0..n {
+            let blk = &mut interleaved[i * block_bytes..(i + 1) * block_bytes];
+            if pi_first {
+                blk[0..8].copy_from_slice(&tuples[i]);
+                blk[8..8 + data_bytes].copy_from_slice(&datas[i]);
+            } else {
+                blk[0..data_bytes].copy_from_slice(&datas[i]);
+                blk[data_bytes..data_bytes + 8].copy_from_slice(&tuples[i]);
+            }
+        }
+        let geom = crate::controller::PiGeom {
+            pi_type: 1,
+            pi_first,
+            data_bytes: data_bytes as u32,
+            block_bytes: block_bytes as u32,
+            prchk: crate::pi::PrChk::from_cdw12((1 << 28) | (1 << 26)), // Guard+RefTag
+            pract: false,
+        };
+        let (data_plane, tuple_concat) =
+            super::completion::pi_read_verify_split(&interleaved, &geom, lba0, n).unwrap();
+        let want_data: Vec<u8> = datas.iter().flatten().copied().collect();
+        assert_eq!(
+            data_plane, want_data,
+            "pi_first={pi_first} dense data 平面错"
+        );
+        let want_tuple: Vec<u8> = tuples.iter().flatten().copied().collect();
+        assert_eq!(
+            tuple_concat, want_tuple,
+            "pi_first={pi_first} tuple concat 错"
+        );
+
+        // corrupt 第 2 块（i=1）data 首字节 → stored PI verify 失配 → Err，失败 LBA=lba0+1。
+        let mut bad = interleaved.clone();
+        let data_off = if pi_first {
+            block_bytes + 8
+        } else {
+            block_bytes
+        };
+        bad[data_off] ^= 0xff;
+        let (check, lba_fail) =
+            super::completion::pi_read_verify_split(&bad, &geom, lba0, n).unwrap_err();
+        assert_eq!(lba_fail, lba0 + 1, "pi_first={pi_first} 失败 LBA 错");
+        assert!(
+            check.to_sc().is_some(),
+            "pi_first={pi_first} 失败 PiCheck 应映射到 SC byte，实得 {:?}",
+            check
+        );
+    }
+}
+
+/// **SGL×PI P-A / M-2** — `pi_write_finalize_stream` 的 **PRACT=1**（controller 自算 tuple）
+/// 分支 known-answer：喂纯 data 流（host 不供 tuple）、`geom.pract=true`，断 backing 每块 ==
+/// interleave([`PiTuple::compute`(data_i, lba+i, pi_type)][data_i])（独立 oracle）。此分支在
+/// P-A 尚未接 dispatch（PRACT=1 当前走 K4 generate 链），故直测 helper 守 M-2 前瞻形状不腐。
+#[test]
+fn pi_write_finalize_stream_pract1_generates_tuples() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx};
+    for pi_first in [true, false] {
+        let mut c = make_ctrl_with_tmp("pa_pract1");
+        {
+            let ns = c.namespaces.get_mut(&1).unwrap();
+            ns.lbads = 12;
+            ns.meta_size = 8;
+            ns.pi_type = 1;
+            ns.pi_first = pi_first;
+            ns.meta_inline = false;
+            let size = ns.file.metadata().unwrap().len();
+            ns.total_lba = size / ns.block_bytes();
+        }
+        c.cqs.insert(
+            1,
+            crate::regs::CompletionQueue {
+                base_gpa: 0x1_0000,
+                size: 64,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 0,
+                interrupt_enabled: false,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        let data_bytes = 4096usize;
+        let block_bytes = 4104usize;
+        let lba0 = 2u64;
+        let n = 3usize;
+        let datas: Vec<Vec<u8>> = (0..n)
+            .map(|i| {
+                (0..data_bytes)
+                    .map(|b| ((b * 3 + i) & 0xff) as u8)
+                    .collect()
+            })
+            .collect();
+        let stream: Vec<u8> = datas.iter().flatten().copied().collect(); // 纯 data 流
+        let geom = crate::controller::PiGeom {
+            pi_type: 1,
+            pi_first,
+            data_bytes: data_bytes as u32,
+            block_bytes: block_bytes as u32,
+            prchk: crate::pi::PrChk::from_cdw12(0),
+            pract: true,
+        };
+        let ids = crate::controller::PiCqeIds {
+            sq_id: 0,
+            cid: 0x33,
+            sq_head: 0,
+            cq_id: 1,
+            nsid: 1,
+        };
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let mut ctx = DeviceCtx::new(&mut cap);
+        c.pi_write_finalize_stream(&mut ctx, stream, None, &geom, lba0, n, ids);
+
+        // 读 backing 独立 oracle：每块 == interleave([controller 自算 tuple][data]) per pi_first。
+        let ns = c.namespaces.get(&1).unwrap();
+        for i in 0..n {
+            let mut blk = vec![0u8; block_bytes];
+            ns.read_at(&mut blk, (lba0 + i as u64) * block_bytes as u64)
+                .unwrap();
+            let want_tuple = crate::pi::PiTuple::compute(&datas[i], lba0 + i as u64, 1).to_bytes();
+            let (got_tuple, got_data): (&[u8], &[u8]) = if pi_first {
+                (&blk[0..8], &blk[8..8 + data_bytes])
+            } else {
+                (&blk[data_bytes..data_bytes + 8], &blk[0..data_bytes])
+            };
+            assert_eq!(
+                got_tuple,
+                &want_tuple[..],
+                "pi_first={pi_first} blk{i} tuple 非 controller 自算"
+            );
+            assert_eq!(
+                got_data,
+                &datas[i][..],
+                "pi_first={pi_first} blk{i} data 错"
+            );
+        }
+    }
+}
+
+/// **SGL×PI P-A / M-2（reviewer LOW-2）** — `pi_write_finalize_stream` 在 **PRACT=1** 下
+/// **忽略 host 供的 `sep_meta`**：`inline_pract0` 在 `pract=true` 时恒 false（无论 sep_meta），
+/// store else 臂先判 `geom.pract` → 走 `PiTuple::compute` 自算，绝不取 sep_meta。喂 pract=true
+/// + `sep_meta=Some(全 0xEE 垃圾)`，断 backing tuple 仍 == compute（非垃圾）——守 P-B 引入
+/// PRACT=1 separate dispatch 前这条"host tuple 被忽略"的前瞻语义不腐。
+#[test]
+fn pi_write_finalize_stream_pract1_ignores_sep_meta() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx};
+    let mut c = make_ctrl_with_tmp("pa_pract1_ignore_meta");
+    {
+        let ns = c.namespaces.get_mut(&1).unwrap();
+        ns.lbads = 12;
+        ns.meta_size = 8;
+        ns.pi_type = 1;
+        ns.pi_first = true;
+        ns.meta_inline = false;
+        let size = ns.file.metadata().unwrap().len();
+        ns.total_lba = size / ns.block_bytes();
+    }
+    c.cqs.insert(
+        1,
+        crate::regs::CompletionQueue {
+            base_gpa: 0x1_0000,
+            size: 64,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        },
+    );
+    let data_bytes = 4096usize;
+    let block_bytes = 4104usize;
+    let lba0 = 1u64;
+    let n = 2usize;
+    let datas: Vec<Vec<u8>> = (0..n)
+        .map(|i| {
+            (0..data_bytes)
+                .map(|b| ((b + i * 7) & 0xff) as u8)
+                .collect()
+        })
+        .collect();
+    let stream: Vec<u8> = datas.iter().flatten().copied().collect(); // 纯 data 流
+    let garbage_meta = vec![0xEEu8; n * 8]; // host 供垃圾 tuple，应被 PRACT=1 忽略
+    let geom = crate::controller::PiGeom {
+        pi_type: 1,
+        pi_first: true,
+        data_bytes: data_bytes as u32,
+        block_bytes: block_bytes as u32,
+        prchk: crate::pi::PrChk::from_cdw12(0),
+        pract: true,
+    };
+    let ids = crate::controller::PiCqeIds {
+        sq_id: 0,
+        cid: 0x44,
+        sq_head: 0,
+        cq_id: 1,
+        nsid: 1,
+    };
+    let mut cap = CaptureTransport::with_start_token(0x100);
+    let mut ctx = DeviceCtx::new(&mut cap);
+    c.pi_write_finalize_stream(&mut ctx, stream, Some(garbage_meta), &geom, lba0, n, ids);
+
+    let ns = c.namespaces.get(&1).unwrap();
+    for i in 0..n {
+        let mut blk = vec![0u8; block_bytes];
+        ns.read_at(&mut blk, (lba0 + i as u64) * block_bytes as u64)
+            .unwrap();
+        let want_tuple = crate::pi::PiTuple::compute(&datas[i], lba0 + i as u64, 1).to_bytes();
+        assert_eq!(
+            &blk[0..8],
+            &want_tuple[..],
+            "blk{i} tuple 应为 controller 自算（pract=1 忽略 host sep_meta）"
+        );
+        assert_ne!(
+            &blk[0..8],
+            &[0xEEu8; 8][..],
+            "blk{i} tuple 不该是 host 垃圾"
+        );
+        assert_eq!(&blk[8..8 + data_bytes], &datas[i][..], "blk{i} data 错");
+    }
+}
+
 // ════════════════════════ Wave 3：proptest 属性测试 ════════════════════════
 //
 // 对纯/近纯函数喂随机输入 + 断言**不变量**（而非具体值），找 example 测试列不全

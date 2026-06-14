@@ -55,6 +55,59 @@ pub(crate) fn check_copy_range_conflict(sdlba: u64, dst_total: u64, ranges: &[(u
     })
 }
 
+/// **SGL×PI P-A** — gather-agnostic PI READ verify+split 核心。从 separate-meta READ
+/// 路径（io.rs）抽出，SGL separate READ（P-B）复用，避免两份 verify+split 漂移（§32）。
+///
+/// 输入 = backing 上读好的 N 个**连续 interleaved** extended-block。**caller 契约**：
+/// `interleaved.len()` 须 ≥ `num_blocks × block_bytes`，否则下方切片越界 panic（P-B 经 SGL
+/// gather 喂入时尤须保证——故加 `debug_assert!` 让契约违背在 debug 构建即暴露，不靠凑巧）。
+/// 逐块按 `pi_first` 切 [tuple][data]、**verify-all stored PI**：任一失败 → `Err((PiCheck,
+/// 失败 LBA))`，由 caller 决定错误码 + 是否 push error-log（separate 不 push、K4c strip
+/// push——故错误处理留 caller）。全通过 → `Ok((dense data 平面 = N×data_bytes, tuple
+/// concat = N×8))`。
+///
+/// **PRACT 无关**（`geom.pract` 不参与）：READ 永远 verify stored PI（PRACT=1 strip 也
+/// 须先验再决定不回 tuple）；故 helper 恒返回 data 平面 + tuple concat，**由 caller 取舍**
+/// （separate → tuple 到 MPTR；strip → 丢 tuple concat）。scatter / MPTR-dispatch 几何各
+/// caller 自留。纯函数（不碰 controller 状态）便于 known-answer 直测。
+pub(super) fn pi_read_verify_split(
+    interleaved: &[u8],
+    geom: &crate::controller::PiGeom,
+    lba: u64,
+    num_blocks: usize,
+) -> Result<(Vec<u8>, Vec<u8>), (crate::pi::PiCheck, u64)> {
+    let block_bytes = geom.block_bytes as usize;
+    let data_bytes = geom.data_bytes as usize;
+    debug_assert!(
+        interleaved.len() >= num_blocks * block_bytes,
+        "pi_read_verify_split: interleaved len {} < num_blocks {} × block_bytes {}（caller 契约）",
+        interleaved.len(),
+        num_blocks,
+        block_bytes
+    );
+    let mut data_plane = Vec::with_capacity(num_blocks * data_bytes);
+    let mut tuple_concat = Vec::with_capacity(num_blocks * 8);
+    for i in 0..num_blocks {
+        let blk = &interleaved[i * block_bytes..(i + 1) * block_bytes];
+        let (tuple_bytes, data_part): ([u8; 8], &[u8]) = if geom.pi_first {
+            (blk[0..8].try_into().unwrap(), &blk[8..8 + data_bytes])
+        } else {
+            (
+                blk[data_bytes..data_bytes + 8].try_into().unwrap(),
+                &blk[0..data_bytes],
+            )
+        };
+        let stored_tuple = crate::pi::PiTuple::from_bytes(&tuple_bytes);
+        match stored_tuple.verify(data_part, lba + i as u64, geom.pi_type, geom.prchk) {
+            crate::pi::PiCheck::Ok => {}
+            other => return Err((other, lba + i as u64)),
+        }
+        data_plane.extend_from_slice(data_part);
+        tuple_concat.extend_from_slice(&tuple_bytes);
+    }
+    Ok((data_plane, tuple_concat))
+}
+
 impl NvmeController {
     /// **B6b-2/B6b-4（separate metadata，PRACT=0）** — separate-buffer PI Write 收尾：
     /// N 条 host data（PRP）+ host PI tuple（MPTR，N×8）都到齐后调用。**verify-all-then-
@@ -333,7 +386,6 @@ impl NvmeController {
             return;
         };
         let num_blocks = op.num_blocks as usize;
-        let phase = self.cqs.get(&op.cq_id).map(|c| c.phase).unwrap_or(1);
 
         // layout 分派：从统一 PI 描述符取几何 + metadata 形态。`take()` 把描述符所有权
         // 移出（op 其余字段 lba/nsid/data_pages 仍可用）；separate 的 meta **move** 出来
@@ -342,100 +394,181 @@ impl NvmeController {
             tracing::warn!(op_id, "prp_pi_write_finalize 缺 pi 描述符");
             return;
         };
-        let block_bytes = pi.block_bytes as usize;
-        let data_bytes = pi.data_bytes as usize;
-        let pi_first = pi.pi_first;
-        let pi_type = pi.pi_type;
-        let prchk = pi.prchk;
         // separate：tuple 经 MPTR（取出 meta 流）；inline：tuple 在 data 流内（sep_meta=None）。
         let sep_meta: Option<Vec<u8>> = match pi.layout {
             crate::controller::PiLayout::Inline => None,
             crate::controller::PiLayout::Separate { meta, .. } => Some(meta.unwrap_or_default()),
         };
+        // PRP-list PI finalize 当前仅 PRACT=0（host-tuple verify）路径；PRACT=1（controller
+        // generate）走独立 K4 generate 链，未经本 finalize。
+        let geom = crate::controller::PiGeom {
+            pi_type: pi.pi_type,
+            pi_first: pi.pi_first,
+            data_bytes: pi.data_bytes,
+            block_bytes: pi.block_bytes,
+            prchk: pi.prchk,
+            pract: false,
+        };
 
-        // 拼回连续 host data 流：inline = nlb×block_bytes（extended-block 流）；
-        // separate = nlb×data_bytes（纯 data 流，metadata 不在流里）。
+        // 拼回连续 host data 流（offset-aware，#4c-a：host-page-segmented，O=0 时每页恰
+        // 1 LBA）：inline = nlb×block_bytes（extended-block 流）；separate = nlb×data_bytes
+        // （纯 data 流，metadata 不在流里）。post-gather 长度校验 + verify-all + store-all
+        // 收敛到共享 helper（`pi_write_finalize_stream`，SGL 路径 P-B/P-C 复用）。
         let stream_unit = if sep_meta.is_some() {
-            data_bytes
+            geom.data_bytes as usize
         } else {
+            geom.block_bytes as usize
+        };
+        let mut stream = Vec::with_capacity(num_blocks * stream_unit);
+        for b in op.data_pages.iter().flatten() {
+            stream.extend_from_slice(b);
+        }
+        let ids = crate::controller::PiCqeIds {
+            sq_id: op.sq_id,
+            cid: op.cid,
+            sq_head: op.sq_head,
+            cq_id: op.cq_id,
+            nsid: op.nsid,
+        };
+        self.pi_write_finalize_stream(ctx, stream, sep_meta, &geom, op.lba, num_blocks, ids);
+    }
+
+    /// **SGL×PI P-A** — gather-agnostic PI WRITE finalize 核心。从 `prp_pi_write_finalize`
+    /// 抽出（#4c-b P2 的 verify-all-then-store-all 范式），SGL 数据路径（P-B/P-C）作第二
+    /// 生产者复用。**输入是 post-gather 的连续 `stream`**（PRP 拼 data_pages / SGL 按
+    /// stream_offset 填 frag），helper 只在 dense 流上按 LBA 切——scatter 几何已在 caller 消解。
+    ///
+    /// 三种 (pract, layout) 形态收敛：
+    ///   - **PRACT=0 separate**：`stream` = 纯 data（data_bytes/块），tuple 经 `sep_meta`
+    ///     （MPTR concat）→ verify host tuple → interleave [tuple][data] 落盘。
+    ///   - **PRACT=0 inline**：`stream` = extended-block（block_bytes/块，tuple 在流内），
+    ///     `sep_meta=None` → 按 pi_first 切 verify → **原样**落盘（== backing 布局）。
+    ///   - **PRACT=1**（separate/inline 皆然）：`stream` = 纯 data（host 只传 data），
+    ///     `sep_meta=None` → **不 verify**，controller `PiTuple::compute` 自算 → interleave 落盘。
+    ///
+    /// **H-1 职责切分**：helper 只验 **post-gather stream 长度**（`stream.len() >= total`）+
+    /// meta 长度；fragment / 页 **coverage 校验**（覆盖和 == expected）归各 caller，调前做。
+    /// `sep_meta` 按值传（保 `meta` move 零拷贝，不传 `&PiFinalize` 避免双载，H-1）。
+    pub(super) fn pi_write_finalize_stream(
+        &mut self,
+        ctx: &mut DeviceCtx<'_>,
+        mut stream: Vec<u8>,
+        sep_meta: Option<Vec<u8>>,
+        geom: &crate::controller::PiGeom,
+        lba: u64,
+        num_blocks: usize,
+        ids: crate::controller::PiCqeIds,
+    ) {
+        let phase = self.cqs.get(&ids.cq_id).map(|c| c.phase).unwrap_or(1);
+        let block_bytes = geom.block_bytes as usize;
+        let data_bytes = geom.data_bytes as usize;
+        let pi_first = geom.pi_first;
+        let pi_type = geom.pi_type;
+        let prchk = geom.prchk;
+
+        // stream 单元：仅 **PRACT=0 inline** 是 extended-block（tuple 在流内）；其余
+        // （PRACT=0 separate / PRACT=1）皆纯 data，tuple 来自 MPTR concat 或 controller 自算。
+        let inline_pract0 = !geom.pract && sep_meta.is_none();
+        let stream_unit = if inline_pract0 {
             block_bytes
+        } else {
+            data_bytes
         };
         let total_stream = num_blocks * stream_unit;
-        let mut full = Vec::with_capacity(total_stream);
-        for b in op.data_pages.iter().flatten() {
-            full.extend_from_slice(b);
-        }
 
+        // meta 长度门控仅 PRACT=0 separate（PRACT=1 / inline 无 host meta，恒不 short）。
         let meta_short = sep_meta
             .as_ref()
             .map(|m| m.len() < num_blocks * 8)
             .unwrap_or(false);
-        let cqe = if full.len() < total_stream || meta_short {
+        let cqe = if stream.len() < total_stream || meta_short {
             tracing::warn!(
-                got = full.len(),
+                got = stream.len(),
                 want = total_stream,
                 meta_short,
-                "PRP-list PI WRITE 拼接/meta 长度不符"
+                "PI WRITE finalize 拼接/meta 长度不符"
             );
-            Cqe::error(op.cid, op.sq_id, op.sq_head, phase, sc::DATA_TRANSFER_ERROR)
+            Cqe::error(
+                ids.cid,
+                ids.sq_id,
+                ids.sq_head,
+                phase,
+                sc::DATA_TRANSFER_ERROR,
+            )
         } else {
-            full.truncate(total_stream);
-            // ── ① verify-all（任一失败 → 全不落盘，原子；首个失败 Media SCT=2）──
-            let mut verify_err: Option<crate::pi::PiCheck> = None;
-            for i in 0..num_blocks {
-                let (data_slice, tuple_arr): (&[u8], [u8; 8]) =
-                    if let Some(meta) = sep_meta.as_ref() {
-                        // separate：data 取自纯 data 流；tuple 取自 MPTR concat。
-                        (
-                            &full[i * data_bytes..(i + 1) * data_bytes],
-                            meta[i * 8..i * 8 + 8].try_into().unwrap(),
-                        )
-                    } else {
-                        // inline：从 extended-block 流按 pi_first 切 data/tuple。
-                        let blk = &full[i * block_bytes..(i + 1) * block_bytes];
-                        if pi_first {
-                            (&blk[8..8 + data_bytes], blk[0..8].try_into().unwrap())
-                        } else {
+            stream.truncate(total_stream);
+            // ── ① verify-all（仅 PRACT=0；任一失败 → 全不落盘，原子；首个失败 Media SCT=2）──
+            let verify_err: Option<crate::pi::PiCheck> = if geom.pract {
+                None // PRACT=1：controller 自算 tuple，无 host tuple 可验。
+            } else {
+                let mut err = None;
+                for i in 0..num_blocks {
+                    let (data_slice, tuple_arr): (&[u8], [u8; 8]) =
+                        if let Some(meta) = sep_meta.as_ref() {
+                            // separate：data 取自纯 data 流；tuple 取自 MPTR concat。
                             (
-                                &blk[0..data_bytes],
-                                blk[data_bytes..data_bytes + 8].try_into().unwrap(),
+                                &stream[i * data_bytes..(i + 1) * data_bytes],
+                                meta[i * 8..i * 8 + 8].try_into().unwrap(),
                             )
+                        } else {
+                            // inline：从 extended-block 流按 pi_first 切 data/tuple。
+                            let blk = &stream[i * block_bytes..(i + 1) * block_bytes];
+                            if pi_first {
+                                (&blk[8..8 + data_bytes], blk[0..8].try_into().unwrap())
+                            } else {
+                                (
+                                    &blk[0..data_bytes],
+                                    blk[data_bytes..data_bytes + 8].try_into().unwrap(),
+                                )
+                            }
+                        };
+                    let host_tuple = crate::pi::PiTuple::from_bytes(&tuple_arr);
+                    match host_tuple.verify(data_slice, lba + i as u64, pi_type, prchk) {
+                        crate::pi::PiCheck::Ok => {}
+                        other => {
+                            err = Some(other);
+                            break;
                         }
-                    };
-                let host_tuple = crate::pi::PiTuple::from_bytes(&tuple_arr);
-                match host_tuple.verify(data_slice, op.lba + i as u64, pi_type, prchk) {
-                    crate::pi::PiCheck::Ok => {}
-                    other => {
-                        verify_err = Some(other);
-                        break;
                     }
                 }
-            }
+                err
+            };
             if let Some(other) = verify_err {
                 let sc_byte = other
                     .to_sc()
                     .expect("non-Ok PiCheck always maps to an SC byte");
                 tracing::warn!(
-                    nsid = op.nsid,
-                    lba = op.lba,
+                    nsid = ids.nsid,
+                    lba,
                     ?other,
-                    "PRP-list PI WRITE: host PI verify 失败（全块不落盘）"
+                    "PI WRITE: host PI verify 失败（全块不落盘）"
                 );
                 Cqe::error(
-                    op.cid,
-                    op.sq_id,
-                    op.sq_head,
+                    ids.cid,
+                    ids.sq_id,
+                    ids.sq_head,
                     phase,
                     sc::status(sc_byte, sc::SCT_MEDIA_DATA_INTEGRITY),
                 )
-            } else if let Some(ns) = self.namespaces.get_mut(&op.nsid) {
+            } else if let Some(ns) = self.namespaces.get_mut(&ids.nsid) {
                 // ── ② 全通过 → atomic store-all ──
-                let store_err: Option<std::io::Error> = if let Some(meta) = sep_meta.as_ref() {
-                    // separate：逐块 interleave [tuple][data] 写 backing。
+                // PRACT=0 inline：连续流原样写（== extended-block 布局，无需重排）。
+                // 余者（PRACT=0 separate / PRACT=1）逐块 interleave [tuple][data]，tuple
+                // 来源 = MPTR concat（separate）/ `PiTuple::compute` 自算（PRACT=1）。
+                let store_err: Option<std::io::Error> = if inline_pract0 {
+                    ns.write_at(&stream, lba * block_bytes as u64).err()
+                } else {
                     let mut err = None;
                     for i in 0..num_blocks {
-                        let data = &full[i * data_bytes..(i + 1) * data_bytes];
-                        let tuple_arr: [u8; 8] = meta[i * 8..i * 8 + 8].try_into().unwrap();
+                        let data = &stream[i * data_bytes..(i + 1) * data_bytes];
+                        let tuple_arr: [u8; 8] = if geom.pract {
+                            crate::pi::PiTuple::compute(data, lba + i as u64, pi_type).to_bytes()
+                        } else {
+                            // !inline_pract0 && !pract ⟹ separate ⟹ sep_meta 必 Some。
+                            sep_meta.as_ref().unwrap()[i * 8..i * 8 + 8]
+                                .try_into()
+                                .unwrap()
+                        };
                         let mut block = vec![0u8; block_bytes];
                         if pi_first {
                             block[0..8].copy_from_slice(&tuple_arr);
@@ -444,40 +577,48 @@ impl NvmeController {
                             block[0..data_bytes].copy_from_slice(data);
                             block[data_bytes..data_bytes + 8].copy_from_slice(&tuple_arr);
                         }
-                        if let Err(e) =
-                            ns.write_at(&block, (op.lba + i as u64) * block_bytes as u64)
-                        {
-                            tracing::warn!(error = %e, nsid = op.nsid, lba = op.lba + i as u64,
-                                "PRP-list sep-meta WRITE backing fail");
+                        if let Err(e) = ns.write_at(&block, (lba + i as u64) * block_bytes as u64) {
+                            tracing::warn!(error = %e, nsid = ids.nsid, lba = lba + i as u64,
+                                "PI WRITE backing fail");
                             err = Some(e);
                             break;
                         }
                     }
                     err
-                } else {
-                    // inline：连续流原样写（== extended-block 布局，无需重排）。
-                    ns.write_at(&full, op.lba * block_bytes as u64).err()
                 };
                 if store_err.is_some() {
-                    Cqe::error(op.cid, op.sq_id, op.sq_head, phase, sc::DATA_TRANSFER_ERROR)
+                    Cqe::error(
+                        ids.cid,
+                        ids.sq_id,
+                        ids.sq_head,
+                        phase,
+                        sc::DATA_TRANSFER_ERROR,
+                    )
                 } else {
                     self.stat_host_writes += 1;
                     self.stat_lba_written += num_blocks as u64;
-                    crate::controller::io::advance_zns_wp(ns, op.lba, num_blocks as u32);
+                    crate::controller::io::advance_zns_wp(ns, lba, num_blocks as u32);
                     tracing::debug!(
-                        nsid = op.nsid,
-                        lba = op.lba,
+                        nsid = ids.nsid,
+                        lba,
                         num_blocks,
-                        inline = sep_meta.is_none(),
-                        "PRP-list PI WRITE OK（host PI verified，N 块原子落盘）"
+                        pract = geom.pract,
+                        inline = inline_pract0,
+                        "PI WRITE OK（N 块原子落盘）"
                     );
-                    Cqe::success(op.cid, op.sq_id, op.sq_head, phase)
+                    Cqe::success(ids.cid, ids.sq_id, ids.sq_head, phase)
                 }
             } else {
-                Cqe::error(op.cid, op.sq_id, op.sq_head, phase, sc::INVALID_NAMESPACE)
+                Cqe::error(
+                    ids.cid,
+                    ids.sq_id,
+                    ids.sq_head,
+                    phase,
+                    sc::INVALID_NAMESPACE,
+                )
             }
         };
-        self.post_cqe(ctx, op.cq_id, cqe);
+        self.post_cqe(ctx, ids.cq_id, cqe);
     }
 
     pub(super) fn on_dma_complete_impl(

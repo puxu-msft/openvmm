@@ -1439,10 +1439,6 @@ impl NvmeController {
                             },
                         );
                     }
-                    let mut meta_concat = Vec::with_capacity(nlb as usize * 8);
-                    for t in &tuples {
-                        meta_concat.extend_from_slice(t);
-                    }
                     let tok_m = self.guest_write(ctx, mptr, meta_concat);
                     self.pending_ios.insert(
                         tok_m,

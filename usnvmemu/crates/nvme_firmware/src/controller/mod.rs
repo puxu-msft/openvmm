@@ -786,6 +786,35 @@ impl PrpListOp {
     }
 }
 
+/// **SGL×PI P-A** — PI 数据路径的**标量几何**，gather-agnostic finalize helper 的输入。
+/// 从 `PiFinalize`（PRP 侧）或 NS + cdw12（READ 侧）提取，**与 SGL/PRP 的 scatter 几何
+/// 彻底解耦**：verify/store 永远在 dense 逻辑流上按 LBA 切（`i*unit..(i+1)*unit`），
+/// fragment / 页 / Bit-Bucket 几何只决定「哪些字节往 host 发」，不进本结构。
+///
+/// `pract` 从 day-1 内建（plan M-2）：PRACT=1 = controller `PiTuple::compute` 自算 tuple
+/// 落盘（WRITE）/ verify 后 strip 不回 host（READ）；PRACT=0 = verify host 提供的 tuple。
+/// **非后续阶段结构性追加**——避免先建 PRACT=0-only 形状再回填。
+pub(super) struct PiGeom {
+    pub(super) pi_type: u8,
+    pub(super) pi_first: bool,
+    pub(super) data_bytes: u32,  // 4096
+    pub(super) block_bytes: u32, // 4104
+    /// PRCHK 逐项校验门控（dispatch 时从 cdw12 PRINFO 解析）。
+    pub(super) prchk: crate::pi::PrChk,
+    pub(super) pract: bool,
+}
+
+/// **SGL×PI P-A** — PI finalize helper 构造 CQE + 查 NS 所需的命令标识。各数据路径
+/// （PRP-list / SGL）把自己累积器里的同名字段打包传入，使 helper 与累积器类型解耦。
+#[derive(Clone, Copy)]
+pub(super) struct PiCqeIds {
+    pub(super) sq_id: u16,
+    pub(super) cid: u16,
+    pub(super) sq_head: u16,
+    pub(super) cq_id: u16,
+    pub(super) nsid: u32,
+}
+
 /// **Phase R2b** — SGL segment chain fetch 段数上限（防恶意 driver 构造
 /// Segment 自环导致无限 DMA-read）。教学路径：单段 ≤ 1 page = 256 descriptor，
 /// 64 段足够任何合法 MDTS 传输（远超真实驱动用量）。
