@@ -134,6 +134,9 @@ fuzz **真** `read_pdu`（非抄一份——违 "fuzz the contract" 纪律）：
   plen=1MiB 触发 1MiB alloc，可控、非 bug）。
 
 ## 7. follow-up（本轮后，已承诺非含糊）
-- **async read_pdu_async fuzz**（WARN-1）：futures/tokio-test async Cursor harness，覆盖 async 侧那份
-  独立长度算术拷贝。
+- **async read_pdu_async fuzz**（WARN-1）：✅ **已完成**（commit 见下）。`read_pdu_async<S: AsyncRead>`
+  本就泛型，无需重构；`Cursor<&[u8]>`(tokio AsyncRead) + `futures::executor::block_on` 驱真
+  read_pdu_async（body 只 await read_exact、无 timer/spawn → 同步完成、无 tokio runtime、118k exec/s）。
+  覆盖 async 侧那份独立长度算术拷贝。真 coverage-guided **7,189,616 runs/61s 全绿**（async 算术与
+  sync 1:1、无 drift；hlen 修经共享 decode_common_hdr 两路都覆盖）。
 - fuzz 若挖出 framing 外的 finding（dispatch/reassembler/dhchap）→ 逐个评估新 target。

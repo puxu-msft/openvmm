@@ -15,6 +15,9 @@ rust-version = "1.95"
 nvme_of_tcp_target = { path = ".." }
 arbitrary = { version = "1.3", features = ["derive"] }
 xtask_fuzz = { path = "../../../../xtask/xtask_fuzz" }
+# async fuzz：read_pdu_async 经 tokio AsyncRead；用 futures::executor::block_on 跑（future 在
+# Cursor slice 读上同步完成、无 tokio runtime，快）。仅 fuzz crate 依赖，不入生产。
+futures = "0.3"
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 libfuzzer-sys = "0.4"
@@ -22,11 +25,20 @@ libfuzzer-sys = "0.4"
 [package.metadata]
 cargo-fuzz = true
 
-# **PDU framing fuzz** —— 打 framing::read_pdu（attacker 控 wire 字节 → PLEN/HLEN/PDO/digest
-# 长度算术）。经泛型 <R:Read> + Cursor 驱真 read_pdu。
+# **PDU framing fuzz（sync）** —— 打 framing::read_pdu（attacker 控 wire 字节 → PLEN/HLEN/PDO/
+# digest 长度算术）。经泛型 <R:Read> + Cursor 驱真 read_pdu。
 [[bin]]
 name = "fuzz_read_pdu"
 path = "fuzz_read_pdu.rs"
+test = false
+doc = false
+doctest = false
+
+# **PDU framing fuzz（async）** —— 打 read_pdu_async 的**独立长度算术拷贝**（sync 的平行实现，
+# 可独立 drift）。tokio AsyncRead(Cursor) + block_on 驱真 read_pdu_async。
+[[bin]]
+name = "fuzz_read_pdu_async"
+path = "fuzz_read_pdu_async.rs"
 test = false
 doc = false
 doctest = false
