@@ -11,6 +11,13 @@
 >
 > **置信度图例**:✅ 源码/probe 确认 / ❓ 仍未决(需真连) / ⚠️ caveat 成立 / ❌ 手册事实错误
 
+> **更新（2026-06-14）— usnvmemu 侧已修复**：static-model 盲区已在 usnvmemu 端落地 spec-conformant
+> 修复（C1 commit `e2c022575` Connect CNTLID 校验 + SCT 0x07→0x01 修复 + IPO/IATTR；C2 discovery
+> static-model 广告 + bin `--discovery-static-cntlid`）。下文 §2.1 描述的「静默 coerce」已改为：具体-
+> CNTLID mismatch → reject SC=0x82 + IPO/IATTR；dynamic/static-any/具体匹配 → accept；discovery 可广告
+> 具体 CNTLID。probe 4 绿 + discovery 测绿 + rust-reviewer APPROVE。**仍待母项目跑 real Windows 真连**
+> （§6 两组必测命令不变；TCP-vs-RDMA 单点 gate §5 仍未决）。
+
 ---
 
 ## 1. TL;DR + 裁断
@@ -136,5 +143,6 @@ cargo test --test vt_static_controller_model_probe -- --nocapture
 
 ---
 
-**文档状态**:✅ static-model 盲区 = 源码+probe 确认;❌ DH-group = 手册事实错误;❓ TCP 支持 = 仍待真连。
-**usnvmemu 已把盲区在 Linux 侧坐实 + 落档 + 加 regression gate。**
+**文档状态**:✅ static-model 盲区 = 源码+probe 确认 **+ 2026-06-14 usnvmemu 侧已修复(C1 `e2c022575` + C2)**;
+❌ DH-group = 手册事实错误;❓ TCP 支持 = 仍待真连。**usnvmemu 已修复盲区 + 落档 + regression gate;
+real Windows 真连待母项目(§6)。**

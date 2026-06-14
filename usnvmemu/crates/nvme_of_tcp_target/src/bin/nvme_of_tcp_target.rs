@@ -140,6 +140,14 @@ struct Cli {
     /// 仍可让主 listener 切 Discovery，但不再支持"同时 IO + Discovery"）。
     #[arg(long)]
     discovery_listen: Option<String>,
+    /// **static controller model（2026-06-14）** — Discovery Log entry 广告的 CNTLID。
+    /// 不设（默认）→ `0xFFFF` dynamic controller model（host 用 0xFFFF Connect，沿用
+    /// 现 Linux nvme-cli 行为）。设具体值（usnvmemu 单 controller = `1`）→ static
+    /// controller model：host（如默认 static 的 Windows inbox initiator）经 `nvme
+    /// discover` 学到此 CNTLID 后用它 Connect。target 的 Connect 校验（spec § 3.3）
+    /// 已接受 dynamic/static-any/具体匹配，故本 flag 只影响 discovery 广告侧。
+    #[arg(long)]
+    discovery_static_cntlid: Option<u16>,
     /// **V-followup-tls-3** 额外开 TLS listener（spec § 8.13 推荐端口 8009）。
     /// 同进程内 main IO listener 与本 TLS listener 共享同一 controller；
     /// plaintext 路径行为 100% 不变。TLS port 不 fallback plaintext，handshake
@@ -337,14 +345,19 @@ async fn main() -> Result<()> {
             .iter()
             .zip(cli.discovery_target_addr.iter())
         {
-            let portal = nvme_firmware::controller::discovery_log::DiscoveryPortal::from_ipv4_addr(
+            let mut portal = nvme_firmware::controller::discovery_log::DiscoveryPortal::from_ipv4_addr(
                 nqn, addr,
             )
             .with_context(|| format!("parse --discovery-target-addr {addr:?}"))?;
+            // **static controller model** — 覆盖 dynamic 默认（0xFFFF）为 static 具体值。
+            if let Some(cntlid) = cli.discovery_static_cntlid {
+                portal.cntlid = cntlid;
+            }
             tracing::info!(
                 nqn = portal.nqn.as_str(),
                 traddr = portal.traddr.as_str(),
                 trsvcid = portal.trsvcid.as_str(),
+                cntlid = portal.cntlid,
                 "V8a discovery portal"
             );
             portals.push(portal);
@@ -434,10 +447,13 @@ async fn main() -> Result<()> {
                 .iter()
                 .zip(cli.discovery_target_addr.iter())
             {
-                let p = nvme_firmware::controller::discovery_log::DiscoveryPortal::from_ipv4_addr(
+                let mut p = nvme_firmware::controller::discovery_log::DiscoveryPortal::from_ipv4_addr(
                     nqn, addr,
                 )
                 .with_context(|| format!("parse V8f discovery_target_addr {addr:?}"))?;
+                if let Some(cntlid) = cli.discovery_static_cntlid {
+                    p.cntlid = cntlid;
+                }
                 ps.push(p);
             }
             disc_ctrl.nvme_set_discovery_target(ps);

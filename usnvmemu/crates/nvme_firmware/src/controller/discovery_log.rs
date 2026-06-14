@@ -126,6 +126,11 @@ pub struct DiscoveryPortal {
     pub adrfam: u8,
     /// PORTID
     pub portid: u16,
+    /// CNTLID advertised in the Discovery Log entry（offset 6）：
+    /// `0xFFFF` = dynamic controller model（默认）；具体值 = static controller
+    /// model，host 须用此 CNTLID Connect。usnvmemu 单 controller target 的 static
+    /// 广告值 = `TEACHING_CNTLID`(1)。见 bin `--discovery-static-cntlid`。
+    pub cntlid: u16,
 }
 
 impl DiscoveryPortal {
@@ -140,6 +145,7 @@ impl DiscoveryPortal {
             trsvcid: port.to_string(),
             adrfam: 1, // IPv4
             portid: 1,
+            cntlid: 0xFFFF, // dynamic（默认；--discovery-static-cntlid 可覆盖为 static 具体值）
         })
     }
 }
@@ -170,7 +176,7 @@ pub fn build_discovery_log(gen_ctr: u64, portals: &[DiscoveryPortal], bytes: usi
             subtype: 2, // NVM subsystem
             treq: 0,    // no secure channel
             portid: p.portid,
-            cntlid: 0xFFFF, // dynamic
+            cntlid: p.cntlid, // 0xFFFF dynamic（默认）/ 具体值 static（--discovery-static-cntlid）
             asqsz: 32,
             ..Default::default()
         };
@@ -298,6 +304,7 @@ mod tests {
                 trsvcid: "4421".into(),
                 adrfam: 1,
                 portid: 1,
+                cntlid: 0xFFFF,
             },
             DiscoveryPortal {
                 nqn: "nqn.test2".into(),
@@ -305,6 +312,7 @@ mod tests {
                 trsvcid: "4422".into(),
                 adrfam: 1,
                 portid: 2,
+                cntlid: 0xFFFF,
             },
         ];
         let buf = build_discovery_log(42, &portals, 1024 + 1024 * 2);
@@ -341,6 +349,7 @@ mod tests {
             trsvcid: "4420".into(),
             adrfam: 1,
             portid: 1,
+            cntlid: 0xFFFF,
         }];
         // host 请求仅 16 byte（典型先 fetch header 看 NUMREC）
         let buf = build_discovery_log(99, &portals, 16);
@@ -366,6 +375,44 @@ mod tests {
         assert_eq!(p.traddr, "10.0.0.1");
         assert_eq!(p.trsvcid, "4420");
         assert_eq!(p.adrfam, 1);
+        // from_ipv4_addr 默认 dynamic controller model（CNTLID=0xFFFF）。
+        assert_eq!(p.cntlid, 0xFFFF, "默认 dynamic（0xFFFF）");
+    }
+
+    /// **static controller model（2026-06-14）** — Discovery Log entry 的 CNTLID
+    /// 字段（offset 6）随 `DiscoveryPortal.cntlid` 走：dynamic 默认 0xFFFF；static
+    /// 广告具体值（usnvmemu 单 controller = 1）。让 static-default host（Windows）
+    /// 经 discovery 学到该 CNTLID 后用它 Connect。spec § 5.16.1.20 Figure 351。
+    #[test]
+    fn discovery_entry_cntlid_reflects_portal_static_or_dynamic() {
+        // static：广告具体 CNTLID=1。
+        let static_portal = DiscoveryPortal {
+            nqn: "nqn.static".into(),
+            traddr: "127.0.0.1".into(),
+            trsvcid: "4420".into(),
+            adrfam: 1,
+            portid: 1,
+            cntlid: 1,
+        };
+        let buf = build_discovery_log(7, std::slice::from_ref(&static_portal), 1024 * 2);
+        // entry[0] @ 1024；CNTLID @ entry+6 = 1030（u16 LE）。
+        assert_eq!(
+            u16::from_le_bytes(buf[1030..1032].try_into().unwrap()),
+            1,
+            "static 广告 CNTLID=1"
+        );
+
+        // dynamic：默认 0xFFFF。
+        let dyn_portal = DiscoveryPortal {
+            cntlid: 0xFFFF,
+            ..static_portal
+        };
+        let buf2 = build_discovery_log(7, std::slice::from_ref(&dyn_portal), 1024 * 2);
+        assert_eq!(
+            u16::from_le_bytes(buf2[1030..1032].try_into().unwrap()),
+            0xFFFF,
+            "dynamic 广告 CNTLID=0xFFFF"
+        );
     }
 
     /// **V7-6** — DiscoveryEntry struct size = 1024 byte (spec § 5.16.1.20 Figure 351)

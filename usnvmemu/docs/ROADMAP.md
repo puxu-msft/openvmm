@@ -320,27 +320,32 @@ portal；多 portal 走 [[nvme-of-tcp-real-linux-interop-milestone]] 验过。
 **Acceptance**：起 target with `--discovery-target-addr A:p1 -p A:p2 -p A:p3`，
 `nvme discover -t tcp -a A -s 4420` 输出 3 个 entry，每个 NQN/IP/Port 正确。
 
-### V-followup-static-controller-model (Tier 2, MEDIUM, 纯代码可做 — Windows interop 盲区)
+### ✅ V-followup-static-controller-model (2026-06-14 SHIPPED C1+C2 — Windows interop 盲区已修)
 
-**What**：让 fabric Connect 真读 `cd.cntlid` 并按 spec § 3.3 处理 static controller
-model：honor 已知 CNTLID / 接受 `0xFFFF`(dynamic)·`0xFFFE`(static-any) / 对不可满足的
-**具体** CNTLID 请求返 SC=0x82(Connect Invalid Parameters)，而非现在的**静默 coerce 成 1**。
-Discovery Log 增加 static-portal 选项（可播具体 CNTLID 而非只 `0xFFFF`）。
+**来源**：母项目 Windows NVMe-oF 互通手册（2026-06-13 交接）暴露 + probe 坐实：Windows inbox
+initiator(`stornvmeofi`/`nvmeofutil`)**默认 static controller model**(`-dy false` / `connect -ci`)，
+Linux `nvme-cli` 默认 dynamic(`0xFFFF`)，故现有全部 Linux interop 测试结构性盖不到 static 路径。
+缺口在 transport-无关的 `fabric.rs` Connect + `discovery_log.rs` → V9 RDMA 会继承。
 
-**Why（来源 = 母项目 Windows NVMe-oF 互通手册 2026-06-13 交接）**：Windows inbox
-initiator(`stornvmeofi`/`nvmeofutil`)**默认 static controller model**(`add SubsystemPort
--dy false` / `connect -ci`)。Linux `nvme-cli` 默认 dynamic(发 `0xFFFF`)，所以**现有全部
-Linux interop 测试结构性盖不到 static 路径**。实测坐实当前缺口：
-- Discovery 写死 `cntlid: 0xFFFF`（[discovery_log.rs:173](/usnvmemu/crates/nvme_firmware/src/controller/discovery_log.rs)）→ 只播 dynamic。
-- `handle_connect_async` 解析 `ConnectData` 但**从不读 `cd.cntlid`**，无条件返 `TEACHING_CNTLID=1`（[async_session.rs:773](/usnvmemu/crates/nvme_of_tcp_target/src/async_session.rs) / [fabric.rs:44](/usnvmemu/crates/nvme_of_tcp_target/src/fabric.rs)）。
-- probe `tests/vt_static_controller_model_probe.rs`（3 绿）：host 请求 CNTLID=5 → SC=0 + 分配 1（**静默 coerce，无错误**），non-conformant。
+**✅ C1（commit `e2c022575`）— Connect CNTLID 校验 + SCT 修复**：
+- `dispatch_plan::decide_connect_cntlid`（纯函数，sync/async dual-track）：dynamic(`0xFFFF`)/
+  static-any(`0xFFFE`)/具体匹配 → accept；指定不存在的具体 cntlid → reject SC=0x82 + CQE
+  result DW0 = IPO/IATTR(`0x0001_0004`)。修「静默 coerce 成 1」。
+- **SCT 修复（CRITICAL，architect 发现）**：fabrics SC(0x80-0x9F)原用 SCT=0x07 Vendor Specific
+  是既存 wire bug，应 SCT=0x01 Command Specific（IPO/IATTR 仅此下定义）；连带修 self-consistent
+  错误测试。
 
-**关键**：缺口在 `fabric.rs` Connect + `discovery_log.rs`，是 **transport-无关**层（不在
-`framing.rs` TCP PDU 层）→ 即便 §V9 走 RDMA，这条缺口照样继承。配套 caveat：DHCHAP
-当前 HMAC-only / `DHGROUP_NULL`（[dhchap.rs:517](/usnvmemu/crates/nvme_of_tcp_target/src/dhchap.rs)），若 Windows `authkey` 要求真 DH 组则 auth 不通——同属 Windows-only 盲区。
+**✅ C2（discovery static-model 广告）**：`DiscoveryPortal.cntlid`（默认 0xFFFF dynamic）+ bin
+`--discovery-static-cntlid <N>`（usnvmemu 单 controller = 1）→ static-default host 经 `nvme discover`
+学到具体 CNTLID。
 
-**Acceptance**：probe 翻红并更新为 spec-conformant 断言（具体-CNTLID 不可满足 → SC=0x82）；
-新增 static-portal discovery 测试；real Windows 真连见母项目 companion（[experiments/2026-06-13-openhcl-vpci-nvme/](/usnvmemu/experiments/2026-06-13-openhcl-vpci-nvme/)）。
+**验证**：173 lib + 全 integration + 4 probe + discovery static-advertise 测全绿，clippy clean，
+rust-reviewer APPROVE(C1+C2)。plan [2026-06-14-static-controller-model-conformance.md](/usnvmemu/crates/nvme_of_tcp_target/docs/plans/2026-06-14-static-controller-model-conformance.md)。
+
+**deferred → `V-spec-strict-mode`（非 Windows 承重路径，可拆高级）**：① spec-strict reject
+`cntlid=0`（+ 21 个 legacy fixture 改送 faithful `0xFFFF`）；② IO queue(qid≥1) Connect 拒哨值
+（须送 admin 已分配的具体 cntlid）。real host 不触发，纯 spec 纯化。real Windows 真连待母项目跑
+（companion §6 已给两组必测命令）。
 
 ### ✅ V-followup-py-harness-spec-wire-conformance (2026-06-09 SHIPPED — commit `57d12a7b`)
 
