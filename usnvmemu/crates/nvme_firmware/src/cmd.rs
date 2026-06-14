@@ -275,6 +275,9 @@ pub mod sc {
     pub const INVALID_SGL_SEGMENT_DESCRIPTOR: u16 = 0x000d;
     pub const SGL_INVALID_NUMBER_OF_DESCRIPTORS: u16 = 0x000e;
     pub const DATA_SGL_LENGTH_INVALID: u16 = 0x000f;
+    /// Metadata SGL Length Invalid（Generic 0x10）—— metadata-SGL（E1）的 meta fragment 覆盖
+    /// 总长 ≠ 期望 N×8 tuple 字节时返此（与 DATA_SGL_LENGTH_INVALID 对 data 平面对称）。
+    pub const METADATA_SGL_LENGTH_INVALID: u16 = 0x0010;
     pub const SGL_DESCRIPTOR_TYPE_INVALID: u16 = 0x0011;
     pub const SGL_INVALID_USE_OF_CMB: u16 = 0x0012;
     /// SGL Offset Invalid（Generic 0x16）—— CMB-relative SGL（sub_type=1 Offset）的
@@ -713,7 +716,13 @@ impl IdentifyController {
         // 故 R2d 把 bit16 加回——advertise⟺implement 重新对齐（这次是真支持）。
         // bit17（byte-alignment 等额外位）仍不置：未实现对应语义。
         // 注：Segment chain 属基础 SGL 支持（bits 1:0），无独立 SGLS bit。
-        id.sgls = 0x0001_0001;
+        //
+        // **SGL×PI E1** — bit 19 = "Metadata SGL / MPTR-may-contain-SGL-descriptor support"
+        // （Linux `NVME_CTRL_SGLS_MSDS` = `1<<19`，独立 oracle；**非** plan architect §5 误写的
+        // bit15——bit15 在 reserved 区，见 plan line120 订正）。E1 实现 metadata-SGL（PSDT=10
+        // METASEG，MPTR→meta SGL descriptor，meta tuple 经 meta-frag scatter/gather）→ advertise⟺
+        // implement 对齐置 bit19。值 = bit0 (data-SGL) | bit16 (Bit Bucket) | bit19 (MSDS)。
+        id.sgls = 0x0001_0001 | (1 << 19);
         // **CMB-P5** — SGLS bit 20 = "SGL Address Field Specifies an Offset"（SAOS，
         // CMB-relative 寻址支持；spec NVMe Base 2.0 § 5.1.13.2 / Linux 内核
         // `NVME_CTRL_SGLS_SAOS` = `1<<20`）。**条件化** advertise⟺implement：仅在 CMB

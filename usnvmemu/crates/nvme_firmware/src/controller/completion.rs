@@ -398,6 +398,12 @@ impl NvmeController {
         let sep_meta: Option<Vec<u8>> = match pi.layout {
             crate::controller::PiLayout::Inline => None,
             crate::controller::PiLayout::Separate { meta, .. } => Some(meta.unwrap_or_default()),
+            // PRP 路径（`PrpListOp`）永不构造 `MetaSgl`（metadata-SGL 仅 SGL 数据路径，见
+            // `PiLayout::MetaSgl` doc）；到此即代码不变量被破坏。
+            crate::controller::PiLayout::MetaSgl { .. } => {
+                tracing::error!(op_id, "PRP finalize 遇 metadata-SGL layout（不变量破坏）");
+                return;
+            }
         };
         // PRP-list PI finalize 当前仅 PRACT=0（host-tuple verify）路径；PRACT=1（controller
         // generate）走独立 K4 generate 链，未经本 finalize。
@@ -809,14 +815,19 @@ impl NvmeController {
                     }
                     PendingOp::NvmSglFetch { op_id, .. }
                     | PendingOp::NvmSglData { op_id, .. }
-                    | PendingOp::NvmSglSepMeta { op_id } => {
-                        // **Phase R2 / SGL×PI P-B** — SGL 多 fragment op：清 sibling pending
-                        // （含 separate-meta 的 MPTR 子-DMA NvmSglSepMeta）+ 累积器，保证只 post
-                        // 一次 error CQE（同 C1 修复语义）。
+                    | PendingOp::NvmSglSepMeta { op_id }
+                    | PendingOp::NvmSglMetaFetch { op_id, .. }
+                    | PendingOp::NvmSglMetaData { op_id, .. } => {
+                        // **Phase R2 / SGL×PI P-B/E1** — SGL 多 fragment op：清 sibling pending
+                        // （含 separate-meta 的 MPTR 子-DMA NvmSglSepMeta + E1 meta 平面
+                        // NvmSglMetaFetch/NvmSglMetaData）+ 累积器，保证只 post 一次 error CQE
+                        // （同 C1 修复语义）。
                         self.pending_ios.retain(|_, q| match q.op {
                             PendingOp::NvmSglFetch { op_id: o, .. }
                             | PendingOp::NvmSglData { op_id: o, .. }
-                            | PendingOp::NvmSglSepMeta { op_id: o } => o != op_id,
+                            | PendingOp::NvmSglSepMeta { op_id: o }
+                            | PendingOp::NvmSglMetaFetch { op_id: o, .. }
+                            | PendingOp::NvmSglMetaData { op_id: o, .. } => o != op_id,
                             _ => true,
                         });
                         self.sgl_ops.remove(&op_id);
@@ -2839,54 +2850,19 @@ impl NvmeController {
                     // cba+offset；≥2 已拒）。返回的 descriptor 的 `address` 对 CMB-relative
                     // 已是实际 GPA，可直接喂 `guest_*`。保留此处旧的 `!=0` 检查会把已放行的
                     // CMB-relative fragment 误拒（classifier 集中化纪律：单一裁决点）。
-                    let mut walk_err: Option<u16> = None;
-                    {
+                    //
+                    // 数据 descriptor → frag plan 经共享 `append_sgl_data_frags`（与 meta 平面
+                    // `NvmSglMetaFetch` 同一份逻辑，§32 anti-drift）。
+                    let walk_err = {
                         let op = self.sgl_ops.get_mut(&op_id).unwrap();
-                        for d in data_descs {
-                            match d.sgl_type {
-                                crate::sgl::SglType::DataBlock => {
-                                    // 0 长度 Data Block 无数据传输：跳过（不 push
-                                    // frag / 不发 DMA），防恶意 driver 用海量
-                                    // 0-length block 制造 no-op DMA 放大（覆盖检查
-                                    // 不约束其数量）。
-                                    if d.length == 0 {
-                                        continue;
-                                    }
-                                    op.frags.push(crate::controller::SglPlanFrag {
-                                        address: d.address,
-                                        stream_offset: op.walk_offset,
-                                        length: d.length,
-                                    });
-                                    op.walk_offset = op.walk_offset.saturating_add(d.length as u64);
-                                }
-                                crate::sgl::SglType::BitBucket => {
-                                    // **Phase R2c** — Bit Bucket（spec § 4.4.1）。
-                                    // READ (controller→host)：跳过 length 字节输出
-                                    //   ——advance stream offset（discard 这段 backing
-                                    //   数据，**不**发 dma_write），其后 fragment 的
-                                    //   stream 偏移据此前移。
-                                    // WRITE (host→controller)：spec 规定 Bit Bucket
-                                    //   length **视为 0**（如同不存在）——不 advance、
-                                    //   不 DMA。
-                                    // 两方向都不产生 transfer fragment。
-                                    if !op.is_write {
-                                        op.walk_offset =
-                                            op.walk_offset.saturating_add(d.length as u64);
-                                    }
-                                }
-                                other => {
-                                    // 数据位置出现 (Last)Segment = 非法（chain 只能
-                                    // 在段末位）；Keyed/Transport → reject (NVMe-oF)。
-                                    tracing::warn!(
-                                        kind = ?other,
-                                        "SGL 数据位置非 Data Block/Bit Bucket (chain 须末位)"
-                                    );
-                                    walk_err = Some(sc::SGL_DESCRIPTOR_TYPE_INVALID);
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                        append_sgl_data_frags(
+                            &mut op.frags,
+                            &mut op.walk_offset,
+                            data_descs,
+                            op.is_write,
+                        )
+                        .err()
+                    };
                     if let Some(sc_byte) = walk_err {
                         self.finish_sgl_error(ctx, op_id, sc_byte);
                         return;
@@ -2973,10 +2949,14 @@ impl NvmeController {
                     if bad {
                         self.finish_sgl_error(ctx, op_id, sc::DATA_TRANSFER_ERROR);
                     } else if done_all {
-                        // **SGL×PI P-B** — data 平面全到齐。separate-meta PI 走双门控
-                        // （还需 meta 门：WRITE MPTR tuple 已到 / READ MPTR 已写出，PRACT=1
-                        // 自算/strip 无需）；plain 直接 finalize（保持原行为）。
-                        if self.sgl_ops.get(&op_id).is_some_and(|o| o.is_separate_pi()) {
+                        // **SGL×PI P-B/E1** — data 平面全到齐。需 data+meta 双门控的 PI（flat
+                        // separate 或 metadata-SGL）走 `try_finish_sgl_pi` 查合取；plain/inline
+                        // 直接 finalize（保持原行为）。
+                        if self
+                            .sgl_ops
+                            .get(&op_id)
+                            .is_some_and(|o| o.needs_meta_gate())
+                        {
                             self.try_finish_sgl_pi(ctx, op_id);
                         } else {
                             self.finish_sgl_done(ctx, op_id);
@@ -2998,6 +2978,48 @@ impl NvmeController {
                         tracing::warn!(op_id, "NvmSglSepMeta unknown op_id");
                     }
                     self.try_finish_sgl_pi(ctx, op_id);
+                }
+                PendingOp::NvmSglMetaFetch { op_id, stage } => {
+                    // **SGL×PI E1** — meta 平面 walk DMA-read 完成（MPTR→meta SGL1 描述符 / segment 页）。
+                    self.on_sgl_meta_fetch(ctx, op_id, stage, data);
+                }
+                PendingOp::NvmSglMetaData { op_id, frag_idx } => {
+                    // **SGL×PI E1** — 单条 meta fragment 传输完成（WRITE gather 填 meta_buf / READ
+                    // scatter 已写出）。计数 + 满足双门控即 finalize。
+                    let bad = if let Some(op) = self.sgl_ops.get_mut(&op_id) {
+                        let mut bad = false;
+                        if op.is_write {
+                            if let Some(frag) = op.meta_frags.get(frag_idx as usize).copied() {
+                                let off = frag.stream_offset as usize;
+                                let end = off.saturating_add(frag.length as usize);
+                                if data.len() == frag.length as usize && end <= op.meta_buf.len() {
+                                    op.meta_buf[off..end].copy_from_slice(&data);
+                                } else {
+                                    tracing::warn!(
+                                        op_id,
+                                        frag_idx,
+                                        got = data.len(),
+                                        want = frag.length,
+                                        "SGL meta gather fragment 字节数异常"
+                                    );
+                                    bad = true;
+                                }
+                            } else {
+                                tracing::warn!(op_id, frag_idx, "SGL meta gather frag_idx 越界");
+                                bad = true;
+                            }
+                        }
+                        op.meta_transfers_done += 1;
+                        bad
+                    } else {
+                        tracing::warn!(op_id, frag_idx, "NvmSglMetaData unknown op_id");
+                        false
+                    };
+                    if bad {
+                        self.finish_sgl_error(ctx, op_id, sc::DATA_TRANSFER_ERROR);
+                    } else {
+                        self.try_finish_sgl_pi(ctx, op_id);
+                    }
                 }
             }
             return;
@@ -3105,6 +3127,254 @@ impl NvmeController {
         }
     }
 
+    /// **SGL×PI E1** — meta 平面 walk 一步 DMA-read 完成（MPTR→meta SGL1 描述符 / segment 页）。
+    /// 镜像 data 平面 `NvmSglFetch` walk，但操作独立的 `meta_frags`/`meta_walk_offset`/
+    /// `meta_walk_segments`，且多一步 `Mptr`：因 meta SGL1 不内联在 SQE（MPTR 仅 8 字节地址），
+    /// 须先 DMA-read MPTR 处的 16-byte 描述符才知是单 Data Block 还是 Segment 链。
+    fn on_sgl_meta_fetch(
+        &mut self,
+        ctx: &mut DeviceCtx<'_>,
+        op_id: u64,
+        stage: crate::controller::MetaWalkStage,
+        data: Vec<u8>,
+    ) {
+        let cmb = self.cmb_window();
+        match stage {
+            crate::controller::MetaWalkStage::Mptr => {
+                // data = MPTR 处的 16-byte meta SGL1 描述符。
+                let Ok(buf) = <[u8; 16]>::try_from(&data[..data.len().min(16)]) else {
+                    tracing::warn!(op_id, got = data.len(), "meta SGL1 描述符 DMA 短读");
+                    self.finish_sgl_error(ctx, op_id, sc::SGL_DESCRIPTOR_TYPE_INVALID);
+                    return;
+                };
+                let Some(mut desc) = crate::sgl::SglDescriptor::parse(&buf) else {
+                    self.finish_sgl_error(ctx, op_id, sc::SGL_DESCRIPTOR_TYPE_INVALID);
+                    return;
+                };
+                // sub_type 合法性经共享 classifier（与 data 平面同判据）。
+                if let Some(sc_byte) = crate::sgl::subtype_to_sc(desc.sub_type, cmb.is_some()) {
+                    self.finish_sgl_error(ctx, op_id, sc_byte);
+                    return;
+                }
+                // **CMB-P2 rebase（reviewer HIGH 修复）** — meta SGL1 描述符的 address 对
+                // CMB-relative（sub_type=1）是 CMB 内偏移，须 rebase 成实际 GPA `cba+offset` 才能喂
+                // `guest_*`（否则被误当绝对 GPA、DMA 错地址静默损坏）。data 平面 `parse_sgl1_segment`
+                // 在此处恒 `resolve_sgl_address`；meta plane 的 Mptr 描述符在 `parse_sgl_list` 之外
+                // 单独解析，故须在此**同样** rebase（DataBlock 的 frag 地址 + Segment 指针地址都用
+                // rebased 值）。sub_type=0 为 identity；越界 offset≥size → `SGL_OFFSET_INVALID`(0x16)。
+                desc.address =
+                    match crate::sgl::resolve_sgl_address(desc.sub_type, desc.address, cmb) {
+                        Ok(a) => a,
+                        Err(sc_byte) => {
+                            self.finish_sgl_error(ctx, op_id, sc_byte);
+                            return;
+                        }
+                    };
+                match desc.sgl_type {
+                    crate::sgl::SglType::DataBlock | crate::sgl::SglType::BitBucket => {
+                        // 单 contiguous meta（Data Block）或 sole Bit Bucket（discard 全部 meta，
+                        // READ advance offset / WRITE 视为 0）→ 经共享 helper append 后 walk 结束。
+                        let walk_err = {
+                            let op = self.sgl_ops.get_mut(&op_id).unwrap();
+                            append_sgl_data_frags(
+                                &mut op.meta_frags,
+                                &mut op.meta_walk_offset,
+                                std::slice::from_ref(&desc),
+                                op.is_write,
+                            )
+                            .err()
+                        };
+                        if let Some(sc_byte) = walk_err {
+                            self.finish_sgl_error(ctx, op_id, sc_byte);
+                            return;
+                        }
+                        self.start_sgl_meta_transfer(ctx, op_id);
+                    }
+                    crate::sgl::SglType::Segment | crate::sgl::SglType::LastSegment => {
+                        // meta SGL1 是 segment 指针 → DMA-read 该 segment 页（descriptor 数组）。
+                        let (seg_len, is_last) =
+                            match crate::controller::io::validate_segment_pointer(&desc, cmb) {
+                                Ok(t) => t,
+                                Err(sc_byte) => {
+                                    self.finish_sgl_error(ctx, op_id, sc_byte);
+                                    return;
+                                }
+                            };
+                        self.issue_meta_segment_fetch(ctx, op_id, desc.address, seg_len, is_last);
+                    }
+                    other => {
+                        tracing::warn!(kind = ?other, "meta SGL1 = Keyed/Transport（NVMe-oF 专属）unsupported");
+                        self.finish_sgl_error(ctx, op_id, sc::SGL_DESCRIPTOR_TYPE_INVALID);
+                    }
+                }
+            }
+            crate::controller::MetaWalkStage::Segment { is_last } => {
+                // data = segment 页（descriptor 数组）。镜像 data 平面 NvmSglFetch。
+                let descs = match crate::sgl::parse_sgl_list(&data, cmb) {
+                    Ok(d) => d,
+                    Err(sc_byte) => {
+                        tracing::warn!(op_id, sc = sc_byte, "meta SGL segment 解析失败");
+                        self.finish_sgl_error(ctx, op_id, sc_byte);
+                        return;
+                    }
+                };
+                // meta segment-hop 上限（同 data：防 Segment 自环无限 fetch）。
+                let hops = match self.sgl_ops.get_mut(&op_id) {
+                    Some(op) => {
+                        op.meta_walk_segments += 1;
+                        op.meta_walk_segments
+                    }
+                    None => {
+                        tracing::warn!(op_id, "NvmSglMetaFetch unknown op_id");
+                        return;
+                    }
+                };
+                if hops > crate::controller::MAX_SGL_SEGMENTS {
+                    tracing::warn!(op_id, hops, "meta SGL segment chain 超上限（疑似自环）");
+                    self.finish_sgl_error(ctx, op_id, sc::SGL_INVALID_NUMBER_OF_DESCRIPTORS);
+                    return;
+                }
+                let (data_descs, cont): (
+                    &[crate::sgl::SglDescriptor],
+                    Option<&crate::sgl::SglDescriptor>,
+                ) = if is_last {
+                    (&descs[..], None)
+                } else if let Some((last, head)) = descs.split_last() {
+                    (head, Some(last))
+                } else {
+                    tracing::warn!(op_id, "meta SGL 非-last segment 为空");
+                    self.finish_sgl_error(ctx, op_id, sc::SGL_DESCRIPTOR_TYPE_INVALID);
+                    return;
+                };
+                let walk_err = {
+                    let op = self.sgl_ops.get_mut(&op_id).unwrap();
+                    append_sgl_data_frags(
+                        &mut op.meta_frags,
+                        &mut op.meta_walk_offset,
+                        data_descs,
+                        op.is_write,
+                    )
+                    .err()
+                };
+                if let Some(sc_byte) = walk_err {
+                    self.finish_sgl_error(ctx, op_id, sc_byte);
+                    return;
+                }
+                match cont {
+                    None => self.start_sgl_meta_transfer(ctx, op_id),
+                    Some(c) => {
+                        let (next_len, next_is_last) =
+                            match crate::controller::io::validate_segment_pointer(c, cmb) {
+                                Ok(t) => t,
+                                Err(sc_byte) => {
+                                    self.finish_sgl_error(ctx, op_id, sc_byte);
+                                    return;
+                                }
+                            };
+                        self.issue_meta_segment_fetch(
+                            ctx,
+                            op_id,
+                            c.address,
+                            next_len,
+                            next_is_last,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **SGL×PI E1** — 入队一条 meta segment 页 DMA-read（`NvmSglMetaFetch{Segment}`）。
+    fn issue_meta_segment_fetch(
+        &mut self,
+        ctx: &mut DeviceCtx<'_>,
+        op_id: u64,
+        addr: u64,
+        len: u32,
+        is_last: bool,
+    ) {
+        let (sq_id, cid, sq_head, cq_id, nsid) = match self.sgl_ops.get(&op_id) {
+            Some(op) => (op.sq_id, op.cid, op.sq_head, op.cq_id, op.nsid),
+            None => return,
+        };
+        let tok = self.guest_read(ctx, addr, len);
+        self.pending_ios.insert(
+            tok,
+            PendingIo {
+                sq_id,
+                cid,
+                sq_head,
+                cq_id,
+                nsid,
+                op: PendingOp::NvmSglMetaFetch {
+                    op_id,
+                    stage: crate::controller::MetaWalkStage::Segment { is_last },
+                },
+            },
+        );
+    }
+
+    /// **SGL×PI E1** — meta 平面 walk 完成 → 启动 meta-frag 传输（WRITE = gather host tuple 进
+    /// `meta_buf`；READ = scatter `meta_buf` 的 N×8 tuple concat 到各 host 地址）。先校验 meta
+    /// 覆盖正好 == N×8（不足/超出 → `METADATA_SGL_LENGTH_INVALID`，与 data 平面 `DATA_SGL_LENGTH_
+    /// INVALID` 对称）。0 frag（全 Bit Bucket discard，仅 READ 且覆盖==N×8）直接判 meta done。
+    fn start_sgl_meta_transfer(&mut self, ctx: &mut DeviceCtx<'_>, op_id: u64) {
+        let (meta_offset, expected_meta) = match self.sgl_ops.get(&op_id) {
+            Some(op) => (op.meta_walk_offset, op.num_blocks as u64 * 8),
+            None => return,
+        };
+        if meta_offset != expected_meta {
+            tracing::warn!(
+                op_id,
+                got = meta_offset,
+                expected = expected_meta,
+                "meta SGL fragment 覆盖与 N×8 tuple 不符"
+            );
+            self.finish_sgl_error(ctx, op_id, sc::METADATA_SGL_LENGTH_INVALID);
+            return;
+        }
+        let (sq_id, cid, sq_head, cq_id, nsid, is_write, plan) = {
+            let op = self.sgl_ops.get_mut(&op_id).unwrap();
+            op.meta_transfers_total = op.meta_frags.len() as u32;
+            op.meta_walk_done = true;
+            (
+                op.sq_id,
+                op.cid,
+                op.sq_head,
+                op.cq_id,
+                op.nsid,
+                op.is_write,
+                op.meta_frags.clone(),
+            )
+        };
+        for (idx, frag) in plan.iter().enumerate() {
+            let frag_idx = idx as u32;
+            let tok = if is_write {
+                // WRITE gather：dma_read host tuple → 后续填 meta_buf。
+                self.guest_read(ctx, frag.address, frag.length)
+            } else {
+                // READ scatter：从 meta_buf（tuple concat）切片 dma_write 到 host。
+                let off = frag.stream_offset as usize;
+                let end = off + frag.length as usize;
+                let slice = self.sgl_ops[&op_id].meta_buf[off..end].to_vec();
+                self.guest_write(ctx, frag.address, slice)
+            };
+            self.pending_ios.insert(
+                tok,
+                PendingIo {
+                    sq_id,
+                    cid,
+                    sq_head,
+                    cq_id,
+                    nsid,
+                    op: PendingOp::NvmSglMetaData { op_id, frag_idx },
+                },
+            );
+        }
+        // 0-frag（全 Bit Bucket discard）→ meta 已 done；或 data 已先完成 → 满足双门控即 finalize。
+        self.try_finish_sgl_pi(ctx, op_id);
+    }
+
     /// **Phase R2** — SGL op 全 fragment 传输完成 → 终结。
     /// WRITE：把 gather buffer 一次性写 backing 再 post CQE；READ：data 已
     /// scatter 到 host，直接 post success CQE。**SGL×PI P-B**：separate-meta PI op 走
@@ -3140,6 +3410,12 @@ impl NvmeController {
                 let sep_meta = match pi.layout {
                     crate::controller::PiLayout::Separate { meta, .. } => meta,
                     crate::controller::PiLayout::Inline => None,
+                    // **E1** metadata-SGL：tuple 经 meta-frag gather 进 `op.meta_buf`（N×8）。
+                    // MetaSgl 仅 PRACT=0 构造（pract 退化成 Separate），故此处恒是已 gather 的 host
+                    // tuple → helper verify-all。
+                    crate::controller::PiLayout::MetaSgl { .. } => {
+                        Some(std::mem::take(&mut op.meta_buf))
+                    }
                 };
                 self.pi_write_finalize_stream(
                     ctx,
@@ -3205,7 +3481,11 @@ impl NvmeController {
         self.pending_ios.retain(|_, q| match q.op {
             PendingOp::NvmSglFetch { op_id: o, .. }
             | PendingOp::NvmSglData { op_id: o, .. }
-            | PendingOp::NvmSglSepMeta { op_id: o } => o != op_id,
+            | PendingOp::NvmSglSepMeta { op_id: o }
+            // **E1** — meta 平面在途 token 同 op 一并清理（否则 meta-frag walk 失败时孤儿 token
+            // 泄漏：那些 NvmSglMetaFetch/NvmSglMetaData 完成回调会查不到已移除的 op_id）。
+            | PendingOp::NvmSglMetaFetch { op_id: o, .. }
+            | PendingOp::NvmSglMetaData { op_id: o, .. } => o != op_id,
             _ => true,
         });
         if let Some(op) = self.sgl_ops.remove(&op_id) {
@@ -3225,8 +3505,14 @@ impl NvmeController {
     /// 不满足则静默等另一完成点。plain op（非 separate PI）不经本函数（走 `finish_sgl_done` 直调）。
     fn try_finish_sgl_pi(&mut self, ctx: &mut DeviceCtx<'_>, op_id: u64) {
         let ready = match self.sgl_ops.get(&op_id) {
-            Some(op) if op.is_separate_pi() => {
-                let meta_ok = if op.is_write {
+            Some(op) if op.needs_meta_gate() => {
+                let meta_ok = if op.is_meta_sgl() {
+                    // **E1 metadata-SGL**：meta tuple 经 meta-frag scatter/gather → meta 平面全
+                    // 完成（walk + 所有 meta frag DMA）。PRACT 不进 MetaSgl（pract 退化成 Separate），
+                    // `op.pract` 此处恒 false，保留作防御。
+                    op.pract || op.meta_all_done()
+                } else if op.is_write {
+                    // flat Separate（P-B）：单条 MPTR 子-DMA。
                     op.pract || op.meta_ready()
                 } else {
                     op.pract || op.meta_done()
@@ -3239,4 +3525,52 @@ impl NvmeController {
             self.finish_sgl_done(ctx, op_id);
         }
     }
+}
+
+/// **Phase R2 / SGL×PI E1 共享** — 处理一段 SGL **数据** descriptor 数组（data 平面或 meta 平面
+/// 共用），把数据 descriptor append 进 frag plan：
+/// - **Data Block**：push 一条 frag（`address` + 当前 `walk_offset` + `length`）；0-length 跳过
+///   （防恶意 driver 用海量 0-length block 制造 no-op DMA 放大）。
+/// - **Bit Bucket**（spec § 4.4.1）：READ（controller→host）= 跳过 length 字节输出（advance
+///   `walk_offset`，**不**发 DMA，discard 该段）；WRITE（host→controller）= length 视为 0（不
+///   advance、不 DMA）。两方向都不产生 transfer fragment。
+/// - **(Last)Segment / Keyed / Transport** 出现在**数据位置** = 非法（chain 只能在段末位，
+///   Keyed/Transport 是 NVMe-oF）→ `Err(SGL_DESCRIPTOR_TYPE_INVALID)`。
+///
+/// `descs` 须是 caller 已分出的**数据段**（不含末位 continuation）。`walk_offset` 原地累加。
+/// data 与 meta 平面用各自的 `frags`/`walk_offset`，逻辑同一份（§32 anti-drift，避免两份漂移）。
+fn append_sgl_data_frags(
+    frags: &mut Vec<crate::controller::SglPlanFrag>,
+    walk_offset: &mut u64,
+    descs: &[crate::sgl::SglDescriptor],
+    is_write: bool,
+) -> Result<(), u16> {
+    for d in descs {
+        match d.sgl_type {
+            crate::sgl::SglType::DataBlock => {
+                if d.length == 0 {
+                    continue;
+                }
+                frags.push(crate::controller::SglPlanFrag {
+                    address: d.address,
+                    stream_offset: *walk_offset,
+                    length: d.length,
+                });
+                *walk_offset = walk_offset.saturating_add(d.length as u64);
+            }
+            crate::sgl::SglType::BitBucket => {
+                if !is_write {
+                    *walk_offset = walk_offset.saturating_add(d.length as u64);
+                }
+            }
+            other => {
+                tracing::warn!(
+                    kind = ?other,
+                    "SGL 数据位置非 Data Block/Bit Bucket (chain 须末位；Keyed/Transport=NVMe-oF)"
+                );
+                return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID);
+            }
+        }
+    }
+    Ok(())
 }

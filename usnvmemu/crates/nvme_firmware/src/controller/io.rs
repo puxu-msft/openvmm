@@ -547,7 +547,7 @@ impl NvmeController {
         //     `pi_read_verify_split` verify-all stored PI（失败同步 Media SCT=2）→ dense data
         //     平面入 `data`；PRACT=0 tuple concat 待写 MPTR（meta=Some），PRACT=1 strip
         //     （丢 tuple concat、无 MPTR）。
-        let (data, pi_finalize, pract) = if let Some(pa) = pi {
+        let (data, pi_finalize, pract, meta_buf_init) = if let Some(pa) = pi {
             let block_bytes = pa.block_bytes as usize;
             let mut interleaved = vec![0u8; block_bytes * nlb as usize];
             let ns_mut = self.ns_mut(nsid).unwrap();
@@ -596,10 +596,18 @@ impl NvmeController {
                 };
             // **P-C inline-meta + PRACT=0**：host 收 **extended-block** 流（tuple 在流内）→
             // op.data = 原 `interleaved`（== backing 布局），`PiLayout::Inline`、**无 MPTR**。
-            // 其余（separate P-B / PRACT=1 strip）：op.data = dense data 平面，`PiLayout::Separate`
-            // （PRACT=0 tuple concat 待写 MPTR / PRACT=1 丢弃）。verify 已在上方对全 N 块完成。
-            let (op_data, layout) = if pa.inline && !pa.pract {
-                (interleaved, crate::controller::PiLayout::Inline)
+            // **E1 metadata-SGL + PRACT=0**：op.data = dense data 平面，`PiLayout::MetaSgl`，
+            // tuple concat 存 `meta_buf`（待 meta-frag scatter 写各 host 地址，非单条 MPTR）。
+            // 其余（flat separate P-B / PRACT=1 strip）：op.data = dense data，`PiLayout::Separate`
+            // （PRACT=0 tuple concat 待写 flat MPTR / PRACT=1 丢弃）。verify 已在上方对全 N 块完成。
+            let (op_data, layout, meta_buf) = if pa.inline && !pa.pract {
+                (interleaved, crate::controller::PiLayout::Inline, Vec::new())
+            } else if pa.meta_sgl && !pa.pract {
+                (
+                    data_plane,
+                    crate::controller::PiLayout::MetaSgl { mptr: pa.mptr },
+                    tuple_concat,
+                )
             } else {
                 (
                     data_plane,
@@ -608,6 +616,7 @@ impl NvmeController {
                         meta: if pa.pract { None } else { Some(tuple_concat) },
                         meta_pending: false,
                     },
+                    Vec::new(),
                 )
             };
             let pf = crate::controller::PiFinalize {
@@ -618,7 +627,7 @@ impl NvmeController {
                 prchk: pa.prchk,
                 layout,
             };
-            (op_data, Some(pf), pa.pract)
+            (op_data, Some(pf), pa.pract, meta_buf)
         } else {
             // 一次性把 backing 读到 data buffer（plain READ：先读盘再 scatter）。
             let mut data = vec![0u8; bytes as usize];
@@ -633,7 +642,7 @@ impl NvmeController {
                     sc::DATA_TRANSFER_ERROR,
                 ));
             }
-            (data, None, false)
+            (data, None, false, Vec::new())
         };
         let op_id = self.alloc_op_id();
         self.sgl_ops.insert(
@@ -657,6 +666,17 @@ impl NvmeController {
                 transfers_total: 0,
                 pi: pi_finalize,
                 pract,
+                // **E1** meta 平面：默认空（非 metadata-SGL 恒空）；metadata-SGL 路径在下方
+                // 启动 meta walk 时填 `meta_buf` 尺寸并入队 `NvmSglMetaFetch`。
+                meta_frags: Vec::new(),
+                meta_walk_offset: 0,
+                meta_walk_segments: 0,
+                meta_transfers_done: 0,
+                meta_transfers_total: 0,
+                meta_walk_done: false,
+                // **E1 READ metadata-SGL**：`meta_buf_init` = finalize 前算好的 N×8 tuple concat
+                // （PRACT=0），待 meta-frag scatter 写各 host 地址；非 metadata-SGL 为空。
+                meta_buf: meta_buf_init,
             },
         );
         let tok = self.guest_read(ctx, seg_addr, seg_len);
@@ -671,7 +691,45 @@ impl NvmeController {
                 op: PendingOp::NvmSglFetch { op_id, is_last },
             },
         );
+        // **E1 metadata-SGL** — 额外启动 meta 平面 walk（MPTR→meta SGL1 描述符）。与 data walk
+        // 平行、独立计数。READ 的 tuple concat 已在 `meta_buf`，待 meta-frag scatter。
+        self.start_sgl_meta_walk_if_needed(ctx, op_id);
         None
+    }
+
+    /// **SGL×PI E1** — 若 op 是 metadata-SGL（`PiLayout::MetaSgl`），启动 meta 平面 walk：
+    /// DMA-read MPTR 处的 16-byte meta SGL1 描述符（`NvmSglMetaFetch{Mptr}`）。非 metadata-SGL
+    /// 路径 no-op。READ/WRITE 共用（meta_buf 由各自 dispatch 预置：READ=tuple concat / WRITE=
+    /// N×8 zero gather buffer）。
+    fn start_sgl_meta_walk_if_needed(&mut self, ctx: &mut DeviceCtx<'_>, op_id: u64) {
+        let (mptr, sq_id, cid, sq_head, cq_id, nsid) = match self.sgl_ops.get(&op_id) {
+            Some(op) if op.is_meta_sgl() => match &op.pi {
+                Some(pf) => match pf.layout {
+                    crate::controller::PiLayout::MetaSgl { mptr } => {
+                        (mptr, op.sq_id, op.cid, op.sq_head, op.cq_id, op.nsid)
+                    }
+                    _ => return,
+                },
+                None => return,
+            },
+            _ => return,
+        };
+        // meta SGL1 描述符是 16 字节（spec：MPTR 指向单个 SGL descriptor）。
+        let tok = self.guest_read(ctx, mptr, 16);
+        self.pending_ios.insert(
+            tok,
+            PendingIo {
+                sq_id,
+                cid,
+                sq_head,
+                cq_id,
+                nsid,
+                op: PendingOp::NvmSglMetaFetch {
+                    op_id,
+                    stage: crate::controller::MetaWalkStage::Mptr,
+                },
+            },
+        );
     }
 
     /// **Phase R2a** — PSDT=10 SGL Segment **Write** 数据路径入口。
@@ -723,14 +781,17 @@ impl NvmeController {
                 Err(sc_byte) => return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte)),
             };
         // **R2b** — SGL1 既可 Last Segment（单段）也可 Segment（chain 首段）。
-        // **SGL×PI P-B/P-C**：`data` gather buffer = nlb×`sector_bytes`：separate/PRACT=1 = 纯
-        // data（data_bytes）；**inline-meta + PRACT=0 = extended-block（block_bytes，tuple 在流内）**。
-        // PI tuple 来源：separate PRACT=0 经 MPTR DMA-read / PRACT=1 controller 自算 / inline PRACT=0
-        // 在 data 流内。layout：inline PRACT=0 = `Inline`（无 MPTR）；其余 = `Separate`。
+        // **SGL×PI P-B/P-C/E1**：`data` gather buffer = nlb×`sector_bytes`：separate/meta-SGL/PRACT=1
+        // = 纯 data（data_bytes）；**inline-meta + PRACT=0 = extended-block（block_bytes，tuple 在流内）**。
+        // PI tuple 来源：flat separate PRACT=0 经单条 MPTR DMA-read / **metadata-SGL PRACT=0 经
+        // meta-frag gather**（E1）/ PRACT=1 controller 自算 / inline PRACT=0 在 data 流内。
+        // layout：inline PRACT=0 = `Inline`；metadata-SGL PRACT=0 = `MetaSgl`；其余 = `Separate`。
         let (pi_finalize, pract) = match &pi {
             Some(pa) => {
                 let layout = if pa.inline && !pa.pract {
                     crate::controller::PiLayout::Inline
+                } else if pa.meta_sgl && !pa.pract {
+                    crate::controller::PiLayout::MetaSgl { mptr: pa.mptr }
                 } else {
                     crate::controller::PiLayout::Separate {
                         mptr: pa.mptr,
@@ -772,6 +833,21 @@ impl NvmeController {
                 transfers_total: 0,
                 pi: pi_finalize,
                 pract,
+                // **E1** meta 平面：默认空（非 metadata-SGL 恒空）；metadata-SGL 路径在下方
+                // 启动 meta walk 时填 `meta_buf` 尺寸并入队 `NvmSglMetaFetch`。
+                meta_frags: Vec::new(),
+                meta_walk_offset: 0,
+                meta_walk_segments: 0,
+                meta_transfers_done: 0,
+                meta_transfers_total: 0,
+                meta_walk_done: false,
+                // **E1 WRITE metadata-SGL**：N×8 zero gather buffer，按 meta frag stream_offset
+                // 填 host tuple，全到齐喂 finalize verify。非 metadata-SGL 为空。
+                meta_buf: if pi.as_ref().is_some_and(|pa| pa.meta_sgl && !pa.pract) {
+                    vec![0u8; (nlb * 8) as usize]
+                } else {
+                    Vec::new()
+                },
             },
         );
         let tok = self.guest_read(ctx, seg_addr, seg_len);
@@ -786,13 +862,14 @@ impl NvmeController {
                 op: PendingOp::NvmSglFetch { op_id, is_last },
             },
         );
-        // **SGL×PI P-B separate + PRACT=0**：host PI tuple 经 MPTR 一条独立子-DMA（N×8）
-        // DMA-read 到达 → NvmSglSepMeta（**不计入** transfers_total，H-3）。**仅 separate**
-        // （inline-meta tuple 在 data 流内、PRACT=1 controller 自算，均无此 DMA → finalize 只门控
-        // data done）。
+        // **SGL×PI P-B flat-separate + PRACT=0**：host PI tuple 经 **单条** MPTR 子-DMA（N×8）
+        // DMA-read 到达 → NvmSglSepMeta（**不计入** transfers_total，H-3）。**仅 flat separate**
+        // （`!inline && !meta_sgl`）：inline-meta tuple 在 data 流内、metadata-SGL 走 meta-frag
+        // gather（下方 meta walk）、PRACT=1 controller 自算，均无此单条 DMA。
         if let Some(pa) = &pi
             && !pa.pract
             && !pa.inline
+            && !pa.meta_sgl
         {
             let meta_tok = self.guest_read(ctx, pa.mptr, nlb * 8);
             self.pending_ios.insert(
@@ -807,6 +884,9 @@ impl NvmeController {
                 },
             );
         }
+        // **E1 metadata-SGL** — 启动 meta 平面 walk（MPTR→meta SGL1 描述符）；与 data walk 平行、
+        // 独立计数。WRITE 的 meta tuple 经 meta-frag gather 填 `meta_buf`（已预置 N×8）。
+        self.start_sgl_meta_walk_if_needed(ctx, op_id);
         None
     }
 
@@ -959,27 +1039,25 @@ impl NvmeController {
                 // P-C，PRACT 0/1）。SGL 用 embedded SGL1 自有数据指针（非 prp1/prp2），必须在下方
                 // PRP PI 块（`is_pi_path`）之前截走——否则该块会以 prp1=0 误处理。
                 if is_sgl && is_pi_path {
-                    // **E0 2×2 路由**（plan §E0）：PSDT 区分 *metadata* 形态（data 已由
+                    // **E0/E1 2×2 路由**（plan §E0/§E1）：PSDT 区分 *metadata* 形态（data 已由
                     // resolve_data_pointers 按 DPTR descriptor 解耦 PSDT）。
                     //   01 (!meta_sgl) → 平坦 MPTR(P-B) / inline 吸收(P-C)，由 meta_inline_r 分（下方）。
-                    //   10 (meta_sgl)+!meta_inline → metadata-SGL（E1）；本阶段未 advertise SGLS bit19。
-                    //   10 (meta_sgl)+meta_inline → 非法（extended-LBA 无独立 metadata 可作 SGL）。
+                    //   10 (meta_sgl)+!meta_inline → metadata-SGL（E1，MPTR→meta SGL1 指针）。
+                    //   10 (meta_sgl)+meta_inline → 非法（extended-LBA 无独立 metadata 可作 SGL）→ reject。
                     let meta_sgl = sqe.psdt() == 0b10;
-                    if meta_sgl {
+                    if meta_sgl && meta_inline_r {
                         tracing::warn!(
                             nsid,
-                            meta_inline = meta_inline_r,
-                            "SGL metadata-SGL (PSDT=10) READ：E0 未支持（E1 advertise SGLS bit19=MSDS 后启用）/ 10+inline 为 spec-非法组合"
+                            "SGL metadata-SGL (PSDT=10) + inline-meta NS READ：spec-非法组合（extended-LBA 无独立 metadata）"
                         );
                         return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                     }
-                    // 以下为 PSDT=01（meta_sgl=false）：平坦 MPTR(P-B) / inline 吸收(P-C)。
-                    // L-2：仅 separate-meta PRACT=0 需 host PI buffer MPTR（inline 在流内、PRACT=1
-                    // controller 自验/strip，皆不需）。
+                    // L-2：separate(flat 或 meta-SGL) PRACT=0 需 MPTR（flat=host PI buffer /
+                    // meta-SGL=meta SGL1 指针）。MPTR=0 → reject（E1：与 separate L-2 对称）。
                     if !pract && !meta_inline_r && sqe.mptr == 0 {
                         tracing::warn!(
                             nsid,
-                            "SGL separate-meta READ PRACT=0 需 MPTR（host PI buffer）"
+                            "SGL separate/meta-SGL READ PRACT=0 需 MPTR（host PI buffer / meta SGL1 指针）"
                         );
                         return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                     }
@@ -992,6 +1070,7 @@ impl NvmeController {
                         prchk: crate::pi::PrChk::from_cdw12(cdw12),
                         pract,
                         inline: meta_inline_r,
+                        meta_sgl,
                     };
                     // SGL "sector"（每 LBA host 传输字节）：inline-meta + PRACT=0 = extended-block
                     // （block_bytes，tuple 在流内）；separate 或 PRACT=1 = 纯 data（data_bytes）。
@@ -2177,26 +2256,24 @@ impl NvmeController {
                 // P-C，PRACT 0/1）。同 READ：SGL 用 embedded SGL1 自有数据指针，必须在下方 PRP PI
                 // 块（`is_pi_capable`）之前截走。
                 if is_sgl && is_pi_capable {
-                    // **E0 2×2 路由**（plan §E0，同 READ）：PSDT 区分 *metadata* 形态。
+                    // **E0/E1 2×2 路由**（plan §E0/§E1，同 READ）：PSDT 区分 *metadata* 形态。
                     //   01 (!meta_sgl) → 平坦 MPTR(P-B) / inline 吸收(P-C)，由 meta_inline 分（下方）。
-                    //   10 (meta_sgl)+!meta_inline → metadata-SGL（E1）；本阶段未 advertise SGLS bit19。
-                    //   10 (meta_sgl)+meta_inline → 非法（extended-LBA 无独立 metadata 可作 SGL）。
+                    //   10 (meta_sgl)+!meta_inline → metadata-SGL（E1，MPTR→meta SGL1 指针）。
+                    //   10 (meta_sgl)+meta_inline → 非法（extended-LBA 无独立 metadata 可作 SGL）→ reject。
                     let meta_sgl = sqe.psdt() == 0b10;
-                    if meta_sgl {
+                    if meta_sgl && meta_inline {
                         tracing::warn!(
                             nsid,
-                            meta_inline,
-                            "SGL metadata-SGL (PSDT=10) WRITE：E0 未支持（E1 advertise SGLS bit19=MSDS 后启用）/ 10+inline 为 spec-非法组合"
+                            "SGL metadata-SGL (PSDT=10) + inline-meta NS WRITE：spec-非法组合（extended-LBA 无独立 metadata）"
                         );
                         return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                     }
-                    // 以下为 PSDT=01（meta_sgl=false）：平坦 MPTR(P-B) / inline 吸收(P-C)。
-                    // L-2：仅 separate-meta PRACT=0 需 host PI buffer MPTR（inline 在流内、PRACT=1
-                    // controller 自算，皆不需）。
+                    // L-2：separate(flat 或 meta-SGL) PRACT=0 需 MPTR（flat=host PI buffer /
+                    // meta-SGL=meta SGL1 指针）。MPTR=0 → reject（E1：与 separate L-2 对称）。
                     if !pract && !meta_inline && sqe.mptr == 0 {
                         tracing::warn!(
                             nsid,
-                            "SGL separate-meta WRITE PRACT=0 需 MPTR（host PI buffer）"
+                            "SGL separate/meta-SGL WRITE PRACT=0 需 MPTR（host PI buffer / meta SGL1 指针）"
                         );
                         return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
                     }
@@ -2209,6 +2286,7 @@ impl NvmeController {
                         prchk: crate::pi::PrChk::from_cdw12(cdw12),
                         pract,
                         inline: meta_inline,
+                        meta_sgl,
                     };
                     // inline-meta + PRACT=0 = extended-block（block_bytes）；其余纯 data（data_bytes）。
                     let pi_sector = if meta_inline && !pract {

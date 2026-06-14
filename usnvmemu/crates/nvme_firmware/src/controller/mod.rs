@@ -336,6 +336,15 @@ pub(super) struct PendingIo {
     op: PendingOp,
 }
 
+/// **SGL×PI E1（metadata-SGL）** — meta 平面 walk 的 DMA 阶段（`NvmSglMetaFetch.stage`）。
+#[derive(Clone, Copy)]
+pub(super) enum MetaWalkStage {
+    /// 读 MPTR 处的 16-byte meta SGL1 描述符（决定单 Data Block vs Segment 链）。
+    Mptr,
+    /// 读 segment 页（descriptor 数组）。`is_last`：经 Last Segment(true) / Segment(false) 到达。
+    Segment { is_last: bool },
+}
+
 pub(super) enum PendingOp {
     /// 等 PRP1 内的 data DMA-read 完成 → 写文件 → success CQE。
     /// (单 PRP Write 路径)
@@ -404,6 +413,24 @@ pub(super) enum PendingOp {
     /// 双门控满足才 finalize（两完成点各查合取，镜像 PRP 的 `Nvm{Read,Write}PrpListSepMeta`）。
     NvmSglSepMeta {
         op_id: u64,
+    },
+    /// **SGL×PI E1（metadata-SGL）** — MPTR-as-SGL 的 meta 平面 walk DMA-read 完成（**独立于**
+    /// data 平面 `NvmSglFetch`，H-3 同理由：不污染 data 计数）。`stage` 区分两步：
+    ///   - `Mptr`：读 MPTR 处的 **16-byte meta SGL1 描述符**（spec：MPTR 含 SGL descriptor，非
+    ///     flat data 指针）。Data Block → 单 contiguous meta frag；(Last)Segment → 取地址/长度
+    ///     再 fetch segment 页（`Segment` 阶段）。
+    ///   - `Segment{is_last}`：读 segment 页（descriptor 数组）→ parse → append meta frag +
+    ///     处理末位 continuation（同 data 平面 chain；cap `MAX_SGL_SEGMENTS`）。
+    NvmSglMetaFetch {
+        op_id: u64,
+        stage: MetaWalkStage,
+    },
+    /// **SGL×PI E1（metadata-SGL）** — 单条 meta fragment 传输完成（READ = tuple scatter
+    /// dma_write / WRITE = tuple gather dma_read）。`frag_idx` 索引 `SglOp.meta_frags`。**独立于**
+    /// data 平面 `NvmSglData`（H-3）。
+    NvmSglMetaData {
+        op_id: u64,
+        frag_idx: u32,
     },
     /// **Phase H3** — NVM Compare：DMA-read host buffer 完成后与 backing
     /// LBA 对比。`lba/num_blocks` 用于 file seek+read；对比失败返
@@ -735,17 +762,37 @@ pub(super) enum PiLayout {
         meta: Option<Vec<u8>>,
         meta_pending: bool,
     },
+    /// **metadata-SGL（E1，PSDT=10 METASEG）**：metadata 本身经 SGL 描述——`mptr` 不是 flat
+    /// GPA 而是指向 **meta SGL1 描述符**（spec：MPTR 含 SGL descriptor，Linux `NVME_CTRL_SGLS_MSDS`）。
+    /// data 流仍是纯 data（data_bytes/块，同 Separate）；N×8 tuple 经**独立 meta-frag scatter/
+    /// gather**（`SglOp.meta_*` 平面，与 data 平面平行、counter 门控 H-3），不经单条 MPTR DMA。
+    /// 故仅 SGL 路径（`SglOp`）构造本变体，PRP 路径（`PrpListOp`）永不产生。meta 的 gather/scatter
+    /// 缓冲在 `SglOp.meta_buf`（不在本变体内——与 data plane 缓冲 `SglOp.data` 同处一致）。
+    MetaSgl { mptr: u64 },
 }
 
 // **SGL×PI P-B（reviewer M1，§32 anti-drift）** — separate-meta 双门控状态机的**单一真相
 // 源**：直接操作 `Option<PiFinalize>`，PRP 路径（`PrpListOp`）与 SGL 路径（`SglOp`）的同名
 // 访问器都委托到这里，杜绝两份拷贝漂移（一处改门控语义、另一处忘）。
-/// 是否 separate-meta PI 路径（`None`/inline → false）。
+/// 是否 separate-meta PI 路径（`None`/inline/meta-SGL → false）。**仅 flat-MPTR Separate**
+/// （单条 MPTR 子-DMA）——metadata-SGL（`MetaSgl`）走独立 meta-frag 平面，不归此判据。
 pub(super) fn pi_is_separate(pi: &Option<PiFinalize>) -> bool {
     matches!(
         pi.as_ref().map(|p| &p.layout),
         Some(PiLayout::Separate { .. })
     )
+}
+/// 是否 metadata-SGL PI 路径（`MetaSgl`，E1）。meta tuple 经 meta-frag scatter/gather。
+pub(super) fn pi_is_meta_sgl(pi: &Option<PiFinalize>) -> bool {
+    matches!(
+        pi.as_ref().map(|p| &p.layout),
+        Some(PiLayout::MetaSgl { .. })
+    )
+}
+/// 是否需 data+meta **双门控**的 PI 路径（flat Separate 或 metadata-SGL；inline/plain → false）。
+/// 决定 `NvmSglData` 末 frag 完成后走 `try_finish_sgl_pi`（双门控）还是 `finish_sgl_done`（直结）。
+pub(super) fn pi_needs_meta_gate(pi: &Option<PiFinalize>) -> bool {
+    pi_is_separate(pi) || pi_is_meta_sgl(pi)
 }
 /// separate-meta 的 MPTR 子任务是否已完成（非 separate → true，不门控）。
 pub(super) fn pi_meta_done(pi: &Option<PiFinalize>) -> bool {
@@ -924,12 +971,46 @@ pub(super) struct SglOp {
     /// **SGL×PI P-B** — PRACT（`PiFinalize` 不含此轴；helper 的 `PiGeom.pract` 从此取）。
     /// PRACT=1 = controller 自算/strip tuple；PRACT=0 = verify host tuple。
     pub(super) pract: bool,
+    /// **SGL×PI E1（metadata-SGL）** — meta 平面 fragment plan（MPTR-as-SGL walk 累积），与
+    /// data 平面 `frags` 平行、**独立计数**（不污染 `transfers_total`，H-3 同理）。仅 `PiLayout::
+    /// MetaSgl` 路径填充；flat Separate / inline / plain 恒空。`SglPlanFrag` 结构复用。
+    pub(super) meta_frags: Vec<SglPlanFrag>,
+    /// meta 平面流累积偏移（下一 meta frag 在 N×8 tuple 流中的起点）。
+    pub(super) meta_walk_offset: u64,
+    /// meta segment chain hop 计数（cap `MAX_SGL_SEGMENTS`，防 meta 链自环）。
+    pub(super) meta_walk_segments: u32,
+    /// meta 平面已完成的 frag DMA 数。
+    pub(super) meta_transfers_done: u32,
+    /// meta 平面需完成的 frag DMA 总数（meta walk 完成后 set = `meta_frags.len()`）。
+    pub(super) meta_transfers_total: u32,
+    /// meta walk 是否完成（`meta_transfers_total` 已 set）——门控防 meta-frag DMA 先于 walk
+    /// 完成时 `0>=0` 误判（与 data 平面 `transfers_total>0` 同理；但 meta 可能 0 frag = 全
+    /// Bit Bucket，故用显式 bool 而非 `>0`）。
+    pub(super) meta_walk_done: bool,
+    /// meta 平面缓冲：WRITE = N×8 gather buffer（按 meta frag `stream_offset` 填，全到齐喂
+    /// finalize verify）；READ = finalize 前算好的 N×8 tuple concat（按 meta frag scatter 写各
+    /// host 地址）。与 data 平面 `data` 同处一致（不塞进 `PiLayout::MetaSgl`）。
+    pub(super) meta_buf: Vec<u8>,
 }
 
 impl SglOp {
-    /// 是否 separate-meta PI 路径（`None`/plain → false）。委托共享真相源（M1）。
+    /// 是否 flat-MPTR separate-meta PI 路径（单条 MPTR 子-DMA；**不含** metadata-SGL）。委托
+    /// 共享真相源（M1）。
     pub(super) fn is_separate_pi(&self) -> bool {
         pi_is_separate(&self.pi)
+    }
+    /// 是否 metadata-SGL PI 路径（E1，`PiLayout::MetaSgl`）。
+    pub(super) fn is_meta_sgl(&self) -> bool {
+        pi_is_meta_sgl(&self.pi)
+    }
+    /// 是否需 data+meta 双门控（flat Separate 或 metadata-SGL）。
+    pub(super) fn needs_meta_gate(&self) -> bool {
+        pi_needs_meta_gate(&self.pi)
+    }
+    /// metadata-SGL meta 平面是否全部完成（walk 完成 **且** 所有 meta frag DMA 完成）。
+    /// `meta_walk_done` 防 frag DMA 先到误判；0-frag（全 Bit Bucket）时 `0>=0` 即成立。
+    pub(super) fn meta_all_done(&self) -> bool {
+        self.meta_walk_done && self.meta_transfers_done >= self.meta_transfers_total
     }
     /// data 平面是否全部传输完成（walk 已 set `transfers_total`>0 才成立——防 MPTR 先到
     /// 时 `0>=0` 误判 data done；PI 路径 expected>0 故 frags 恒非空、transfers_total>0）。
@@ -978,6 +1059,10 @@ pub(super) struct SglPiArgs {
     pub(super) pract: bool,
     /// NS metadata 形态：true=inline（extended-LBA，P-C）/ false=separate（MPTR，P-B）。
     pub(super) inline: bool,
+    /// **E1** — metadata-SGL（PSDT=10 METASEG）：true 时 `mptr` 是 **meta SGL1 指针**（非 flat
+    /// GPA），tuple 经 meta-frag scatter/gather。仅 `inline=false` 时可为 true（2×2：10+inline 非法，
+    /// 已在 dispatch reject）。false = 现有 P-B(flat MPTR)/P-C(inline) 行为不变。
+    pub(super) meta_sgl: bool,
 }
 
 /// **Phase R2** — 单个 SGL 数据 fragment 的传输计划（walk 阶段构建）。

@@ -7330,6 +7330,13 @@ fn identify_controller_sgls_matches_impl() {
         1 << 16,
         "Bit Bucket advertise（R2c 已实现）"
     );
+    // **SGL×PI E1** — bit19 = Metadata SGL / MPTR-may-contain-SGL（Linux NVME_CTRL_SGLS_MSDS=1<<19）
+    // advertise⟺implement：E1 实现 metadata-SGL（PSDT=10 METASEG）→ 置 bit19。
+    assert_eq!(
+        sgls & (1 << 19),
+        1 << 19,
+        "Metadata SGL (MSDS, bit19) advertise（E1 已实现）"
+    );
     assert_eq!(
         sgls & (1 << 17),
         0,
@@ -7436,6 +7443,10 @@ fn sc_constants_match_nvme_spec() {
     assert_eq!(
         sc::DATA_SGL_LENGTH_INVALID,
         Status::DATA_SGL_LENGTH_INVALID.0
+    );
+    assert_eq!(
+        sc::METADATA_SGL_LENGTH_INVALID,
+        Status::METADATA_SGL_LENGTH_INVALID.0
     );
     assert_eq!(
         sc::SGL_DESCRIPTOR_TYPE_INVALID,
@@ -8760,33 +8771,31 @@ mod sgl_pi_pb {
         c
     }
 
-    /// **SGL×PI E0 2×2 路由** — PSDT=10（metadata-SGL）在 PI NS 上 E0 阶段一律 reject
-    /// `INVALID_FIELD`：① `10+separate` = E1 才支持（SGLS bit15 未 advertise）；② `10+inline`
-    /// = spec-非法组合（extended-LBA 无独立 metadata 可作 SGL）。两 NS 形态 × READ/WRITE 全覆盖。
-    /// 这把 E0→E1 边界与非法格固化：E1 落地只放开 `10+separate` 一格，`10+inline` 恒 reject。
-    /// mptr 给非 0 排除 L-2(MPTR=0) 早退混淆 → 确保命中的是 meta_sgl 早退。
+    /// **SGL×PI E1 2×2 路由** — `10+inline`（metadata-SGL + extended-LBA NS）= spec-非法组合
+    /// （extended-LBA 无独立 metadata 可作 SGL）→ 恒 reject `INVALID_FIELD`，READ/WRITE 全覆盖。
+    /// E1 落地后 `10+separate` 已支持（见 `meta_sgl_*` e2e），故仅 inline 这一非法格仍 reject。
+    /// mptr 给非 0 排除 L-2(MPTR=0) 早退混淆 → 确保命中的是 meta_sgl×inline 非法早退。
     #[test]
-    fn psdt10_metadata_sgl_rejected_e0() {
+    fn psdt10_meta_inline_illegal_rejected() {
         // sgl_sqe 默认 PSDT=01；翻成 PSDT=10 验 metadata-SGL 路由。
         let to_psdt10 = |mut sqe: Sqe| -> Sqe {
             sqe.cdw0 = (sqe.cdw0 & !(0b11 << 14)) | (0b10 << 14);
             sqe
         };
         for opc in [0x01u8 /* WRITE */, 0x02 /* READ */] {
-            for (label, mut c) in [("separate", pi_ns(true)), ("inline", pi_ns_inline(true))] {
-                let mut cap = CaptureTransport::with_start_token(0x100);
-                let mut ctx = DeviceCtx::new(&mut cap);
-                let sqe = to_psdt10(sgl_sqe(opc, 0, 1, 0x55, false, 0x5000, 0x2000, 16));
-                let r = c.dispatch_io(&mut ctx, 1, sqe, 0x55, 0, 1);
-                let cqe = r.expect("PSDT=10 应同步 reject（非异步）");
-                assert_eq!(
-                    cqe_status(&cqe),
-                    crate::cmd::sc::INVALID_FIELD,
-                    "{label} opc={opc:#x} PSDT=10 应 INVALID_FIELD"
-                );
-                assert!(c.sgl_ops.is_empty(), "{label} reject 不建 SglOp");
-                assert!(c.pending_ios.is_empty(), "{label} reject 不挂异步");
-            }
+            let mut c = pi_ns_inline(true); // inline-meta NS（extended-LBA）
+            let mut cap = CaptureTransport::with_start_token(0x100);
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let sqe = to_psdt10(sgl_sqe(opc, 0, 1, 0x55, false, 0x5000, 0x2000, 16));
+            let r = c.dispatch_io(&mut ctx, 1, sqe, 0x55, 0, 1);
+            let cqe = r.expect("PSDT=10+inline 应同步 reject（非异步）");
+            assert_eq!(
+                cqe_status(&cqe),
+                crate::cmd::sc::INVALID_FIELD,
+                "opc={opc:#x} PSDT=10+inline 应 INVALID_FIELD"
+            );
+            assert!(c.sgl_ops.is_empty(), "reject 不建 SglOp");
+            assert!(c.pending_ios.is_empty(), "reject 不挂异步");
         }
     }
 
@@ -9397,6 +9406,505 @@ mod sgl_pi_pb {
         );
         assert!(!writes.contains_key(&0x5000), "PRACT=1 无 MPTR");
         assert_eq!(last_cqe_status(&cap), Some(0));
+    }
+
+    // ════════════ SGL×PI E1：metadata-SGL（PSDT=10）e2e 差分 oracle ════════════
+    //
+    // MPTR 不是 flat GPA 而是指向 meta SGL1 描述符（spec：MPTR 含 SGL descriptor）。tuple 经
+    // meta-frag scatter/gather（独立 meta 平面），与 data 平面平行。差分 oracle 四件套同 P-B：
+    // ① backing/compute 期望；② 显式断 meta DmaRead/DmaWrite (gpa,len)（MPTR desc fetch + segment
+    // fetch + 各 meta frag）；③ 断走 SglOp + MetaSgl layout；④ revert-verify。
+
+    /// 16-byte SGL Last Segment 指针 descriptor（id=0x30）——meta SGL1 指向 meta segment 页。
+    fn last_seg(gpa: u64, len: u32) -> [u8; 16] {
+        let mut d = [0u8; 16];
+        d[0..8].copy_from_slice(&gpa.to_le_bytes());
+        d[8..12].copy_from_slice(&len.to_le_bytes());
+        d[15] = 0x30;
+        d
+    }
+    /// 把 sgl_sqe（默认 PSDT=01）翻成 PSDT=10（metadata-SGL）。
+    fn to_psdt10(mut sqe: Sqe) -> Sqe {
+        sqe.cdw0 = (sqe.cdw0 & !(0b11 << 14)) | (0b10 << 14);
+        sqe
+    }
+    /// 驱动 metadata-SGL op 的全部在途子-DMA（data 平面 + meta 平面）：
+    ///   - NvmSglFetch → data segment 页；NvmSglData → WRITE 喂 data frag 切片 / READ 空。
+    ///   - NvmSglMetaFetch{Mptr} → MPTR 处 16-byte meta SGL1 描述符；{Segment} → meta segment 页。
+    ///   - NvmSglMetaData → WRITE 喂 meta tuple frag 切片 / READ 空（scatter 已写出，cap 截获）。
+    #[allow(clippy::too_many_arguments)]
+    fn drive_meta(
+        c: &mut NvmeController,
+        cap: &mut CaptureTransport,
+        data_seg: &[u8],
+        write_stream: Option<&[u8]>,
+        meta_mptr_desc: &[u8; 16],
+        meta_seg: Option<&[u8]>,
+        write_meta: Option<&[u8]>,
+    ) {
+        let mut ctx = DeviceCtx::new(cap);
+        loop {
+            let pick = c.pending_ios.iter().find_map(|(t, p)| match p.op {
+                PendingOp::NvmSglFetch { .. } => Some((*t, 0u8, 0u64, 0u32)),
+                PendingOp::NvmSglData { op_id, frag_idx } => Some((*t, 1, op_id, frag_idx)),
+                PendingOp::NvmSglMetaFetch { op_id, stage } => Some((
+                    *t,
+                    match stage {
+                        crate::controller::MetaWalkStage::Mptr => 3,
+                        crate::controller::MetaWalkStage::Segment { .. } => 4,
+                    },
+                    op_id,
+                    0,
+                )),
+                PendingOp::NvmSglMetaData { op_id, frag_idx } => Some((*t, 5, op_id, frag_idx)),
+                _ => None,
+            });
+            let Some((tok, kind, op_id, frag_idx)) = pick else {
+                break;
+            };
+            let data = match kind {
+                0 => data_seg.to_vec(),
+                1 => write_stream
+                    .map(|ws| {
+                        let f = c.sgl_ops[&op_id].frags[frag_idx as usize];
+                        let off = f.stream_offset as usize;
+                        ws[off..off + f.length as usize].to_vec()
+                    })
+                    .unwrap_or_default(),
+                3 => meta_mptr_desc.to_vec(),
+                4 => meta_seg.map(|m| m.to_vec()).unwrap_or_default(),
+                5 => write_meta
+                    .map(|wm| {
+                        let f = c.sgl_ops[&op_id].meta_frags[frag_idx as usize];
+                        let off = f.stream_offset as usize;
+                        wm[off..off + f.length as usize].to_vec()
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            c.on_dma_complete_impl(&mut ctx, tok, true, data);
+        }
+    }
+
+    /// host N tuple concat（PRACT=0 host 供 → verify 通过）。
+    fn host_tuples(stream: &[u8], lba0: u64, n: usize) -> Vec<u8> {
+        let mut m = Vec::new();
+        for i in 0..n {
+            let d = &stream[i * DATA..(i + 1) * DATA];
+            m.extend_from_slice(&crate::pi::PiTuple::compute(d, lba0 + i as u64, 1).to_bytes());
+        }
+        m
+    }
+
+    /// **E1 WRITE metadata-SGL multi-frag（MPTR→LastSegment→2 DataBlock）PRACT=0**。差分 oracle：
+    /// backing 每块 == interleave([tuple][data])；meta DmaRead = MPTR desc(16) + segment(32) + 2
+    /// frag(8,8)；走 MetaSgl op。revert-verify：喂错 host tuple → verify-all 失败 → Media 错、不落盘。
+    #[test]
+    fn meta_sgl_write_multi_frag_pract0() {
+        for pi_first in [true, false] {
+            let mut c = pi_ns(pi_first);
+            let (lba0, n) = (0u64, 2usize);
+            let stream: Vec<u8> = (0..n * DATA).map(|i| ((i * 3 + 1) & 0xff) as u8).collect();
+            let tuples = host_tuples(&stream, lba0, n);
+            let (g0, g1) = (0x4000u64, 0x6000u64);
+            let data_seg = seg_page(&[data_block(g0, 4096), data_block(g1, 4096)]);
+            // meta: MPTR(0x5000) → LastSegment → meta_seg(0x9000)={DataBlock(m0,8),DataBlock(m1,8)}。
+            let (m0, m1, mptr, meta_seg_gpa) = (0x7000u64, 0x8000u64, 0x5000u64, 0x9000u64);
+            let meta_seg = seg_page(&[data_block(m0, 8), data_block(m1, 8)]);
+            let meta_mptr_desc = last_seg(meta_seg_gpa, 32);
+            let mut cap = CaptureTransport::with_start_token(0x100);
+            let r = {
+                let mut ctx = DeviceCtx::new(&mut cap);
+                let sqe = to_psdt10(sgl_sqe(
+                    0x01,
+                    lba0,
+                    n as u32,
+                    0x70,
+                    false,
+                    mptr,
+                    0x2000,
+                    data_seg.len() as u32,
+                ));
+                c.dispatch_io(&mut ctx, 1, sqe, 0x70, 0, 1)
+            };
+            assert!(r.is_none(), "meta-SGL WRITE 走异步");
+            assert_eq!(c.sgl_ops.len(), 1, "走 SglOp 累积器");
+            assert!(
+                c.sgl_ops.values().next().unwrap().is_meta_sgl(),
+                "MetaSgl layout"
+            );
+            drive_meta(
+                &mut c,
+                &mut cap,
+                &data_seg,
+                Some(&stream),
+                &meta_mptr_desc,
+                Some(&meta_seg),
+                Some(&tuples),
+            );
+            assert!(c.sgl_ops.is_empty(), "finalize 后 op 移除");
+            // ② meta DmaRead (gpa,len)：MPTR desc + segment fetch + 2 meta frag。
+            let reads: Vec<(u64, u32)> = cap
+                .events()
+                .iter()
+                .filter_map(|e| match e {
+                    TransportEvent::DmaRead { gpa, len, .. } => Some((*gpa, *len)),
+                    _ => None,
+                })
+                .collect();
+            assert!(reads.contains(&(mptr, 16)), "MPTR meta SGL1 描述符 fetch");
+            assert!(reads.contains(&(meta_seg_gpa, 32)), "meta segment 页 fetch");
+            assert!(reads.contains(&(m0, 8)), "meta frag0 gather");
+            assert!(reads.contains(&(m1, 8)), "meta frag1 gather");
+            // ① backing 每块 == interleave([tuple][data]) per pi_first。
+            let ns = c.namespaces.get(&1).unwrap();
+            for i in 0..n {
+                let mut blk = vec![0u8; BLOCK];
+                ns.read_at(&mut blk, (lba0 + i as u64) * BLOCK as u64)
+                    .unwrap();
+                let tup = &tuples[i * 8..i * 8 + 8];
+                let dat = &stream[i * DATA..(i + 1) * DATA];
+                let (gt, gd): (&[u8], &[u8]) = if pi_first {
+                    (&blk[0..8], &blk[8..8 + DATA])
+                } else {
+                    (&blk[DATA..DATA + 8], &blk[0..DATA])
+                };
+                assert_eq!(gt, tup, "pi_first={pi_first} blk{i} tuple 落盘");
+                assert_eq!(gd, dat, "pi_first={pi_first} blk{i} data 落盘");
+            }
+            assert_eq!(last_cqe_status(&cap), Some(0), "success CQE");
+
+            // ④ revert-verify：喂**错** host tuple（全 0xEE）→ verify-all 失败 → Media SCT=2、不落盘。
+            let mut c2 = pi_ns(pi_first);
+            let bad_tuples = vec![0xEEu8; n * 8];
+            let mut cap2 = CaptureTransport::with_start_token(0x100);
+            {
+                let mut ctx = DeviceCtx::new(&mut cap2);
+                let sqe = to_psdt10(sgl_sqe(
+                    0x01,
+                    lba0,
+                    n as u32,
+                    0x71,
+                    false,
+                    mptr,
+                    0x2000,
+                    data_seg.len() as u32,
+                ));
+                assert!(c2.dispatch_io(&mut ctx, 1, sqe, 0x71, 0, 1).is_none());
+            }
+            drive_meta(
+                &mut c2,
+                &mut cap2,
+                &data_seg,
+                Some(&stream),
+                &meta_mptr_desc,
+                Some(&meta_seg),
+                Some(&bad_tuples),
+            );
+            assert_ne!(
+                last_cqe_status(&cap2),
+                Some(0),
+                "revert: 错 tuple 不该 success（verify-all 失败）"
+            );
+        }
+    }
+
+    /// **E1 READ metadata-SGL multi-frag PRACT=0**。backing 预置 interleave；READ → data scatter
+    /// 到 g0/g1 + tuple split scatter 到 meta frag m0/m1。差分 oracle：m0/m1 各收 compute(data,lba)
+    /// 的 8 字节 tuple。revert-verify：篡改 backing 存储 tuple → stored-PI verify 失败 → 不 scatter +
+    /// Media 错。
+    #[test]
+    fn meta_sgl_read_multi_frag_pract0() {
+        let mut c = pi_ns(true);
+        let (lba0, n) = (1u64, 2usize);
+        let stream: Vec<u8> = (0..n * DATA).map(|i| ((i * 7 + 5) & 0xff) as u8).collect();
+        let tuples = host_tuples(&stream, lba0, n);
+        // 预置 backing：interleave [tuple][data]（pi_first=true）。
+        {
+            let ns = c.namespaces.get_mut(&1).unwrap();
+            for i in 0..n {
+                let mut blk = vec![0u8; BLOCK];
+                blk[0..8].copy_from_slice(&tuples[i * 8..i * 8 + 8]);
+                blk[8..8 + DATA].copy_from_slice(&stream[i * DATA..(i + 1) * DATA]);
+                ns.write_at(&blk, (lba0 + i as u64) * BLOCK as u64).unwrap();
+            }
+        }
+        let (g0, g1) = (0x4000u64, 0x6000u64);
+        let data_seg = seg_page(&[data_block(g0, 4096), data_block(g1, 4096)]);
+        let (m0, m1, mptr, meta_seg_gpa) = (0x7000u64, 0x8000u64, 0x5000u64, 0x9000u64);
+        let meta_seg = seg_page(&[data_block(m0, 8), data_block(m1, 8)]);
+        let meta_mptr_desc = last_seg(meta_seg_gpa, 32);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let sqe = to_psdt10(sgl_sqe(
+                0x02,
+                lba0,
+                n as u32,
+                0x72,
+                false,
+                mptr,
+                0x2000,
+                data_seg.len() as u32,
+            ));
+            assert!(c.dispatch_io(&mut ctx, 1, sqe, 0x72, 0, 1).is_none());
+        }
+        drive_meta(
+            &mut c,
+            &mut cap,
+            &data_seg,
+            None,
+            &meta_mptr_desc,
+            Some(&meta_seg),
+            None,
+        );
+        let writes = collect_writes(&cap);
+        // ① data scatter g0/g1 + tuple scatter m0/m1（split per frag）。
+        assert_eq!(
+            writes.get(&g0).map(|d| &d[..]),
+            Some(&stream[0..DATA]),
+            "frag0 data"
+        );
+        assert_eq!(
+            writes.get(&g1).map(|d| &d[..]),
+            Some(&stream[DATA..2 * DATA]),
+            "frag1 data"
+        );
+        assert_eq!(
+            writes.get(&m0).map(|d| &d[..]),
+            Some(&tuples[0..8]),
+            "meta frag0 tuple0"
+        );
+        assert_eq!(
+            writes.get(&m1).map(|d| &d[..]),
+            Some(&tuples[8..16]),
+            "meta frag1 tuple1"
+        );
+        assert_eq!(last_cqe_status(&cap), Some(0), "success");
+
+        // ④ revert-verify：篡改 backing tuple → stored-PI verify 失败 → 不 scatter + Media 错。
+        let mut c2 = pi_ns(true);
+        {
+            let ns = c2.namespaces.get_mut(&1).unwrap();
+            let mut blk = vec![0u8; BLOCK];
+            blk[0..8].copy_from_slice(&[0xAAu8; 8]); // 错 tuple
+            blk[8..8 + DATA].copy_from_slice(&stream[0..DATA]);
+            ns.write_at(&blk, lba0 * BLOCK as u64).unwrap();
+            let mut blk1 = vec![0u8; BLOCK];
+            blk1[0..8].copy_from_slice(&tuples[8..16]);
+            blk1[8..8 + DATA].copy_from_slice(&stream[DATA..2 * DATA]);
+            ns.write_at(&blk1, (lba0 + 1) * BLOCK as u64).unwrap();
+        }
+        let mut cap2 = CaptureTransport::with_start_token(0x100);
+        let r2 = {
+            let mut ctx = DeviceCtx::new(&mut cap2);
+            let sqe = to_psdt10(sgl_sqe(
+                0x02,
+                lba0,
+                n as u32,
+                0x73,
+                false,
+                mptr,
+                0x2000,
+                data_seg.len() as u32,
+            ));
+            c2.dispatch_io(&mut ctx, 1, sqe, 0x73, 0, 1)
+        };
+        // READ 的 stored-PI verify 在 dispatch 内**同步**完成（先读 backing 再 verify）→ 篡改
+        // tuple 使 dispatch 直接同步返 Media 错 CQE（非异步），且不建 op、不发任何 scatter。
+        let cqe2 = r2.expect("revert: stored-PI verify 失败 → 同步 reject");
+        assert_ne!(
+            cqe_status(&cqe2),
+            0,
+            "revert: verify 失败非 success（Media SCT=2）"
+        );
+        assert!(c2.sgl_ops.is_empty(), "revert: verify 失败不建 op");
+        let w2 = collect_writes(&cap2);
+        assert!(!w2.contains_key(&m0), "revert: verify 失败不 scatter tuple");
+        assert!(!w2.contains_key(&g0), "revert: verify 失败不 scatter data");
+    }
+
+    /// **E1 READ metadata-SGL × Bit Bucket（meta 平面）PRACT=0**。meta seg = [BitBucket(8),
+    /// DataBlock(m1,8)]：tuple0 被 bucket discard（不 scatter）、tuple1 scatter 到 m1。覆盖仍 == N×8
+    /// （bucket 8 + frag 8）。差分 oracle：m1 收 tuple1，m0 无 DmaWrite，data 平面照常。
+    #[test]
+    fn meta_sgl_read_bit_bucket() {
+        let mut c = pi_ns(true);
+        let (lba0, n) = (0u64, 2usize);
+        let stream: Vec<u8> = (0..n * DATA).map(|i| ((i * 11 + 3) & 0xff) as u8).collect();
+        let tuples = host_tuples(&stream, lba0, n);
+        {
+            let ns = c.namespaces.get_mut(&1).unwrap();
+            for i in 0..n {
+                let mut blk = vec![0u8; BLOCK];
+                blk[0..8].copy_from_slice(&tuples[i * 8..i * 8 + 8]);
+                blk[8..8 + DATA].copy_from_slice(&stream[i * DATA..(i + 1) * DATA]);
+                ns.write_at(&blk, (lba0 + i as u64) * BLOCK as u64).unwrap();
+            }
+        }
+        let (g0, g1) = (0x4000u64, 0x6000u64);
+        let data_seg = seg_page(&[data_block(g0, 4096), data_block(g1, 4096)]);
+        // meta: MPTR → LastSegment → [BitBucket(8), DataBlock(m1,8)]。
+        let (m1, mptr, meta_seg_gpa) = (0x8000u64, 0x5000u64, 0x9000u64);
+        let meta_seg = seg_page(&[bit_bucket(8), data_block(m1, 8)]);
+        let meta_mptr_desc = last_seg(meta_seg_gpa, 32);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let sqe = to_psdt10(sgl_sqe(
+                0x02,
+                lba0,
+                n as u32,
+                0x74,
+                false,
+                mptr,
+                0x2000,
+                data_seg.len() as u32,
+            ));
+            assert!(c.dispatch_io(&mut ctx, 1, sqe, 0x74, 0, 1).is_none());
+        }
+        drive_meta(
+            &mut c,
+            &mut cap,
+            &data_seg,
+            None,
+            &meta_mptr_desc,
+            Some(&meta_seg),
+            None,
+        );
+        let writes = collect_writes(&cap);
+        assert!(!writes.contains_key(&0x7000), "bucket 段 tuple0 不 scatter");
+        assert_eq!(
+            writes.get(&m1).map(|d| &d[..]),
+            Some(&tuples[8..16]),
+            "tuple1 scatter 到 m1"
+        );
+        assert_eq!(
+            writes.get(&g0).map(|d| &d[..]),
+            Some(&stream[0..DATA]),
+            "data frag0 照常"
+        );
+        assert_eq!(last_cqe_status(&cap), Some(0), "success（bucket 合法）");
+    }
+
+    /// **E1 MPTR=0 reject** — metadata-SGL PRACT=0 的 MPTR 是 meta SGL1 指针，0 → INVALID_FIELD
+    /// （与 separate L-2 对称），同步拒、不建 op。
+    #[test]
+    fn meta_sgl_mptr_zero_rejected() {
+        for opc in [0x01u8, 0x02] {
+            let mut c = pi_ns(true);
+            let mut cap = CaptureTransport::with_start_token(0x100);
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let sqe = to_psdt10(sgl_sqe(opc, 0, 1, 0x75, false, 0, 0x2000, 16));
+            let cqe = c
+                .dispatch_io(&mut ctx, 1, sqe, 0x75, 0, 1)
+                .expect("MPTR=0 应同步 reject");
+            assert_eq!(
+                cqe_status(&cqe),
+                crate::cmd::sc::INVALID_FIELD,
+                "MPTR=0 → INVALID_FIELD"
+            );
+            assert!(c.sgl_ops.is_empty());
+        }
+    }
+
+    /// **E1 meta length invalid** — meta fragment 覆盖 ≠ N×8 → `METADATA_SGL_LENGTH_INVALID`(0x10)。
+    /// MPTR→单 DataBlock len=8，但 N=2（期望 16）→ 覆盖不足，meta walk 完成时 reject。
+    #[test]
+    fn meta_sgl_length_invalid() {
+        let mut c = pi_ns(true);
+        let (lba0, n) = (0u64, 2usize);
+        let stream: Vec<u8> = (0..n * DATA).map(|i| (i & 0xff) as u8).collect();
+        let (g0, g1) = (0x4000u64, 0x6000u64);
+        let data_seg = seg_page(&[data_block(g0, 4096), data_block(g1, 4096)]);
+        let mptr = 0x5000u64;
+        // MPTR → 单 DataBlock len=8（仅够 1 个 tuple，N=2 需 16）→ 覆盖 8 ≠ 16。
+        let meta_mptr_desc = data_block(0x7000, 8);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let sqe = to_psdt10(sgl_sqe(
+                0x01,
+                lba0,
+                n as u32,
+                0x76,
+                false,
+                mptr,
+                0x2000,
+                data_seg.len() as u32,
+            ));
+            assert!(c.dispatch_io(&mut ctx, 1, sqe, 0x76, 0, 1).is_none());
+        }
+        drive_meta(
+            &mut c,
+            &mut cap,
+            &data_seg,
+            Some(&stream),
+            &meta_mptr_desc,
+            None,
+            Some(&[0u8; 8]),
+        );
+        assert_eq!(
+            last_cqe_status(&cap),
+            Some(crate::cmd::sc::METADATA_SGL_LENGTH_INVALID),
+            "meta 覆盖 8 ≠ N×8(16) → METADATA_SGL_LENGTH_INVALID"
+        );
+        assert!(c.sgl_ops.is_empty(), "reject 后 op 移除");
+    }
+
+    /// **E1 CMB-relative meta SGL1 rebase（reviewer HIGH/MEDIUM 回归守卫）** — meta SGL1 描述符
+    /// 的 sub_type=1（CMB-relative）address 须经 `resolve_sgl_address` rebase 成 `cba+offset`。差分
+    /// oracle 用**越界 offset≥size**：仅当 rebase 真发生时才会触发 `SGL_OFFSET_INVALID`(0x16)；若
+    /// 漏 rebase（HIGH bug 原状），offset 被误当 GPA、绕过 bound check → 不会返此 SC（revert-verify：
+    /// 去掉 on_sgl_meta_fetch 的 rebase → 本断言转红）。这正是漏测才让 HIGH 溜过的那条 oracle。
+    #[test]
+    fn meta_sgl_cmb_relative_offset_invalid() {
+        let mut c = pi_ns(true);
+        c.enable_cmb(0x1000, 1).unwrap(); // 4 KiB CMB
+        {
+            let cmb = c.cmb.as_mut().unwrap();
+            cmb.cre = true;
+            cmb.cmse = true; // cmb_window() → Some((cba, size))
+            cmb.cba = 0x10_0000;
+        }
+        let (lba0, n) = (0u64, 1usize);
+        let stream = vec![0x5Au8; n * DATA];
+        let data_seg = seg_page(&[data_block(0x4000, 4096)]);
+        let mptr = 0x5000u64; // flat（不在 CMB 窗口）→ meta SGL1 描述符经普通 DMA 喂入。
+        // meta SGL1 = DataBlock，sub_type=1（CMB-relative，id 低 nibble=1），offset=0x2000 ≥ size
+        // 0x1000 → rebase 时越界。
+        let mut meta_desc = data_block(0x2000, 8);
+        meta_desc[15] = 0x01; // type=0 DataBlock | sub_type=1
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let sqe = to_psdt10(sgl_sqe(
+                0x01,
+                lba0,
+                n as u32,
+                0x77,
+                false,
+                mptr,
+                0x2000,
+                data_seg.len() as u32,
+            ));
+            assert!(c.dispatch_io(&mut ctx, 1, sqe, 0x77, 0, 1).is_none());
+        }
+        drive_meta(
+            &mut c,
+            &mut cap,
+            &data_seg,
+            Some(&stream),
+            &meta_desc,
+            None,
+            Some(&[0u8; 8]),
+        );
+        assert_eq!(
+            last_cqe_status(&cap),
+            Some(crate::cmd::sc::SGL_OFFSET_INVALID),
+            "CMB-relative meta SGL1 越界 offset → SGL_OFFSET_INVALID（证 rebase 经 resolve_sgl_address）"
+        );
+        assert!(c.sgl_ops.is_empty(), "reject 后 op 移除");
     }
 }
 

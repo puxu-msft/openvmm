@@ -42,7 +42,8 @@
 //! - Keyed Data Block / Transport-specific：NVMe-oF 专属，本地 PCIe 不用 → reject。
 //! - `PSDT=11`（reserved）→ `INVALID_FIELD`；`PSDT=00` → 原 PRP 不变。
 //! - PSDT 仅区分 *metadata* 形态（由 dispatch 层按 `meta_sgl=(psdt==0b10)` 路由）：01=平坦
-//!   MPTR / inline 吸收；10=metadata-SGL（SGLS bit19 = `NVME_CTRL_SGLS_MSDS`，**E1 待落地**，现 reject INVALID_FIELD）。
+//!   MPTR / inline 吸收；10=metadata-SGL（E1 已实现，SGLS bit19 = `NVME_CTRL_SGLS_MSDS`：
+//!   MPTR→meta SGL1 描述符，tuple 经独立 meta-frag scatter/gather + 计数器双门控）。
 //!
 //! ## CMB-P2（2026-06-12，CMB-relative SGL 放行）
 //!
