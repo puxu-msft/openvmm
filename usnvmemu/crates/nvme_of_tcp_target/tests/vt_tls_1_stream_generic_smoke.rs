@@ -57,7 +57,7 @@ async fn vt_tls_1_async_session_compiles_with_tokio_duplex() {
 
     let s = Arc::clone(&shared);
     let h = tokio::spawn(async move {
-        let sess: AsyncSession<DuplexStream> = accept_and_handshake_async(server, s).await.unwrap();
+        let sess = accept_and_handshake_async(server, s).await.unwrap();
         (sess.conn_id, sess.next_token)
     });
 
@@ -78,14 +78,17 @@ async fn vt_tls_1_async_session_compiles_with_tokio_duplex() {
 ///
 /// 旧版 `_assert_default<F>()` 永不实例化，编译器对未实例化的泛型函数不做完整
 /// bound check，等于空测。改用 type ascription：把 `AsyncSession`（不写类型参
-/// 数）与 `AsyncSession<tokio::net::TcpStream>` 拼成同一 `Option`，类型不一致
-/// 即编译失败。
+/// 数）与 `AsyncSession<TcpFabricBackend<tokio::net::TcpStream>>` 拼成同一 `Option`，
+/// 类型不一致即编译失败。**V9 R3c**：default 泛型参数从 stream 改为 backend，
+/// 默认 = `TcpFabricBackend<TokioStream>`。
 #[test]
-fn vt_tls_1_async_session_default_type_param_is_tcpstream() {
+fn vt_tls_1_async_session_default_type_param_is_tcp_backend() {
+    use nvme_of_tcp_target::fabric_backend::TcpFabricBackend;
     // 同一变量绑定两次类型表达式 → 编译器强制等价。
     let _slot: Option<AsyncSession> = None;
-    let _slot2: Option<AsyncSession> = None::<AsyncSession<tokio::net::TcpStream>>;
-    // 若 default param 改成非 TcpStream，第二行立即编译失败。
+    let _slot2: Option<AsyncSession> =
+        None::<AsyncSession<TcpFabricBackend<tokio::net::TcpStream>>>;
+    // 若 default param 改成非 TcpFabricBackend<TokioStream>，第二行立即编译失败。
     // 让编译器看见使用，避免 unused warning。
     drop(_slot);
     drop(_slot2);
@@ -100,7 +103,7 @@ async fn vt_tls_1_dispatch_pdu_over_duplex_smoke() {
 
     let s = Arc::clone(&shared);
     let h = tokio::spawn(async move {
-        let mut sess: AsyncSession<DuplexStream> =
+        let mut sess =
             accept_and_handshake_async(server, s).await.unwrap();
         // 用公开 API pump_one_async 从 wire 读 PDU；watch channel 用作占位
         // shutdown 通道（plan §3 Q4 设计），本测试不发 shutdown。

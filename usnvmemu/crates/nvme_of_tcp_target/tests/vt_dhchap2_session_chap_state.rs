@@ -20,7 +20,7 @@ use nvme_of_tcp_target::dhchap::{ChapSecretStore, ChapStage};
 use nvme_of_tcp_target::fabric::{self, ConnectData, ConnectFabricFields, fctype};
 use nvme_of_tcp_target::framing::{read_pdu_async, write_pdu_async};
 use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
-use nvme_of_tcp_target::{AsyncSession, SharedControllerInner, accept_and_handshake_async};
+use nvme_of_tcp_target::{SharedControllerInner, accept_and_handshake_async};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::{TcpListener, TcpStream};
@@ -86,7 +86,7 @@ async fn run_server_capture_stage(
     let addr = listener.local_addr().unwrap();
     addr_tx.send(addr).unwrap();
     let (server, _) = listener.accept().await.unwrap();
-    let mut sess: AsyncSession<TcpStream> =
+    let mut sess =
         accept_and_handshake_async(server, shared).await.unwrap();
     if let Some(s) = store {
         sess.enable_chap(s);

@@ -18,7 +18,7 @@ use nvme_of_tcp_target::fabric::{self, ConnectData, ConnectFabricFields, fctype}
 use nvme_of_tcp_target::framing::{read_pdu_async, write_pdu_async};
 use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
 use nvme_of_tcp_target::{
-    AsyncSession, SharedControllerInner, accept_and_handshake_async,
+    SharedControllerInner, accept_and_handshake_async,
     accept_and_handshake_async_with_auth,
 };
 use std::collections::HashSet;
@@ -87,7 +87,7 @@ async fn vt_auth_allows_listed_hostnqn() {
     let a = Arc::clone(&allow);
     let server = tokio::spawn(async move {
         let (server, _) = listener.accept().await.unwrap();
-        let mut sess: AsyncSession<TcpStream> = accept_and_handshake_async_with_auth(server, s, a)
+        let mut sess = accept_and_handshake_async_with_auth(server, s, a)
             .await
             .unwrap();
         let (_tx, mut rx) = tokio::sync::watch::channel(false);
@@ -127,7 +127,7 @@ async fn vt_auth_rejects_unlisted_hostnqn() {
     let a = Arc::clone(&allow);
     let server = tokio::spawn(async move {
         let (server, _) = listener.accept().await.unwrap();
-        let mut sess: AsyncSession<TcpStream> = accept_and_handshake_async_with_auth(server, s, a)
+        let mut sess = accept_and_handshake_async_with_auth(server, s, a)
             .await
             .unwrap();
         let (_tx, mut rx) = tokio::sync::watch::channel(false);
@@ -163,7 +163,7 @@ async fn vt_auth_disabled_when_allowlist_none() {
     let s = Arc::clone(&shared);
     let server = tokio::spawn(async move {
         let (server, _) = listener.accept().await.unwrap();
-        let mut sess: AsyncSession<TcpStream> =
+        let mut sess =
             accept_and_handshake_async(server, s).await.unwrap();
         let (_tx, mut rx) = tokio::sync::watch::channel(false);
         if let Ok(nvme_of_tcp_target::PumpEvent::Pdu(p)) = sess.pump_one_async(&mut rx).await {

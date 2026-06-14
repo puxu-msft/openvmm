@@ -257,6 +257,13 @@ impl<V: RdmaVerbs> FabricBackend for RdmaFabricBackend<V> {
         self.post_one_recv()?;
         Ok(RecvFrame::Frame(pdu))
     }
+
+    async fn terminate(&mut self, fes: u16) -> anyhow::Result<()> {
+        // RDMA 无 C2HTermReq wire 对应；fatal 错误映射到 QP teardown（真 association
+        // teardown / in-flight drain 是 R3c 的 QP-drain 工作，此处先记日志）。
+        tracing::warn!(fes, "R3b RDMA terminate（无 C2HTerm；QP teardown 留 R3c）");
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -23,7 +23,7 @@ use nvme_of_tcp_target::dhchap::{ChapSecretStore, compute_response, wire};
 use nvme_of_tcp_target::fabric::{self, ConnectData, ConnectFabricFields, fctype};
 use nvme_of_tcp_target::framing::{Pdu, read_pdu_async, write_pdu_async};
 use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
-use nvme_of_tcp_target::{AsyncSession, SharedControllerInner, accept_and_handshake_async};
+use nvme_of_tcp_target::{SharedControllerInner, accept_and_handshake_async};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::{TcpListener, TcpStream};
@@ -178,7 +178,7 @@ async fn spawn_server_with_chap(
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (server, _) = listener.accept().await.unwrap();
-        let mut sess: AsyncSession<TcpStream> =
+        let mut sess =
             accept_and_handshake_async(server, shared).await.unwrap();
         sess.enable_chap(store);
         let (_tx, mut rx) = tokio::sync::watch::channel(false);

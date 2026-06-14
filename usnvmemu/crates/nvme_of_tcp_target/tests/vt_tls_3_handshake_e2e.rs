@@ -19,7 +19,7 @@ use nvme_firmware::NvmeController;
 use nvme_of_tcp_target::framing::{Pdu, read_pdu_async, write_pdu_async};
 use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
 use nvme_of_tcp_target::{
-    AsyncSession, SharedControllerInner, accept_and_handshake_async, build_acceptor_from_pem,
+    SharedControllerInner, accept_and_handshake_async, build_acceptor_from_pem,
 };
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::sync::Arc;
@@ -164,7 +164,7 @@ async fn vt_tls_3_handshake_then_icreq_roundtrip() {
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let tls = acceptor.accept(tcp).await.unwrap();
-        let mut sess: AsyncSession<tokio_rustls::server::TlsStream<TokioStream>> =
+        let mut sess =
             accept_and_handshake_async(tls, s).await.unwrap();
         // 跑 2 个 cmd: Connect + Property Get
         let (_tx, mut rx) = tokio::sync::watch::channel(false);

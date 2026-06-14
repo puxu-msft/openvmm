@@ -19,7 +19,7 @@ use nvme_of_tcp_target::fabric::{
 };
 use nvme_of_tcp_target::framing::{read_pdu_async, write_pdu_async};
 use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
-use nvme_of_tcp_target::{AsyncSession, SharedControllerInner, accept_and_handshake_async};
+use nvme_of_tcp_target::{SharedControllerInner, accept_and_handshake_async};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::{TcpListener, TcpStream};
@@ -169,7 +169,7 @@ async fn spawn_server(shared: Arc<SharedControllerInner>) -> std::net::SocketAdd
             };
             let s = Arc::clone(&shared);
             tokio::spawn(async move {
-                let mut sess: AsyncSession<TcpStream> =
+                let mut sess =
                     accept_and_handshake_async(server, s).await.unwrap();
                 let (_tx, mut rx) = tokio::sync::watch::channel(false);
                 for _ in 0..256 {

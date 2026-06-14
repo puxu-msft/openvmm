@@ -20,7 +20,7 @@ use nvme_firmware::NvmeController;
 use nvme_of_tcp_target::framing::{read_pdu_async, write_pdu_async};
 use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
 use nvme_of_tcp_target::{
-    AsyncSession, SharedControllerInner, accept_and_handshake_async, build_acceptor_with_mtls,
+    SharedControllerInner, accept_and_handshake_async, build_acceptor_with_mtls,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use std::sync::Arc;
@@ -179,7 +179,7 @@ async fn vt_mtls_handshake_with_valid_client_cert() {
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let tls = acceptor.accept(tcp).await.expect("mTLS handshake 应成功");
-        let mut sess: AsyncSession<tokio_rustls::server::TlsStream<TokioStream>> =
+        let mut sess =
             accept_and_handshake_async(tls, s).await.unwrap();
         let (_tx, mut rx) = tokio::sync::watch::channel(false);
         // 不实际 dispatch，只验 NVMe ICReq/ICResp 走过 mTLS 通道

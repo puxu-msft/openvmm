@@ -121,6 +121,11 @@ pub trait FabricBackend {
     /// 错位破帧。当前 biased select 里 recv 是末 arm 且取消后 caller 多退出循环，触发面窄；长远应换
     /// cancel-safe framed reader。**RDMA impl 无此坑**（`poll_cq` 是 cancel-safe 的瞬时 poll）。
     async fn recv_next(&mut self) -> anyhow::Result<RecvFrame>;
+
+    /// **R3c** — fatal 错误时终止连接（pump/dispatch 检出坏帧时调）。
+    /// - **TCP**：发 `C2HTermReq`（`fes` = fatal error status）。
+    /// - **RDMA**：无 C2HTerm wire 对应；映射到 QP teardown / disconnect（`fes` 仅作日志）。
+    async fn terminate(&mut self, fes: u16) -> anyhow::Result<()>;
 }
 
 /// [`FabricBackend::recv_next`] 的产出：一帧入站，或对端关闭。
@@ -293,6 +298,10 @@ impl<S: AsyncSessionStream> FabricBackend for TcpFabricBackend<S> {
                 }
             }
         }
+    }
+
+    async fn terminate(&mut self, fes: u16) -> anyhow::Result<()> {
+        self.send_c2h_term(fes).await
     }
 }
 

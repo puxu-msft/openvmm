@@ -18,7 +18,7 @@ use nvme_of_tcp_target::fabric::{self, ConnectData, ConnectFabricFields, fctype}
 use nvme_of_tcp_target::framing::{read_pdu_async, write_pdu_async};
 use nvme_of_tcp_target::pdu::{CommonHdr, IcPsh, pdu_type};
 use nvme_of_tcp_target::{
-    AsyncSession, SharedControllerInner, accept_and_handshake_async, build_acceptor_with_mtls,
+    SharedControllerInner, accept_and_handshake_async, build_acceptor_with_mtls,
     extract_host_identities,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
@@ -221,7 +221,7 @@ async fn run_connect_e2e(pki: Pki, hostnqn: &str) -> u8 {
             .transpose()
             .unwrap()
             .unwrap_or_default();
-        let mut sess: AsyncSession<tokio_rustls::server::TlsStream<TokioStream>> =
+        let mut sess =
             accept_and_handshake_async(tls, s).await.unwrap();
         sess.bind_host_identities(ids);
         let (_tx, mut rx) = tokio::sync::watch::channel(false);

@@ -41,6 +41,7 @@
 
 use crate::SharedController;
 use crate::fabric::{self, ConnectData, fabric_sc, fctype};
+use crate::fabric_backend::TcpFabricBackend;
 use crate::framing::{Pdu, read_pdu_async, write_pdu_async};
 use crate::pdu::{CommonHdr, IcPsh, pdu_type};
 use anyhow::Context as _;
@@ -69,10 +70,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncSessionStream for 
 /// 字段集合刻意收得比 sync `V2Session` 少：V8e-3 只交付 ICReq/Connect/简单
 /// dispatch 骨架；V8e-4 加 AER Notify、V8e-5 加 KATO Sleep、V8e-6 加完整
 /// admin/IO dispatch。
-pub struct AsyncSession<S: AsyncSessionStream = TokioStream> {
-    /// **V9 R2/R3** — TCP 出站数据移动后端（owns stream + ttag 分配 + MAXH2CDATA）。
-    /// recv 与数据移动**全经 `FabricBackend` trait**（R3 起 pump 不再直借 backend 具体字段）。
-    pub(crate) backend: crate::fabric_backend::TcpFabricBackend<S>,
+pub struct AsyncSession<B: crate::fabric_backend::FabricBackend = TcpFabricBackend<TokioStream>> {
+    /// **V9 R2/R3** — fabric 数据移动后端（TCP `TcpFabricBackend` / RDMA `RdmaFabricBackend`）。
+    /// recv 与数据移动**全经 `FabricBackend` trait**（R3c：AsyncSession 泛化于 `B: FabricBackend`，
+    /// pump/dispatch/桥共享，TCP/RDMA 各注入自己的 backend）。
+    pub(crate) backend: B,
     controller: SharedController,
     /// 协商后参数（与 sync `NegotiatedIc` 等价）。
     pub negotiated: crate::NegotiatedIc,
@@ -213,7 +215,7 @@ where
 pub async fn accept_and_handshake_async<S>(
     mut stream: S,
     controller: SharedController,
-) -> anyhow::Result<AsyncSession<S>>
+) -> anyhow::Result<AsyncSession<TcpFabricBackend<S>>>
 where
     S: AsyncSessionStream,
 {
@@ -265,7 +267,7 @@ pub async fn accept_and_handshake_async_with_auth<S>(
     stream: S,
     controller: SharedController,
     allowlist: std::sync::Arc<std::collections::HashSet<String>>,
-) -> anyhow::Result<AsyncSession<S>>
+) -> anyhow::Result<AsyncSession<TcpFabricBackend<S>>>
 where
     S: AsyncSessionStream,
 {
@@ -274,7 +276,7 @@ where
     Ok(sess)
 }
 
-impl<S: AsyncSessionStream> AsyncSession<S> {
+impl<B: crate::fabric_backend::FabricBackend> AsyncSession<B> {
     /// **V-followup-auth-2** — 在 mTLS handshake 完成后注入 host identity 集合
     /// （SAN URI / DNS / CN），开启 NQN ↔ TLS identity binding 校验。
     ///
@@ -314,7 +316,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         &mut self,
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<PumpEvent> {
-        use crate::fabric_backend::{FabricBackend as _, RecvFrame};
+        use crate::fabric_backend::RecvFrame;
         // V8e-5：KATO=0 时第 3 arm 用 `std::future::pending()` 占位（spec § 7.13
         // "Keep Alive disabled"）。已 arm 的 Sleep 通过 `as_mut` 拿 Pin 借用。
         let kato_fut = async {
@@ -438,7 +440,7 @@ pub enum PumpEvent {
 /// **V8e-7-2** — Drop 扩展也 sweep 本 conn `io_queues` 镜像里的 IO SQ/CQ
 /// （与 sync V2Session V8d Drop 1:1 等价；spec § 7.6.1 ordering 先 SQ 后 CQ）。
 /// peer close 路径（不发 Disconnect）也走这里兜底。
-impl<S: AsyncSessionStream> Drop for AsyncSession<S> {
+impl<B: crate::fabric_backend::FabricBackend> Drop for AsyncSession<B> {
     fn drop(&mut self) {
         if self.conn_id == 0 {
             return;
@@ -499,7 +501,7 @@ pub struct DispatchOutcome {
     pub disconnected: bool,
 }
 
-impl<S: AsyncSessionStream> AsyncSession<S> {
+impl<B: crate::fabric_backend::FabricBackend> AsyncSession<B> {
     /// **V8e-7-2** — async PDU dispatch 入口。
     ///
     /// 行为与 sync `dispatch_capsule_cmd` 1:1 等价，但走 tokio async 路径
@@ -935,7 +937,6 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         cqe[0..4].copy_from_slice(&result_dw0.to_le_bytes());
         cqe[4..8].copy_from_slice(&result_dw1.to_le_bytes());
         cqe[12..14].copy_from_slice(&cid.to_le_bytes());
-        use crate::fabric_backend::FabricBackend as _;
         self.backend.send_response_capsule(&cqe).await
     }
 
@@ -967,12 +968,11 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         };
         let status: u16 = ((sct as u16) << 9) | ((sc as u16) << 1);
         cqe[14..16].copy_from_slice(&status.to_le_bytes());
-        use crate::fabric_backend::FabricBackend as _;
         self.backend.send_response_capsule(&cqe).await
     }
 
     async fn send_c2h_term_async(&mut self, fes: u16) -> anyhow::Result<()> {
-        self.backend.send_c2h_term(fes).await
+        self.backend.terminate(fes).await
     }
 
     /// **V-followup-dhchap-3-wire / V-followup-dhchap-4** — 处理 AUTH_RECV：
@@ -2031,7 +2031,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         base_offset: u32,
         len: u32,
     ) -> anyhow::Result<Vec<u8>> {
-        use crate::fabric_backend::{FabricBackend as _, HostBuf};
+        use crate::fabric_backend::HostBuf;
         // **cap-before-allocate**（rust-reviewer HIGH-1）：先验上界再分配，防 pathological len
         // 先吃一坨内存（backend 内也有同款防御，此处保留旧的「分配前拒」顺序）。
         if len > crate::session::V4_MAX_DMA_READ_BYTES {
@@ -2065,7 +2065,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         data_offset: u32,
         is_last: bool,
     ) -> anyhow::Result<()> {
-        use crate::fabric_backend::{FabricBackend as _, HostBuf};
+        use crate::fabric_backend::HostBuf;
         let host = HostBuf::FlowControlled {
             total_len: data.len() as u32,
         };
@@ -2081,7 +2081,6 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         let cqe: [u8; 16] = cqe_bytes
             .try_into()
             .map_err(|_| anyhow::anyhow!("CQE bytes len {} != 16", cqe_bytes.len()))?;
-        use crate::fabric_backend::FabricBackend as _;
         self.backend.send_response_capsule(&cqe).await
     }
 
