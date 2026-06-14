@@ -1520,34 +1520,33 @@ async fn openhcl_fused_compare_and_write() -> Result<()> {
     Ok(())
 }
 
-/// P1 —— admin 数据 DMA 的**非连续 PRP** 正确性（修 latent silent corruption）。
+/// **NUMD clamp 端到端：Get Log Page 巨 NUMD 被截到自然尺寸 → 不触发 2-page PRP2 scatter**。
 ///
-/// 旧 `dma_write_then_complete` 把整 buf 连续写单个 PRP1、无视 PRP2 → > 4 KiB 的数据
-/// 在 PRP1/PRP2 **非连续**的 host 上把 page1 写到 `PRP1+4096` 而非 PRP2。本测试请求一个
-/// 6 KiB(1.5 page) Get Log Page，**故意给非连续 PRP1/PRP2**，在 `PRP1+4096` 与 PRP2 各
-/// 种 sentinel，断言：page1 落 PRP2、**不**碰 `PRP1+4096`。
+/// 原测试用 over-request 6 KiB Telemetry 撑出 1.5 page 来测「page1 落 PRP2 非连续」。NUMD-截断
+/// 硬化后（`logs.rs build_telemetry_host` 返自然 1024 单页），GLP **无法再被 over-request 撑过
+/// 1 page**：1024B → 单 `guest_write` 落 PRP1，PRP2 / PRP1+4096 都不被碰。多页 PRP2/list scatter
+/// 机件本身由 lib `prp_list_chaining_device_to_host`（直驱 `dma_write_then_complete`）守。
 ///
-/// **独立 oracle / revert-verify**：把 helper 退回"整 buf 连续写 PRP1"，本测试必 FAIL
-/// （page1 覆盖 PRP1+4096 的 sentinel）→ 证明测试有牙。
+/// revert-verify：把 `build_telemetry_host` 改回 `vec![0u8; bytes.max(1024)]`（不截）→ 又撑到
+/// 6 KiB → page1 落 PRP2 → 本测试"PRP2 仍 sentinel"断言转红。
 #[tokio::test]
-async fn openhcl_get_log_page_noncontiguous_prp() -> Result<()> {
-    // 故意非连续：PRP1+4096 = 0xA1000 ≠ PRP2 = 0xC0000。
+async fn openhcl_get_log_page_numd_clamp_no_2page_scatter() -> Result<()> {
+    // 非连续 PRP1/PRP2；clamp 后两者都不该跨页写。
     const LOG_PRP1: u64 = 0xA_0000;
     const LOG_PRP2: u64 = 0xC_0000;
-    const BUG_GPA: u64 = LOG_PRP1 + 4096; // 0xA1000 —— 连续写 bug 会把 page1 写这
-    const LOG_BYTES: usize = 6144; // 1.5 page → 触发 2-page PRP1+PRP2 路径
+    const PAST_GPA: u64 = LOG_PRP1 + 4096; // 0xA1000 —— clamp 后不该被碰
+    const LOG_BYTES: usize = 6144; // over-request 1.5 page；clamp 应截到 1024
 
     let (stream, _harness) = spawn_and_accept().await?;
     let (driver, _dev) = NvmeDriver::start(stream).await?;
     driver.enable_controller().await.context("enable")?;
     let mut admin = QueueState::admin();
 
-    // 种 sentinel：PRP1+4096 区 = 0x77（fix 下不该被碰）、PRP2 区 = 0x88（fix 下该被写）。
-    driver.write_guest(BUG_GPA, vec![0x77; 4096]);
+    // 种 sentinel：PRP2 与 PRP1+4096 —— clamp 后都不该被写。
+    driver.write_guest(PAST_GPA, vec![0x77; 4096]);
     driver.write_guest(LOG_PRP2, vec![0x88; 4096]);
 
-    // Get Log Page（opcode 0x02）LID=0x07 Telemetry Host-Initiated，6 KiB，非连续 PRP。
-    // NUMD = bytes/4 - 1（0-based dwords）；cdw10 bits31:16 = NUMDL，cdw11 = NUMDU。
+    // Get Log Page LID=0x07 Telemetry(自然 1024)，over-request 6 KiB，非连续 PRP。
     let numd = (LOG_BYTES / 4 - 1) as u32;
     let cdw10 = 0x07u32 | ((numd & 0xffff) << 16);
     let cdw11 = numd >> 16;
@@ -1570,59 +1569,58 @@ async fn openhcl_get_log_page_noncontiguous_prp() -> Result<()> {
         .context("Get Log Page")?;
     assert_eq!(cqe.sc, 0, "Get Log Page sc 应=0，实={:#x}", cqe.sc);
 
-    // ★ 独立 oracle：page1 落 PRP2，**不**碰 PRP1+4096。
-    let bug_region = driver.read_guest(BUG_GPA, 2048).await?;
-    assert!(
-        bug_region.iter().all(|&b| b == 0x77),
-        "PRP1+4096(0xA1000) 应仍是 sentinel 0x77（firmware 未越界连续写 page1）—— \
-         否则即 ×连续 PRP latent corruption"
+    // ★ clamp oracle：payload 截到 1024 → 单页落 PRP1[0..1024]（Telemetry header byte0=LID 0x07）。
+    let prp1_head = driver.read_guest(LOG_PRP1, 16).await?;
+    assert_eq!(
+        prp1_head[0], 0x07,
+        "PRP1 应落 Telemetry log（byte0=LID 0x07）"
     );
-    let prp2_region = driver.read_guest(LOG_PRP2, 2048).await?;
+    // PRP2 与 PRP1+4096 都未被碰（clamp 截断了多页 scatter）。
+    let prp2_region = driver.read_guest(LOG_PRP2, 4096).await?;
     assert!(
-        !prp2_region.iter().all(|&b| b == 0x88),
-        "PRP2 应被 firmware 写入 page1 数据（不再全 0x88 sentinel）"
+        prp2_region.iter().all(|&b| b == 0x88),
+        "clamp 后 PRP2 不应被写（payload 1024≤1page，无 2-page scatter）"
+    );
+    let past = driver.read_guest(PAST_GPA, 4096).await?;
+    assert!(
+        past.iter().all(|&b| b == 0x77),
+        "PRP1+4096 不应被碰（无越界连续写）"
     );
 
     Ok(())
 }
 
-/// P2 —— admin 数据 DMA 的 **PRP list**（> 2 page，去 8 KiB 上限）。
+/// **NUMD clamp 端到端：Get Log Page 巨 NUMD 被截到自然尺寸 → 不触发 PRP-list 跟随**。
 ///
-/// > 2 page 时 PRP2 是 PRP **list 页**指针。本测试请求 12 KiB(3 page) Get Log Page，在
-/// guest-mem 放一个**真 PRP list 页**（2 个 entry 指向**非连续**数据页 GPA），断言
-/// firmware：① DMA-read 该 list 页 ② page0→PRP1、page1→list[0]、page2→list[1]（非连续
-/// 落地）③ **不**碰连续写 bug 会命中的 PRP1+4096 / PRP1+8192。
+/// 原测试 over-request 12 KiB Telemetry 撑出 3 page 来测 PRP-list 跟随 + 非连续 scatter。NUMD-截断
+/// 硬化后 Telemetry 返自然 1024 单页 → controller **不读 PRP list 页、不写任何 list entry**。
+/// PRP-list 跟随机件本身由 lib `prp_list_chaining_device_to_host`（直驱 600 页）守，不依赖本
+/// over-request 路径。
 ///
-/// **revert-verify**：把 helper > 2 页分支退回连续写，本测试必 FAIL。
+/// revert-verify：把 `build_telemetry_host` 改回 `vec![0u8; bytes.max(1024)]`（不截）→ 又撑到
+/// 12 KiB → 跟随 PRP list 写 list entry → 本测试"list entry 仍 sentinel"断言转红。
 #[tokio::test]
-async fn openhcl_get_log_page_prp_list() -> Result<()> {
+async fn openhcl_get_log_page_numd_clamp_no_prp_list() -> Result<()> {
     const LOG_PRP1: u64 = 0xA_0000; // page 0 目标
-    const LOG_LIST: u64 = 0xB_0000; // PRP list 页（= prp2）
-    const LIST_E0: u64 = 0xC_0000; // list[0] → page 1 目标（与 PRP1 非连续）
-    const LIST_E1: u64 = 0xE_0000; // list[1] → page 2 目标（非连续）
-    const BUG_P1: u64 = LOG_PRP1 + 4096; // 0xA1000 —— 连续写 bug 会把 page1 写这
-    const BUG_P2: u64 = LOG_PRP1 + 8192; // 0xA2000 —— 连续写 bug 会把 page2 写这
-    const LOG_BYTES: usize = 12288; // 3 page → 触发 PRP list 路径
+    const LOG_LIST: u64 = 0xB_0000; // PRP list 页（= prp2；clamp 后不该被读/跟随）
+    const LIST_E0: u64 = 0xC_0000; // list[0] 目标（clamp 后不该被写）
+    const LIST_E1: u64 = 0xE_0000; // list[1] 目标（clamp 后不该被写）
+    const LOG_BYTES: usize = 12288; // over-request 3 page；clamp 应截到 1024
 
     let (stream, _harness) = spawn_and_accept().await?;
     let (driver, _dev) = NvmeDriver::start(stream).await?;
     driver.enable_controller().await.context("enable")?;
     let mut admin = QueueState::admin();
 
-    // 放真 PRP list 页：entry0 = LIST_E0、entry1 = LIST_E1（LE u64）。
+    // 放真 PRP list 页 + sentinel（clamp 后都不该被写）。
     let mut list_page = vec![0u8; 16];
     list_page[0..8].copy_from_slice(&LIST_E0.to_le_bytes());
     list_page[8..16].copy_from_slice(&LIST_E1.to_le_bytes());
     driver.write_guest(LOG_LIST, list_page);
-
-    // 种 sentinel：连续写 bug 命中的 PRP1+4096/+8192 = 0x77（fix 下不该碰）；
-    // list entry 目标 = 0x88/0x99（fix 下该被写）。
-    driver.write_guest(BUG_P1, vec![0x77; 4096]);
-    driver.write_guest(BUG_P2, vec![0x77; 4096]);
     driver.write_guest(LIST_E0, vec![0x88; 4096]);
     driver.write_guest(LIST_E1, vec![0x99; 4096]);
 
-    // Get Log Page 12 KiB，prp1=LOG_PRP1，prp2=LOG_LIST(PRP list 页)。
+    // Get Log Page 12 KiB(over-request)，prp1=LOG_PRP1，prp2=LOG_LIST(PRP list 页)。
     let numd = (LOG_BYTES / 4 - 1) as u32;
     let cdw10 = 0x07u32 | ((numd & 0xffff) << 16);
     let cdw11 = numd >> 16;
@@ -1642,30 +1640,22 @@ async fn openhcl_get_log_page_prp_list() -> Result<()> {
             .encode(),
         )
         .await
-        .context("Get Log Page (PRP list)")?;
-    assert_eq!(cqe.sc, 0, "Get Log Page(>8KiB) sc 应=0，实={:#x}", cqe.sc);
+        .context("Get Log Page (clamp)")?;
+    assert_eq!(cqe.sc, 0, "Get Log Page sc 应=0，实={:#x}", cqe.sc);
 
-    // ★ 独立 oracle：page1/page2 落 list entry，不碰连续写 bug 位。
-    let bug1 = driver.read_guest(BUG_P1, 4096).await?;
-    assert!(
-        bug1.iter().all(|&b| b == 0x77),
-        "PRP1+4096 应仍 sentinel 0x77（page1 未越界连续写）—— 否则即 ×连续 PRP bug"
-    );
-    let bug2 = driver.read_guest(BUG_P2, 4096).await?;
-    assert!(
-        bug2.iter().all(|&b| b == 0x77),
-        "PRP1+8192 应仍 sentinel 0x77（page2 未越界连续写）"
+    // ★ clamp oracle：单页落 PRP1，**不跟随 PRP list** → list entry 都未被写。
+    let prp1_head = driver.read_guest(LOG_PRP1, 16).await?;
+    assert_eq!(
+        prp1_head[0], 0x07,
+        "PRP1 应落 Telemetry log（byte0=LID 0x07）"
     );
     let e0 = driver.read_guest(LIST_E0, 4096).await?;
     assert!(
-        !e0.iter().all(|&b| b == 0x88),
-        "list[0](0xC0000) 应被写入 page1 数据（不再全 0x88）"
+        e0.iter().all(|&b| b == 0x88),
+        "clamp 后 list[0] 不应被写（payload 1024≤1page，无 PRP-list 跟随）"
     );
     let e1 = driver.read_guest(LIST_E1, 4096).await?;
-    assert!(
-        !e1.iter().all(|&b| b == 0x99),
-        "list[1](0xE0000) 应被写入 page2 数据（不再全 0x99）"
-    );
+    assert!(e1.iter().all(|&b| b == 0x99), "clamp 后 list[1] 不应被写");
 
     Ok(())
 }
