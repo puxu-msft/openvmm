@@ -186,6 +186,16 @@ golden,revert-verified 2 轮)。**仅剩 OpenHCL L3 真 guest 欠档-2 frozen �
 oracle → 档1 必有≥1 独立-ish standing gate(非自家两端 loopback)→ 凡有档3 路径必配档2 frozen 代理
 → 自写 harness 满足 ≥4 GiB 子条款。
 
+**✅ Coverage-guided fuzz 体系(2026-06-14,基本收口)** — standing-gate 结构律的 fuzz 维度。三类攻击面
+× 三 transport,10 个 fuzz target(+1 个 `_proof_*` 承重假设证明,故意崩、CI 排除)、百万级真 coverage-guided runs:**A 类存活性 DoS**(nvme_firmware DMA-completion
+链 SGL/PRP/shadow-poll/CMB-drain)、**B 类内存安全**(vfio §22 mmap 唯一 unsafe 面,4M runs)、**C 类 wire
+parser**(nvme_of framing sync/async + h2c_reassembler + dhchap)。挖出并修 **2 个真 DoS**(truncated-read /
+hlen<8 下溢)+ 1 个台账数据点。双层 CI:`usnvmemu.yml` stable blind smoke(per-PR 防 bit-rot)+
+`usnvmemu-fuzz-nightly.yml`(nightly+cargo-fuzz 真覆盖,自动发现 + corpus cache)。**架构/约定/how-to 见
+[FUZZING.md](FUZZING.md)**;A 类覆盖台账见 `nvme_firmware/docs/DMA_COMPLETION_INVARIANTS.md`;各 crate
+设计 plan 见 `<crate>/docs/plans/2026-06-*-*fuzz*.md`。**续接 todo**:§22 B wire-level(`handle_dma_map`
+端到端,补 A 直驱漏的 region 边界/wire 解析/溢出 3 缺口);firmware 驱动循环统一 O(N) + 抽共享模块。
+
 **下方三执行实例**(保留各自 runbook/blocker 执行细节,状态归本元项统辖)：
 
 ### V-followup-dhchap-4-real-host-interop (Tier 1, HIGH 优先, 预计 1 day)
