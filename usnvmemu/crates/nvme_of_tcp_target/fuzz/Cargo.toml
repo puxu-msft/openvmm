@@ -42,3 +42,12 @@ path = "fuzz_read_pdu_async.rs"
 test = false
 doc = false
 doctest = false
+
+# **H2CData reassembler fuzz** —— 打 H2cReassembler::accept_pdu 的 offset/length chasing 状态机
+# （attacker 控 H2CData PDU 序列的 offset/length/ttag）。纯公共 API,无 refactor。
+[[bin]]
+name = "fuzz_h2c_reassembler"
+path = "fuzz_h2c_reassembler.rs"
+test = false
+doc = false
+doctest = false
