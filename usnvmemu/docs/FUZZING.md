@@ -37,7 +37,8 @@ harness 经**公共面**驱动 SUT，不加 fuzz-only 的*驱动*钩子：
 要断言**内部不变量**（生产不可见的私有态）时，用 `fuzzing` 空 feature gate 一个 `#[cfg(feature="fuzzing")]
 pub fn __fuzz_*` 访问器（先例 upstream `firmware_uefi`）：
 - `nvme_firmware`：`__fuzz_invariants() -> FuzzInvariants`（op-表长度 + 守卫常量 + CFS），`impl NvmeController` 末尾（mod.rs 尾部）。
-- `vfio_user_transport`：`__fuzz_map_and_touch(fd,offset,size,writeable)`（map_dma_fd + 逐页 volatile-touch）。
+- `vfio_user_transport`：`__fuzz_map_and_touch(fd,offset,size,writeable)`（§22 A：map_dma_fd + 逐页 volatile-touch）
+  + `__fuzz_mmap_access(table,gpa,len,write)`（§22 B：直驱 `mmap_read`/`mmap_write` 的 region-relative 边界 SAFETY #3）。
 **生产构建不开 feature → 零额外公共面**。命名统一 `__fuzz_` 前缀。fuzz crate 依赖写 `features=["fuzzing"]`。
 **只在需要内部断言时加**——纯公共枚举可观测的（如 reassembler 的 `AcceptOutcome`）不需要访问器。
 
@@ -64,8 +65,8 @@ firmware fuzz crate 提供共享 `common::drive_dma_drain`，新 A 类 target �
 ### 1.7 `_proof_*` target 必须 CI exclude
 `vfio_user_transport/fuzz/_proof_sigbus_catchable` **故意 SIGBUS**（证"libfuzzer+ASan 能 catch SIGBUS"
 这一承重假设）。CI 两层都**机制化排除**它、不靠人记得别列：stable smoke 解析 Cargo.toml 中 `fuzz_*`
-开头的 `name =` 行（`[[bin]].name` 约定；`_proof_*` 不带前缀 → 天然漏掉），nightly 用
-`cargo fuzz list | grep -v '^_proof'`。
+开头的 `name =` 行（`[[bin]].name` 约定；`_proof_*` 不带前缀 → 天然漏掉），nightly 的 `discover` job
+**同款 grep** 产出 by-target matrix。两层机制一致（统一 `fuzz_*` 解析），不靠人记得别列 `_proof_*`。
 加任何"故意崩的承重假设证明"都用 `_proof_` 前缀（既给人读、又给两层过滤器吃）。
 
 ## 2. 双层 CI
@@ -74,8 +75,12 @@ firmware fuzz crate 提供共享 `common::drive_dma_drain`，新 A 类 target �
   smoke（无 coverage instrument），只防 harness bit-rot / SUT 公共 API 漂移即编译炸。target 列表
   **自动发现**（`grep -oP '^name = "\Kfuzz_[^"]+' Cargo.toml`——轻量、不给 per-PR gate 装 cargo-fuzz；
   `fuzz_*` 约定使 `_proof_*` 天然排除）。加 target 无需改 CI。
-- **`usnvmemu-fuzz-nightly.yml`**（nightly + cargo-fuzz，定时）：真 coverage-guided + ASan，`cargo fuzz list
-  | grep -v '^_proof'` 自动发现全 target、corpus 经 `actions/cache` 跨夜累积 + `cmin` 界增长、crash 上传 artifact。
+- **`usnvmemu-fuzz-nightly.yml`**（nightly + cargo-fuzz，定时）：真 coverage-guided + ASan，**discover→by-target
+  matrix**——`discover` job grep 各 Cargo.toml 的 `fuzz_*`（同 stable smoke，`_proof_*` 天然排除；**fail-loud**：
+  任一 crate 0 个 target 即 `exit 1`，封死"空 matrix 静默绿"违 ADR-013）产出 matrix，**每 target 一个并行 job**
+  （墙钟 ≈ 最慢单 target、加 target 不增、`fail-fast: false` 一崩不取消其余）。per-target corpus 经 `actions/cache`
+  跨夜累积 + `cmin` 界增长、crash 上传 artifact。schedule 加 fork-guard（`if: github.repository == ...`）防下游
+  fork 空跑；concurrency `cancel-in-progress: false`（corpus 累积宁排队不丢）。
 - 真覆盖跑只在 `cargo +nightly fuzz run`；**不动 `rust-toolchain.toml` 1.95 pin**（restore-packages 用
   plain `cargo xflowey` 走 1.95，flowey 在 nightly 撞 `Path::absolute`）。本地真跑需 `rustup toolchain
   install nightly` + `cargo install cargo-fuzz`。
@@ -94,8 +99,8 @@ firmware fuzz crate 提供共享 `common::drive_dma_drain`，新 A 类 target �
 6. **build（stable）+ 真 coverage-guided run（`cargo +nightly fuzz run`）**——跑出 crash 先诊断 real-vs-artifact
    （1.5），真 finding 报对应 owner（A 类→silver-heron 域 / C 类 framing→本 crate）。
 7. rust-reviewer 复核 harness（无 false-positive、oracle 正确、限幅）。
-8. CI 自动覆盖（无需改 CI——stable smoke 解析 Cargo.toml `fuzz_*`、nightly `cargo fuzz list` 都自动发现；
-   `_proof_*` 两层都自动排除）。
+8. CI 自动覆盖（无需改 CI——stable smoke 与 nightly `discover` 都解析 Cargo.toml `fuzz_*`（**统一机制**）自动发现；
+   `_proof_*` 两层都因前缀天然排除；nightly 每 target 并行一个 job）。
 9. commit：**共享文件 filtered-patch 隔离**（`git apply --cached` 自己 hunk + 裸 commit；提交前
    `git diff HEAD -- <file>` 重核 hunk 归属；`-F` 写 message 避反引号被 bash 当命令替换；见 memory
    `git-commit-shared-index-multisession`）。
