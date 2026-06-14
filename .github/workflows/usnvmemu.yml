@@ -140,7 +140,7 @@ jobs:
           cd usnvmemu/crates/nvme_of_tcp_target/fuzz
           cargo build
           fail=0
-          for t in fuzz_read_pdu fuzz_read_pdu_async fuzz_h2c_reassembler; do
+          for t in fuzz_read_pdu fuzz_read_pdu_async fuzz_h2c_reassembler fuzz_dhchap; do
             echo "::group::fuzz smoke ${t}"
             if "./target/debug/${t}" -runs=20000 -max_total_time=15 -timeout=10 -seed=1; then
               echo "${t}: ok"

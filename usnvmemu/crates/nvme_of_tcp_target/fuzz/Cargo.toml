@@ -51,3 +51,12 @@ path = "fuzz_h2c_reassembler.rs"
 test = false
 doc = false
 doctest = false
+
+# **DH-HMAC-CHAP auth-message parse fuzz** —— 打 parse_negotiate / parse_reply（attacker 控 auth
+# wire 字节;parse_negotiate 含手写长度算术 + descriptor 迭代）。auth 面 security-sensitive。
+[[bin]]
+name = "fuzz_dhchap"
+path = "fuzz_dhchap.rs"
+test = false
+doc = false
+doctest = false
