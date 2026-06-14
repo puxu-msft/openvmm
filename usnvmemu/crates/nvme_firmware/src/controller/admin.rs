@@ -1506,17 +1506,19 @@ impl NvmeController {
                 // → 改只声明 SECP=0 Info（list 长度 = 1）。
                 let secp = ((sqe.cdw10 >> 16) & 0xff) as u8;
                 let alloc = (sqe.cdw11 & 0xffff) as usize;
-                let bytes = alloc.max(16);
                 if secp == 0 {
-                    let mut buf = vec![0u8; bytes];
+                    // 自然尺寸 = Security Protocol List header(8) + 1 protocol ID = 9
+                    // （SECP=0 只声明 Info）。**alloc 截断纪律（同 Get Log Page NUMD）**：alloc
+                    // (cdw11 低 16，≤64 KiB host 控) 历史直接分配+pad → 小命令撑出 64 KiB 全零
+                    // （放大）。改：返自然 9B、超请求截到 9、不按 alloc pad。
+                    let mut buf = vec![0u8; 9];
                     // bytes 0..6 reserved
                     // bytes 6..8 = LIST LENGTH (big endian) = 1 protocol
                     buf[6] = 0;
                     buf[7] = 1;
-                    // bytes 8..N = supported protocol IDs (just 0x00 Info)
-                    if bytes > 8 {
-                        buf[8] = 0x00;
-                    }
+                    // byte 8 = supported protocol ID (0x00 Info)
+                    buf[8] = 0x00;
+                    buf.truncate(alloc); // 返 min(alloc, 9)：alloc≥9 noop、alloc<9 返前缀
                     self.dma_write_then_complete(
                         ctx, sqe.prp1, sqe.prp2, buf, cid, 0, sq_head, cq_id,
                     );
