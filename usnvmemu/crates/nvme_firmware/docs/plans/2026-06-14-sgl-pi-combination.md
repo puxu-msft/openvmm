@@ -112,5 +112,12 @@ advertise SGLS bit19 + metadata-SGL descriptor parser，让 metadata 本身也 S
 
 ## 承重假设需 POC（状态）
 - ✅ **#1 metadata 形态**（MPTR vs metadata-SGL）：POC 完成，MPTR-only 可行（见 POC 结论）。
-- ✅ **C-1 Bit Bucket 语义**：设计已解（op.data dense LBA-indexed + bucket 仅抑制 scatter + tuple 恒全发 MPTR，见「设计」C-1）；**剩 known-answer 测试（bucket 跨 LBA）= P-B entry gate**，cheap，不依赖真驱动。
-- ⏳ **进 P-B 前**：写 C-1 known-answer 单测 + 「SGL frag 跨 LBA + MPTR tuple」单测验两个 helper 正确接管（设计期最廉价 oracle）。
+- ✅ **C-1 Bit Bucket 语义**：设计已解（op.data dense LBA-indexed + bucket 仅抑制 scatter + tuple 恒全发 MPTR，见「设计」C-1）；**P-B e2e known-answer 测试（bucket 跨 LBA）已落地并绿**，不依赖真驱动。
+- ✅ **进 P-B 前**：C-1 known-answer + 「SGL frag 跨 LBA + MPTR tuple」helper 接管已由 P-B e2e 测试覆盖。
+
+## 实施进度（live）
+- ✅ **P-A 完成**（commit `0678946ca`）：抽 `pi_write_finalize_stream` + `pi_read_verify_split` 两个 gather-agnostic PI helper（`PiGeom` 含 `pract` day-1，M-2），PRP 既有 finalize/separate READ 改调，纯重构行为不变；3 known-answer 直测 + revert-verify；rust-reviewer APPROVE 0 C/H。
+- ✅ **P-B 完成**（commit `05139ba6f`）：SGL × separate-meta（PRACT 0/1）。**关键前提发现**：PI NS 上 PRP PI 处理块（io.rs `if !pract && is_pi_path`）拦截所有 PI-NS 命令含 SGL（prp1=0 误处理），故在其**之前**加 `if is_sgl && is_pi_path` 早路由。`SglOp.pi`+`pract` 复用 `PiLayout::Separate` 双门控（抽 `pi_*` 自由函数单一真相源，PRP/SGL 共享，§32 anti-drift）；`NvmSglSepMeta` MPTR 子-DMA 不计入 transfers_total（H-3）；`try_finish_sgl_pi` 双门控合取；`finish_sgl_done` PI 分支（M-1 防双计）。5 个 e2e 差分 oracle（含 C-1 bucket 跨 LBA）+ revert-verify 双门控 load-bearing；rust-reviewer APPROVE 0 C/H（M1 DRY 收敛 + L1 clippy allow）。SPEC_CONFORMANCE 同步：SGL×PI separate-meta ✅ / inline ⏳。
+- ⏳ **P-C（inline-meta，PRACT 0/1）**：io.rs 早路由对 `meta_inline_r` 暂拒 INVALID_PROTECTION_INFO，待 P-C 解禁。详化 gate 见 P-C 节。
+- ⏳ **P-E（Metadata SGL，roadmap）**：未启动。
+
