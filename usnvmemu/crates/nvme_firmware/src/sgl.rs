@@ -28,17 +28,21 @@
 //!                 0x2-0xF = reserved / vendor
 //! ```
 //!
-//! ## 教学限制（R1，2026-06-10 校正 advertise⟺implement）
+//! ## PSDT/SGL 模型（E0，2026-06-14 对齐 spec；原 R1 教学限制已演进）
 //!
-//! `io.rs::resolve_data_pointers` 当前**只**接受 PSDT=01 的 **inline 单 Data Block
-//! (Type 0)、sub_type=0 (Address)、length ≤ 1 page**，映射成单 PRP 复用 PRP 路径。
-//! 其余一律返 SGL_DESCRIPTOR_TYPE_INVALID：
-//! - Bit Bucket (Type 1) / Segment / Last Segment (Type 2/3)：**未 wire**
-//!   （`parse_sgl_list` + `flatten_data_blocks` 是 R2 scaffolding，dead-code 待接）。
-//!   SGLS 也已不 advertise Bit Bucket（一致性，见 `cmd.rs` sgls）。
-//! - Keyed Data Block / Transport-specific：NVMe-oF 专属，本地 PCIe 不用。
-//! - PSDT=10 (Segment pointer)：留 R2，见
-//!   `docs/plans/2026-06-10-sgl-r2-segment-chains-detailed.md`。
+//! `io.rs::resolve_data_pointers`：`PSDT∈{01,10}` **都**是 SGL data 命令，data SGL1 恒在
+//! DPTR（bytes 24..40），单/碎由 **DPTR descriptor 类型**决定、**与 PSDT 无关**（spec § 4.4
+//! / Linux：`01b`=SGL data + 平坦元数据 `NVME_CMD_SGL_METABUF`，`10b`=SGL data + 元数据-SGL
+//! `NVME_CMD_SGL_METASEG`；两者 data 解析相同）。
+//! - **单 Data Block (Type 0)、length ≤ 1 page** → 映射成单 PRP 复用 PRP 路径（CMB-relative
+//!   sub_type=1 经 [`resolve_sgl_address`] rebase）。
+//! - **(Last)Segment (Type 2/3)** → 走平行 SGL scatter-gather（`parse_sgl_list` 段 walk）。
+//! - Bit Bucket (Type 1) 作 sole DPTR descriptor / 单 Data Block length > 1 page → reject
+//!   `SGL_DESCRIPTOR_TYPE_INVALID`（教学裁剪；SGLS 不 advertise 对应能力）。
+//! - Keyed Data Block / Transport-specific：NVMe-oF 专属，本地 PCIe 不用 → reject。
+//! - `PSDT=11`（reserved）→ `INVALID_FIELD`；`PSDT=00` → 原 PRP 不变。
+//! - PSDT 仅区分 *metadata* 形态（由 dispatch 层按 `meta_sgl=(psdt==0b10)` 路由）：01=平坦
+//!   MPTR / inline 吸收；10=metadata-SGL（SGLS bit19 = `NVME_CTRL_SGLS_MSDS`，**E1 待落地**，现 reject INVALID_FIELD）。
 //!
 //! ## CMB-P2（2026-06-12，CMB-relative SGL 放行）
 //!
@@ -119,7 +123,7 @@ impl SglDescriptor {
 ///
 /// 三条 SGL 路径共用本判据，使**同一非法 sub_type 跨路径返同一 SC**，不再漂移：
 /// - `parse_sgl_list`（PSDT=10 segment 页里的 Data Block descriptor）
-/// - `controller/io.rs::resolve_data_pointers`（PSDT=01 inline 单 Data Block）
+/// - `controller/io.rs::resolve_data_pointers`（PSDT∈{01,10} inline 单 Data Block）
 /// - `controller/io.rs::validate_segment_pointer`（PSDT=10 SGL1 / chain continuation 指针）
 ///
 /// **CMB-P2（CMB-relative 放行）**：`cmb_enabled` = CMB 是否启用（CMBMSC.CMSE=1）。

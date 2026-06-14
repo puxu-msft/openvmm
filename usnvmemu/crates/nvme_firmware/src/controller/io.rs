@@ -305,33 +305,30 @@ pub(crate) fn validate_prp2(prp2: u64, offset: u64, total_len: u64) -> Option<u1
     }
 }
 
-/// **Phase R1/R2** — data pointer 解析结果。
+/// **Phase R1/R2 + SGL×PI E0** — data pointer 解析结果。
 ///
-/// PRP 路径（PSDT=00 / PSDT=01 inline 单 Data Block）返 `(prp1, prp2)`，复用
-/// 现有三档 PRP dispatch。SGL Segment 路径（PSDT=10）返 `SglSegment`，由 caller
-/// 路由到平行的 SGL scatter-gather 机件（embedded SGL1 在 bytes 24..40），**不**
-/// 复用 PRP dispatch。
+/// PRP 路径（PSDT=00，或 PSDT∈{01,10} 且 DPTR 是单 Data Block ≤1page）返 `(prp1, prp2)`，
+/// 复用现有三档 PRP dispatch。SGL Segment 路径（PSDT∈{01,10} 且 DPTR 是 (Last)Segment 指针）
+/// 返 `SglSegment`，由 caller 路由到平行的 SGL scatter-gather 机件（embedded SGL1 在
+/// bytes 24..40），**不**复用 PRP dispatch。单/碎由 **DPTR descriptor 类型**定、与 PSDT 无关
+/// （E0 对齐 spec）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DataPointer {
     Prp { prp1: u64, prp2: u64 },
     SglSegment,
 }
 
-/// **Phase R1** — 解析 SQE 的 data pointer：根据 PSDT 选 PRP 或 SGL。
+/// **Phase R1/R2 + SGL×PI E0** — 解析 SQE 的 data pointer：根据 PSDT 选 PRP 或 SGL data。
 ///
-/// 返回 `DataPointer::Prp { prp1, prp2 }` 让 caller 复用现有 PRP 三档 dispatch
-/// （≤1 page 单 PRP，≤2 page dual PRP，> 2 page PRP list），或返
-/// `DataPointer::SglSegment` 让 caller 走 SGL 数据路径（PSDT=10，见 Phase R2）。
+/// **PSDT/SGL 模型对齐 spec（E0，2026-06-14）**：`PSDT∈{01,10}` **都**是 SGL data 命令——
+/// data SGL1 恒在 DPTR（bytes 24..40），单/碎由 **DPTR descriptor 类型**决定，**与 PSDT 无关**
+/// （spec § 4.4 / Linux：`01b`=SGL data + 平坦元数据 `NVME_CMD_SGL_METABUF`，`10b`=SGL data
+/// 加元数据-SGL `NVME_CMD_SGL_METASEG`；两者 data 解析同）。PSDT 仅区分 *metadata* 形态，由
+/// dispatch 层按 `meta_sgl=(psdt==0b10)` 路由（见 plan 2×2 表）；本函数不涉及 metadata。
 ///
-/// SGL 教学路径：
-/// - PSDT=00：直接返 raw prp1/prp2（标准 PRP 路径）
-/// - PSDT=01：解析 SQE 内嵌 16-byte SGL descriptor (bytes 24..40)
-///   * 单 Data Block + 长度 ≤ 1 page → 用 address 当 prp1，prp2=0（R1）
-///   * 单 Data Block + 长度 > 1 page 或多 fragment → 当前不支持，返
-///     SGL_DESCRIPTOR_TYPE_INVALID（任意 scatter-gather 走 PSDT=10 R2）
-///   * 其他 type (Bit Bucket / Segment / Keyed) → reject
-/// - PSDT=10 (SGL Segment pointer)：返 `SglSegment`，caller 走 R2 segment walk
-/// - PSDT=11 reserved → INVALID_FIELD
+/// 返回 `DataPointer::Prp { prp1, prp2 }`（PSDT=00 原 PRP，或 PSDT∈{01,10} 单 Data Block ≤1page，
+/// address→prp1 复用 PRP 三档 dispatch）或 `DataPointer::SglSegment`（PSDT∈{01,10} 且 DPTR 是
+/// (Last)Segment 指针，caller 走平行 SGL 数据路径，见 Phase R2）。
 ///
 /// **CMB-P2**：`cmb` = controller 当前 CMB 窗口 `Some((cba, size))`（CMSE=1 时）/ `None`。
 /// 经共享 `sgl::subtype_to_sc(sub_type, cmb.is_some())` 判 sub_type 合法性——CMB 启用时
@@ -346,8 +343,13 @@ pub(crate) fn resolve_data_pointers(
     let prp2 = sqe.prp2;
     match psdt {
         0b00 => Ok(DataPointer::Prp { prp1, prp2 }),
-        0b01 => {
-            // Inline SGL descriptor in bytes 24..40
+        // **E0** — PSDT=01（SGL data + 平坦/inline 元数据）与 10（SGL data + 元数据-SGL）的
+        // **data** SGL1 解析**完全相同**（spec：data 单/碎由 DPTR descriptor 类型定，与 PSDT
+        // 无关）。二者合并一臂 → 保证 `10+DataBlock` 与 `01+DataBlock` 复用**同一段**
+        // subtype_to_sc + resolve_sgl_address（CMB-relative sub_type=1 rebase 不会漏，
+        // architect §2）。PSDT 区分的 metadata 形态由 dispatch 层按 meta_sgl 路由。
+        0b01 | 0b10 => {
+            // Inline SGL data descriptor in bytes 24..40
             let bytes = sqe.embedded_sgl_bytes();
             let desc = match crate::sgl::SglDescriptor::parse(&bytes) {
                 Some(d) => d,
@@ -364,11 +366,11 @@ pub(crate) fn resolve_data_pointers(
                     // 单 Data Block：address → prp1，length 隐含由 NLB 验证。
                     // length 必须 ≥ nlb*sector_size，否则不够装数据。
                     // 教学路径不允许 length > 1 page 的单 SGL (driver 应拆
-                    // 多 fragment 走 R2 Segment 链)。
+                    // 多 fragment 走 (Last)Segment 链)。
                     if desc.length as u64 > crate::regs::NVME_PAGE_SIZE {
                         tracing::warn!(
                             length = desc.length,
-                            "SGL inline Data Block > 1 page; need R2 Segment chain"
+                            "SGL inline Data Block > 1 page; need Segment chain"
                         );
                         return Err(sc::SGL_DESCRIPTOR_TYPE_INVALID);
                     }
@@ -380,17 +382,18 @@ pub(crate) fn resolve_data_pointers(
                         prp2: 0,
                     })
                 }
+                crate::sgl::SglType::Segment | crate::sgl::SglType::LastSegment => {
+                    // DPTR 是 (Last)Segment 指针 → 走平行 SGL scatter 路径。caller
+                    // （dispatch_sgl_read/write）DMA-read 该 segment 后递归 walk 各段 +
+                    // 逐 fragment scatter/gather。此处恒接受（PSDT 01 与 10 同——E0 解耦
+                    // PSDT 与 data 形态）；segment 指针真伪由 dispatch 阶段 parse_sgl1_segment 校验。
+                    Ok(DataPointer::SglSegment)
+                }
                 crate::sgl::SglType::BitBucket => {
                     // Bit Bucket 在 Read = controller 不写 host (driver 丢弃)；
                     // Write = controller 看不到 host data。单 Bit Bucket 没
                     // 意义（无数据传输），reject 让 driver 知道。
                     tracing::warn!("SGL Bit Bucket as sole inline descriptor rejected");
-                    Err(sc::SGL_DESCRIPTOR_TYPE_INVALID)
-                }
-                crate::sgl::SglType::Segment | crate::sgl::SglType::LastSegment => {
-                    // PSDT=01 的 inline 应是数据 descriptor 而非 Segment；
-                    // 若 driver 想 chain 应用 PSDT=10。
-                    tracing::warn!("SGL Segment as inline (PSDT=01) is mis-encoded");
                     Err(sc::SGL_DESCRIPTOR_TYPE_INVALID)
                 }
                 crate::sgl::SglType::KeyedDataBlock | crate::sgl::SglType::TransportSpecific => {
@@ -399,13 +402,7 @@ pub(crate) fn resolve_data_pointers(
                 }
             }
         }
-        0b10 => {
-            // PSDT=10：bytes 24..40 是 SGL Segment descriptor 指向首段 SGL list。
-            // **Phase R2** — 返 SglSegment，caller（dispatch_sgl_read/write）
-            // DMA-read 该 segment 页后递归 walk 各段 + 逐 fragment scatter/gather。
-            Ok(DataPointer::SglSegment)
-        }
-        _ => Err(sc::INVALID_FIELD),
+        _ => Err(sc::INVALID_FIELD), // 0b11 reserved
     }
 }
 
@@ -962,6 +959,21 @@ impl NvmeController {
                 // P-C，PRACT 0/1）。SGL 用 embedded SGL1 自有数据指针（非 prp1/prp2），必须在下方
                 // PRP PI 块（`is_pi_path`）之前截走——否则该块会以 prp1=0 误处理。
                 if is_sgl && is_pi_path {
+                    // **E0 2×2 路由**（plan §E0）：PSDT 区分 *metadata* 形态（data 已由
+                    // resolve_data_pointers 按 DPTR descriptor 解耦 PSDT）。
+                    //   01 (!meta_sgl) → 平坦 MPTR(P-B) / inline 吸收(P-C)，由 meta_inline_r 分（下方）。
+                    //   10 (meta_sgl)+!meta_inline → metadata-SGL（E1）；本阶段未 advertise SGLS bit19。
+                    //   10 (meta_sgl)+meta_inline → 非法（extended-LBA 无独立 metadata 可作 SGL）。
+                    let meta_sgl = sqe.psdt() == 0b10;
+                    if meta_sgl {
+                        tracing::warn!(
+                            nsid,
+                            meta_inline = meta_inline_r,
+                            "SGL metadata-SGL (PSDT=10) READ：E0 未支持（E1 advertise SGLS bit19=MSDS 后启用）/ 10+inline 为 spec-非法组合"
+                        );
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                    }
+                    // 以下为 PSDT=01（meta_sgl=false）：平坦 MPTR(P-B) / inline 吸收(P-C)。
                     // L-2：仅 separate-meta PRACT=0 需 host PI buffer MPTR（inline 在流内、PRACT=1
                     // controller 自验/strip，皆不需）。
                     if !pract && !meta_inline_r && sqe.mptr == 0 {
@@ -2165,6 +2177,20 @@ impl NvmeController {
                 // P-C，PRACT 0/1）。同 READ：SGL 用 embedded SGL1 自有数据指针，必须在下方 PRP PI
                 // 块（`is_pi_capable`）之前截走。
                 if is_sgl && is_pi_capable {
+                    // **E0 2×2 路由**（plan §E0，同 READ）：PSDT 区分 *metadata* 形态。
+                    //   01 (!meta_sgl) → 平坦 MPTR(P-B) / inline 吸收(P-C)，由 meta_inline 分（下方）。
+                    //   10 (meta_sgl)+!meta_inline → metadata-SGL（E1）；本阶段未 advertise SGLS bit19。
+                    //   10 (meta_sgl)+meta_inline → 非法（extended-LBA 无独立 metadata 可作 SGL）。
+                    let meta_sgl = sqe.psdt() == 0b10;
+                    if meta_sgl {
+                        tracing::warn!(
+                            nsid,
+                            meta_inline,
+                            "SGL metadata-SGL (PSDT=10) WRITE：E0 未支持（E1 advertise SGLS bit19=MSDS 后启用）/ 10+inline 为 spec-非法组合"
+                        );
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                    }
+                    // 以下为 PSDT=01（meta_sgl=false）：平坦 MPTR(P-B) / inline 吸收(P-C)。
                     // L-2：仅 separate-meta PRACT=0 需 host PI buffer MPTR（inline 在流内、PRACT=1
                     // controller 自算，皆不需）。
                     if !pract && !meta_inline && sqe.mptr == 0 {

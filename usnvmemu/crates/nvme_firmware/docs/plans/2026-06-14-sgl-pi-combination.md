@@ -117,7 +117,7 @@ advertise SGLS bit19 + metadata-SGL descriptor parser，让 metadata 本身也 S
 
 ### E1 — metadata-SGL（P-E proper，单 commit）
 
-- **advertise SGLS bit15**（Metadata SGL Descriptor Supported，**非 bit19**——architect §5 纠正 plan/POC 的 bit 编号错误；`cmd.rs` 改前用 `nvme_spec` 源 + Linux `NVME_CTRL_SGLS_*` **逐位锚定**，自洽编号骗过 review = `[[review-not-optional-self-consistent-trap]]` 第6/7次同型陷阱）。
+- **advertise SGLS bit19**（`NVME_CTRL_SGLS_MSDS` = `1 << 19`，Metadata SGL / MPTR-may-contain-SGL-descriptor support）。**bit 编号订正（2026-06-14，E0 rust-reviewer + Linux `include/linux/nvme.h` master 实证）**：plan 正文（§本节上方 line 17/18/84/86）一直写的 **bit19 是对的**；中途 architect §5 "纠正" 成 bit15 反而**引入错误**（bit15 落在 SGLS reserved 区）——这正是 `[[review-not-optional-self-consistent-trap]]`：自信的"纠正"本身是陷阱，骗过 plan v2 + 邻居转述，唯独立 oracle（Linux `NVME_CTRL_SGLS_MSDS=1<<19` / `NVME_CTRL_SGLS_SAOS=1<<20`，与本仓库 `cmd.rs:717` 已实证的 bit20 SAOS 锚点对齐）证伪。E1 改 `cmd.rs` 仍须以 Linux `NVME_CTRL_SGLS_*` 逐位锚定复核，**绝不沿用任何自洽编号（含本行）**。
 - `meta_sgl`(PSDT=10)+`!meta_inline`+有 PI → **MPTR 当 SGL segment 指针**（非平坦 GPA）：DMA-read MPTR 指向的 segment → parse descriptor（单 DataBlock / Segment 链）→ 建**元数据 fragment plan**。MPTR=0→reject `INVALID_FIELD`（与 separate L-2 对称）。meta segment-hop 上限同 `MAX_SGL_SEGMENTS`（防 meta 链自环）。
 - **承重结构（architect §4，不可隐于"独立累积器"措辞）**：
   - meta 门控**从布尔升级为计数器**：`PiLayout::Separate` 加 `meta_transfers_done/meta_transfers_total`；`try_finish_sgl_pi` 合取从「data_done && meta_ok」升为「data_done && meta_all_frags_done」。

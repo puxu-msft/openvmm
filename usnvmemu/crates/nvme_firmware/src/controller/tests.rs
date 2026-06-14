@@ -4662,6 +4662,82 @@ fn get_log_page_huge_numd_clamps_at_dispatch_no_amplification() {
     assert_eq!(list_fetches, 0, "≤1 页传输不应触发 PRP-list chaining");
 }
 
+/// **Security Receive(SECP=0) alloc 截到自然 Security Protocol List 尺寸(9B)** —— 与 Get Log Page
+/// NUMD 截断同一纪律的另一处：`alloc`(cdw11 低 16，≤64 KiB host 控)历史直接 `vec![0u8; alloc.max(16)]`
+/// + pad → 一条小命令撑出 64 KiB 全零(放大，有界 64 KiB 故非 DoS，但纯浪费)。硬化：返自然 9B
+/// (SPC header 8 + 1 protocol ID)、over-request 截到 9。
+///
+/// 独立 oracle：恰 1 条 9B DmaWrite 落 PRP1 + 0 list-fetch。revert-verify：把 `vec![0u8; 9]+
+/// truncate(alloc)` 改回 `vec![0u8; alloc.max(16)]` → alloc=0xffff 又撑到 64 KiB → 走 PRP-list
+/// scatter → 本测试断言转红。
+#[test]
+fn security_receive_clamps_alloc_to_natural_list_size() {
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+    const PRP1: u64 = 0x10_0000;
+    const PRP2: u64 = 0x20_0000;
+
+    let mut c = make_ctrl_with_tmp("secrecv_clamp");
+    c.cqs.insert(
+        0,
+        crate::regs::CompletionQueue {
+            base_gpa: 0xF_0000,
+            size: 64,
+            tail: 0,
+            phase: 1,
+            head: 0,
+            interrupt_vector: 0,
+            interrupt_enabled: false,
+            pending_completions: 0,
+            last_fire: None,
+        },
+    );
+    let mut cap = CaptureTransport::with_start_token(0x100);
+
+    // Security Receive(0x82) SECP=0、alloc=65535(cdw11 低 16=0xffff，over-request)。
+    let zero = [0u8; 64];
+    let mut sqe: crate::cmd::Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+    sqe.cdw0 = (admin_opc::SECURITY_RECEIVE as u32) | (0x55u32 << 16);
+    sqe.cdw10 = 0; // SECP=0（bits 23:16）
+    sqe.cdw11 = 0xffff; // alloc = 65535
+    sqe.prp1 = PRP1;
+    sqe.prp2 = PRP2;
+    {
+        let mut ctx = DeviceCtx::new(&mut cap);
+        let r = c.dispatch_admin(&mut ctx, sqe, 0x55, 0, 0);
+        assert!(r.is_none(), "Security Receive 走异步 guest_write");
+        for _ in 0..4 {
+            let toks: Vec<u64> = c.pending_ios.keys().copied().collect();
+            if toks.is_empty() {
+                break;
+            }
+            for t in toks {
+                c.on_dma_complete_impl(&mut ctx, t, true, Vec::new());
+            }
+        }
+    }
+
+    // ★ clamp oracle：恰 1 条 9B（自然 SPC List 尺寸）DmaWrite 落 PRP1，非 over-request 撑大。
+    let writes_to_prp1: Vec<usize> = cap
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            TransportEvent::DmaWrite { gpa, data, .. } if *gpa == PRP1 => Some(data.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        writes_to_prp1,
+        vec![9],
+        "Security Protocol List 应截到自然 9B（SPC header 8 + 1 protocol），不再被 alloc 撑大"
+    );
+    let list_fetches = cap
+        .events()
+        .iter()
+        .filter(|e| matches!(e, TransportEvent::DmaRead { .. }))
+        .count();
+    assert_eq!(list_fetches, 0, "9B≤1page 不应触发 PRP-list");
+}
+
 /// **C1② chaining 深度封顶（defense-in-depth）差分 oracle** — 抬 cap 后仍要给
 /// host-malicious / malformed chain 封顶。`MAX_PRP_LIST_PAGES=16` 上限：直接注入一个
 /// `total_pages` 超过 16 张 list 页能装下（8200 > 16×511=8176）的 PrpListOp，喂同一张
@@ -7043,8 +7119,10 @@ fn psdt_zero_passes_through_prp() {
     assert_eq!(p2, 0xBEEF_1000);
 }
 
-/// **Phase R2** — PSDT=10 (Segment pointer) 现走 SGL segment 路径（返 SglSegment，
-/// 不再 Err）。embedded SGL1 的真伪在 dispatch 阶段（dispatch_sgl_read/write）校验。
+/// **SGL×PI E0** — PSDT=10 + DPTR (Last)Segment 指针 → SGL segment 路径（返 SglSegment）。
+/// E0 后 PSDT 不再单独决定 data 形态：必须 DPTR 是 (Last)Segment descriptor 才走 segment 路径
+/// （全零 embedded = DataBlock len=0 → Prp，不再是 SglSegment）。embedded SGL1 真伪在 dispatch
+/// 阶段（dispatch_sgl_read/write）校验。
 #[test]
 fn psdt_segment_pointer_routes_to_sgl() {
     use crate::controller::io::DataPointer;
@@ -7052,9 +7130,96 @@ fn psdt_segment_pointer_routes_to_sgl() {
     let zero = [0u8; 64];
     let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
     sqe.cdw0 = 0x0042_8002; // PSDT=10 (bits 15:14 = 10 = 0x8000)
+    // DPTR = Last Segment 指针（id byte=0x30），address=0xSEG，length=64（16 倍数）。
+    sqe.prp1 = 0xDEAD_2000;
+    sqe.prp2 = 64 | (0x30u64 << 56);
     assert_eq!(
         resolve_data_pointers(&sqe, None),
         Ok(DataPointer::SglSegment)
+    );
+}
+
+/// **SGL×PI E0** — PSDT=01 + DPTR (Last)Segment 指针 → SGL segment 路径（**E0 新接受面**：
+/// E0 前 PSDT=01+Segment 被拒 "mis-encoded"，E0 后 data 形态由 DPTR 类型定、与 PSDT 无关）。
+#[test]
+fn psdt01_segment_pointer_routes_to_sgl() {
+    use crate::controller::io::DataPointer;
+    use crate::controller::io::resolve_data_pointers;
+    let zero = [0u8; 64];
+    let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+    sqe.cdw0 = 0x0042_4002; // PSDT=01
+    sqe.prp1 = 0xDEAD_3000;
+    sqe.prp2 = 32 | (0x20u64 << 56); // id=0x20 Segment（非 Last），length=32
+    assert_eq!(
+        resolve_data_pointers(&sqe, None),
+        Ok(DataPointer::SglSegment)
+    );
+}
+
+/// **SGL×PI E0** — PSDT=10 + DPTR 单 Data Block ≤1page → Prp（**E0 新接受面**：E0 前 PSDT=10
+/// 恒走 segment 路径、DataBlock 会在 dispatch 被拒；E0 后 10+DataBlock 与 01+DataBlock **同臂**
+/// 解析 → 复用同一段 subtype_to_sc + resolve_sgl_address）。
+#[test]
+fn psdt10_data_block_resolves_to_prp() {
+    use crate::controller::io::DataPointer;
+    use crate::controller::io::resolve_data_pointers;
+    let zero = [0u8; 64];
+    let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+    sqe.cdw0 = 0x0042_8002; // PSDT=10
+    let address: u64 = 0xBEEF_5000;
+    sqe.prp1 = address;
+    sqe.prp2 = 4096; // length=4096, id byte=0 → DataBlock sub=0
+    let DataPointer::Prp { prp1, prp2 } = resolve_data_pointers(&sqe, None).unwrap() else {
+        panic!("PSDT=10 单 Data Block 应解析成 Prp（同 01）");
+    };
+    assert_eq!(prp1, address);
+    assert_eq!(prp2, 0);
+}
+
+/// **SGL×PI E0** — PSDT=11 (reserved) → INVALID_FIELD（合并臂 `0b01 | 0b10` 不得误吞 11）。
+#[test]
+fn psdt_reserved_11_invalid_field() {
+    use crate::controller::io::resolve_data_pointers;
+    let zero = [0u8; 64];
+    let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+    sqe.cdw0 = 0x0042_C002; // PSDT=11 (bits 15:14 = 11 = 0xC000)
+    assert_eq!(sqe.psdt(), 3);
+    assert_eq!(
+        resolve_data_pointers(&sqe, None),
+        Err(crate::cmd::sc::INVALID_FIELD)
+    );
+}
+
+/// **SGL×PI E0 + CMB-P2** — CMB-relative（sub_type=1）单 Data Block 的 address rebase 成
+/// `cba+offset`，**PSDT=01 与 10 走同一段 resolve_sgl_address**（architect §2 最易漏的 rebase
+/// 不会因合并臂而漏）。两 PSDT 必须返回**逐字节相同**的 rebased prp1。
+#[test]
+fn psdt_sgl_cmb_relative_rebase_identical_01_and_10() {
+    use crate::controller::io::DataPointer;
+    use crate::controller::io::resolve_data_pointers;
+    let cba: u64 = 0x1_0000_0000;
+    let cmb_size: u64 = 0x10_0000;
+    let offset: u64 = 0x2000;
+    let mut build = |psdt_bits: u32| -> DataPointer {
+        let zero = [0u8; 64];
+        let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+        sqe.cdw0 = 0x0042_0002 | (psdt_bits << 14);
+        sqe.prp1 = offset; // CMB 内偏移
+        sqe.prp2 = 4096 | (0x01u64 << 56); // length=4096, id byte=0x01 → DataBlock sub_type=1
+        resolve_data_pointers(&sqe, Some((cba, cmb_size))).unwrap()
+    };
+    let p01 = build(0b01);
+    let p10 = build(0b10);
+    assert_eq!(
+        p01,
+        DataPointer::Prp {
+            prp1: cba + offset,
+            prp2: 0
+        }
+    );
+    assert_eq!(
+        p01, p10,
+        "01 与 10 的 CMB-relative DataBlock rebase 必须逐字节相同"
     );
 }
 
@@ -8538,6 +8703,36 @@ mod sgl_pi_pb {
         c
     }
 
+    /// **SGL×PI E0 2×2 路由** — PSDT=10（metadata-SGL）在 PI NS 上 E0 阶段一律 reject
+    /// `INVALID_FIELD`：① `10+separate` = E1 才支持（SGLS bit15 未 advertise）；② `10+inline`
+    /// = spec-非法组合（extended-LBA 无独立 metadata 可作 SGL）。两 NS 形态 × READ/WRITE 全覆盖。
+    /// 这把 E0→E1 边界与非法格固化：E1 落地只放开 `10+separate` 一格，`10+inline` 恒 reject。
+    /// mptr 给非 0 排除 L-2(MPTR=0) 早退混淆 → 确保命中的是 meta_sgl 早退。
+    #[test]
+    fn psdt10_metadata_sgl_rejected_e0() {
+        // sgl_sqe 默认 PSDT=01；翻成 PSDT=10 验 metadata-SGL 路由。
+        let to_psdt10 = |mut sqe: Sqe| -> Sqe {
+            sqe.cdw0 = (sqe.cdw0 & !(0b11 << 14)) | (0b10 << 14);
+            sqe
+        };
+        for opc in [0x01u8 /* WRITE */, 0x02 /* READ */] {
+            for (label, mut c) in [("separate", pi_ns(true)), ("inline", pi_ns_inline(true))] {
+                let mut cap = CaptureTransport::with_start_token(0x100);
+                let mut ctx = DeviceCtx::new(&mut cap);
+                let sqe = to_psdt10(sgl_sqe(opc, 0, 1, 0x55, false, 0x5000, 0x2000, 16));
+                let r = c.dispatch_io(&mut ctx, 1, sqe, 0x55, 0, 1);
+                let cqe = r.expect("PSDT=10 应同步 reject（非异步）");
+                assert_eq!(
+                    cqe_status(&cqe),
+                    crate::cmd::sc::INVALID_FIELD,
+                    "{label} opc={opc:#x} PSDT=10 应 INVALID_FIELD"
+                );
+                assert!(c.sgl_ops.is_empty(), "{label} reject 不建 SglOp");
+                assert!(c.pending_ios.is_empty(), "{label} reject 不挂异步");
+            }
+        }
+    }
+
     /// 16-byte SGL Data Block descriptor（id=0x00）。
     fn data_block(gpa: u64, len: u32) -> [u8; 16] {
         let mut d = [0u8; 16];
@@ -8558,7 +8753,8 @@ mod sgl_pi_pb {
         descs.iter().flatten().copied().collect()
     }
 
-    /// 构造 PSDT=10 SGL SQE：embedded SGL1 = Last Segment descriptor 指向 seg 页。
+    /// 构造 PSDT=01 SGL SQE：embedded SGL1 = Last Segment descriptor 指向 seg 页（E0：data
+    /// 形态由 DPTR 类型定、metadata 形态由 NS meta_inline 定，与 PSDT 无关）。
     #[allow(clippy::too_many_arguments)]
     fn sgl_sqe(
         opc: u8,
@@ -8572,7 +8768,10 @@ mod sgl_pi_pb {
     ) -> Sqe {
         let zero = [0u8; 64];
         let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
-        sqe.cdw0 = (opc as u32) | (0b10 << 14) | ((cid as u32) << 16); // PSDT=10
+        // **E0**：PSDT=01（SGL data + 平坦/inline 元数据）。data 单/碎由 DPTR descriptor 类型
+        // 定（此处 id=0x30 Last Segment → SGL scatter），metadata 形态由 NS `meta_inline` 定
+        // （separate=P-B / inline=P-C），**与 PSDT 无关**。PSDT=10 改留给 metadata-SGL（E1）。
+        sqe.cdw0 = (opc as u32) | (0b01 << 14) | ((cid as u32) << 16); // PSDT=01
         sqe.nsid = 1;
         sqe.cdw10 = slba as u32;
         sqe.cdw11 = (slba >> 32) as u32;
