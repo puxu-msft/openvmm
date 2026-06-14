@@ -18,10 +18,12 @@ use super::NvmeController;
 /// 最近一次。我们的 `error_log` VecDeque 按 push 顺序（旧→新）保存，
 /// build 时 `.rev()` 倒序写。
 pub(super) fn build_error_info(c: &NvmeController, bytes: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; bytes];
+    // 自然尺寸 = ELPE+1 = 64 entry × 64B = 4096（spec Error Info Log 满槽数）。超请求返此、
+    // **不再按 attacker NUMD pad 到 32 MiB**（见 get_log_page_clamps_numd_to_natural_log_size）。
+    let mut buf = vec![0u8; 4096];
     for (i, e) in c.error_log.iter().rev().enumerate() {
         let off = i * 64;
-        if off + 64 > bytes {
+        if off + 64 > buf.len() {
             break;
         }
         buf[off..off + 8].copy_from_slice(&e.error_count.to_le_bytes());
@@ -33,6 +35,7 @@ pub(super) fn build_error_info(c: &NvmeController, bytes: usize) -> Vec<u8> {
         buf[off + 24..off + 28].copy_from_slice(&e.nsid.to_le_bytes());
         // offset 28..64 = vendor info / log page ver / cmd-specific = 0
     }
+    buf.truncate(bytes); // host 请求 < 4096 时返前缀；≥ 4096 时 noop（不 pad）
     buf
 }
 
@@ -41,7 +44,7 @@ pub(super) fn build_error_info(c: &NvmeController, bytes: usize) -> Vec<u8> {
 /// Phase F 真追踪 counters；Phase G reviewer H3 修复用 `div_ceil(1000)` round-up
 /// （spec 'rounded up'）。
 pub(super) fn build_smart_health(c: &NvmeController, bytes: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; bytes.max(512)];
+    let mut buf = vec![0u8; 512];
     // Offset 0: critical_warning (1 byte) = 0
     // Offset 1-2: composite_temperature (2 byte LE, in Kelvin)
     let temp_kelvin: u16 = 313;
@@ -78,7 +81,7 @@ pub(super) fn build_smart_health(c: &NvmeController, bytes: usize) -> Vec<u8> {
 /// fw_slot_revisions。AFI = (next << 4) | active；FRS[slot 1..7] @
 /// offset 8 + (slot-1) * 8。
 pub(super) fn build_fw_slot_info(c: &NvmeController, bytes: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; bytes.max(512)];
+    let mut buf = vec![0u8; 512];
     let afi = ((c.fw_next_active_slot & 0x7) << 4) | (c.fw_active_slot & 0x7);
     buf[0] = afi;
     for slot in 1..=7usize {
@@ -106,7 +109,7 @@ pub(super) fn build_fw_slot_info(c: &NvmeController, bytes: usize) -> Vec<u8> {
 ///   - byte 0: STC nibble + Result nibble
 ///   - byte 4..12: Power On Hours 完成时刻快照
 pub(super) fn build_self_test(c: &NvmeController, bytes: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; bytes.max(564)];
+    let mut buf = vec![0u8; 564];
     if let Some(ip) = &c.self_test_in_progress {
         buf[0] = ip.stc & 0x0f;
         buf[1] = ip.percent_complete & 0x7f;
@@ -137,7 +140,7 @@ pub(super) fn build_self_test(c: &NvmeController, bytes: usize) -> Vec<u8> {
 pub(super) fn build_reservation_notification(c: &NvmeController, bytes: usize) -> Vec<u8> {
     let n_entries = c.reservation_notification_log.len();
     let need = (n_entries * 64).max(64);
-    let mut buf = vec![0u8; bytes.max(need)];
+    let mut buf = vec![0u8; need];
     for (i, e) in c.reservation_notification_log.iter().enumerate() {
         let off = i * 64;
         if off + 16 > buf.len() {
@@ -167,7 +170,7 @@ pub(super) fn build_reservation_notification(c: &NvmeController, bytes: usize) -
 ///   bytes 80..96 Media and Data Integrity Errors
 ///   bytes 96..112 Number of Error Information Log Entries
 pub(super) fn build_endurance_group(c: &NvmeController, bytes: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; bytes.max(512)];
+    let mut buf = vec![0u8; 512];
     // critical_warning 0..2 = 0 (no warnings)
     buf[2] = 100; // Available Spare = 100%
     buf[3] = 10; // Available Spare Threshold
@@ -193,14 +196,14 @@ pub(super) fn build_endurance_group(c: &NvmeController, bytes: usize) -> Vec<u8>
 
 /// **Phase L2** — Log Page 0x0A Predictable Latency Per NVM Set (spec § 5.16.1.10)。
 pub(super) fn build_predictable_latency_nvmset(_c: &NvmeController, bytes: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; bytes.max(512)];
+    let mut buf = vec![0u8; 512];
     buf.truncate(bytes);
     buf
 }
 
 /// **Phase L2** — Log Page 0x0B Predictable Latency Event Aggregate (spec § 5.16.1.11)。
 pub(super) fn build_predictable_latency_event(_c: &NvmeController, bytes: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; bytes.max(8)];
+    let mut buf = vec![0u8; 8];
     buf.truncate(bytes);
     buf
 }
@@ -214,7 +217,7 @@ pub(super) fn build_ana_log(c: &NvmeController, bytes: usize) -> Vec<u8> {
     nsids.sort();
     let n_nsid = nsids.len() as u32;
     let total = 16 + 32 + 4 * (n_nsid as usize);
-    let mut buf = vec![0u8; bytes.max(total)];
+    let mut buf = vec![0u8; total];
     // Header
     // bytes 0..8 = change count (incrementing per state change)
     buf[0..8].copy_from_slice(&c.ana_change_count.to_le_bytes());
@@ -246,7 +249,7 @@ pub(super) fn build_ana_log(c: &NvmeController, bytes: usize) -> Vec<u8> {
 
 /// **Phase L2** — Log Page 0x0F Endurance Group Event Aggregate (spec § 5.16.1.12)。
 pub(super) fn build_endurance_group_event(_c: &NvmeController, bytes: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; bytes.max(8)];
+    let mut buf = vec![0u8; 8];
     buf.truncate(bytes);
     buf
 }
@@ -274,7 +277,7 @@ pub(super) fn build_endurance_group_event(_c: &NvmeController, bytes: usize) -> 
 ///   bytes 390..512 Reason Identifier (vendor-specific)
 pub(super) fn build_telemetry_host(c: &NvmeController, bytes: usize) -> Vec<u8> {
     // Allocate header + 1 block of Data Area 1 = 1024 byte 总 (512 header + 512 data)
-    let total = (bytes).max(1024);
+    let total = 1024;
     let mut buf = vec![0u8; total];
     buf[0] = 0x07; // Log Identifier
     // Data Area 1 Last Block = 1 (1-based; 1 block = bytes 512..1024)
@@ -285,8 +288,8 @@ pub(super) fn build_telemetry_host(c: &NvmeController, bytes: usize) -> Vec<u8> 
     let n = tag.len().min(512 - 390);
     buf[390..390 + n].copy_from_slice(&tag[..n]);
     // Data Area 1 block @ 512..1024 — 写 host I/O counters snapshot
-    // (total = bytes.max(1024) 恒 ≥ 1024，所以 fill 后由 truncate(bytes)
-    // 决定 driver 是否真拿到 — driver 请求 < 1024 时只看到 header)
+    // (total = 1024 自然尺寸；`truncate(bytes)` 决定 driver 拿到多少 —— 请求 < 1024 只看到
+    // header；**超请求返 1024 不再按 NUMD pad**，driver 据 header 的 Last Block 字段知有 1 块)
     let mut off = 512;
     let reads = c.stat_host_reads.to_le_bytes();
     buf[off..off + 8].copy_from_slice(&reads);
@@ -307,7 +310,7 @@ pub(super) fn build_telemetry_host(c: &NvmeController, bytes: usize) -> Vec<u8> 
 /// **Phase K7 + Q3** — Log Page 0x08 Telemetry Controller-Initiated (同 0x07
 /// 布局，content 由 controller 自主生成而非 driver 触发)。
 pub(super) fn build_telemetry_ctrl(c: &NvmeController, bytes: usize) -> Vec<u8> {
-    let total = (bytes).max(1024);
+    let total = 1024;
     let mut buf = vec![0u8; total];
     buf[0] = 0x08;
     // Controller-Initiated Data Area 1 Last Block = 1
@@ -340,7 +343,7 @@ pub(super) fn build_telemetry_ctrl(c: &NvmeController, bytes: usize) -> Vec<u8> 
 ///
 /// 教学版：TNEV=0, TLL=512, 无 event 数据。
 pub(super) fn build_persistent_event(_c: &NvmeController, bytes: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; bytes.max(512)];
+    let mut buf = vec![0u8; 512];
     buf[0] = 0x0D;
     // TLL @ 8..16 = 512
     buf[8..16].copy_from_slice(&512u64.to_le_bytes());
@@ -359,7 +362,7 @@ pub(super) fn build_persistent_event(_c: &NvmeController, bytes: usize) -> Vec<u
 /// - byte 4..8 = Completion Condition Indicator (CCI) = 0 (no condition)
 /// - byte 8..40 reserved
 pub(super) fn build_lba_status_info(_c: &NvmeController, bytes: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; bytes.max(40)];
+    let mut buf = vec![0u8; 40];
     buf.truncate(bytes);
     buf
 }
@@ -376,7 +379,7 @@ pub(super) fn build_lba_status_info(_c: &NvmeController, bytes: usize) -> Vec<u8
 ///   bits 19:16 = Command Submission and Execution (CSE):
 ///     0 = no special, 1 = serialize per NS, 2 = serialize entire ctrl
 pub(super) fn build_cmds_supported_effects(_c: &NvmeController, bytes: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; bytes.max(4096)];
+    let mut buf = vec![0u8; 4096];
     // CSE 字段 (bits 18:16)：
     //   0 = no special, 1 = serialize per NS, 2 = serialize controller-wide
     // **reviewer H5 修复**：Format / Sanitize / NS Mgmt 内部都拒绝
@@ -436,7 +439,7 @@ pub(super) fn build_cmds_supported_effects(_c: &NvmeController, bytes: usize) ->
 /// - offset 4..8 SCDW10 — driver 发起 Sanitize 时的 cdw10 副本
 /// - offset 8..16 ETFO / ETFBE / ETFCE / ETFOW (estimated time)
 pub(super) fn build_sanitize_status(c: &NvmeController, bytes: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; bytes.max(512)];
+    let mut buf = vec![0u8; 512];
     // SPROG @ 0..2
     let sprog = c.sanitize.as_ref().map(|s| s.percent_complete).unwrap_or(0);
     buf[0..2].copy_from_slice(&sprog.to_le_bytes());

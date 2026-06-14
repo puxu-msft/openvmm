@@ -878,7 +878,9 @@ impl NvmeController {
                             lid = format_args!("{:#x}", lid),
                             "Get Log Page: unknown LID, returning zeros"
                         );
-                        vec![0u8; bytes]
+                        // 未知 LID 无自然 log；返 ≤1 页零让 driver 继续，**不按 attacker NUMD
+                        // pad 到 32 MiB**（与 logs.rs 各 builder 的自然尺寸截断同纪律）。
+                        vec![0u8; bytes.min(NVME_PAGE_SIZE as usize)]
                     }
                 };
                 self.dma_write_then_complete(ctx, sqe.prp1, sqe.prp2, buf, cid, 0, sq_head, cq_id);

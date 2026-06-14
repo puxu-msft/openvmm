@@ -765,6 +765,71 @@ fn fw_slot_info_log_reflects_state() {
     assert_eq!(&buf[24..32], b"newrev2 ");
 }
 
+/// **Get Log Page NUMD 截到真实 log 尺寸（防 attacker-NUMD 控的过度分配/传输放大）**。
+///
+/// buffer 历史按 NUMD(`bytes=(NUMD+1)*4`)分配 + zero-pad：一条小命令把 NUMD 拉满(LID=SMART,
+/// 真内容 512B)→ controller 分配 **32 MiB 全零 Vec + DMA 写 32 MiB 给 host**(~50 万× 放大;
+/// 有界于 chain cap 故非 DoS,但纯浪费)。硬化：builder 只分配/返回**自然尺寸**(各 log 的 spec
+/// 大小)，超请求返自然尺寸、不再 pad 到 NUMD。真驱动从不超请求(算精确尺寸)故行为不变；spec
+/// § 5.16 允许 controller 返 ≤ 请求量。
+///
+/// revert-verify：把 builder 的 `vec![0u8; N]` 改回 `bytes.max(N)`(error_info 改回 `vec![0u8; bytes]`)
+/// → 本测试 over-request 断言转红。
+#[test]
+fn get_log_page_clamps_numd_to_natural_log_size() {
+    let c = make_ctrl_with_tmp("loglen");
+    const HUGE: usize = 32 * 1024 * 1024; // NUMD 拉满（≈ chain cap 上界）
+    // 固定尺寸 log：超请求 → 返自然尺寸，**非** padded 到 HUGE。
+    assert_eq!(
+        super::logs::build_smart_health(&c, HUGE).len(),
+        512,
+        "SMART 自然 512"
+    );
+    assert_eq!(
+        super::logs::build_fw_slot_info(&c, HUGE).len(),
+        512,
+        "FW Slot 自然 512"
+    );
+    assert_eq!(
+        super::logs::build_self_test(&c, HUGE).len(),
+        564,
+        "Self-test 自然 564"
+    );
+    assert_eq!(
+        super::logs::build_cmds_supported_effects(&c, HUGE).len(),
+        4096,
+        "Cmds Supported 自然 4096"
+    );
+    assert_eq!(
+        super::logs::build_error_info(&c, HUGE).len(),
+        4096,
+        "Error Info 自然 4096（ELPE+1=64 × 64B）"
+    );
+    assert_eq!(
+        super::logs::build_telemetry_host(&c, HUGE).len(),
+        1024,
+        "Telemetry Host 自然 1024"
+    );
+    assert_eq!(
+        super::logs::build_sanitize_status(&c, HUGE).len(),
+        512,
+        "Sanitize 自然 512"
+    );
+    assert_eq!(
+        super::logs::build_lba_status_info(&c, HUGE).len(),
+        40,
+        "LBA Status 自然 40"
+    );
+    // 精确请求（真驱动行为）：返自然尺寸，不变。
+    assert_eq!(super::logs::build_smart_health(&c, 512).len(), 512);
+    // 部分请求（host 用小 NUMD 拉前缀）：返请求量。
+    assert_eq!(super::logs::build_smart_health(&c, 256).len(), 256);
+    assert_eq!(
+        super::logs::build_cmds_supported_effects(&c, 1024).len(),
+        1024
+    );
+}
+
 /// Phase H6：Reservation Register/Acquire/Release 状态机校验。
 #[test]
 fn reservation_state_machine() {
@@ -4512,30 +4577,25 @@ fn b6c_inline_nlb1_prp1_offset() {
     list_case(4095, &ext, 1); // 极限偏移（首段仅 1 字节）
 }
 
-/// 之前 admin Get Log Page > 2 MiB 被早退 INVALID_FIELD（防 chaining 未实现的 DoS）。
-/// 现 chaining walk 已上 `MAX_PRP_LIST_PAGES` 深度封顶，cap 抬到 32 MiB；本测试驱
-/// **真 dispatch_admin** 一条 numd=2.4 MiB 的 Get Log Page，证明 chaining 端到端真激活：
-///   - 不再早退 INVALID_FIELD（chaining cap 抬升生效）；
-///   - PRP-list 跨 2 张 list 页（pre-cap 单页≈2 MiB 不够），chain pointer 被跟随；
-///   - 完整 2.4 MiB 数据 scatter 到全部 600 个 host page GPA，没有漏页/mis-scatter。
+/// **Get Log Page 巨 NUMD 在 dispatch 端被截到自然尺寸（无放大、无 chaining）**。
+/// 原测试曾用「GLP Error Info 请求 2.4 MiB 触发 admin PRP-list chaining」证 chaining 端到端激活。
+/// **NUMD-截断硬化后**（logs.rs 各 builder 只返自然尺寸、不再按 attacker NUMD pad），GLP **无法
+/// 再被 over-request 撑大**：Error Info 自然 4096B(=1 page) → 单页 `guest_write`、不走 PRP-list、
+/// 不再 DMA 2.4 MiB。admin PRP-list chaining 机件本身仍由 `prp_list_chaining_device_to_host`
+/// （直驱 600 页）守，不依赖这条 over-request 路径。
 ///
-/// 独立 oracle：scatter 后 capture DmaWrite 字节逐 GPA 覆盖校验（每页都被写、长度=PAGE）。
-/// revert-verify：把 admin cap 改回 2 MiB → numd 超阈 → 早退 INVALID_FIELD → 本测试
-/// 期望的 chaining scatter 不发生（pending_ios 为空、写计数 0）→ 红。
+/// 独立 oracle：对 PRP1 恰 1 条 4096B DmaWrite + 0 条 list-page DmaRead（无 chaining）。
+/// revert-verify：把 `build_error_info` 改回 `vec![0u8; bytes]`（不截）→ 又撑到 2.4 MiB →
+/// 出现 list-fetch DmaRead + 多条 DmaWrite → 本测试断言转红。
 #[test]
-fn c1_chaining_activated_get_log_page_2_mib_plus() {
+fn get_log_page_huge_numd_clamps_at_dispatch_no_amplification() {
     use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
     const PAGE: u64 = crate::regs::NVME_PAGE_SIZE;
-    const TOTAL_PAGES: usize = 600; // 2.4 MiB，原 2 MiB cap 会拦
     const PRP1: u64 = 0x10_0000;
     const LIST0: u64 = 0x1000;
-    const LIST1: u64 = 0x2000;
-    const DATA_BASE: u64 = 0x20_0000;
-    let entries_per_page = (PAGE / 8) as usize;
-    let page_gpa = |i: usize| DATA_BASE + (i as u64) * PAGE;
 
-    let mut c = make_ctrl_with_tmp("c1_chain_glp");
-    // admin CQ0：admin CQE 也走 dma_write。
+    let mut c = make_ctrl_with_tmp("glp_clamp_e2e");
+    // admin CQ0：admin CQE 走 dma_write。
     c.cqs.insert(
         0,
         crate::regs::CompletionQueue {
@@ -4552,76 +4612,54 @@ fn c1_chaining_activated_get_log_page_2_mib_plus() {
     );
     let mut cap = CaptureTransport::with_start_token(0x100);
 
-    // 准备 list 页：list0 装 PRP[1..512]，末位 chain → LIST1；list1 装 PRP[512..600]。
-    let mut list0 = vec![0u8; PAGE as usize];
-    for k in 0..(entries_per_page - 1) {
-        list0[k * 8..k * 8 + 8].copy_from_slice(&page_gpa(k + 1).to_le_bytes());
-    }
-    let last = entries_per_page - 1;
-    list0[last * 8..last * 8 + 8].copy_from_slice(&LIST1.to_le_bytes());
-    let n_list1 = (TOTAL_PAGES - 1) - (entries_per_page - 1);
-    let mut list1 = vec![0u8; PAGE as usize];
-    for k in 0..n_list1 {
-        list1[k * 8..k * 8 + 8].copy_from_slice(&page_gpa(entries_per_page + k).to_le_bytes());
-    }
-
-    // 构造 Get Log Page admin sqe：LID=0x01 (Error Info) 走 PRP-list build 路径。
-    // numd（dword zero-based）= TOTAL_PAGES * PAGE / 4 - 1。
-    let numd_total: u32 = (TOTAL_PAGES as u32 * PAGE as u32) / 4 - 1;
-    let numd_lo = numd_total & 0xffff;
-    let numd_hi = (numd_total >> 16) & 0xffff;
+    // GLP Error Info(LID=0x01)、NUMD 请求 2.4 MiB（原 over-request 撑大路径；现应被截到自然 4096）。
+    let numd_total: u32 = (600u32 * PAGE as u32) / 4 - 1;
     let zero = [0u8; 64];
     let mut sqe: crate::cmd::Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
-    sqe.cdw0 = 0x02 | (0x7Au32 << 16); // OPC=0x02 (Get Log Page admin), cid=0x7A
+    sqe.cdw0 = 0x02 | (0x7Au32 << 16); // OPC=0x02 Get Log Page, cid=0x7A
     sqe.nsid = 0xFFFF_FFFF;
-    sqe.cdw10 = 0x01 | (numd_lo << 16); // LID=0x01 (Error Info) + NUMDL
-    sqe.cdw11 = numd_hi; // NUMDU
-    sqe.cdw12 = 0; // LPO low
-    sqe.cdw13 = 0; // LPO high
+    sqe.cdw10 = 0x01 | ((numd_total & 0xffff) << 16); // LID=0x01 + NUMDL
+    sqe.cdw11 = (numd_total >> 16) & 0xffff; // NUMDU
     sqe.prp1 = PRP1;
     sqe.prp2 = LIST0;
 
     {
         let mut ctx = DeviceCtx::new(&mut cap);
         let r = c.dispatch_admin(&mut ctx, sqe, 0x7A, 0, 0);
-        assert!(
-            r.is_none(),
-            "chaining 激活后 GLP > 2 MiB 应走异步 PRP-list，**不再**早退 INVALID_FIELD"
-        );
-        // 驱 chaining：feed list0 → 触发 list1 fetch → feed list1 → scatter。
-        let tok_a = *c.pending_ios.keys().next().expect("应有 list0 fetch");
-        c.on_dma_complete_impl(&mut ctx, tok_a, true, list0);
-        let tok_b = *c
-            .pending_ios
-            .keys()
-            .next()
-            .expect("chaining 应触发 list1 fetch");
-        c.on_dma_complete_impl(&mut ctx, tok_b, true, list1);
-    }
-
-    // 独立 oracle：scatter 后每页 GPA 都有 capture 的 DmaWrite（admin Error Info log
-    // 内容为 zeros，我们只校验 scatter 覆盖：每个 GPA 都被写、且长度=PAGE）。
-    let mut wrote: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    for e in cap.events() {
-        if let TransportEvent::DmaWrite { gpa, data, .. } = e
-            && (*gpa == PRP1 || (*gpa >= DATA_BASE && *gpa < DATA_BASE + TOTAL_PAGES as u64 * PAGE))
-            && data.len() == PAGE as usize
-        {
-            wrote.insert(*gpa);
+        assert!(r.is_none(), "GLP 走异步 guest_write");
+        // 服务所有 in-flight DMA（单页 data write + CQE-post），让命令收尾。
+        for _ in 0..4 {
+            let toks: Vec<u64> = c.pending_ios.keys().copied().collect();
+            if toks.is_empty() {
+                break;
+            }
+            for t in toks {
+                c.on_dma_complete_impl(&mut ctx, t, true, Vec::new());
+            }
         }
     }
+
+    // oracle 1：对 PRP1 恰 1 条 4096B（= Error Info 自然尺寸）DmaWrite，**非** over-request 撑大。
+    let writes_to_prp1: Vec<usize> = cap
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            TransportEvent::DmaWrite { gpa, data, .. } if *gpa == PRP1 => Some(data.len()),
+            _ => None,
+        })
+        .collect();
     assert_eq!(
-        wrote.len(),
-        TOTAL_PAGES,
-        "应 scatter {TOTAL_PAGES} 页（PRP1 + 599 个 list 项 = chaining 跨 2 list 页激活）"
+        writes_to_prp1,
+        vec![4096],
+        "Error Info 应恰 1 条 4096B DmaWrite（自然尺寸），不再被 NUMD 撑大"
     );
-    assert!(wrote.contains(&PRP1), "page 0 → PRP1");
-    for i in 1..TOTAL_PAGES {
-        assert!(wrote.contains(&page_gpa(i)), "page {i} → page_gpa({i}) 漏");
-    }
-    // revert-verify（手动）：把 admin.rs Get Log Page cap 改回 `> 2 * 1024 * 1024` →
-    // numd_total 超阈 → dispatch_admin 返 INVALID_FIELD CQE → 上面 r.is_none() 断言
-    // 转红；即便绕过 cap，chain depth 防御仍兜底（见 c1_chain_depth_cap_rejects_malformed_chain）。
+    // oracle 2：无 list-page fetch（DmaRead）= ≤1 页传输不触发 PRP-list chaining。
+    let list_fetches = cap
+        .events()
+        .iter()
+        .filter(|e| matches!(e, TransportEvent::DmaRead { .. }))
+        .count();
+    assert_eq!(list_fetches, 0, "≤1 页传输不应触发 PRP-list chaining");
 }
 
 /// **C1② chaining 深度封顶（defense-in-depth）差分 oracle** — 抬 cap 后仍要给
