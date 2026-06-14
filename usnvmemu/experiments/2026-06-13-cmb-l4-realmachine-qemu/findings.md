@@ -55,7 +55,12 @@ guest dmesg 新增：`nvme 0000:00:03.0: added peer-to-peer DMA memory 0xfe00000
 - **firmware CMB 现完全 spec-aligned 且对真驱动 p2p 注册成立**（64-bit prefetchable BAR 是真改进,已 keep）。
 - **SQ 物理落 CMB** 卡在 `pci_alloc_p2pmem`(QEMU/p2pdma 分配层),**firmware 无杠杆**。三个 lever 试毕(64-bit BAR ✅注册 / use_cmb_sqes ✗ / 都不改变分配失败)。
 - **建议**:L4 在此收束于"握手+真 IO+p2p 注册已真机证";SQ-in-CMB 需换一个 p2pdma 分配能成的环境(真硬件 NVMe-CMB,或 p2p 拓扑更完整的 guest/hypervisor),非 QEMU-vfio-user-emulated 可达。
-- **follow-up**:OpenHCL client(`vfio_user_pci_device` P3b)的 BAR2 也应改 64-bit prefetchable 以与 firmware 一致(当前 OpenHCL CMB 路径未真机验证,记此待办)。
+- **follow-up（2026-06-14 裁定 = WONTFIX）**:OpenHCL client(`vfio_user_pci_device`)的 CMB BAR 与 firmware 的 64-bit prefetchable 对齐——**经核源码后判为 WONTFIX，非正确性待办**：
+  - **64-bit 已一致**：pci_core 把每个 BAR 都呈 64-bit(`identity.rs:50` + `cfg_space_emu.rs:278/664` `with_type_64_bit(true)`)。这半本就满足。
+  - **prefetchable 不一致但无功能影响**：pci_core 全程不设 prefetchable(`cfg_space_emu` 无 `with_prefetchable`)→ client 呈非-prefetchable。但 prefetchable 的唯一功能=让 p2pdma/零拷贝(write-combining)成立，而**零拷贝 CMB-on-OpenHCL 已真机证伪**(host `create_ram_gpa_range` 一律 FAILED，见 `experiments/2026-06-14-cmb-zerocopy-openhcl-phase1/`)；OpenHCL 上唯一可用 CMB=trap 模式，每访问 intercept，prefetchable(UC vs WC)对它无功能差别。
+  - **且是 pci_core 共性**：所有 openvmm 模拟 PCI 设备 BAR 都非-prefetchable，非 CMB 专属回归；改它要动 openvmm 共享 `cfg_space_emu` 影响所有设备，**零功能收益**(消费它的零拷贝路径在 OpenHCL 不存在)。
+  - **另**：OpenHCL client 本地合成 config space(`ConfigSpaceType0Emulator`，为 reconnect/身份-latch)，**不逐字 relay firmware config**——firmware 的 prefetchable 意图本就不自动流到 guest。
+  - **裁定**：功能正确性**不需要**；spec-保真良性偏差，WONTFIX/文档化即可。
 
 ## 修订（独立 subagent 审计后，2026-06-13）—— 根因归因纠正
 
