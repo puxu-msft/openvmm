@@ -46,16 +46,10 @@ use crate::pdu::{CommonHdr, IcPsh, pdu_type};
 use anyhow::Context as _;
 use std::pin::Pin;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream as TokioStream;
 use tokio::time::{Instant as TokioInstant, Sleep, sleep_until};
 use zerocopy::{FromBytes, IntoBytes};
-
-/// **R2T host-data 读不活跃超时** — host 回 R2T 后须发 H2CData 把数据推过来；此上界防 host
-/// 发了 transport-SGL Connect / IO write 却永不（或半截）回 H2CData 挂死该连接 task（KATO 救不了
-/// ——`await_host_data_async` 在 dispatch 内同步 await，不经 pump select!）。覆盖 Connect data +
-/// IO write + fused 全部 R2T 路径（architect spec-audit MEDIUM）。仿 `TLS_HANDSHAKE_TIMEOUT_SECS` 量级。
-const H2C_DATA_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// **V-followup-tls-1** — `AsyncSession` 接受的 stream trait bound。
 ///
@@ -64,7 +58,7 @@ const H2C_DATA_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// `tokio_rustls::server::TlsStream<TcpStream>` 后将自动满足；bin 端
 /// `handle_conn_async` 届时根据是否 TLS 二分调用，由 monomorphize 各产一份代码。
 ///
-/// `Send + 'static` 是 `tokio::spawn` 强制；`Unpin` 让我们能直接 `&mut self.stream`
+/// `Send + 'static` 是 `tokio::spawn` 强制；`Unpin` 让我们能直接 `&mut self.backend.stream`
 /// 不需要 Pin projection。
 pub trait AsyncSessionStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncSessionStream for T {}
@@ -76,7 +70,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncSessionStream for 
 /// dispatch 骨架；V8e-4 加 AER Notify、V8e-5 加 KATO Sleep、V8e-6 加完整
 /// admin/IO dispatch。
 pub struct AsyncSession<S: AsyncSessionStream = TokioStream> {
-    stream: S,
+    /// **V9 R2** — TCP 出站数据移动后端（owns stream + ttag 分配 + MAXH2CDATA）。
+    /// pump 的 recv `select!` 借 `backend.stream` 字段；数据移动经 `FabricBackend` trait。
+    pub(crate) backend: crate::fabric_backend::TcpFabricBackend<S>,
     controller: SharedController,
     /// 协商后参数（与 sync `NegotiatedIc` 等价）。
     pub negotiated: crate::NegotiatedIc,
@@ -109,8 +105,6 @@ pub struct AsyncSession<S: AsyncSessionStream = TokioStream> {
     pub io_queues: std::collections::HashMap<u16, crate::io_queue::IoQueueState>,
 
     // ============ V8e-7-3 新增：admin/IO/AER dispatch 所需 state ============
-    /// **V8e-7-3** — TTAG 分配器（V4b R2T；admin/IO dma_read 用）。
-    pub ttag_alloc: crate::TtagAllocator,
     /// **V8e-7-3** — session 镜像 pending AER 列表（cap MAX_PENDING_AERS=4）。
     /// controller `aen_pending` 是 source of truth；本字段仅做 cap + debug。
     pub pending_aers: Vec<crate::aer::PendingAer>,
@@ -236,7 +230,7 @@ where
     let conn_id = controller.allocate_conn_id();
     let aen_notify = controller.aen_notify_handle();
     Ok(AsyncSession {
-        stream,
+        backend: crate::fabric_backend::TcpFabricBackend::new(stream, crate::MAXH2CDATA_BYTES),
         controller,
         negotiated,
         conn_id,
@@ -249,7 +243,6 @@ where
         admin_connected: false,
         current_qid: 0,
         io_queues: std::collections::HashMap::new(),
-        ttag_alloc: crate::TtagAllocator::default(),
         pending_aers: Vec::new(),
         host_nqn_allowlist: None,
         bound_host_identities: None,
@@ -355,7 +348,10 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
                 );
                 Ok(PumpEvent::KatoExpired)
             }
-            r = read_pdu_async(&mut self.stream) => {
+            // **R3 落地条件**（architect review）：RDMA recv = poll_cq（非 read stream），此处直借
+            // `self.backend.stream` 是 TCP-specific 泄漏；R3 须抽 `FabricBackend::recv_next` 方法
+            // 让本 arm 变 `self.backend.recv_next()`，TCP/RDMA 各内部实现。见 fabric_backend trait doc。
+            r = read_pdu_async(&mut self.backend.stream) => {
                 match r {
                     Ok(pdu) => Ok(PumpEvent::Pdu(pdu)),
                     Err(e) => {
@@ -946,20 +942,13 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         cqe[0..4].copy_from_slice(&result_dw0.to_le_bytes());
         cqe[4..8].copy_from_slice(&result_dw1.to_le_bytes());
         cqe[12..14].copy_from_slice(&cid.to_le_bytes());
-        let hdr = CommonHdr {
-            pdu_type: pdu_type::RSP,
-            flags: 0,
-            hlen: 24,
-            pdo: 0,
-            plen: 24,
-        };
-        write_pdu_async(&mut self.stream, &hdr, &cqe, &[])
-            .await
-            .context("V8e-7-2 async write CapsuleResp")
+        use crate::fabric_backend::FabricBackend as _;
+        self.backend.send_response_capsule(&cqe).await
     }
 
     async fn send_capsule_resp_err_async(&mut self, cid: u16, sc: u8) -> anyhow::Result<()> {
-        self.send_capsule_resp_err_with_result_async(cid, sc, 0).await
+        self.send_capsule_resp_err_with_result_async(cid, sc, 0)
+            .await
     }
 
     /// 同 [`send_capsule_resp_err_async`] 但填 CQE result DW0（用于 Connect 失败
@@ -985,31 +974,12 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         };
         let status: u16 = ((sct as u16) << 9) | ((sc as u16) << 1);
         cqe[14..16].copy_from_slice(&status.to_le_bytes());
-        let hdr = CommonHdr {
-            pdu_type: pdu_type::RSP,
-            flags: 0,
-            hlen: 24,
-            pdo: 0,
-            plen: 24,
-        };
-        write_pdu_async(&mut self.stream, &hdr, &cqe, &[])
-            .await
-            .context("V8e-7-2 async write CapsuleResp err")
+        use crate::fabric_backend::FabricBackend as _;
+        self.backend.send_response_capsule(&cqe).await
     }
 
     async fn send_c2h_term_async(&mut self, fes: u16) -> anyhow::Result<()> {
-        let hdr = CommonHdr {
-            pdu_type: pdu_type::C2H_TERM,
-            flags: 0,
-            hlen: 24,
-            pdo: 0,
-            plen: 24,
-        };
-        let mut psh = [0u8; 16];
-        psh[0..2].copy_from_slice(&fes.to_le_bytes());
-        write_pdu_async(&mut self.stream, &hdr, &psh, &[])
-            .await
-            .context("V8e-7-2 async write C2HTermReq")
+        self.backend.send_c2h_term(fes).await
     }
 
     /// **V-followup-dhchap-3-wire / V-followup-dhchap-4** — 处理 AUTH_RECV：
@@ -2060,54 +2030,29 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         self.write_capsule_resp_bytes_async(&cqe_bytes).await
     }
 
-    /// **V8e-7-3** — async 版 dma_read_via_r2t（V4c 多 R2T 串行；V5e-2
-    /// base_offset 累计）。
+    /// **V9 R2** — 委托 `TcpFabricBackend::move_host_to_local`（R2T+H2CData 逻辑已迁入
+    /// `fabric_backend`）。保留本签名（返 `Vec`）让 caller 不变；内部填入 dst 后返回。
     async fn dma_read_via_r2t_async(
         &mut self,
         cid: u16,
         base_offset: u32,
         len: u32,
     ) -> anyhow::Result<Vec<u8>> {
+        use crate::fabric_backend::{FabricBackend as _, HostBuf};
+        // **cap-before-allocate**（rust-reviewer HIGH-1）：先验上界再分配，防 pathological len
+        // 先吃一坨内存（backend 内也有同款防御，此处保留旧的「分配前拒」顺序）。
         if len > crate::session::V4_MAX_DMA_READ_BYTES {
             anyhow::bail!(
-                "V8e-7-3 dma_read len {len} exceeds cap {}",
+                "R2 dma_read len {len} exceeds cap {}",
                 crate::session::V4_MAX_DMA_READ_BYTES
             );
         }
-        let max = crate::MAXH2CDATA_BYTES;
-        let mut buf: Vec<u8> = Vec::with_capacity(len as usize);
-        let mut offset_in_this_read: u32 = 0;
-        while offset_in_this_read < len {
-            let remaining = len - offset_in_this_read;
-            let chunk = remaining.min(max);
-            let cmd_offset = base_offset.saturating_add(offset_in_this_read);
-            let bytes = self
-                .dma_read_one_chunk_async(cid, cmd_offset, chunk)
-                .await?;
-            buf.extend_from_slice(&bytes);
-            offset_in_this_read += chunk;
-        }
-        debug_assert_eq!(buf.len(), len as usize);
-        Ok(buf)
-    }
-
-    /// **V8e-7-3** — 单片 R2T 子路径 (async)。
-    async fn dma_read_one_chunk_async(
-        &mut self,
-        cid: u16,
-        offset: u32,
-        chunk: u32,
-    ) -> anyhow::Result<Vec<u8>> {
-        let ttag = self.ttag_alloc.alloc();
-        let (hdr, psh) = crate::r2t::encode_r2t(cid, ttag, offset, chunk);
-        write_pdu_async(&mut self.stream, &hdr, psh.as_bytes(), &[])
-            .await
-            .context("V8e-7-3 async write R2T PDU")?;
-        await_host_data_async(&mut self.stream, cid, ttag, offset, chunk)
-            .await
-            .with_context(|| {
-                format!("V8e-7-3 await_host_data failed (ttag={ttag}, off={offset}, chunk={chunk})")
-            })
+        let mut dst = vec![0u8; len as usize];
+        let host = HostBuf::FlowControlled { total_len: len };
+        self.backend
+            .move_host_to_local(cid, &host, base_offset, &mut dst)
+            .await?;
+        Ok(dst)
     }
 
     /// **V8e-7-3** — 发 C2HData PDU（一次性 + DATA_LAST），data_offset=0。
@@ -2118,12 +2063,8 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
     }
 
     /// **2026-06-09 纯 4K / chunked** — 带 host-buffer `data_offset` + `is_last`
-    /// 的 C2HData。chunked READ 每片 C2HData 必须带**累计** host 偏移（spec
-    /// TP-8000 host 按 DATAO 落位）；否则 spec-compliant host（如 Linux kernel）
-    /// 把每片都写到 buffer[0] → 多片读数据 corruption。
-    /// `is_last`：DATA_LAST 仅打在**整条命令最后一片** C2HData（chunked 多片时
-    /// 非末片 LAST=0），spec-strict host 据此判命令 data 传输结束；非 chunked
-    /// 单片 = 末片 = LAST=1。
+    /// 的 C2HData。**V9 R2** 委托 `TcpFabricBackend::move_local_to_host`（C2HData 逻辑迁入）。
+    /// chunked READ 每片 C2HData 必须带**累计** host 偏移；`is_last` 仅打在整条命令最后一片。
     async fn send_c2h_data_at_async(
         &mut self,
         cid: u16,
@@ -2131,44 +2072,24 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         data_offset: u32,
         is_last: bool,
     ) -> anyhow::Result<()> {
-        let flags = if is_last {
-            crate::pdu::flags::DATA_LAST
-        } else {
-            0
+        use crate::fabric_backend::{FabricBackend as _, HostBuf};
+        let host = HostBuf::FlowControlled {
+            total_len: data.len() as u32,
         };
-        let hdr = CommonHdr {
-            pdu_type: pdu_type::C2H_DATA,
-            flags,
-            hlen: 24,
-            pdo: 24,
-            plen: 24 + data.len() as u32,
-        };
-        let psh = crate::pdu::DataPsh {
-            cccid: cid,
-            ttag_or_rsvd: 0,
-            data_offset,
-            data_length: data.len() as u32,
-            rsvd: [0u8; 4],
-        };
-        write_pdu_async(&mut self.stream, &hdr, psh.as_bytes(), data)
+        self.backend
+            .move_local_to_host(cid, &host, data, data_offset, is_last)
             .await
-            .context("V8e-7-3 async write C2HData")
     }
 
     /// **V8e-7-3** — 把 controller 已 dma_write 的 16-byte CQE bytes 当
     /// CapsuleResp PSH 直接 emit（spec：RSP PDU PSH = CQE）。
     async fn write_capsule_resp_bytes_async(&mut self, cqe_bytes: &[u8]) -> anyhow::Result<()> {
         debug_assert_eq!(cqe_bytes.len(), 16);
-        let hdr = CommonHdr {
-            pdu_type: pdu_type::RSP,
-            flags: 0,
-            hlen: 24,
-            pdo: 0,
-            plen: 24,
-        };
-        write_pdu_async(&mut self.stream, &hdr, cqe_bytes, &[])
-            .await
-            .context("V8e-7-3 async write CapsuleResp raw CQE")
+        let cqe: [u8; 16] = cqe_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("CQE bytes len {} != 16", cqe_bytes.len()))?;
+        use crate::fabric_backend::FabricBackend as _;
+        self.backend.send_response_capsule(&cqe).await
     }
 
     /// **V8e-7-3** — caller (handle_conn_async) 收到 `PumpEvent::AenReady`
@@ -2282,73 +2203,5 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             self.pending_aers.remove(0);
         }
         Ok(emitted)
-    }
-}
-
-/// **V8e-7-3** — async 版 await_host_data（与 sync 等价）。
-async fn await_host_data_async<S>(
-    stream: &mut S,
-    cid: u16,
-    ttag: u16,
-    base_offset: u32,
-    expected_len: u32,
-) -> anyhow::Result<Vec<u8>>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut r = crate::H2cReassembler::with_base_offset(cid, ttag, base_offset, expected_len);
-    loop {
-        let mut pdu = match tokio::time::timeout(H2C_DATA_READ_TIMEOUT, read_pdu_async(stream)).await
-        {
-            Ok(res) => res.context("V8e-7-3 read H2CData")?,
-            Err(_) => anyhow::bail!("R2T host-data: read H2CData 超时（host 半开/卡死）"),
-        };
-        let pt = pdu.header.pdu_type;
-        if pt == pdu_type::H2C_TERM {
-            anyhow::bail!("V8e-7-3 host sent H2CTermReq while awaiting H2CData");
-        }
-        // **Windows H2CData PLEN quirk（2026-06-14 真 WS2025 互通）** — Windows 把 H2CData 的
-        // PLEN 设为 HLEN（仅头），data 长度由 PSH DATAL 给（Linux/spec 把 data 计进 PLEN）。于是
-        // read_pdu 按 PLEN 读到 0 data、且把 DATAL 字节留在 stream。这里按 DATAL 补读，上界 = R2T
-        // 剩余（`expected_len - received`）防恶意 DATAL DoS；超界则不补读、交 accept_pdu 报错拒。
-        if pt == pdu_type::H2C_DATA
-            && pdu.psh.len() >= 16
-            && let Ok(psh) = crate::pdu::DataPsh::read_from_bytes(&pdu.psh[..16])
-        {
-            let datal = psh.data_length as usize;
-            let remaining = (expected_len as usize).saturating_sub(r.received() as usize);
-            if pdu.data.len() < datal && datal <= remaining {
-                let missing = datal - pdu.data.len();
-                let mut extra = vec![0u8; missing];
-                match tokio::time::timeout(H2C_DATA_READ_TIMEOUT, stream.read_exact(&mut extra)).await
-                {
-                    Ok(res) => {
-                        res.context("Windows H2CData trailing data (PLEN=HLEN quirk)")?;
-                    }
-                    Err(_) => {
-                        anyhow::bail!("R2T host-data: trailing data 读超时（host 半开/卡死）")
-                    }
-                }
-                pdu.data.extend_from_slice(&extra);
-            }
-        }
-        match r.accept_pdu(&pdu) {
-            crate::AcceptOutcome::Continue => continue,
-            crate::AcceptOutcome::Done(bytes) => return Ok(bytes),
-            crate::AcceptOutcome::Error { fes, reason } => {
-                // emit C2HTerm
-                let term_hdr = CommonHdr {
-                    pdu_type: pdu_type::C2H_TERM,
-                    flags: 0,
-                    hlen: 24,
-                    pdo: 0,
-                    plen: 24,
-                };
-                let mut term_psh = [0u8; 16];
-                term_psh[0..2].copy_from_slice(&fes.to_le_bytes());
-                let _ = write_pdu_async(stream, &term_hdr, &term_psh, &[]).await;
-                anyhow::bail!("V8e-7-3 H2CData reassembly: fes={fes:#x} reason={reason}");
-            }
-        }
     }
 }

@@ -150,6 +150,14 @@ trait RdmaVerbs {
 - **POC gate 输出**：(a)→R1' trait；(b)→R2 trait 形状；(c)→R3 session 模型。
 
 ### R2 — `FabricBackend` trait 泛化（execution-ready，零阻塞，建议优先）
+
+> **✅ 2026-06-14 DONE** → 新 `src/fabric_backend.rs`（`HostBuf` 三态/segments + `FabricBackend` trait
+> placement-intent 三方法 + `TcpFabricBackend<S>`，R2T/C2HData/CapsuleResp/await_host_data 逻辑从
+> `AsyncSession` **迁入**非复制）。AsyncSession `stream`+`ttag_alloc` 两字段 → 单 `backend` 字段，6 叶方法
+> 委托、删 `dma_read_one_chunk`+`await_host_data_async`。**~322 tests 全绿 + byte-identical + clippy clean +
+> `#![forbid(unsafe_code)]` 维持**。rust-reviewer：byte-identical PASS + 修 HIGH-1（cap-before-allocate）；
+> architect：**commit-ready 地基**，两笔分阶段债（R3 抽 `recv_next` / R4 调 `move_*` 签名 + 桥层 CQE 分流）
+> 已补前向锚点注释（HostBuf 类型已 RDMA-complete 不需改）。
 - **前置 gate（architect review）**：R0 产出物 (b) 必须先到位——`HostBufRef`/`CapsuleIn` 须按三态（TCP-无远端 / RDMA-keyed-SGL / inline）字段级定死，否则 R2 仅 TCP 视角盲定的类型在 R4 接 keyed-SGL 时要加变体 → 牵动 trait + byte-identical regression gate 重录（正是纠正②警告的失败模式挂在类型形状上）。
 - **What**：把现有 TCP 写/读路径抽到 `FabricBackend` trait 后面（**纠正②的 placement-intent + 借 MR 形状**），TCP 迁过去。
 - **Acceptance**：306 tests 全绿 + byte-identical regression gate（仿 `v8e1`）守护;clippy 0;`#![forbid(unsafe_code)]` 维持。**trait 签名不出现 `->Vec<u8>` 强制拷贝;`HostBufRef` 三态可表达。**

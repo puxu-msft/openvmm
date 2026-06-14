@@ -79,6 +79,7 @@ pub mod dhchap;
 pub mod digest;
 pub mod dispatch_plan;
 pub mod fabric;
+pub mod fabric_backend;
 pub mod framing;
 pub mod h2c_reassembler;
 pub mod io_queue;
