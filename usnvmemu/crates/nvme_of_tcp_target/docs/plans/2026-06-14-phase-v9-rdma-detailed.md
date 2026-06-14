@@ -198,6 +198,10 @@ trait RdmaVerbs {
 >     clippy clean；rust-reviewer 无 C/H，**确认 dispatch/pump/Drop 已 backend-agnostic、R3d 不翻车**。
 >   - **⏳ R3c-2**：RDMA 构造器（类比 `accept_and_handshake_async`，built `RdmaFabricBackend` + 填 `negotiated` 默认）
 >     + 多 QP 聚合 + teardown（terminate fes→neutral reason 顺手换）。
+>     - **✅ R3c-2 构造器 + keystone e2e DONE**（commit `5920e6c72`）：抽 `AsyncSession::from_backend` 共享构造器
+>       （TCP/RDMA 两 handshake 入口汇此，byte-identical）+ `accept_rdma`；keystone e2e `rdma_session_pumps_injected_capsule`
+>       证明**泛型 AsyncSession + RdmaFabricBackend + 共享 pump** 打通（inject 命令胶囊→pump→recv_next→合成 PDU）。
+>       336 绿 rust-reviewer 无 C/H/M。**多 QP 聚合 + teardown 仍待做**。
 > - **⏳ R3d**：admin 全路径过 RDMA mock + Discovery-over-RDMA（`NVME_TRTYPE_RDMA`）+ IRD/ORD/CQ-depth sizing。
 >   **⚠️ 发现（R3c-1 review）**：admin 返数据命令（Identify 4KB）的 e2e 需**桥层把命令 capsule 的 keyed-SGL 抽出
 >   作 `HostBuf::Keyed` 喂 move_local_to_host**（现桥硬编 `FlowControlled`）——这是 R4 的桥层 HostBuf 来源债，故
