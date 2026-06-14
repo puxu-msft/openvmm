@@ -106,8 +106,9 @@ sibling + 移 accum),不依赖某 transport 偶然强制满长读(self-consisten
 不变量 oracle,`975536142` 修 admin harness 误报)。a 类 4 条路径覆盖:
 - **#1 SGL chain — ✅ fuzz 覆盖**(108k exec + ASan 全绿)。
 - **#2 Read PRP-list chain — ✅ fuzz 覆盖**(107k exec + ASan 全绿;副产 truncated-read 缺口已修,见上)。
-- **#3 shadow-poll cascade / #4 CMB-drain cascade — ⏳ 待 fuzz**(已有确定性 firing 测试守;补 fuzz 是叠加)。
-- **CFS-后-0-DMA(I2)多步不变式 — ⏳ 待 fuzz**(I2 已强制 `b3e8b4350`,可做成多步 fuzz 不变式)。
+- **#3 shadow-poll cascade — ✅ fuzz 覆盖**(`fuzz_shadow_poll`,`076aeeb38`;纯公共 API enable+DBBUF+ring 驱链,O(N) 驱动循环,CFS 经越界 shadow 廉价触达 → 行使 leak-exception + I2 oracle;deep 65536 iter-cap 仍由确定性 dbbuf_tests 守)。
+- **#4 CMB-drain cascade — ✅ fuzz 覆盖**(`fuzz_cmb_drain`;enable_cmb+CMBMSC 激活窗口,IO 命令 PRP 落 CMB → cmb_hit cascade,核心 oracle = 非重入 `debug_assert!(!cmb_in_access_guest)` + 无残留;rust-reviewer 跑 reproducer 证 CMB 真命中非假绿。1M iter-cap 由确定性 `cmb_drain_iters_cap_fires` 守;本 target cfs 恒 false,I2/CFS-例外是守未来 guard)。
+- **CFS-后-0-DMA(I2)多步不变式 — 部分**:#3 的越界-shadow→CFS 路径已行使"CFS 后 0 新 DmaRead";更深的多步序列 fuzz 仍可叠加。
 
 **fuzz 副产的威胁模型订正(NUMD 分配)**:admin fuzz 跑出一条大 NUMD Get Log Page(~16 MiB,
 total_dmas≈4137)——**controller 完全有界正确**(自然 drain、表全 0、cfs=false),但暴露出

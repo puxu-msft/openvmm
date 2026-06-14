@@ -96,7 +96,7 @@ jobs:
           cd usnvmemu/crates/nvme_firmware/fuzz
           cargo build
           fail=0
-          for t in fuzz_sgl_chain fuzz_prp_list_chain fuzz_admin_dispatch fuzz_shadow_poll; do
+          for t in fuzz_sgl_chain fuzz_prp_list_chain fuzz_admin_dispatch fuzz_shadow_poll fuzz_cmb_drain; do
             echo "::group::fuzz smoke ${t}"
             # 定 seed → 确定性（不引入 flaky）；blind（无 coverage instrument）仅作回归 smoke。
             if "./target/debug/${t}" -runs=5000 -max_total_time=15 -timeout=10 -seed=1; then

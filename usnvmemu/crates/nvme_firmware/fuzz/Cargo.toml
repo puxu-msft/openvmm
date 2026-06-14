@@ -54,3 +54,10 @@ path = "fuzz_shadow_poll.rs"
 test = false
 doc = false
 doctest = false
+
+[[bin]]
+name = "fuzz_cmb_drain"
+path = "fuzz_cmb_drain.rs"
+test = false
+doc = false
+doctest = false
