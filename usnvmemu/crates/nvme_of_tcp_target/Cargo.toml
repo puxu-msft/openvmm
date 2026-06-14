@@ -7,6 +7,8 @@ description = "NVMe-over-Fabrics TCP target backed by nvme_firmware NvmeControll
 [dependencies]
 nvme_firmware = { path = "../nvme_firmware" }
 pcie_device_core = { path = "../pcie_device_core" }
+# V9 RDMA R3b — verbs 抽象（RdmaVerbs + MockRdma）；RdmaFabricBackend 据此 impl FabricBackend。
+rdma_transport = { path = "../rdma_transport" }
 anyhow = "1.0.102"
 thiserror = "1.0"
 tracing = "0.1.44"

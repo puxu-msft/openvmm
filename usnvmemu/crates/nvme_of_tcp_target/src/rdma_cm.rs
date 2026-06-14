@@ -248,8 +248,10 @@ mod tests {
             Err(CmReqError::TooShort(16))
         ));
         // recfmt 非 1.0。
-        let mut bad = NvmeRdmaCmReq::default();
-        bad.recfmt = 0x99;
+        let bad = NvmeRdmaCmReq {
+            recfmt: 0x99,
+            ..Default::default()
+        };
         assert!(matches!(
             NvmeRdmaCmReq::parse(bad.as_bytes()),
             Err(CmReqError::InvalidRecfmt(0x99))

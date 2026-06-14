@@ -85,6 +85,7 @@ pub mod h2c_reassembler;
 pub mod io_queue;
 pub mod pdu;
 pub mod r2t;
+pub mod rdma_backend;
 pub mod rdma_cm;
 pub mod session;
 pub mod tcp_transport;
