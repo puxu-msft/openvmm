@@ -24,10 +24,17 @@ on:
 permissions:
   contents: read
 
+# 同一时刻只跑一个；新触发取消旧 run（schedule 与 dispatch 撞车时省 runner）。
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
 jobs:
   differential:
     name: libvfio-user vs nvme_firmware vfio-user
     runs-on: ubuntu-latest
+    # **fork-guard**：只在本 fork 跑——防下游 fork 继承 schedule、每周在他们账号空跑。
+    if: github.repository == 'puxu-msft/openvmm'
     steps:
       - name: Checkout
         uses: actions/checkout@v6

@@ -8,9 +8,11 @@
 # - 兑现 ADR-013「独立-oracle 须有 standing CI gate」：让 fuzz 子项目的真覆盖跑成为**持续**的 standing
 #   gate（否则手跑一次即快照，下个回归无人值守）。corpus 经 actions/cache 跨夜累积、覆盖越跑越深。
 #
-# 覆盖两个 nested-workspace fuzz crate 的全部 target（`cargo fuzz list` 自动发现，新 target 免改本
-# 文件）——**但排除 `_proof_*`**（vfio §22 的 `_proof_sigbus_catchable` 故意触 SIGBUS 证 catch 能力、
-# 跑必崩）。任一 target 跑出 crash → job fail + 上传 artifact（crash 输入）便于复现。
+# **结构 = discover → by-target matrix**：`discover` job 解析各 fuzz crate Cargo.toml 的 `fuzz_*`
+# `[[bin]]`（`_proof_*` 不带前缀天然排除——vfio §22 的 `_proof_sigbus_catchable` 故意触 SIGBUS 跑必崩）
+# 产出 matrix；每个 target 一个**并行** job。墙钟 ≈ 最慢单 target，而非 ΣN×SECS；**加 target 免改本文件**
+# （discover 自动发现）。任一 target crash → 该 job fail + 上传其 crash artifact；`fail-fast: false`
+# 使一个 target 崩不取消其余（各 target 独立 standing gate）。
 #
 # 不动 `rust-toolchain.toml` 1.95 pin：nightly 仅经 `cargo +nightly fuzz run` 显式调用；仓库内其它
 # cargo 命令仍 1.95。
@@ -31,18 +33,64 @@ on:
 permissions:
   contents: read
 
+# 同一时刻只跑一个 nightly fuzz（group 全局单例）。**cancel-in-progress: false**——fuzz 的 corpus 跨夜
+# 累积是承重资产，宁可排队不丢：若 schedule 与 dispatch 撞车，新 run 排队等而非取消在跑的（取消会丢该
+# 夜 corpus append+cmin 回写）。differential（无累积状态）才用 cancel: true。
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
-  fuzz:
-    name: nightly coverage-guided fuzz
+  # ① 发现 target —— 解析各 fuzz crate Cargo.toml 的 `fuzz_*` [[bin]]（与 usnvmemu.yml stable smoke 同款
+  #    自动发现；`_proof_*` 不带前缀天然排除）→ 产出 by-target matrix。轻量（只 grep、不装 toolchain/build）。
+  #    **fork-guard**：只在本 fork 跑——防下游 fork 继承 schedule、每天在他们账号空跑。discover 被 guard 跳过
+  #    则下游 `fuzz` job（needs: discover）连带跳过。
+  discover:
+    name: discover fuzz targets
     runs-on: ubuntu-latest
+    if: github.repository == 'puxu-msft/openvmm'
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Enumerate fuzz_* targets per crate
+        id: set
+        run: |
+          set -uo pipefail
+          items=""
+          for crate in nvme_firmware vfio_user_transport nvme_of_tcp_target; do
+            toml="usnvmemu/crates/${crate}/fuzz/Cargo.toml"
+            crate_targets="$(grep -oP '^name = "\Kfuzz_[^"]+' "${toml}" || true)"
+            # **fail-loud（防"静默跑 0 target 却绿"，同 ADR-013 standing-gate 须真在跑）**：每个 crate
+            # 都该有 ≥1 个 fuzz_ target；grep 因 Cargo.toml 漂移/路径错/改名 返回空 → 立即 fail，绝不
+            # 让 matrix 退化成空、fuzz job 被跳过却判 success。加 crate 才改本列表，加 target 自动发现。
+            if [ -z "${crate_targets}" ]; then
+              echo "::error::discover: crate ${crate} 发现 0 个 fuzz_ target（${toml} 漂移/路径错？）"
+              exit 1
+            fi
+            for t in ${crate_targets}; do
+              items="${items:+${items},}{\"crate\":\"${crate}\",\"target\":\"${t}\"}"
+            done
+          done
+          echo "matrix={\"include\":[${items}]}" >> "$GITHUB_OUTPUT"
+
+  # ② 每个 target 一个并行 job（by-target matrix）。
+  fuzz:
+    needs: discover
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
       # nightly（cargo-fuzz 的 libfuzzer sanitizer/coverage instrument 只在 nightly）+ **显式装
       # 1.95**：`cargo xflowey`（下一步）经 rust-toolchain.toml 走 1.95，必须本机已装——不能赖
-      # rustup auto-install（被 RUSTUP_AUTO_INSTALL=0 / 旧 rustup 关掉时会 fallback 到 nightly-default
-      # → 撞 flowey Path::absolute → 首跑炸）。两 toolchain 并存，各司其职。
+      # rustup auto-install（被关掉时会 fallback 到 nightly-default → 撞 flowey Path::absolute → 首跑炸）。
+      # 两 toolchain 并存，各司其职。
       - name: Install nightly + 1.95 + cargo-fuzz
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -54,64 +102,37 @@ jobs:
 
       # protoc：nvme_firmware fuzz crate 经 mesh_protobuf build.rs 需要（同 usnvmemu.yml）。
       # **用 plain `cargo xflowey`**（非 `+nightly`）：repo 的 rust-toolchain.toml 钉 1.95，flowey 在
-      # 1.96+/nightly 会撞 `Path::absolute` 命名冲突编不过——故 restore 必走 toml 的 1.95（rustup
-      # 见 toml 自动装 1.95）；nightly 仅留给下面的 `cargo +nightly fuzz run`。
+      # 1.96+/nightly 撞 `Path::absolute` 编不过——故 restore 必走 toml 的 1.95；nightly 仅留给
+      # `cargo +nightly fuzz run`。（保守起见全 crate 都 restore；vfio/nvme_of 不必但无害。）
       - name: Restore packages (protoc)
         run: cargo xflowey restore-packages --no-compat-igvm
 
-      # corpus 跨夜累积：restore 最近一次、跑完 append、按 run_id 存新（restore-keys 前缀回退）。
+      # corpus 跨夜累积，**按 target 独立 cache key**（matrix 各 job 互不挤占；prefix restore-keys 回退）。
       - name: Restore fuzz corpus
         uses: actions/cache@v4
         with:
-          path: |
-            usnvmemu/crates/nvme_firmware/fuzz/corpus
-            usnvmemu/crates/vfio_user_transport/fuzz/corpus
-            usnvmemu/crates/nvme_of_tcp_target/fuzz/corpus
-          key: usnvmemu-fuzz-corpus-${{ github.run_id }}
+          path: usnvmemu/crates/${{ matrix.crate }}/fuzz/corpus/${{ matrix.target }}
+          key: usnvmemu-fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: |
-            usnvmemu-fuzz-corpus-
+            usnvmemu-fuzz-corpus-${{ matrix.target }}-
 
-      - name: Coverage-guided fuzz (all targets, exclude _proof_*)
+      - name: Coverage-guided fuzz ${{ matrix.target }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
           SECS="${{ github.event.inputs.seconds_per_target || '120' }}"
-          rm -f /tmp/fuzz_fail   # 子 shell（`while` 循环）经文件传出失败标记，先清干净。
-          for crate_dir in \
-            usnvmemu/crates/nvme_firmware/fuzz \
-            usnvmemu/crates/vfio_user_transport/fuzz \
-            usnvmemu/crates/nvme_of_tcp_target/fuzz; do
-            # cargo fuzz 从 crate 根（fuzz/ 的父目录）调用。
-            proj_dir="$(dirname "${crate_dir}")"
-            # **先捕获 target 列表并对 list 失败 fail-loud**（review MEDIUM）：直接 `... | while`
-            # 会把 fuzz crate 编不过/cargo-fuzz 坏导致的 list 失败静默吞掉 → 跑 0 个 target 却绿。
-            targets="$(cd "${proj_dir}" && cargo +nightly fuzz list)" || {
-              echo "::error::cargo fuzz list failed in ${proj_dir}（fuzz crate 编译/列举失败）"
-              exit 1
-            }
-            for t in $(echo "${targets}" | grep -v '^_proof'); do
-              echo "::group::fuzz ${t} (${SECS}s)"
-              if ( cd "${proj_dir}" && cargo +nightly fuzz run "${t}" -- -max_total_time="${SECS}" -timeout=20 ); then
-                echo "${t}: ok"
-                # corpus 最小化（review 长期项）：cmin 去冗余、界住 corpus 增长（防 10GB cache 顶）。
-                ( cd "${proj_dir}" && cargo +nightly fuzz cmin "${t}" ) || \
-                  echo "::warning::${t} cmin failed（非致命，corpus 未最小化）"
-              else
-                echo "::error::${t} fuzz run failed（crash 或 build error；artifact 已上传）"
-                echo "1" >> /tmp/fuzz_fail
-              fi
-              echo "::endgroup::"
-            done
-          done
-          test ! -s /tmp/fuzz_fail
+          cd "usnvmemu/crates/${{ matrix.crate }}"
+          echo "::group::fuzz ${{ matrix.target }} (${SECS}s)"
+          # crash 即非零退出 → set -e 令本步 fail → job fail（artifact 由下方 if: failure() 上传）。
+          cargo +nightly fuzz run "${{ matrix.target }}" -- -max_total_time="${SECS}" -timeout=20
+          # corpus 最小化（cmin 去冗余、界住增长，防 cache 顶）；非致命。
+          cargo +nightly fuzz cmin "${{ matrix.target }}" || echo "::warning::${{ matrix.target }} cmin failed（corpus 未最小化）"
+          echo "::endgroup::"
 
-      # crash 输入（fuzz/artifacts/）便于复现；仅失败时上传。
+      # crash 输入（fuzz/artifacts/）便于复现；仅失败时上传。matrix 各 job artifact 名须唯一 → 带 target 名。
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-crash-artifacts
-          path: |
-            usnvmemu/crates/nvme_firmware/fuzz/artifacts
-            usnvmemu/crates/vfio_user_transport/fuzz/artifacts
-            usnvmemu/crates/nvme_of_tcp_target/fuzz/artifacts
+          name: fuzz-crash-${{ matrix.target }}
+          path: usnvmemu/crates/${{ matrix.crate }}/fuzz/artifacts
           if-no-files-found: ignore

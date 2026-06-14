@@ -38,6 +38,12 @@ on:
 permissions:
   contents: read
 
+# 同一 ref（分支/PR）上新 push 取消尚在跑的旧 run——避免快速连 push 时陈旧 run 堆叠空转、
+# 反馈更快、少占共享 runner（public 仓库分钟免费，此举为卫生非省额度）。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: usnvmemu cargo test
