@@ -109,6 +109,27 @@ pub trait FabricBackend {
         base_offset: u32,
         dst: &mut [u8],
     ) -> anyhow::Result<()>;
+
+    /// **R3** — 收下一帧入站（pump 的 `select!` recv arm 调）。把入站抽进 trait，消除 R2 遗留的
+    /// `select!` 直借 `TcpFabricBackend::stream` 的 TCP 泄漏。
+    /// - **TCP**：`read_pdu_async` 读一帧 PDU；EOF → `PeerClosed`。
+    /// - **RDMA**（R3b）：`poll_cq` 取 RECV completion → 把 SEND 来的命令胶囊**合成成 CapsuleCmd
+    ///   PDU**（复用 `dispatch_pdu_async` 全路径，同「假-GPA 桥」合成思路）；QP disconnect → `PeerClosed`。
+    ///
+    /// **取消安全注意（pre-existing framing 债，非 R3 引入）**：TCP impl 的 `read_pdu_async` 跨多段
+    /// `read_exact`；若在 `select!` 里被别的 arm 取消而半读一帧，已读字节随 future drop 丢失 → 下次
+    /// 错位破帧。当前 biased select 里 recv 是末 arm 且取消后 caller 多退出循环，触发面窄；长远应换
+    /// cancel-safe framed reader。**RDMA impl 无此坑**（`poll_cq` 是 cancel-safe 的瞬时 poll）。
+    async fn recv_next(&mut self) -> anyhow::Result<RecvFrame>;
+}
+
+/// [`FabricBackend::recv_next`] 的产出：一帧入站，或对端关闭。
+#[derive(Debug)]
+pub enum RecvFrame {
+    /// 一帧入站 PDU（TCP read_pdu / RDMA 合成胶囊 PDU）。
+    Frame(crate::framing::Pdu),
+    /// 对端关闭连接（TCP EOF / RDMA disconnect）。
+    PeerClosed,
 }
 
 /// H2CData 读超时（host 半开/卡死兜底）。与迁入前 `async_session::H2C_DATA_READ_TIMEOUT` 等值。
@@ -119,10 +140,9 @@ const H2C_DATA_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// 数据移动逻辑从 `AsyncSession` 的 `dma_read_via_r2t_async` / `send_c2h_data_at_async` /
 /// `write_capsule_resp_bytes_async` / `await_host_data_async` **迁入**（byte-identical wire）。
 pub struct TcpFabricBackend<S: AsyncSessionStream> {
-    /// TCP 连接（pump 的 recv select! 也借此字段，故 `pub(crate)`）。
-    /// **R3 落地条件**：recv 抽成 `FabricBackend::recv_next` trait 方法后，本字段降回私有
-    /// （RDMA backend owns QP 无 stream 字段，select! recv arm 不能再直借具体字段）。
-    pub(crate) stream: S,
+    /// TCP 连接。**R3 起私有**：recv 已抽进 `FabricBackend::recv_next`，pump 不再直借此字段
+    /// （消除 R2 的 TCP 泄漏；RDMA backend owns QP 无 stream 字段，靠 trait 方法对齐）。
+    stream: S,
     /// V4b R2T transfer tag 分配器（写路径 dma_read 用）。
     pub(crate) ttag_alloc: crate::TtagAllocator,
     /// ICResp 协商的 MAXH2CDATA（R2T 单片上限）。
@@ -257,6 +277,22 @@ impl<S: AsyncSessionStream> FabricBackend for TcpFabricBackend<S> {
             filled += chunk;
         }
         Ok(())
+    }
+
+    async fn recv_next(&mut self) -> anyhow::Result<RecvFrame> {
+        // PeerClosed 检测从 pump 迁入（transport-specific 入站语义归 backend）。
+        match read_pdu_async(&mut self.stream).await {
+            Ok(pdu) => Ok(RecvFrame::Frame(pdu)),
+            Err(e) => {
+                if let Some(crate::framing::FramingError::PeerClosed { .. }) =
+                    e.downcast_ref::<crate::framing::FramingError>()
+                {
+                    Ok(RecvFrame::PeerClosed)
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }
 
@@ -431,5 +467,39 @@ mod tests {
             .unwrap();
         host_task.await.unwrap();
         assert_eq!(dst, (0u8..16).collect::<Vec<_>>());
+    }
+
+    /// recv_next：收到一帧 CapsuleCmd PDU → `Frame`。
+    #[tokio::test]
+    async fn recv_next_returns_frame() {
+        let (a, mut b) = tokio::io::duplex(4096);
+        let mut be = TcpFabricBackend::new(a, crate::MAXH2CDATA_BYTES);
+        // host 侧发一帧入站 CapsuleCmd（recv_next 不解析类型，只交回 caller dispatch）。
+        let hdr = CommonHdr {
+            pdu_type: pdu_type::CMD,
+            flags: 0,
+            hlen: 24,
+            pdo: 0,
+            plen: 24,
+        };
+        write_pdu_async(&mut b, &hdr, &[0u8; 16], &[])
+            .await
+            .unwrap();
+        match be.recv_next().await.unwrap() {
+            RecvFrame::Frame(pdu) => assert_eq!(pdu.header.pdu_type, pdu_type::CMD),
+            RecvFrame::PeerClosed => panic!("expected Frame"),
+        }
+    }
+
+    /// recv_next：对端关闭 → `PeerClosed`（非 Err）。
+    #[tokio::test]
+    async fn recv_next_peer_closed_on_eof() {
+        let (a, b) = tokio::io::duplex(4096);
+        let mut be = TcpFabricBackend::new(a, crate::MAXH2CDATA_BYTES);
+        drop(b); // host 关连接 → EOF
+        match be.recv_next().await.unwrap() {
+            RecvFrame::PeerClosed => {}
+            RecvFrame::Frame(_) => panic!("expected PeerClosed"),
+        }
     }
 }

@@ -58,7 +58,7 @@ use zerocopy::{FromBytes, IntoBytes};
 /// `tokio_rustls::server::TlsStream<TcpStream>` 后将自动满足；bin 端
 /// `handle_conn_async` 届时根据是否 TLS 二分调用，由 monomorphize 各产一份代码。
 ///
-/// `Send + 'static` 是 `tokio::spawn` 强制；`Unpin` 让我们能直接 `&mut self.backend.stream`
+/// `Send + 'static` 是 `tokio::spawn` 强制；`Unpin` 让 backend 内 `read_pdu_async(&mut stream)`
 /// 不需要 Pin projection。
 pub trait AsyncSessionStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncSessionStream for T {}
@@ -70,8 +70,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncSessionStream for 
 /// dispatch 骨架；V8e-4 加 AER Notify、V8e-5 加 KATO Sleep、V8e-6 加完整
 /// admin/IO dispatch。
 pub struct AsyncSession<S: AsyncSessionStream = TokioStream> {
-    /// **V9 R2** — TCP 出站数据移动后端（owns stream + ttag 分配 + MAXH2CDATA）。
-    /// pump 的 recv `select!` 借 `backend.stream` 字段；数据移动经 `FabricBackend` trait。
+    /// **V9 R2/R3** — TCP 出站数据移动后端（owns stream + ttag 分配 + MAXH2CDATA）。
+    /// recv 与数据移动**全经 `FabricBackend` trait**（R3 起 pump 不再直借 backend 具体字段）。
     pub(crate) backend: crate::fabric_backend::TcpFabricBackend<S>,
     controller: SharedController,
     /// 协商后参数（与 sync `NegotiatedIc` 等价）。
@@ -314,6 +314,7 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
         &mut self,
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<PumpEvent> {
+        use crate::fabric_backend::{FabricBackend as _, RecvFrame};
         // V8e-5：KATO=0 时第 3 arm 用 `std::future::pending()` 占位（spec § 7.13
         // "Keep Alive disabled"）。已 arm 的 Sleep 通过 `as_mut` 拿 Pin 借用。
         let kato_fut = async {
@@ -348,21 +349,13 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
                 );
                 Ok(PumpEvent::KatoExpired)
             }
-            // **R3 落地条件**（architect review）：RDMA recv = poll_cq（非 read stream），此处直借
-            // `self.backend.stream` 是 TCP-specific 泄漏；R3 须抽 `FabricBackend::recv_next` 方法
-            // 让本 arm 变 `self.backend.recv_next()`，TCP/RDMA 各内部实现。见 fabric_backend trait doc。
-            r = read_pdu_async(&mut self.backend.stream) => {
+            // **R3** — recv 经 `FabricBackend::recv_next`（TCP read_pdu / RDMA poll_cq），
+            // 不再直借 backend 的具体 stream 字段（R2 泄漏已消除）。PeerClosed 检测在 backend 内。
+            r = self.backend.recv_next() => {
                 match r {
-                    Ok(pdu) => Ok(PumpEvent::Pdu(pdu)),
-                    Err(e) => {
-                        if let Some(crate::framing::FramingError::PeerClosed { .. }) =
-                            e.downcast_ref::<crate::framing::FramingError>()
-                        {
-                            Ok(PumpEvent::PeerClosed)
-                        } else {
-                            Err(e)
-                        }
-                    }
+                    Ok(RecvFrame::Frame(pdu)) => Ok(PumpEvent::Pdu(pdu)),
+                    Ok(RecvFrame::PeerClosed) => Ok(PumpEvent::PeerClosed),
+                    Err(e) => Err(e),
                 }
             }
         }
