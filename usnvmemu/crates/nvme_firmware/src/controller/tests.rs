@@ -8490,6 +8490,464 @@ fn pi_write_finalize_stream_pract1_ignores_sep_meta() {
     }
 }
 
+// ════════════════════════ SGL×PI P-B：separate-meta 数据路径 e2e 差分 oracle ════════════════════════
+//
+// 端到端驱动 PSDT=10 SGL × separate-meta PI NS（PRACT 0/1）：构造 segment descriptor 页 →
+// dispatch → 喂 NvmSglFetch（walk 建 frag plan）→ 喂 NvmSglData（data frag gather/scatter）
+// + NvmSglSepMeta（MPTR tuple 子-DMA）→ finalize。差分 oracle 四件套：① backing/
+// `PiTuple::compute` 期望；② 显式断每条 SGL frag + MPTR 的 DmaRead/DmaWrite (gpa,len)；
+// ③ 断走 SglOp（sgl_ops 出现该 op）；④ revert-verify（见各 case 注）。
+
+#[cfg(test)]
+mod sgl_pi_pb {
+    // 多处 `for i in 0..n` 同步索引 datas[i] 且用 i 算 lba0+i，enumerate 改写收益小。
+    #![allow(clippy::needless_range_loop)]
+    use super::*;
+    use pcie_device_core::{CaptureTransport, DeviceCtx, TransportEvent};
+
+    const DATA: usize = 4096;
+    const BLOCK: usize = 4104;
+
+    /// separate-meta PI NS（lbads=12 / meta=8 / Type1 / separate）+ CQ。
+    fn pi_ns(pi_first: bool) -> NvmeController {
+        let mut c = make_ctrl_with_tmp("sgl_pi_pb");
+        {
+            let ns = c.namespaces.get_mut(&1).unwrap();
+            ns.lbads = 12;
+            ns.meta_size = 8;
+            ns.pi_type = 1;
+            ns.pi_first = pi_first;
+            ns.meta_inline = false;
+            let size = ns.file.metadata().unwrap().len();
+            ns.total_lba = size / ns.block_bytes();
+        }
+        c.cqs.insert(
+            1,
+            crate::regs::CompletionQueue {
+                base_gpa: 0x1_0000,
+                size: 64,
+                tail: 0,
+                phase: 1,
+                head: 0,
+                interrupt_vector: 0,
+                interrupt_enabled: false,
+                pending_completions: 0,
+                last_fire: None,
+            },
+        );
+        c
+    }
+
+    /// 16-byte SGL Data Block descriptor（id=0x00）。
+    fn data_block(gpa: u64, len: u32) -> [u8; 16] {
+        let mut d = [0u8; 16];
+        d[0..8].copy_from_slice(&gpa.to_le_bytes());
+        d[8..12].copy_from_slice(&len.to_le_bytes());
+        d[15] = 0x00;
+        d
+    }
+    /// 16-byte SGL Bit Bucket descriptor（id=0x10；address 被忽略）。
+    fn bit_bucket(len: u32) -> [u8; 16] {
+        let mut d = [0u8; 16];
+        d[8..12].copy_from_slice(&len.to_le_bytes());
+        d[15] = 0x10;
+        d
+    }
+    /// 拼 segment 页（多个 16-byte descriptor 顺序排）。
+    fn seg_page(descs: &[[u8; 16]]) -> Vec<u8> {
+        descs.iter().flatten().copied().collect()
+    }
+
+    /// 构造 PSDT=10 SGL SQE：embedded SGL1 = Last Segment descriptor 指向 seg 页。
+    #[allow(clippy::too_many_arguments)]
+    fn sgl_sqe(
+        opc: u8,
+        slba: u64,
+        nlb: u32,
+        cid: u16,
+        pract: bool,
+        mptr: u64,
+        seg_gpa: u64,
+        seg_len: u32,
+    ) -> Sqe {
+        let zero = [0u8; 64];
+        let mut sqe: Sqe = zerocopy::FromBytes::read_from_bytes(&zero[..]).unwrap();
+        sqe.cdw0 = (opc as u32) | (0b10 << 14) | ((cid as u32) << 16); // PSDT=10
+        sqe.nsid = 1;
+        sqe.cdw10 = slba as u32;
+        sqe.cdw11 = (slba >> 32) as u32;
+        sqe.cdw12 = (nlb - 1) | if pract { 1 << 29 } else { 0 } | (1 << 28) | (1 << 26);
+        // embedded SGL1：prp1=address(byte0..8)；prp2 低 32=length、byte15(=prp2 bit56..63)=id。
+        sqe.prp1 = seg_gpa;
+        sqe.prp2 = (seg_len as u64) | (0x30u64 << 56); // id=0x30 Last Segment
+        sqe.mptr = mptr;
+        sqe
+    }
+
+    /// 顺序无关地把所有在途 SGL 子-DMA 喂完（NvmSglFetch→seg 页 / NvmSglData→WRITE 喂该
+    /// frag 的 stream 切片、READ 空 / NvmSglSepMeta→WRITE 喂 host tuple、READ 空）。
+    fn drive(
+        c: &mut NvmeController,
+        cap: &mut CaptureTransport,
+        seg: &[u8],
+        write_stream: Option<&[u8]>,
+        write_meta: Option<&[u8]>,
+    ) {
+        let mut ctx = DeviceCtx::new(cap);
+        loop {
+            let pick = c.pending_ios.iter().find_map(|(t, p)| match p.op {
+                PendingOp::NvmSglFetch { .. } => Some((*t, 0u8, 0u64, 0u32)),
+                PendingOp::NvmSglData { op_id, frag_idx } => Some((*t, 1, op_id, frag_idx)),
+                PendingOp::NvmSglSepMeta { op_id } => Some((*t, 2, op_id, 0)),
+                _ => None,
+            });
+            let Some((tok, kind, op_id, frag_idx)) = pick else {
+                break;
+            };
+            let data = match kind {
+                0 => seg.to_vec(),
+                1 => {
+                    if let Some(ws) = write_stream {
+                        let frag = c.sgl_ops[&op_id].frags[frag_idx as usize];
+                        let off = frag.stream_offset as usize;
+                        ws[off..off + frag.length as usize].to_vec()
+                    } else {
+                        Vec::new()
+                    }
+                }
+                _ => write_meta.map(|m| m.to_vec()).unwrap_or_default(),
+            };
+            c.on_dma_complete_impl(&mut ctx, tok, true, data);
+        }
+    }
+
+    /// 从 capture 收集 DmaWrite (gpa→bytes)。
+    fn collect_writes(cap: &CaptureTransport) -> std::collections::HashMap<u64, Vec<u8>> {
+        let mut m = std::collections::HashMap::new();
+        for e in cap.events() {
+            if let TransportEvent::DmaWrite { gpa, data, .. } = e {
+                m.insert(*gpa, data.clone());
+            }
+        }
+        m
+    }
+    /// 末条 CQE 的 16-bit status（DmaWrite 到 CQ GPA 窗口）。
+    fn last_cqe_status(cap: &CaptureTransport) -> Option<u16> {
+        cap.events()
+            .iter()
+            .filter_map(|e| match e {
+                TransportEvent::DmaWrite { gpa, data, .. }
+                    if *gpa >= 0x1_0000 && *gpa < 0x1_0000 + 64 * 16 && data.len() >= 16 =>
+                {
+                    let dw3 = u32::from_le_bytes(data[12..16].try_into().unwrap());
+                    Some((((dw3 >> 17) & 0xff) | (((dw3 >> 25) & 0x7) << 8)) as u16)
+                }
+                _ => None,
+            })
+            .next_back()
+    }
+
+    /// **P-B WRITE separate PRACT=0** — 2 LBA，data 经多 frag（一 LBA 跨 frag [3000,1096]）
+    /// gather，host PI tuple 经 MPTR；finalize verify-all + interleave store-all。差分 oracle：
+    /// backing 每块 == interleave([host tuple][data])；frag DmaRead (gpa,len) 全断；走 SglOp；
+    /// success。revert-verify：store interleave 切轴弄反（P-A 已验）→ 本断言转红。
+    #[test]
+    fn write_separate_pract0_frag_cross_lba() {
+        for pi_first in [true, false] {
+            let mut c = pi_ns(pi_first);
+            let lba0 = 1u64;
+            let n = 2usize;
+            let stream: Vec<u8> = (0..n * DATA).map(|i| ((i * 5 + 7) & 0xff) as u8).collect();
+            // host PI tuple（正确算，PRACT=0 host 供 → verify 通过）。
+            let mut meta = Vec::new();
+            for i in 0..n {
+                let d = &stream[i * DATA..(i + 1) * DATA];
+                meta.extend_from_slice(
+                    &crate::pi::PiTuple::compute(d, lba0 + i as u64, 1).to_bytes(),
+                );
+            }
+            // 3 个 data-block frag：[3000][1096][4096]——第 1 个 LBA 的 data 跨 frag0/frag1。
+            let (g0, g1, g2) = (0x4000u64, 0x6000u64, 0x8000u64);
+            let seg = seg_page(&[
+                data_block(g0, 3000),
+                data_block(g1, 1096),
+                data_block(g2, 4096),
+            ]);
+            let mut cap = CaptureTransport::with_start_token(0x100);
+            let r = {
+                let mut ctx = DeviceCtx::new(&mut cap);
+                let sqe = sgl_sqe(
+                    0x01,
+                    lba0,
+                    n as u32,
+                    0x70,
+                    false,
+                    0x5000,
+                    0x2000,
+                    seg.len() as u32,
+                );
+                c.dispatch_io(&mut ctx, 1, sqe, 0x70, 0, 1)
+            };
+            assert!(r.is_none(), "separate-meta SGL WRITE 走异步");
+            assert_eq!(c.sgl_ops.len(), 1, "走 SglOp 累积器");
+            drive(&mut c, &mut cap, &seg, Some(&stream), Some(&meta));
+            assert!(c.sgl_ops.is_empty(), "finalize 后 op 移除");
+            // ② frag DmaRead (gpa,len)：seg fetch + MPTR(0x5000,16) + 3 data frag。
+            let reads: Vec<(u64, u32)> = cap
+                .events()
+                .iter()
+                .filter_map(|e| match e {
+                    TransportEvent::DmaRead { gpa, len, .. } => Some((*gpa, *len)),
+                    _ => None,
+                })
+                .collect();
+            assert!(reads.contains(&(0x2000, seg.len() as u32)), "seg 页 fetch");
+            assert!(reads.contains(&(g0, 3000)), "frag0 DmaRead");
+            assert!(reads.contains(&(g1, 1096)), "frag1 DmaRead");
+            assert!(reads.contains(&(g2, 4096)), "frag2 DmaRead");
+            assert!(reads.contains(&(0x5000, 16)), "MPTR(gpa,len=N×8)");
+            // ① backing 每块 == interleave([host tuple][data]) per pi_first。
+            let ns = c.namespaces.get(&1).unwrap();
+            for i in 0..n {
+                let mut blk = vec![0u8; BLOCK];
+                ns.read_at(&mut blk, (lba0 + i as u64) * BLOCK as u64)
+                    .unwrap();
+                let tup = &meta[i * 8..i * 8 + 8];
+                let dat = &stream[i * DATA..(i + 1) * DATA];
+                let (gt, gd): (&[u8], &[u8]) = if pi_first {
+                    (&blk[0..8], &blk[8..8 + DATA])
+                } else {
+                    (&blk[DATA..DATA + 8], &blk[0..DATA])
+                };
+                assert_eq!(gt, tup, "pi_first={pi_first} blk{i} tuple 落盘");
+                assert_eq!(gd, dat, "pi_first={pi_first} blk{i} data 落盘");
+            }
+            assert_eq!(
+                last_cqe_status(&cap),
+                Some(0),
+                "pi_first={pi_first} success CQE"
+            );
+        }
+    }
+
+    /// **P-B WRITE separate PRACT=1** — host 只传 data（无 MPTR），controller `PiTuple::compute`
+    /// 自算 tuple 落盘。oracle：backing tuple == 独立 compute（非 host）；无 MPTR(gpa=0) DmaRead。
+    #[test]
+    fn write_separate_pract1_compute() {
+        let mut c = pi_ns(true);
+        let lba0 = 0u64;
+        let n = 2usize;
+        let stream: Vec<u8> = (0..n * DATA).map(|i| ((i * 9 + 1) & 0xff) as u8).collect();
+        let seg = seg_page(&[data_block(0x4000, 4096), data_block(0x6000, 4096)]);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            // PRACT=1：mptr 给 0（不需）。
+            let sqe = sgl_sqe(
+                0x01,
+                lba0,
+                n as u32,
+                0x71,
+                true,
+                0,
+                0x2000,
+                seg.len() as u32,
+            );
+            assert!(c.dispatch_io(&mut ctx, 1, sqe, 0x71, 0, 1).is_none());
+        }
+        drive(&mut c, &mut cap, &seg, Some(&stream), None);
+        // 无 MPTR(gpa=0) DmaRead（PRACT=1 不读 host tuple）。
+        let mptr_reads = cap
+            .events()
+            .iter()
+            .any(|e| matches!(e, TransportEvent::DmaRead { gpa, .. } if *gpa == 0));
+        assert!(!mptr_reads, "PRACT=1 不应有 MPTR(gpa=0) DmaRead");
+        let ns = c.namespaces.get(&1).unwrap();
+        for i in 0..n {
+            let mut blk = vec![0u8; BLOCK];
+            ns.read_at(&mut blk, (lba0 + i as u64) * BLOCK as u64)
+                .unwrap();
+            let want =
+                crate::pi::PiTuple::compute(&stream[i * DATA..(i + 1) * DATA], lba0 + i as u64, 1)
+                    .to_bytes();
+            assert_eq!(&blk[0..8], &want[..], "blk{i} tuple = controller 自算");
+            assert_eq!(
+                &blk[8..8 + DATA],
+                &stream[i * DATA..(i + 1) * DATA],
+                "blk{i} data"
+            );
+        }
+        assert_eq!(last_cqe_status(&cap), Some(0), "PRACT=1 success");
+    }
+
+    /// **P-B READ separate PRACT=0** — 盘上 interleaved → verify-all → data scatter per-frag +
+    /// N×8 tuple → MPTR。oracle：DmaWrite 每 frag (gpa) == dense data 切片、MPTR == tuple concat。
+    #[test]
+    fn read_separate_pract0() {
+        let lba0 = 0u64;
+        let n = 2usize;
+        let datas: Vec<Vec<u8>> = (0..n)
+            .map(|i| (0..DATA).map(|b| ((b + i * 11) & 0xff) as u8).collect())
+            .collect();
+        let mut c = pi_ns(true);
+        {
+            let ns = c.namespaces.get_mut(&1).unwrap();
+            for i in 0..n {
+                let mut blk = vec![0u8; BLOCK];
+                let t = crate::pi::PiTuple::compute(&datas[i], lba0 + i as u64, 1).to_bytes();
+                blk[0..8].copy_from_slice(&t);
+                blk[8..8 + DATA].copy_from_slice(&datas[i]);
+                ns.write_at(&blk, (lba0 + i as u64) * BLOCK as u64).unwrap();
+            }
+        }
+        let (g0, g1) = (0x4000u64, 0x6000u64);
+        let seg = seg_page(&[data_block(g0, 4096), data_block(g1, 4096)]);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let sqe = sgl_sqe(
+                0x02,
+                lba0,
+                n as u32,
+                0x72,
+                false,
+                0x5000,
+                0x2000,
+                seg.len() as u32,
+            );
+            assert!(c.dispatch_io(&mut ctx, 1, sqe, 0x72, 0, 1).is_none());
+        }
+        drive(&mut c, &mut cap, &seg, None, None);
+        let writes = collect_writes(&cap);
+        assert_eq!(
+            writes.get(&g0).map(|d| &d[..]),
+            Some(&datas[0][..]),
+            "frag0 data scatter"
+        );
+        assert_eq!(
+            writes.get(&g1).map(|d| &d[..]),
+            Some(&datas[1][..]),
+            "frag1 data scatter"
+        );
+        let mut tuple_concat = Vec::new();
+        for i in 0..n {
+            tuple_concat.extend_from_slice(
+                &crate::pi::PiTuple::compute(&datas[i], lba0 + i as u64, 1).to_bytes(),
+            );
+        }
+        assert_eq!(
+            writes.get(&0x5000).map(|d| &d[..]),
+            Some(&tuple_concat[..]),
+            "N×8 tuple → MPTR"
+        );
+        assert_eq!(last_cqe_status(&cap), Some(0), "READ success");
+    }
+
+    /// **P-B READ C-1 Bit Bucket 跨 LBA 边界** — frag [2596 data→g0][1500 bucket][4096 data→g1]
+    /// 覆盖 dense 8192：g0 收 dense[0..2596]（LBA0 头）、bucket 丢 dense[2596..4096]（LBA0 尾
+    /// 1500B）、g1 收 dense[4096..8192]（LBA1 全）。断：verify 仍按 LBA dense 切（全 verify 通过）、
+    /// scatter 跳 bucket 区间、N 个 tuple 全到 MPTR（separate metadata 与 data bucket 无关，C-1）。
+    /// revert-verify：把 BitBucket 也当 data scatter → "bucket 区间不出现在 DmaWrite" 转红。
+    #[test]
+    fn read_bit_bucket_cross_lba() {
+        let lba0 = 0u64;
+        let n = 2usize;
+        let datas: Vec<Vec<u8>> = (0..n)
+            .map(|i| {
+                (0..DATA)
+                    .map(|b| ((b * 2 + i * 3 + 1) & 0xff) as u8)
+                    .collect()
+            })
+            .collect();
+        let mut c = pi_ns(true);
+        {
+            let ns = c.namespaces.get_mut(&1).unwrap();
+            for i in 0..n {
+                let mut blk = vec![0u8; BLOCK];
+                let t = crate::pi::PiTuple::compute(&datas[i], lba0 + i as u64, 1).to_bytes();
+                blk[0..8].copy_from_slice(&t);
+                blk[8..8 + DATA].copy_from_slice(&datas[i]);
+                ns.write_at(&blk, (lba0 + i as u64) * BLOCK as u64).unwrap();
+            }
+        }
+        let (g0, g1) = (0x4000u64, 0x6000u64);
+        let seg = seg_page(&[data_block(g0, 2596), bit_bucket(1500), data_block(g1, 4096)]);
+        let dense: Vec<u8> = datas.iter().flatten().copied().collect();
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let sqe = sgl_sqe(
+                0x02,
+                lba0,
+                n as u32,
+                0x73,
+                false,
+                0x5000,
+                0x2000,
+                seg.len() as u32,
+            );
+            assert!(c.dispatch_io(&mut ctx, 1, sqe, 0x73, 0, 1).is_none());
+        }
+        drive(&mut c, &mut cap, &seg, None, None);
+        let writes = collect_writes(&cap);
+        assert_eq!(
+            writes.get(&g0).map(|d| &d[..]),
+            Some(&dense[0..2596]),
+            "frag0 = dense 头（bucket 前）"
+        );
+        assert_eq!(
+            writes.get(&g1).map(|d| &d[..]),
+            Some(&dense[4096..8192]),
+            "frag2 = dense[4096..]（跳过 bucket 区间）"
+        );
+        let mut tuple_concat = Vec::new();
+        for i in 0..n {
+            tuple_concat.extend_from_slice(
+                &crate::pi::PiTuple::compute(&datas[i], lba0 + i as u64, 1).to_bytes(),
+            );
+        }
+        assert_eq!(
+            writes.get(&0x5000).map(|d| &d[..]),
+            Some(&tuple_concat[..]),
+            "C-1：N 个 tuple 全到 MPTR"
+        );
+        assert_eq!(last_cqe_status(&cap), Some(0), "bucket READ success");
+    }
+
+    /// **P-B READ stored-PI verify 失败** — 盘上 guard 损坏 → 同步 Media SCT=2、**不** scatter。
+    #[test]
+    fn read_stored_pi_verify_fail_no_scatter() {
+        let mut c = pi_ns(true);
+        let data: Vec<u8> = (0..DATA).map(|b| (b & 0xff) as u8).collect();
+        {
+            let ns = c.namespaces.get_mut(&1).unwrap();
+            let mut blk = vec![0u8; BLOCK];
+            let mut t = crate::pi::PiTuple::compute(&data, 0, 1).to_bytes();
+            t[0] ^= 0xff; // 损坏 stored guard
+            blk[0..8].copy_from_slice(&t);
+            blk[8..8 + DATA].copy_from_slice(&data);
+            ns.write_at(&blk, 0).unwrap();
+        }
+        let seg = seg_page(&[data_block(0x4000, 4096)]);
+        let mut cap = CaptureTransport::with_start_token(0x100);
+        let cqe = {
+            let mut ctx = DeviceCtx::new(&mut cap);
+            let sqe = sgl_sqe(0x02, 0, 1, 0x74, false, 0x5000, 0x2000, seg.len() as u32);
+            c.dispatch_io(&mut ctx, 1, sqe, 0x74, 0, 1)
+        };
+        // verify 在 dispatch 同步完成（读盘即 verify）→ 直接返 Media 错误 CQE，不入 SglOp。
+        let cqe = cqe.expect("stored-PI 失败应同步返错误 CQE");
+        assert_eq!(
+            cqe_status(&cqe),
+            crate::cmd::sc::status(0x82, crate::cmd::sc::SCT_MEDIA_DATA_INTEGRITY),
+            "stored guard 错 → Media GUARD (0x0282)"
+        );
+        assert!(c.sgl_ops.is_empty(), "verify 失败不建 SglOp");
+        let writes = collect_writes(&cap);
+        assert!(!writes.contains_key(&0x4000), "verify 失败不 scatter data");
+    }
+}
+
 // ════════════════════════ Wave 3：proptest 属性测试 ════════════════════════
 //
 // 对纯/近纯函数喂随机输入 + 断言**不变量**（而非具体值），找 example 测试列不全

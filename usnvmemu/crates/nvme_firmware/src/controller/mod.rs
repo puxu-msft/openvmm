@@ -397,6 +397,14 @@ pub(super) enum PendingOp {
         op_id: u64,
         frag_idx: u32,
     },
+    /// **SGL×PI P-B** — SGL separate-meta PI 的 MPTR PI tuple 子-DMA 完成（**独立于**
+    /// `NvmSglData`，故 **不计入** `SglOp.transfers_total = frags.len()`，避免 frag 越界/
+    /// 错位，H-3）。WRITE：MPTR DMA-read 到达 → 填 `SglOp.pi` 的 `Separate.meta`；READ：
+    /// MPTR DMA-write 完成 → 清 `meta_pending`。与 data 平面 `transfers_done==transfers_total`
+    /// 双门控满足才 finalize（两完成点各查合取，镜像 PRP 的 `Nvm{Read,Write}PrpListSepMeta`）。
+    NvmSglSepMeta {
+        op_id: u64,
+    },
     /// **Phase H3** — NVM Compare：DMA-read host buffer 完成后与 backing
     /// LBA 对比。`lba/num_blocks` 用于 file seek+read；对比失败返
     /// COMPARE_FAILURE (SC 0x85, SCT=0x02 Media/Data Integrity)。
@@ -729,6 +737,60 @@ pub(super) enum PiLayout {
     },
 }
 
+// **SGL×PI P-B（reviewer M1，§32 anti-drift）** — separate-meta 双门控状态机的**单一真相
+// 源**：直接操作 `Option<PiFinalize>`，PRP 路径（`PrpListOp`）与 SGL 路径（`SglOp`）的同名
+// 访问器都委托到这里，杜绝两份拷贝漂移（一处改门控语义、另一处忘）。
+/// 是否 separate-meta PI 路径（`None`/inline → false）。
+pub(super) fn pi_is_separate(pi: &Option<PiFinalize>) -> bool {
+    matches!(
+        pi.as_ref().map(|p| &p.layout),
+        Some(PiLayout::Separate { .. })
+    )
+}
+/// separate-meta 的 MPTR 子任务是否已完成（非 separate → true，不门控）。
+pub(super) fn pi_meta_done(pi: &Option<PiFinalize>) -> bool {
+    match pi.as_ref().map(|p| &p.layout) {
+        Some(PiLayout::Separate { meta_pending, .. }) => !meta_pending,
+        _ => true,
+    }
+}
+/// separate-meta 的 meta buffer 是否已到（WRITE finalize 第二门控）。
+pub(super) fn pi_meta_ready(pi: &Option<PiFinalize>) -> bool {
+    matches!(
+        pi.as_ref().map(|p| &p.layout),
+        Some(PiLayout::Separate { meta: Some(_), .. })
+    )
+}
+/// WRITE：MPTR DMA-read 到达，填入 separate 的 meta（非 separate 则 no-op）。
+pub(super) fn pi_set_separate_meta(pi: &mut Option<PiFinalize>, data: Vec<u8>) {
+    if let Some(PiLayout::Separate { meta, .. }) = pi.as_mut().map(|p| &mut p.layout) {
+        *meta = Some(data);
+    }
+}
+/// READ scatter：取出 separate 的 meta 待写 MPTR，并置 `meta_pending=true`。
+/// 返回 `(mptr, meta)`；非 separate → `None`。
+pub(super) fn pi_take_separate_meta_for_scatter(
+    pi: &mut Option<PiFinalize>,
+) -> Option<(u64, Vec<u8>)> {
+    if let Some(PiLayout::Separate {
+        mptr,
+        meta,
+        meta_pending,
+    }) = pi.as_mut().map(|p| &mut p.layout)
+    {
+        *meta_pending = true;
+        Some((*mptr, meta.take().unwrap_or_default()))
+    } else {
+        None
+    }
+}
+/// READ：MPTR DMA-write 完成，清 `meta_pending`（非 separate 则 no-op）。
+pub(super) fn pi_clear_separate_meta_pending(pi: &mut Option<PiFinalize>) {
+    if let Some(PiLayout::Separate { meta_pending, .. }) = pi.as_mut().map(|p| &mut p.layout) {
+        *meta_pending = false;
+    }
+}
+
 impl PrpListOp {
     /// 是否 inline PI 路径。
     pub(super) fn is_inline_pi(&self) -> bool {
@@ -736,53 +798,28 @@ impl PrpListOp {
     }
     /// 是否 separate-meta PI 路径。
     pub(super) fn is_separate_pi(&self) -> bool {
-        matches!(
-            self.pi.as_ref().map(|p| &p.layout),
-            Some(PiLayout::Separate { .. })
-        )
+        pi_is_separate(&self.pi)
     }
     /// separate-meta 的 MPTR 子任务是否已完成（非 separate → true，不门控）。
     pub(super) fn meta_done(&self) -> bool {
-        match self.pi.as_ref().map(|p| &p.layout) {
-            Some(PiLayout::Separate { meta_pending, .. }) => !meta_pending,
-            _ => true,
-        }
+        pi_meta_done(&self.pi)
     }
     /// separate-meta 的 meta buffer 是否已到（WRITE finalize 第二门控）。
     pub(super) fn meta_ready(&self) -> bool {
-        matches!(
-            self.pi.as_ref().map(|p| &p.layout),
-            Some(PiLayout::Separate { meta: Some(_), .. })
-        )
+        pi_meta_ready(&self.pi)
     }
     /// WRITE：MPTR DMA-read 到达，填入 separate 的 meta（非 separate 则 no-op）。
     pub(super) fn set_separate_meta(&mut self, data: Vec<u8>) {
-        if let Some(PiLayout::Separate { meta, .. }) = self.pi.as_mut().map(|p| &mut p.layout) {
-            *meta = Some(data);
-        }
+        pi_set_separate_meta(&mut self.pi, data);
     }
     /// READ scatter：取出 separate 的 meta 待写 MPTR，并置 `meta_pending=true`。
     /// 返回 `(mptr, meta)`；非 separate → `None`。
     pub(super) fn take_separate_meta_for_scatter(&mut self) -> Option<(u64, Vec<u8>)> {
-        if let Some(PiLayout::Separate {
-            mptr,
-            meta,
-            meta_pending,
-        }) = self.pi.as_mut().map(|p| &mut p.layout)
-        {
-            *meta_pending = true;
-            Some((*mptr, meta.take().unwrap_or_default()))
-        } else {
-            None
-        }
+        pi_take_separate_meta_for_scatter(&mut self.pi)
     }
     /// READ：MPTR DMA-write 完成，清 `meta_pending`（非 separate 则 no-op）。
     pub(super) fn clear_separate_meta_pending(&mut self) {
-        if let Some(PiLayout::Separate { meta_pending, .. }) =
-            self.pi.as_mut().map(|p| &mut p.layout)
-        {
-            *meta_pending = false;
-        }
+        pi_clear_separate_meta_pending(&mut self.pi);
     }
 }
 
@@ -879,6 +916,61 @@ pub(super) struct SglOp {
     pub(super) transfers_done: u32,
     /// TRANSFER 阶段需完成的数据 fragment DMA 总数（walk 完成后 set）。
     pub(super) transfers_total: u32,
+    /// **SGL×PI P-B** — separate-meta PI finalize 描述符（`None` = plain，走原 finish
+    /// 路径）。复用 `PiFinalize` 的 PI 几何 + `PiLayout::Separate{mptr,meta,meta_pending}`
+    /// 双门控状态（与 PRP 路径同一套，§32 anti-drift）。`data` 平面恒 dense 纯 data
+    /// （`num_blocks×data_bytes`）；metadata 经 MPTR 独立子-DMA（不计入 `transfers_total`）。
+    pub(super) pi: Option<PiFinalize>,
+    /// **SGL×PI P-B** — PRACT（`PiFinalize` 不含此轴；helper 的 `PiGeom.pract` 从此取）。
+    /// PRACT=1 = controller 自算/strip tuple；PRACT=0 = verify host tuple。
+    pub(super) pract: bool,
+}
+
+impl SglOp {
+    /// 是否 separate-meta PI 路径（`None`/plain → false）。委托共享真相源（M1）。
+    pub(super) fn is_separate_pi(&self) -> bool {
+        pi_is_separate(&self.pi)
+    }
+    /// data 平面是否全部传输完成（walk 已 set `transfers_total`>0 才成立——防 MPTR 先到
+    /// 时 `0>=0` 误判 data done；PI 路径 expected>0 故 frags 恒非空、transfers_total>0）。
+    /// SGL 专属（PRP 路径用 `transfers_done` 计数不同），不在共享真相源内。
+    pub(super) fn data_done(&self) -> bool {
+        self.transfers_total > 0 && self.transfers_done >= self.transfers_total
+    }
+    /// WRITE：MPTR DMA-read 到达，填 separate 的 meta（非 separate 则 no-op）。
+    pub(super) fn set_separate_meta(&mut self, data: Vec<u8>) {
+        pi_set_separate_meta(&mut self.pi, data);
+    }
+    /// WRITE finalize 第二门控：separate 的 meta buffer 是否已到。
+    pub(super) fn meta_ready(&self) -> bool {
+        pi_meta_ready(&self.pi)
+    }
+    /// READ scatter：取出 separate 的 meta 待写 MPTR，并置 `meta_pending=true`。
+    /// 返回 `(mptr, meta)`；非 separate → `None`。
+    pub(super) fn take_separate_meta_for_scatter(&mut self) -> Option<(u64, Vec<u8>)> {
+        pi_take_separate_meta_for_scatter(&mut self.pi)
+    }
+    /// READ：MPTR DMA-write 完成，清 `meta_pending`（非 separate 则 no-op）。
+    pub(super) fn clear_separate_meta_pending(&mut self) {
+        pi_clear_separate_meta_pending(&mut self.pi);
+    }
+    /// READ finalize 第二门控：MPTR DMA-write 是否已完成（`meta_pending==false`）。
+    pub(super) fn meta_done(&self) -> bool {
+        pi_meta_done(&self.pi)
+    }
+}
+
+/// **SGL×PI P-B** — `dispatch_sgl_{read,write}` 的 PI 参数（`None` = plain 路径）。
+/// separate-meta：host SGL 携纯 data（`data_bytes`/块），metadata 经 `mptr` 独立子-DMA
+/// （PRACT=0）；PRACT=1 时 controller 自算/strip tuple、无 MPTR（`mptr` 被忽略）。
+pub(super) struct SglPiArgs {
+    pub(super) mptr: u64,
+    pub(super) pi_type: u8,
+    pub(super) pi_first: bool,
+    pub(super) data_bytes: u32,
+    pub(super) block_bytes: u32,
+    pub(super) prchk: crate::pi::PrChk,
+    pub(super) pract: bool,
 }
 
 /// **Phase R2** — 单个 SGL 数据 fragment 的传输计划（walk 阶段构建）。

@@ -516,6 +516,7 @@ impl NvmeController {
         nlb: u32,
         sector_bytes: u64,
         phase: u8,
+        pi: Option<crate::controller::SglPiArgs>,
     ) -> Option<Cqe> {
         let bytes = nlb as u64 * sector_bytes;
         // 用真实扇区字节复查 MDTS（与 plain READ 一致）。
@@ -536,27 +537,97 @@ impl NvmeController {
         {
             return Some(cqe);
         }
-        // 解析 embedded SGL1 → 必须 Last Segment（R2a 单段）。
+        // 解析 embedded SGL1（Last Segment 单段 / Segment chain 首段）。先解析以对畸形
+        // SGL1 快速失败，再读 backing（PI 路径含 verify）。`is_last` 透传 NvmSglFetch。
         let (seg_addr, seg_len, is_last) =
             match parse_sgl1_segment(&sqe.embedded_sgl_bytes(), self.cmb_window()) {
                 Ok(t) => t,
                 Err(sc_byte) => return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte)),
             };
-        // **R2b** — SGL1 既可是 Last Segment（单段）也可是 Segment（chain 首段）；
-        // `is_last` 透传给 NvmSglFetch 决定本段是否末段。
-        // 一次性把 backing 读到 data buffer（READ：先读盘再 scatter）。
-        let mut data = vec![0u8; bytes as usize];
-        let ns_mut = self.ns_mut(nsid).unwrap();
-        if let Err(e) = ns_mut.read_at(&mut data, slba * sector_bytes) {
-            tracing::warn!(error = %e, nsid, slba, nlb, "SGL READ backing 读失败");
-            return Some(Cqe::error(
-                cid,
-                sq_id,
-                sq_head,
-                phase,
-                sc::DATA_TRANSFER_ERROR,
-            ));
-        }
+        // 准备 scatter 源 `data`（dense 纯 data 流）+ PI finalize 描述符：
+        //   - plain：直接读 backing nlb×sector_bytes。
+        //   - **SGL×PI P-B separate**：读 backing nlb×block_bytes interleaved →
+        //     `pi_read_verify_split` verify-all stored PI（失败同步 Media SCT=2）→ dense data
+        //     平面入 `data`；PRACT=0 tuple concat 待写 MPTR（meta=Some），PRACT=1 strip
+        //     （丢 tuple concat、无 MPTR）。
+        let (data, pi_finalize, pract) = if let Some(pa) = pi {
+            let block_bytes = pa.block_bytes as usize;
+            let mut interleaved = vec![0u8; block_bytes * nlb as usize];
+            let ns_mut = self.ns_mut(nsid).unwrap();
+            if let Err(e) = ns_mut.read_at(&mut interleaved, slba * block_bytes as u64) {
+                tracing::warn!(error = %e, nsid, slba, nlb, "SGL separate-meta READ backing 读失败");
+                return Some(Cqe::error(
+                    cid,
+                    sq_id,
+                    sq_head,
+                    phase,
+                    sc::DATA_TRANSFER_ERROR,
+                ));
+            }
+            let geom = crate::controller::PiGeom {
+                pi_type: pa.pi_type,
+                pi_first: pa.pi_first,
+                data_bytes: pa.data_bytes,
+                block_bytes: pa.block_bytes,
+                prchk: pa.prchk,
+                pract: pa.pract,
+            };
+            let (data_plane, tuple_concat) =
+                match crate::controller::completion::pi_read_verify_split(
+                    &interleaved,
+                    &geom,
+                    slba,
+                    nlb as usize,
+                ) {
+                    Ok(parts) => parts,
+                    Err((other, lba_i)) => {
+                        let sc_byte = other.to_sc().unwrap_or(0x82);
+                        tracing::warn!(
+                            nsid,
+                            lba = lba_i,
+                            ?other,
+                            "SGL separate-meta READ: stored PI verify 失败"
+                        );
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::status(sc_byte, sc::SCT_MEDIA_DATA_INTEGRITY),
+                        ));
+                    }
+                };
+            let layout = crate::controller::PiLayout::Separate {
+                mptr: pa.mptr,
+                // PRACT=0：N×8 tuple concat 待 scatter 时写 MPTR；PRACT=1：strip 不回 host。
+                meta: if pa.pract { None } else { Some(tuple_concat) },
+                meta_pending: false,
+            };
+            let pf = crate::controller::PiFinalize {
+                pi_type: pa.pi_type,
+                pi_first: pa.pi_first,
+                data_bytes: pa.data_bytes,
+                block_bytes: pa.block_bytes,
+                prchk: pa.prchk,
+                layout,
+            };
+            (data_plane, Some(pf), pa.pract)
+        } else {
+            // 一次性把 backing 读到 data buffer（plain READ：先读盘再 scatter）。
+            let mut data = vec![0u8; bytes as usize];
+            let ns_mut = self.ns_mut(nsid).unwrap();
+            if let Err(e) = ns_mut.read_at(&mut data, slba * sector_bytes) {
+                tracing::warn!(error = %e, nsid, slba, nlb, "SGL READ backing 读失败");
+                return Some(Cqe::error(
+                    cid,
+                    sq_id,
+                    sq_head,
+                    phase,
+                    sc::DATA_TRANSFER_ERROR,
+                ));
+            }
+            (data, None, false)
+        };
         let op_id = self.alloc_op_id();
         self.sgl_ops.insert(
             op_id,
@@ -577,6 +648,8 @@ impl NvmeController {
                 walk_segments: 0,
                 transfers_done: 0,
                 transfers_total: 0,
+                pi: pi_finalize,
+                pract,
             },
         );
         let tok = self.guest_read(ctx, seg_addr, seg_len);
@@ -617,6 +690,7 @@ impl NvmeController {
         nlb: u32,
         sector_bytes: u64,
         phase: u8,
+        pi: Option<crate::controller::SglPiArgs>,
     ) -> Option<Cqe> {
         let bytes = nlb as u64 * sector_bytes;
         if bytes > MDTS_MAX_BYTES {
@@ -642,6 +716,28 @@ impl NvmeController {
                 Err(sc_byte) => return Some(Cqe::error(cid, sq_id, sq_head, phase, sc_byte)),
             };
         // **R2b** — SGL1 既可 Last Segment（单段）也可 Segment（chain 首段）。
+        // **SGL×PI P-B separate**：`data` gather buffer = nlb×data_bytes（host SGL 携纯 data，
+        // == sector_bytes 因 separate NS 的 1<<lbads==data_bytes）；PI tuple 经 MPTR 独立到达
+        // （PRACT=0）或 controller 自算（PRACT=1）。`pi` 描述符 + `pract` 进 SglOp 双门控。
+        let (pi_finalize, pract) = match &pi {
+            Some(pa) => {
+                let layout = crate::controller::PiLayout::Separate {
+                    mptr: pa.mptr,
+                    meta: None, // WRITE：PRACT=0 经 MPTR DMA-read 填；PRACT=1 不用（自算）。
+                    meta_pending: false,
+                };
+                let pf = crate::controller::PiFinalize {
+                    pi_type: pa.pi_type,
+                    pi_first: pa.pi_first,
+                    data_bytes: pa.data_bytes,
+                    block_bytes: pa.block_bytes,
+                    prchk: pa.prchk,
+                    layout,
+                };
+                (Some(pf), pa.pract)
+            }
+            None => (None, false),
+        };
         let op_id = self.alloc_op_id();
         self.sgl_ops.insert(
             op_id,
@@ -662,6 +758,8 @@ impl NvmeController {
                 walk_segments: 0,
                 transfers_done: 0,
                 transfers_total: 0,
+                pi: pi_finalize,
+                pract,
             },
         );
         let tok = self.guest_read(ctx, seg_addr, seg_len);
@@ -676,6 +774,25 @@ impl NvmeController {
                 op: PendingOp::NvmSglFetch { op_id, is_last },
             },
         );
+        // **SGL×PI P-B separate + PRACT=0**：host PI tuple 经 MPTR 一条独立子-DMA（N×8）
+        // DMA-read 到达 → NvmSglSepMeta（**不计入** transfers_total，H-3）。PRACT=1 时
+        // controller 自算 tuple、无此 DMA（finalize 只门控 data done）。
+        if let Some(pa) = &pi
+            && !pa.pract
+        {
+            let meta_tok = self.guest_read(ctx, pa.mptr, nlb * 8);
+            self.pending_ios.insert(
+                meta_tok,
+                PendingIo {
+                    sq_id,
+                    cid,
+                    sq_head,
+                    cq_id,
+                    nsid,
+                    op: PendingOp::NvmSglSepMeta { op_id },
+                },
+            );
+        }
         None
     }
 
@@ -823,6 +940,55 @@ impl NvmeController {
                         phase,
                         sc::INVALID_PROTECTION_INFO,
                     ));
+                }
+                // **SGL×PI P-B** — SGL data path on PI NS（separate-meta，PRACT 0/1）。SGL 用
+                // embedded SGL1 自有数据指针（非 prp1/prp2），必须在下方 PRP PI 块（`is_pi_path`）
+                // 之前截走——否则该块会以 prp1=0 误处理（PRP PI 块不识别 SGL）。inline-meta（P-C）
+                // 暂仍拒（spec 允许不支持即合法拒）。
+                if is_sgl && is_pi_path {
+                    if meta_inline_r {
+                        tracing::warn!(nsid, "SGL inline-meta PI READ 未实现（P-C）→ 暂拒");
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::INVALID_PROTECTION_INFO,
+                        ));
+                    }
+                    // L-2：PRACT=0 separate 需 host PI buffer MPTR（PRACT=1 controller 自验/strip 不需）。
+                    if !pract && sqe.mptr == 0 {
+                        tracing::warn!(
+                            nsid,
+                            "SGL separate-meta READ PRACT=0 需 MPTR（host PI buffer）"
+                        );
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                    }
+                    let pi_args = crate::controller::SglPiArgs {
+                        mptr: sqe.mptr,
+                        pi_type: ns.pi_type,
+                        pi_first: ns.pi_first,
+                        data_bytes: ns.data_bytes() as u32,
+                        block_bytes: ns.block_bytes() as u32,
+                        prchk: crate::pi::PrChk::from_cdw12(cdw12),
+                        pract,
+                    };
+                    // separate：host SGL 携纯 data，SGL "sector" = data_bytes（== 1<<lbads）。
+                    let pi_sector = ns.data_bytes() as u64;
+                    return self.dispatch_sgl_read(
+                        ctx,
+                        &sqe,
+                        sq_id,
+                        cid,
+                        sq_head,
+                        cq_id,
+                        nsid,
+                        slba,
+                        nlb,
+                        pi_sector,
+                        phase,
+                        Some(pi_args),
+                    );
                 }
                 if !pract && is_pi_path {
                     // **B6b-3/B6b-4（separate metadata，PRACT=0）** — separate NS：从 backing
@@ -1501,6 +1667,7 @@ impl NvmeController {
                         nlb,
                         sector_bytes,
                         phase,
+                        None,
                     );
                 }
                 if is_pi_path && nlb != 1 {
@@ -1980,6 +2147,53 @@ impl NvmeController {
                         phase,
                         sc::INVALID_PROTECTION_INFO,
                     ));
+                }
+                // **SGL×PI P-B** — SGL data path on PI NS（separate-meta，PRACT 0/1）。同 READ：
+                // SGL 用 embedded SGL1 自有数据指针，必须在下方 PRP PI 块（`is_pi_capable`）之前
+                // 截走。inline-meta（P-C）暂仍拒。
+                if is_sgl && is_pi_capable {
+                    if meta_inline {
+                        tracing::warn!(nsid, "SGL inline-meta PI WRITE 未实现（P-C）→ 暂拒");
+                        return Some(Cqe::error(
+                            cid,
+                            sq_id,
+                            sq_head,
+                            phase,
+                            sc::INVALID_PROTECTION_INFO,
+                        ));
+                    }
+                    // L-2：PRACT=0 separate 需 host PI buffer MPTR（PRACT=1 controller 自算不需）。
+                    if !pract && sqe.mptr == 0 {
+                        tracing::warn!(
+                            nsid,
+                            "SGL separate-meta WRITE PRACT=0 需 MPTR（host PI buffer）"
+                        );
+                        return Some(Cqe::error(cid, sq_id, sq_head, phase, sc::INVALID_FIELD));
+                    }
+                    let pi_args = crate::controller::SglPiArgs {
+                        mptr: sqe.mptr,
+                        pi_type: ns.pi_type,
+                        pi_first: ns.pi_first,
+                        data_bytes: ns.data_bytes() as u32,
+                        block_bytes: ns.block_bytes() as u32,
+                        prchk: crate::pi::PrChk::from_cdw12(cdw12),
+                        pract,
+                    };
+                    let pi_sector = ns.data_bytes() as u64;
+                    return self.dispatch_sgl_write(
+                        ctx,
+                        &sqe,
+                        sq_id,
+                        cid,
+                        sq_head,
+                        cq_id,
+                        nsid,
+                        slba,
+                        nlb,
+                        pi_sector,
+                        phase,
+                        Some(pi_args),
+                    );
                 }
                 if !pract && is_pi_capable {
                     // **B6b-2/B6b-4（separate metadata，PRACT=0）** — host 供 PI tuple via MPTR。
@@ -2503,6 +2717,7 @@ impl NvmeController {
                         nlb,
                         sector_bytes,
                         phase,
+                        None,
                     );
                 }
                 if !is_plain {

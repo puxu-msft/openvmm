@@ -807,12 +807,16 @@ impl NvmeController {
                             }
                         }
                     }
-                    PendingOp::NvmSglFetch { op_id, .. } | PendingOp::NvmSglData { op_id, .. } => {
-                        // **Phase R2** — SGL 多 fragment op：清 sibling pending +
-                        // 累积器，保证只 post 一次 error CQE（同 C1 修复语义）。
+                    PendingOp::NvmSglFetch { op_id, .. }
+                    | PendingOp::NvmSglData { op_id, .. }
+                    | PendingOp::NvmSglSepMeta { op_id } => {
+                        // **Phase R2 / SGL×PI P-B** — SGL 多 fragment op：清 sibling pending
+                        // （含 separate-meta 的 MPTR 子-DMA NvmSglSepMeta）+ 累积器，保证只 post
+                        // 一次 error CQE（同 C1 修复语义）。
                         self.pending_ios.retain(|_, q| match q.op {
                             PendingOp::NvmSglFetch { op_id: o, .. }
-                            | PendingOp::NvmSglData { op_id: o, .. } => o != op_id,
+                            | PendingOp::NvmSglData { op_id: o, .. }
+                            | PendingOp::NvmSglSepMeta { op_id: o } => o != op_id,
                             _ => true,
                         });
                         self.sgl_ops.remove(&op_id);
@@ -2969,8 +2973,31 @@ impl NvmeController {
                     if bad {
                         self.finish_sgl_error(ctx, op_id, sc::DATA_TRANSFER_ERROR);
                     } else if done_all {
-                        self.finish_sgl_done(ctx, op_id);
+                        // **SGL×PI P-B** — data 平面全到齐。separate-meta PI 走双门控
+                        // （还需 meta 门：WRITE MPTR tuple 已到 / READ MPTR 已写出，PRACT=1
+                        // 自算/strip 无需）；plain 直接 finalize（保持原行为）。
+                        if self.sgl_ops.get(&op_id).is_some_and(|o| o.is_separate_pi()) {
+                            self.try_finish_sgl_pi(ctx, op_id);
+                        } else {
+                            self.finish_sgl_done(ctx, op_id);
+                        }
                     }
+                }
+                PendingOp::NvmSglSepMeta { op_id } => {
+                    // **SGL×PI P-B** — separate-meta 的 MPTR PI tuple 子-DMA 完成（不计入
+                    // transfers_total，H-3）。WRITE：DMA-read 回来的 N×8 host tuple 填入
+                    // `Separate.meta`；READ：MPTR DMA-write 完成 → 清 `meta_pending`。两者完成后
+                    // 与 data 平面双门控合取，满足即 finalize。
+                    if let Some(op) = self.sgl_ops.get_mut(&op_id) {
+                        if op.is_write {
+                            op.set_separate_meta(data);
+                        } else {
+                            op.clear_separate_meta_pending();
+                        }
+                    } else {
+                        tracing::warn!(op_id, "NvmSglSepMeta unknown op_id");
+                    }
+                    self.try_finish_sgl_pi(ctx, op_id);
                 }
             }
             return;
@@ -3047,17 +3074,92 @@ impl NvmeController {
                 },
             );
         }
+        // **SGL×PI P-B READ separate（PRACT=0）** — data scatter 已 dispatch；额外一条 MPTR
+        // DMA-write 把 N×8 stored-PI tuple concat 写到 host PI buffer（置 `meta_pending=true`，
+        // 与 data scatter 双门控）。PRACT=1 strip 无 host tuple → 不写 MPTR（meta 门由 pract
+        // 直接放行）。MPTR **不计入** transfers_total（H-3）。WRITE 的 MPTR 子-DMA 是 read，
+        // 已在 dispatch_sgl_write 入队，此处不重复。
+        if !is_write {
+            let mptr_meta = {
+                let op = self.sgl_ops.get_mut(&op_id).unwrap();
+                if op.is_separate_pi() && !op.pract {
+                    op.take_separate_meta_for_scatter()
+                } else {
+                    None
+                }
+            };
+            if let Some((mptr, meta)) = mptr_meta {
+                let tok = self.guest_write(ctx, mptr, meta);
+                self.pending_ios.insert(
+                    tok,
+                    PendingIo {
+                        sq_id,
+                        cid,
+                        sq_head,
+                        cq_id,
+                        nsid,
+                        op: PendingOp::NvmSglSepMeta { op_id },
+                    },
+                );
+            }
+        }
     }
 
     /// **Phase R2** — SGL op 全 fragment 传输完成 → 终结。
     /// WRITE：把 gather buffer 一次性写 backing 再 post CQE；READ：data 已
-    /// scatter 到 host，直接 post success CQE。
+    /// scatter 到 host，直接 post success CQE。**SGL×PI P-B**：separate-meta PI op 走
+    /// `pi` 分支（M-1），经共享 helper finalize，**绝不**落到下方 plain 路径。
     fn finish_sgl_done(&mut self, ctx: &mut DeviceCtx<'_>, op_id: u64) {
-        let Some(op) = self.sgl_ops.remove(&op_id) else {
+        let Some(mut op) = self.sgl_ops.remove(&op_id) else {
             return;
         };
         let cq = self.cqs.get(&op.cq_id);
         let phase = cq.map(|c| c.phase).unwrap_or(1);
+        // **SGL×PI P-B (M-1)** — separate-meta PI：经共享 PI helper finalize，调后**立即
+        // return**，绝不落到下方 plain 的 `ns.write_at(&op.data, op.lba*sector)`（op.data 是
+        // 纯 data 流、`sector_bytes` 双角色是陷阱）+ plain stat/advance（helper 内已做）。
+        if let Some(pi) = op.pi.take() {
+            let geom = crate::controller::PiGeom {
+                pi_type: pi.pi_type,
+                pi_first: pi.pi_first,
+                data_bytes: pi.data_bytes,
+                block_bytes: pi.block_bytes,
+                prchk: pi.prchk,
+                pract: op.pract,
+            };
+            let ids = crate::controller::PiCqeIds {
+                sq_id: op.sq_id,
+                cid: op.cid,
+                sq_head: op.sq_head,
+                cq_id: op.cq_id,
+                nsid: op.nsid,
+            };
+            if op.is_write {
+                // WRITE：纯 data 流 + host tuple（PRACT=0，经 MPTR 填入 Separate.meta）/ 自算
+                // （PRACT=1，meta=None）→ helper verify-or-compute + interleave store-all + CQE。
+                let sep_meta = match pi.layout {
+                    crate::controller::PiLayout::Separate { meta, .. } => meta,
+                    crate::controller::PiLayout::Inline => None,
+                };
+                self.pi_write_finalize_stream(
+                    ctx,
+                    op.data,
+                    sep_meta,
+                    &geom,
+                    op.lba,
+                    op.num_blocks as usize,
+                    ids,
+                );
+            } else {
+                // READ：data 已 scatter、tuple 已写 MPTR（PRACT=0）/ strip（PRACT=1）→ success
+                // + read stat（与 plain READ 完成路径对称）。
+                self.stat_host_reads += 1;
+                self.stat_lba_read += op.num_blocks as u64;
+                let cqe = Cqe::success(op.cid, op.sq_id, op.sq_head, phase);
+                self.post_cqe(ctx, op.cq_id, cqe);
+            }
+            return;
+        }
         if op.is_write {
             let sector = op.sector_bytes;
             let res = if let Some(ns) = self.namespaces.get_mut(&op.nsid) {
@@ -3101,9 +3203,9 @@ impl NvmeController {
     /// command"）。
     fn finish_sgl_error(&mut self, ctx: &mut DeviceCtx<'_>, op_id: u64, status: u16) {
         self.pending_ios.retain(|_, q| match q.op {
-            PendingOp::NvmSglFetch { op_id: o, .. } | PendingOp::NvmSglData { op_id: o, .. } => {
-                o != op_id
-            }
+            PendingOp::NvmSglFetch { op_id: o, .. }
+            | PendingOp::NvmSglData { op_id: o, .. }
+            | PendingOp::NvmSglSepMeta { op_id: o } => o != op_id,
             _ => true,
         });
         if let Some(op) = self.sgl_ops.remove(&op_id) {
@@ -3113,6 +3215,28 @@ impl NvmeController {
             self.push_error_log(op.sq_id, op.cid, sc::sf_of(status), op.lba, op.nsid);
             let cqe = Cqe::error(op.cid, op.sq_id, op.sq_head, phase, status);
             self.post_cqe(ctx, op.cq_id, cqe);
+        }
+    }
+
+    /// **SGL×PI P-B** — separate-meta PI 双门控终结。任一完成点（末 data frag → `NvmSglData`
+    /// done_all / MPTR 子-DMA → `NvmSglSepMeta`）都调本函数查**合取**：data 平面全传输完成
+    /// （`data_done`）**且** meta 门满足（WRITE: host PI tuple 已到 `meta_ready` / PRACT=1
+    /// 自算无需；READ: MPTR tuple 已写出 `meta_done` / PRACT=1 strip 无需）才 finalize；
+    /// 不满足则静默等另一完成点。plain op（非 separate PI）不经本函数（走 `finish_sgl_done` 直调）。
+    fn try_finish_sgl_pi(&mut self, ctx: &mut DeviceCtx<'_>, op_id: u64) {
+        let ready = match self.sgl_ops.get(&op_id) {
+            Some(op) if op.is_separate_pi() => {
+                let meta_ok = if op.is_write {
+                    op.pract || op.meta_ready()
+                } else {
+                    op.pract || op.meta_done()
+                };
+                op.data_done() && meta_ok
+            }
+            _ => return,
+        };
+        if ready {
+            self.finish_sgl_done(ctx, op_id);
         }
     }
 }
