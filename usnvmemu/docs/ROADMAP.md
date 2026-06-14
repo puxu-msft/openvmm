@@ -173,7 +173,9 @@ standing ✅,故对每条 transport 此刻都**未满足**(vfio 独立性刚补�
    1.95)。**这是把上表任何"已写 oracle"变成"standing"的唯一开关**;没它,vfio/openhcl/firmware-core
    的独立 oracle 全在 CI 外裸奔。属 outward-facing CI 基建,需用户拍板(见会话末决策)。
 2. (已做)vfio 手搓独立 oracle `vfio_user_wire_e2e`(commit 8284c45d4)——独立性补齐,等步骤 1 转 standing。
-3. (opt-in)libvfio-user differential → Tier B `#[ignore]` + pinned job;Python wire harness 留 cadence。
+3. **✅ 已做**(opt-in)libvfio-user differential → Tier B 专属 opt-in/cadence job(`run_libvfio_differential.sh`
+   + `.github/workflows/usnvmemu-libvfio-differential.yml`,pinned libvfio-user `f633a2cb`,commit c1222232d;
+   真第三方 C 实现验协议前缀,revert-verified)。Python wire harness 留 cadence。
 
 **据律自暴缺口(⛔)**：~~vfio 已有档-3 live 欠档-2~~ **✅ 已补**(`vfio_user_guest_replay_e2e`,真 kernel
 前缀 frozen-vector,commit 1695bbce3:抓包 `_capture.py` → 机械抽取 `extract_wire_prefix.py` → replay
