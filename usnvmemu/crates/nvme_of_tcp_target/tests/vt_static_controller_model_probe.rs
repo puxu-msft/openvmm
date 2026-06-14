@@ -22,16 +22,18 @@
 //! 观测 target 回的 CQE.result DW0（= 实际分配的 CNTLID）与 SC，坐实当前
 //! 实现对 static 请求是 **honor / 静默 coerce / reject** 哪一种。
 //!
-//! # 实测结论（见各 test 的断言 + 注释）
+//! # 实测结论（2026-06-14 修复后）
 //!
-//! `handle_connect_async`（`src/async_session.rs`）解析 `ConnectData` 但
-//! **从不读 `cd.cntlid`**，无条件返回 `TEACHING_CNTLID = 1`
-//! （`src/fabric.rs`）。Discovery Log 侧亦写死 `cntlid = 0xFFFF`
-//! （`nvme_firmware/src/controller/discovery_log.rs`）。即 usnvmemu 是
-//! **dynamic-controller-model-only**：对 static 的具体-CNTLID 请求**静默
-//! coerce 成 1**，既不 honor 也不按 spec reject。本 probe 把这个行为锁成
-//! regression gate，供未来修复（让 Connect 真读 cd.cntlid 并按 spec 校验）
-//! 时翻红。
+//! `handle_connect_async`（`src/async_session.rs`）+ sync `handle_connect`
+//! （`src/session.rs`）现经 `dispatch_plan::decide_connect_cntlid` 校验 host 请求的
+//! CNTLID（spec § 3.3）：dynamic(`0xFFFF`)/static-any(`0xFFFE`)/具体匹配(==our) →
+//! accept 分配 `TEACHING_CNTLID=1`；指定一个我们没有的具体 cntlid（如 5）→ **reject
+//! SC=0x82 Connect Invalid Parameters + CQE result DW0 = IPO/IATTR**（指向 Connect data
+//! 内 cntlid 字段，`fabric::CONNECT_CNTLID_INVALID_RESULT_DW0` = `0x0001_0004`）。
+//!
+//! 修复前（probe 初版坐实）是**静默 coerce 成 1**（host 要 5、拿到 1、无错误）。本 probe
+//! 现把 spec-conformant 行为锁成 regression gate。`cntlid=0`（legacy fixture）按 lenient
+//! 接受（见 `decide_connect_cntlid` doc）。
 
 #![allow(missing_docs)]
 
@@ -114,10 +116,11 @@ fn cqe_sc(pdu: &Pdu) -> u8 {
     ((status >> 1) & 0xFF) as u8
 }
 
-/// CapsuleResp PSH byte 0..4 = CQE result DW0 = target 实际分配的 CNTLID（低 16 位）。
-fn cqe_assigned_cntlid(pdu: &Pdu) -> u16 {
+/// CapsuleResp PSH byte 0..4 = CQE result DW0。成功时低 16 位 = 分配的 CNTLID；
+/// Connect 失败时 = IPO(bits0..15) | IATTR(bits16..23)。
+fn cqe_result_dw0(pdu: &Pdu) -> u32 {
     assert_eq!(pdu.header.pdu_type, pdu_type::RSP);
-    u16::from_le_bytes([pdu.psh[0], pdu.psh[1]])
+    u32::from_le_bytes([pdu.psh[0], pdu.psh[1], pdu.psh[2], pdu.psh[3]])
 }
 
 async fn send_icreq(c: &mut TcpStream) {
@@ -164,8 +167,8 @@ async fn spawn_listener(
     (addr, shutdown_tx)
 }
 
-/// 单条 admin Connect，返回 (SC, 分配的 CNTLID)。
-async fn connect_once(addr: std::net::SocketAddr, requested_cntlid: u16) -> (u8, u16) {
+/// 单条 admin Connect，返回 (SC, result DW0)。
+async fn connect_once(addr: std::net::SocketAddr, requested_cntlid: u16) -> (u8, u32) {
     let mut s = TcpStream::connect(addr).await.unwrap();
     send_icreq(&mut s).await;
     let connect = build_connect_with_cntlid(
@@ -180,7 +183,7 @@ async fn connect_once(addr: std::net::SocketAddr, requested_cntlid: u16) -> (u8,
         .await
         .unwrap();
     let r = read_pdu_async(&mut s).await.unwrap();
-    (cqe_sc(&r), cqe_assigned_cntlid(&r))
+    (cqe_sc(&r), cqe_result_dw0(&r))
 }
 
 /// **baseline（dynamic）** — host 发 0xFFFF（Linux nvme-cli 真实行为）。
@@ -189,48 +192,55 @@ async fn connect_once(addr: std::net::SocketAddr, requested_cntlid: u16) -> (u8,
 async fn dynamic_request_0xffff_assigns_cntlid_1() {
     let (shared, _backing) = make_shared();
     let (addr, shutdown_tx) = spawn_listener(Arc::clone(&shared)).await;
-    let (sc, assigned) = connect_once(addr, 0xFFFF).await;
+    let (sc, dw0) = connect_once(addr, 0xFFFF).await;
     assert_eq!(sc, 0, "dynamic Connect (0xFFFF) 应 SC=0");
-    assert_eq!(assigned, 1, "dynamic 模型分配 TEACHING_CNTLID=1");
+    assert_eq!(dw0, 1, "dynamic 模型分配 TEACHING_CNTLID=1 (result DW0)");
     let _ = shutdown_tx.send(true);
 }
 
-/// **decisive probe（static specific）** — host 请求具体 CNTLID=5
-/// （static controller model，Windows `connect -ci 5` 类行为）。
+/// **decisive probe（static specific mismatch）** — host 请求具体 CNTLID=5
+/// （static controller model，Windows `connect -ci 5` 类行为），但我们只有 controller 1。
 ///
-/// **实测锁定的当前行为 = 静默 coerce**：target 无视请求值，仍返 SC=0 +
-/// 分配 CNTLID=1。即 host 要 5、拿到 1，且**没有错误指示**。
-///
-/// spec § 3.3：static controller model 下，若请求的具体 CNTLID 不对应一个
-/// 可用 controller，应返 fabric status「Connect Invalid Parameters」(SC=0x82)
-/// 而非静默换一个。本断言把「静默 coerce」锁成 regression gate——未来修复
-/// （Connect 真读 cd.cntlid 并校验）时本测试应翻红并被更新。
+/// **spec-conformant 行为（2026-06-14 修复）**：reject SC=0x82 Connect Invalid Parameters
+/// + CQE result DW0 = IPO/IATTR 指向 Connect data 内 cntlid 字段（IPO=dword 4，IATTR data
+/// bit → `0x0001_0004`）。修复前是静默 coerce 成 1（host 要 5、拿到 1、无错误）。
 #[tokio::test(flavor = "multi_thread")]
-async fn static_specific_request_is_silently_coerced_to_1() {
+async fn static_specific_mismatch_rejected_invalid_param_with_ipo() {
     let (shared, _backing) = make_shared();
     let (addr, shutdown_tx) = spawn_listener(Arc::clone(&shared)).await;
-    let (sc, assigned) = connect_once(addr, 5).await;
-    // 当前实现：handle_connect_async 不读 cd.cntlid → 静默返 1。
+    let (sc, dw0) = connect_once(addr, 5).await;
     assert_eq!(
-        sc, 0,
-        "当前实现对 static 具体-CNTLID 请求**不 reject**（既不 honor 也不按 spec 拒）"
+        sc, 0x82,
+        "static 具体-CNTLID mismatch 必须 reject SC=0x82 Connect Invalid Parameters"
     );
     assert_eq!(
-        assigned, 1,
-        "当前实现把 host 请求的 CNTLID=5 静默 coerce 成 TEACHING_CNTLID=1"
+        dw0, 0x0001_0004,
+        "CQE result DW0 = IPO(=dword 4，cntlid@data offset 16) | IATTR(data bit)"
     );
+    let _ = shutdown_tx.send(true);
+}
+
+/// **static specific match** — host 请求具体 CNTLID=1（== 我们的 controller，Windows
+/// static host 经 discovery 学到后的正常路径）→ accept，分配 1。
+#[tokio::test(flavor = "multi_thread")]
+async fn static_specific_match_request_1_accepts() {
+    let (shared, _backing) = make_shared();
+    let (addr, shutdown_tx) = spawn_listener(Arc::clone(&shared)).await;
+    let (sc, dw0) = connect_once(addr, 1).await;
+    assert_eq!(sc, 0, "static 具体匹配 (== our cntlid) Connect SC=0");
+    assert_eq!(dw0, 1, "分配 CNTLID=1");
     let _ = shutdown_tx.send(true);
 }
 
 /// **static-any** — host 发 0xFFFE（static 模型「任一 static controller」）。
-/// 当前实现同样静默返 1。0xFFFE 语义下返 1 尚算可接受（任分一个 static），
-/// 但与具体值请求走的是同一条「不读 cd.cntlid」代码路径，一并锁定。
+/// 当前实现同样 accept 返 1。0xFFFE 语义下返 1 可接受（任分一个 static），与具体值
+/// 请求走同一 `decide_connect_cntlid` 决策核，一并锁定。
 #[tokio::test(flavor = "multi_thread")]
 async fn static_any_request_0xfffe_assigns_cntlid_1() {
     let (shared, _backing) = make_shared();
     let (addr, shutdown_tx) = spawn_listener(Arc::clone(&shared)).await;
-    let (sc, assigned) = connect_once(addr, 0xFFFE).await;
+    let (sc, dw0) = connect_once(addr, 0xFFFE).await;
     assert_eq!(sc, 0, "static-any (0xFFFE) Connect SC=0");
-    assert_eq!(assigned, 1, "static-any 分配 CNTLID=1");
+    assert_eq!(dw0, 1, "static-any 分配 CNTLID=1");
     let _ = shutdown_tx.send(true);
 }

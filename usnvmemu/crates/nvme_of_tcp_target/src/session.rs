@@ -1040,6 +1040,27 @@ impl V2Session {
             }
         }
 
+        // **static controller model（2026-06-14）** — 校验 host 请求的 CNTLID（spec
+        // § 3.3）。dual-track 与 async `handle_connect_async` 共用 dispatch_plan 决策核。
+        // dynamic(0xFFFF)/static-any(0xFFFE)/具体匹配 都 accept；指定不存在的具体 cntlid
+        // → reject SC=0x82 + IPO/IATTR。修「静默 coerce 成 1」缺口。
+        let requested_cntlid = cd.cntlid;
+        if matches!(
+            crate::dispatch_plan::decide_connect_cntlid(requested_cntlid, self.cntlid),
+            crate::dispatch_plan::ConnectCntlidDecision::RejectInvalidParam
+        ) {
+            tracing::warn!(
+                requested_cntlid,
+                our_cntlid = self.cntlid,
+                "static controller model Connect 拒：请求的具体 CNTLID 不存在"
+            );
+            return self.send_capsule_resp_err_with_result(
+                cid,
+                fabric_sc::CONNECT_INVALID_PARAM,
+                fabric::CONNECT_CNTLID_INVALID_RESULT_DW0,
+            );
+        }
+
         if qid == 0 {
             if self.admin_connected {
                 return self.send_capsule_resp_err(cid, fabric_sc::CONNECT_INVALID_PARAM);
@@ -1200,12 +1221,27 @@ impl V2Session {
     }
 
     fn send_capsule_resp_err(&mut self, cid: u16, sc: u8) -> anyhow::Result<()> {
+        self.send_capsule_resp_err_with_result(cid, sc, 0)
+    }
+
+    /// 同 [`send_capsule_resp_err`] 但填 CQE result DW0（Connect 失败的 IPO/IATTR，
+    /// 见 `fabric::CONNECT_CNTLID_INVALID_RESULT_DW0`）。
+    fn send_capsule_resp_err_with_result(
+        &mut self,
+        cid: u16,
+        sc: u8,
+        result_dw0: u32,
+    ) -> anyhow::Result<()> {
         let mut cqe = [0u8; 16];
+        cqe[0..4].copy_from_slice(&result_dw0.to_le_bytes());
         cqe[12..14].copy_from_slice(&cid.to_le_bytes());
-        // **review M3** — 对 fabric SC (0x80-0x9F)：SCT=0x07 (Command Specific)；
-        // 其它 generic SC 用 SCT=0。Linux nvme-tcp host 接受两种，但 spec 严格。
+        // **SCT 修复（2026-06-14）** — NVMe-oF fabrics 命令状态码（0x80..=0x9F，含
+        // Connect 0x80-0x84）属 **SCT=0x01 Command Specific Status**，不是 0x07 Vendor
+        // Specific（原注释把 0x07 误标 "Command Specific" 是既存 bug）。IPO/IATTR 的
+        // Dword0 语义只在 SCT=0x01 下定义；用 0x07 会让 conformant host 把 0x82 当厂商
+        // 私有错误。Linux 真互通不回归（成功路径 SC=0；错误路径任何非零 status 都 fail）。
         let sct: u8 = if (0x80..=0x9F).contains(&sc) {
-            0x07
+            0x01
         } else {
             0x00
         };
@@ -1839,8 +1875,10 @@ mod tests {
         let sc = ((status >> 1) & 0xff) as u8;
         let sct = ((status >> 9) & 0x07) as u8;
         assert_eq!(sc, fabric_sc::CONNECT_INVALID_PARAM);
-        // **review M3** — fabric SC 0x80-0x9F 必须 SCT=0x07
-        assert_eq!(sct, 0x07);
+        // **SCT 修复（2026-06-14）** — fabric Connect SC（0x82）必须 SCT=0x01
+        // (Command Specific Status)，非 0x07 (Vendor Specific)。原断言锁死错值是
+        // self-consistent 陷阱（production+test 互洽两边都错）。
+        assert_eq!(sct, 0x01);
         h.join().unwrap().unwrap();
     }
 

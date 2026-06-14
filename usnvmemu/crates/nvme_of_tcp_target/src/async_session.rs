@@ -704,6 +704,29 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
             }
         }
 
+        // **static controller model（2026-06-14）** — 校验 host 请求的 CNTLID
+        // （spec § 3.3）。单 controller target：dynamic(0xFFFF)/static-any(0xFFFE)/具体
+        // 匹配(==our) 都 accept → 分配 self.cntlid；指定一个我们没有的具体 cntlid →
+        // reject SC=0x82 + IPO/IATTR 指向 data 内 cntlid 字段。修「静默 coerce 成 1」缺口。
+        let requested_cntlid = cd.cntlid;
+        if matches!(
+            crate::dispatch_plan::decide_connect_cntlid(requested_cntlid, self.cntlid),
+            crate::dispatch_plan::ConnectCntlidDecision::RejectInvalidParam
+        ) {
+            tracing::warn!(
+                requested_cntlid,
+                our_cntlid = self.cntlid,
+                "static controller model Connect 拒：请求的具体 CNTLID 不存在"
+            );
+            return self
+                .send_capsule_resp_err_with_result_async(
+                    cid,
+                    fabric_sc::CONNECT_INVALID_PARAM,
+                    fabric::CONNECT_CNTLID_INVALID_RESULT_DW0,
+                )
+                .await;
+        }
+
         if qid == 0 {
             if self.admin_connected {
                 return self
@@ -918,10 +941,27 @@ impl<S: AsyncSessionStream> AsyncSession<S> {
     }
 
     async fn send_capsule_resp_err_async(&mut self, cid: u16, sc: u8) -> anyhow::Result<()> {
+        self.send_capsule_resp_err_with_result_async(cid, sc, 0).await
+    }
+
+    /// 同 [`send_capsule_resp_err_async`] 但填 CQE result DW0（用于 Connect 失败
+    /// 的 IPO/IATTR，见 `fabric::CONNECT_CNTLID_INVALID_RESULT_DW0`）。
+    async fn send_capsule_resp_err_with_result_async(
+        &mut self,
+        cid: u16,
+        sc: u8,
+        result_dw0: u32,
+    ) -> anyhow::Result<()> {
         let mut cqe = [0u8; 16];
+        cqe[0..4].copy_from_slice(&result_dw0.to_le_bytes());
         cqe[12..14].copy_from_slice(&cid.to_le_bytes());
+        // **SCT 修复（2026-06-14）** — NVMe-oF fabrics 命令状态码（0x80..=0x9F，
+        // 含 Connect 0x80-0x84）属 **SCT=0x01 Command Specific Status**，不是
+        // 0x07 Vendor Specific（原值是既存 bug：注释把 0x07 误标 Command Specific）。
+        // IPO/IATTR 的 Dword0 语义只在 SCT=0x01 下定义；用 0x07 会让 conformant host
+        // 把 0x82 当厂商私有错误，IPO/IATTR 失效。
         let sct: u8 = if (0x80..=0x9F).contains(&sc) {
-            0x07
+            0x01
         } else {
             0x00
         };

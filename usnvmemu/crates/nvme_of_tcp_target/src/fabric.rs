@@ -266,6 +266,23 @@ pub mod fabric_sc {
     pub const AUTH_REQUIRED: u8 = 0x91;
 }
 
+// **承重前提锚定** — IATTR.bit0=1（data）⟹ 下方 IPO 相对 Connect data payload 起点；
+// 这里依赖 `ConnectData` struct 首字节（`hostid`）即 data payload byte 0，故 `offset_of!`
+// 即 data-relative 偏移。const-assert 锚死该前提，防字段重排破坏语义。
+const _: () = assert!(core::mem::offset_of!(ConnectData, hostid) == 0);
+
+/// **static controller model（2026-06-14）** — Connect 因非法 CNTLID 被拒时填入
+/// CapsuleResp CQE result DW0 的值（spec § 3.3 Connect response / wire-reference
+/// 「失败：DW0 bits0..15 = IPO（dword 单位），bits16..23 = IATTR（bit0：0=command
+/// 1=data）」）。
+///
+/// CNTLID 在 Connect **data** payload offset 16（dword 4）；IATTR.bit0=1（在 data）→
+/// `(4) | (1<<16)` = `0x0001_0004`。仅在 SCT=0x01（Command Specific Status）下有意义
+/// ——见 [`crate::async_session`] / [`crate::session`] 的 err helper（fabrics SC 用 SCT=0x01）。
+pub const CONNECT_CNTLID_INVALID_RESULT_DW0: u32 =
+    (core::mem::offset_of!(ConnectData, cntlid) as u32 / 4) // IPO（dword）= 16/4 = 4
+        | (1u32 << 16); // IATTR bit0 = data → 0x0001_0004
+
 #[cfg(test)]
 mod tests {
     use super::*;

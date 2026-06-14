@@ -267,6 +267,41 @@ pub fn prp2_sentinel_for_nlb(nlb_real: u32, lbads: u8) -> u64 {
     }
 }
 
+/// [`decide_connect_cntlid`] 的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectCntlidDecision {
+    /// 请求可解析到我们的 controller → 分配此 cntlid（填 CQE result DW0）。
+    Accept(u16),
+    /// static 模型指定了一个我们没有的具体 cntlid → 回 SC=0x82 Connect Invalid
+    /// Parameters + IPO/IATTR 指向 cntlid 字段
+    /// （[`crate::fabric::CONNECT_CNTLID_INVALID_RESULT_DW0`]）。
+    RejectInvalidParam,
+}
+
+/// **static controller model（2026-06-14）** — host 在 Connect data 请求的 CNTLID
+/// 该解析到哪个 controller。spec § 3.3 / wire-reference「Connect data」：
+/// `0xFFFF`=dynamic、`0xFFFE`=static-any、其它=static 指定具体 controller id。
+///
+/// 单-controller teaching target（cntlid = [`crate::fabric::TEACHING_CNTLID`]）：凡能
+/// 解析到我们这唯一 controller 的请求都 `Accept`，只 reject「指定一个我们没有的具体
+/// cntlid」（如 host 送 5 而我们只有 1）——这正是修掉「静默 coerce 成 1」的 conformance
+/// 点。permissive：conformant host 永远按 discovery 广告的 model 发请求，不送 mismatch。
+///
+/// **`requested == 0` 的 lenience（刻意，文档化）**：真实 host admin connect 永不送 0
+/// （Linux nvme-tcp 送 `0xFFFF` dynamic；Windows static 送 discovery 学到的具体值或
+/// `0xFFFE`）；0 仅出现在 cntlid-awareness 之前的 legacy 测试 fixture
+/// （`ConnectData::default()`）。把 0 视作「未指定 → accept」对任何 conformant host
+/// 路径零影响。spec-strict reject-0（+ IO-connect 拒哨值）留 `V-spec-strict-mode`。
+pub fn decide_connect_cntlid(requested: u16, our_cntlid: u16) -> ConnectCntlidDecision {
+    match requested {
+        0xFFFF => ConnectCntlidDecision::Accept(our_cntlid), // dynamic
+        0xFFFE => ConnectCntlidDecision::Accept(our_cntlid), // static-any
+        0 => ConnectCntlidDecision::Accept(our_cntlid),      // 未指定/legacy（见 doc）
+        x if x == our_cntlid => ConnectCntlidDecision::Accept(our_cntlid), // static 具体匹配
+        _ => ConnectCntlidDecision::RejectInvalidParam,      // static 具体 mismatch
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,5 +529,24 @@ mod tests {
         // MDTS host 上限：4K → 32 LBA (128 KiB)，512B → 256。
         assert_eq!(host_io_max_lbas(12), 32);
         assert_eq!(host_io_max_lbas(9), 256);
+    }
+
+    /// **static controller model** — `decide_connect_cntlid` 全分支。
+    /// our_cntlid = TEACHING_CNTLID = 1。
+    #[test]
+    fn decide_connect_cntlid_full_matrix() {
+        use ConnectCntlidDecision::*;
+        // dynamic：host 送 0xFFFF（Linux nvme-tcp 真实行为）→ 分配 1。
+        assert_eq!(decide_connect_cntlid(0xFFFF, 1), Accept(1));
+        // static-any：host 送 0xFFFE → 分配 1。
+        assert_eq!(decide_connect_cntlid(0xFFFE, 1), Accept(1));
+        // static 具体匹配：host 送 1（== 我们的）→ 分配 1。
+        assert_eq!(decide_connect_cntlid(1, 1), Accept(1));
+        // **decisive**：static 具体 mismatch：host 送 5（我们只有 1）→ reject。
+        assert_eq!(decide_connect_cntlid(5, 1), RejectInvalidParam);
+        // 另一个 mismatch（高位值）。
+        assert_eq!(decide_connect_cntlid(0xFFFD, 1), RejectInvalidParam);
+        // lenience：0 = 未指定/legacy fixture → accept（见 fn doc；real host 不送 0）。
+        assert_eq!(decide_connect_cntlid(0, 1), Accept(1));
     }
 }
